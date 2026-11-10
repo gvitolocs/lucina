@@ -1,0 +1,43 @@
+The machine reset with no crash report
+reason: nothing recorded a crash: a hardware watchdog, a firmware reset or a hang with interrupts off
+last kernel log:
+[  143.281000] venus: rpmh: qxm_venus0 kBps avg 530000 peak: 583000
+[  143.314000] venus: rpmh:   0x50000=0x60814471 0x5003c=0x60784212 0x50088=0x209d82b6 0x5008c=0x609d82b6 0x5000c=0x60000008
+[  143.949000] wifi: alive at 143615 ms, 788118 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 97, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 1409, rx_in_ord_ind: 1131, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 1190, tx_compl_msdus: 12
+[  145.669000] PID 456: terminating on signal SIGKILL
+[  145.712000] venus: rpmh: qxm_venus0 kBps avg 125 peak: 0
+[  145.731000] venus: rpmh:   0x50000=0x60004000 0x5003c=0x60004000 0x50088=0x20004000 0x5008c=0x60004000 0x5000c=0x60000008
+[  145.749000] venus: session 5: closed, 0 buffers still mapped, 0 block allocations kept, 0 program buffers alive, pool 120492 KiB free
+[  145.950000] wifi: alive at 145615 ms, 794878 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 97, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 1423, rx_in_ord_ind: 1142, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 1200, tx_compl_msdus: 12
+[  147.767000] venus: idle: the bandwidth votes stay (no interconnect sum here to drop them into)
+[  147.783000] venus: idle: powered down after 2000 ms without a session, in 17717 us
+[  147.950000] wifi: alive at 147615 ms, 806801 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 97, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 1446, rx_in_ord_ind: 1161, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 1222, tx_compl_msdus: 12
+[  149.634000] audio: alive at 149299 ms, 24086 loops, stream Idle step Idle, 0 writes, 0 done, mic Idle step Idle, 0 periods in
+[  149.950000] wifi: alive at 149616 ms, 821057 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 97, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 1473, rx_in_ord_ind: 1182, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 1244, tx_compl_msdus: 13
+[  151.951000] wifi: alive at 151616 ms, 837681 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 97, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 1504, rx_in_ord_ind: 1208, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 1273, tx_compl_msdus: 13
+[  153.950000] wifi: alive at 153616 ms, 846231 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 97, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 1521, rx_in_ord_ind: 1223, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 1284, tx_compl_msdus: 13
+[  154.323000] venus: rpmh: qxm_venus0 kBps avg 2500 peak: 0
+[  154.328000] venus: rpmh:   0x50000=0x60008000 0x5003c=0x60008000 0x50088=0x20008000 0x5008c=0x60008000 0x5000c=0x60000008
+[  154.333000] venus: rpmh: acm_apps0 kBps avg 125 peak: 0
+[  154.338000] venus: rpmh:   0x50028=0x60004000 0x5007c=0x60004000 0x500a8=0x60010000
+[  154.344000] venus: idle: woken in 22626 us, status 0x40000001
+[  154.356000] venus: session 6: 1920x1088 needs type 1 size 28672 min 4 actual 4 align 256
+[  154.361000] venus: session 6: 1920x1088 needs type 2 size 28672 min 18 actual 0 align 4096
+[  154.365000] venus: session 6: 1920x1088 needs type 3 size 3133440 min 18 actual 0 align 256
+[  154.370000] venus: session 6: 1920x1088 needs type 7 size 120320 min 1 actual 1 align 256
+[  154.375000] venus: session 6: 1920x1088 needs type 5 size 147456 min 1 actual 1 align 256
+[  154.382000] venus: session 6: opened, pool 189120 KiB free, 0 program buffers alive
+[  154.391000] venus: rpmh: qxm_venus0 kBps avg 530000 peak: 583000
+[  154.396000] venus: rpmh:   0x50000=0x60814471 0x5003c=0x60784212 0x50088=0x209d82b6 0x5008c=0x609d82b6 0x5000c=0x60000008
+[  154.405000] venus: session 6: sequence Sequence { sufficient: false, width: 1920, height: 1088, profile: 4, level: 4096, bit_depth: 0, pic_struct: 1, colour_space: 0, entropy: 2, crop: [0, 0, 1920, 1080], dpb_count: 0, buffer_count: 6 }
+[  154.411000] venus: session 6: 1920x1088 needs type 1 size 1576960 min 4 actual 4 align 256
+[  154.416000] venus: session 6: 1920x1088 needs type 2 size 3153920 min 6 actual 32 align 4096
+[  154.420000] venus: session 6: 1920x1088 needs type 3 size 3133440 min 6 actual 32 align 256
+[  154.425000] venus: session 6: 1920x1088 needs type 6 size 9400320 min 1 actual 1 align 256
+[  154.430000] venus: session 6: 1920x1088 needs type 7 size 3896320 min 1 actual 1 align 256
+[  154.434000] venus: session 6: 1920x1088 needs type 5 size 147456 min 1 actual 1 align 256
+[  154.446000] venus: rpmh: qxm_venus0 kBps avg 530000 peak: 583000
+[  154.452000] venus: rpmh:   0x50000=0x60814471 0x5003c=0x60784212 0x50088=0x209d82b6 0x5008c=0x609d82b6 0x5000c=0x60000008
+[  155.641000] venus: rpmh: qxm_venus0 kBps avg 530000 peak: 583000
+[  155.647000] venus: rpmh:   0x50000=0x60814471 0x5003c=0x60784212 0x50088=0x209d82b6 0x5008c=0x609d82b6 0x5000c=0x60000008
+[  155.951000] wifi: alive at 155617 ms, 857344 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 97, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 1547, rx_in_ord_ind: 1245, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 1307, tx_compl_msdus: 13

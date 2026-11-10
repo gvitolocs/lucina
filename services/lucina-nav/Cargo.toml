@@ -1,0 +1,8 @@
+[package]
+name = "lucina-nav"
+version = "0.1.0"
+description = "Selection and index arithmetic of lists, grids and the viewers that step through a folder: next, previous, first, last, page, grid rows, next file of a kind. Pure, no dependencies, proved by Verus"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

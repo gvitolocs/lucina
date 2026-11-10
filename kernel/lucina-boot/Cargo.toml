@@ -1,0 +1,20 @@
+[package]
+name = "lucina-boot"
+version = "0.1.0"
+description = "LucinaBoot's payload package, arm64 Image header, panel choice and memory plan (no_std), plus the host packer"
+edition.workspace = true
+publish.workspace = true
+
+[features]
+default = ["std"]
+# The library is no_std, allocation-free and unsafe-free (LucinaBoot links it); the packer and the CLI need std.
+std = ["lucina-fdt/std", "dep:lucina-bootimg"]
+
+[dependencies]
+lucina-fdt = { version = "0.1.0", path = "../../kernel/lucina-fdt", default-features = false }
+# Only for its defensive file I/O (regular files only, never a device node).
+lucina-bootimg = { version = "0.1.0", path = "../../kernel/lucina-bootimg", optional = true }
+
+[[bin]]
+name = "lucina-boot"
+required-features = ["std"]

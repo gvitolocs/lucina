@@ -1,0 +1,31 @@
+[package]
+name = "lucina-glass"
+version = "0.1.0"
+description = "Glass phone UI kit (docs/design/phone-concept.md): tokens, a software canvas, thin display type, time-based animation and the concept's widgets and screens. Pure logic in src/rules.rs is proved by Verus"
+edition.workspace = true
+publish.workspace = true
+
+[features]
+# Filled-in data for the review renders (src/home/fixture.rs); never in the shell.
+fixture = []
+
+[dependencies]
+# Text: the same pair lucina-app uses (skrifa reads the outlines, ab_glyph_rasterizer turns them into coverage), here over
+# Lato (OFL) for the thin display face and a DejaVu Sans Mono subset, embedded (fonts/, about 330 KB in all).
+ab_glyph_rasterizer = "0.1.10"
+skrifa = { version = "0.49", default-features = false, features = ["libm"] }
+# Writing PNG frames for review, off the device.
+png = "0.18"
+
+# The review renders and the canvas's pixel reference draw the fixture data.
+[[example]]
+name = "home_render"
+required-features = ["fixture"]
+
+[[example]]
+name = "canvas_ref"
+required-features = ["fixture"]
+
+[[example]]
+name = "home_review"
+required-features = ["fixture"]

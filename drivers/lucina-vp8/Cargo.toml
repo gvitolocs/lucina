@@ -1,0 +1,10 @@
+[package]
+name = "lucina-vp8"
+version = "0.1.0"
+description = "A VP8 encoder for desktops, for one slow CPU"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+# The tables come from libvpx: BSD-3-Clause, see src/tables.rs.

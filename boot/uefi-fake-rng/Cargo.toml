@@ -1,0 +1,12 @@
+[package]
+name = "uefi-fake-rng"
+version = "0.1.0"
+description = "A test program: a fake EFI_RNG_PROTOCOL in front of the real LucinaUEFI, for scripts/qemu-rng-marker.sh. Never on a real disk"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"

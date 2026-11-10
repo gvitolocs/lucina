@@ -1,0 +1,6 @@
+# Same nightly as the pinned Asterinas (third_party/asterinas/rust-toolchain.toml), so this code can move into
+# OSTD as `ostd/src/arch/armv7` without a toolchain change. armv7a-none-eabi has no prebuilt rust-std there;
+# core is built from rust-src (.cargo/config.toml).
+[toolchain]
+channel = "nightly-2026-07-21"
+components = ["rust-src", "llvm-tools-preview"]

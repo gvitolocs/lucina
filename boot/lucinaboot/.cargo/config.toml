@@ -1,0 +1,10 @@
+# Soft-float: no FP/SIMD register use, so nothing depends on CPACR_EL1 as ABL left it. The target also has
+# +strict-align, which matters because with the MMU off every data access is Device memory, where unaligned
+# accesses fault.
+[build]
+target = "aarch64-unknown-none-softfloat"
+target-dir = "../../target/lucinaboot"
+
+[target.aarch64-unknown-none-softfloat]
+# Position independent: ABL picks the load address. The entry code applies the R_AARCH64_RELATIVE relocations.
+rustflags = ["-C", "relocation-model=pie"]

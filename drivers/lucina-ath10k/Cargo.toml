@@ -1,0 +1,10 @@
+[package]
+name = "lucina-ath10k"
+version = "0.1.0"
+description = "ath10k SNOC framing for WCN3990: copy engine rings, HTC, WMI-TLV, HTT, after Linux drivers/net/wireless/ath/ath10k: no_std, unsafe-free, host-tested"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt).
+edition = "2024"
+publish = false
+
+[dependencies]

@@ -1,0 +1,3 @@
+# Generated limits are provisional until a GitHub run sets them. name<TAB>command<TAB>max seconds<TAB>max peak MiB
+largest-proof	"$VERUS" verification/juno-ring/rules.rs	30	2000
+models	bash scripts/verify-models.sh	900	8000

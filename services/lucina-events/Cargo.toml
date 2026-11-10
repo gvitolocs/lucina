@@ -1,0 +1,16 @@
+[package]
+name = "lucina-events"
+version = "0.1.0"
+description = "Juno's semantic events: the Verus-checked queue, order, filter and visibility rules (no_std, shared with the kernel's /dev/lucina-events ring), and with `std` the wire format, the emit client and the hub lucina-eventd"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree (kernel/inject.txt).
+edition = "2024"
+publish = false
+
+[features]
+default = ["std"]
+std = ["dep:serde", "dep:serde_json", "dep:libc"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+libc = { version = "0.2", optional = true }

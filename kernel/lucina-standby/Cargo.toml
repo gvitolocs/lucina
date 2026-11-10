@@ -1,0 +1,8 @@
+[package]
+name = "lucina-standby"
+version = "0.1.0"
+description = "Juno's idle standby: the screen off after the idle minutes, the machine asleep a minute later (ChromeOS's gap), held off by display and system holds; no_std, no dependencies, proved by Verus, tested on the host"
+edition = "2024"
+publish = false
+
+[dependencies]

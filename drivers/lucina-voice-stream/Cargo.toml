@@ -1,0 +1,28 @@
+[package]
+name = "lucina-voice-stream"
+version = "0.1.0"
+description = "Streaming voice notes and voice commands for Juno's Lucina chat: the client side of LucinaVoice protocol sections 2 and 10 (start/server messages, the turn state machine, the 48 to 16 kHz decimator, playback expansion), proved by Verus, and a blocking WebSocket client"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json = "1"
+libc = "0.2"
+# The socket (feature `net`): tungstenite over rustls with the bundled webpki roots, as lucina-account's ureq has them: Juno has no CA store.
+tungstenite = { version = "0.26", default-features = false, features = ["handshake"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+
+[features]
+net = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots"]
+
+[dev-dependencies]
+tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+
+[[example]]
+name = "wav_turn"
+required-features = ["net"]
+
+[[test]]
+name = "mock_server"
+required-features = ["net"]

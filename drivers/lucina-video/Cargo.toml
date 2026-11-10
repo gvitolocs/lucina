@@ -1,0 +1,8 @@
+[package]
+name = "lucina-video"
+version = "0.1.0"
+description = "Video on Juno without a screen: containers, packets, the player's clock. No decoder here, so tools and tests stay small"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

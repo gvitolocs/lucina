@@ -1,0 +1,10 @@
+[package]
+name = "lucina-ksyms"
+version = "0.1.0"
+description = "The kernel's own symbol table, for naming the frames on the crash screen: a fixed placeholder in the image that the build fills from the ELF it just linked (lucina-ksyms-build). no_std, allocation-free, no dependencies"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

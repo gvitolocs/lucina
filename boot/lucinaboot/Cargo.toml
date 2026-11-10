@@ -1,0 +1,23 @@
+[package]
+name = "lucinaboot"
+version = "0.1.0"
+description = "LucinaBoot: the stage ABL starts from a surya boot.img; chainloads the LucinaOS kernel (decision D-009)"
+edition = "2024"
+# No licence field yet: LucinaOS's own licence is open (decision D-006).
+publish = false
+
+# A workspace of its own: it only builds for aarch64-unknown-none-softfloat (see .cargo/config.toml).
+[workspace]
+
+[dependencies]
+lucina-boot = { version = "0.1.0", path = "../../kernel/lucina-boot", default-features = false }
+lucina-fdt = { version = "0.1.0", path = "../../kernel/lucina-fdt", default-features = false }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"

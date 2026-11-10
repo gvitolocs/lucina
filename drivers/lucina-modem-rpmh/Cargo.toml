@@ -1,0 +1,15 @@
+[package]
+name = "lucina-modem-rpmh"
+version = "0.1.0"
+description = "Qualcomm RPMh for a modem start on SC7180: RSC command sets (active only, polled), power domain levels and regulator votes, after Linux rpmh-rsc.c, rpmhpd.c, qcom-rpmh-regulator.c: no_std, unsafe-free, host-tested"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt).
+edition = "2024"
+publish = false
+
+[dependencies]
+# RegIo, Delay and the command DB. The kernel build copies each crate to
+# kernel/libs/<name>, so this relative path resolves there too.
+lucina-qcom-soc = { path = "../../drivers/lucina-qcom-soc" }
+# The device tree parser the kernel uses (its workspace has the same version), for the tree walk of `tree`.
+fdt = "0.1.5"

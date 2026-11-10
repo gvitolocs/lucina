@@ -1,0 +1,89 @@
+use crate::{
+    Mmio, USBHost,
+    backend::kmod::hub::{HubId, HubInfo},
+};
+
+mod dwc;
+mod dwc2;
+mod ehci;
+mod hub;
+mod kcore;
+pub mod osal;
+pub(crate) mod queue;
+mod transfer;
+mod xhci;
+
+use alloc::{boxed::Box, collections::btree_map::BTreeMap};
+
+use dwc::Dwc;
+pub use dwc::{
+    DwcNewParams, DwcParams, NamedResetLine, ResetLine, UdphyParam, Usb2PhyParam,
+    UsbPhyInterfaceMode, usb2phy::Usb2PhyPortId,
+};
+use dwc2::Dwc2;
+pub use dwc2::{
+    Dwc2FifoSizes, Dwc2HostParams, Dwc2NewParams, Dwc2Quirks, Dwc2TransferStats, Dwc2UtmiWidth,
+};
+use ehci::Ehci;
+pub use ehci::EhciNewParams;
+use kcore::*;
+pub use osal::*;
+use usb_if::Speed;
+pub use xhci::Write64Order;
+use xhci::Xhci;
+
+use crate::err::*;
+
+impl USBHost {
+    pub fn new_xhci(
+        mmio: Mmio,
+        dma: dma_api::DeviceDma,
+        kernel: &'static dyn KernelOp,
+    ) -> Result<USBHost> {
+        Ok(USBHost::new(Xhci::new(mmio, dma, kernel)?))
+    }
+
+    /// An xHCI controller whose platform sets the order of ERSTBA's two 32-bit halves: `Write64Order::HiLo` for
+    /// the xHCI of a Synopsys DWC3 core, whose Linux glue always sets `write-64-hi-lo-quirk` (dwc3/host.c).
+    pub fn new_xhci_with_write64_order(
+        mmio: Mmio,
+        dma: dma_api::DeviceDma,
+        kernel: &'static dyn KernelOp,
+        write64_order: Write64Order,
+    ) -> Result<USBHost> {
+        Ok(USBHost::new(Xhci::new_with_write64_order(
+            mmio,
+            dma,
+            kernel,
+            write64_order,
+        )?))
+    }
+
+    pub fn new_dwc(params: DwcNewParams<'_>) -> Result<USBHost> {
+        Ok(USBHost::new(Dwc::new(params)?))
+    }
+
+    pub fn new_dwc2(params: Dwc2NewParams) -> Result<USBHost> {
+        Ok(USBHost::new(Dwc2::new(params)?))
+    }
+
+    pub fn new_ehci(params: EhciNewParams) -> Result<USBHost> {
+        Ok(USBHost::new(Ehci::new(params)?))
+    }
+
+    pub(crate) fn new(backend: impl CoreOp) -> Self {
+        let b = Core::new(backend);
+        Self {
+            backend: Box::new(b),
+            initialized: false,
+        }
+    }
+}
+
+pub struct DeviceAddressInfo {
+    pub root_port_id: u8,
+    pub parent_hub: Option<HubId>,
+    pub port_speed: Speed,
+    pub port_id: u8,
+    pub infos: BTreeMap<HubId, HubInfo>,
+}

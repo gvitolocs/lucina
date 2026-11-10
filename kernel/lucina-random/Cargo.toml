@@ -1,0 +1,13 @@
+[package]
+name = "lucina-random"
+version = "0.1.0"
+description = "Juno's kernel randomness after Linux's random.c: the input pool (BLAKE2s), the generator (ChaCha20 with fast key erasure), when output may be handed out, and the rules of the seed file. no_std, unsafe-free, tested on the host, the rules proved by Verus"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]
+blake2 = { version = "0.10", default-features = false }
+chacha20 = { version = "0.9", default-features = false, features = ["zeroize"] }
+zeroize = { version = "1", default-features = false }

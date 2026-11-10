@@ -1,0 +1,118 @@
+[package]
+name = "eyra"
+version = "0.22.0"
+authors = [
+    "Dan Gohman <dev@sunfishcode.online>",
+]
+description = "Rust programs written entirely in Rust"
+documentation = "https://docs.rs/eyra"
+license = "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+repository = "https://github.com/sunfishcode/eyra"
+edition = "2021"
+exclude = ["/.github", "ci"]
+keywords = ["linux"]
+
+[dependencies]
+c-gull = { path = "../c-gull", version = "0.22.1", default-features = false, features = ["eyra"] }
+
+[dev-dependencies]
+assert_cmd = "2.0.12"
+similar-asserts = "1.1.0"
+rand = "0.9.0"
+libc = "0.2.151"
+cfg-if = "1.0.0"
+rand_xorshift = "0.4.0"
+
+# Test that the ctor crate works under eyra.
+ctor = "0.4.0"
+
+# Check if rustup is installed for tests
+which = "7.0.0"
+
+# Test that the core_simd crate works under eyra.
+# TODO: Reenable this when the crate compiles on nightly. Currently it gets:
+#  - error[E0511]: invalid monomorphization of `simd_shuffle` intrinsic: simd_shuffle index must be a SIMD vector of `u32`, got `[u32; 4]`
+#core_simd = { git = "https://github.com/rust-lang/portable-simd" }
+
+# When generating documentation for docs.rs, don't enable "be-std", since we
+# don't need to duplicate std's documentation.
+[package.metadata.docs.rs]
+no-default-features = true
+
+[features]
+default = ["be-std", "threadsafe-setenv"]
+
+# Enable features that depend on std. Disable this for `no_std`.
+std = ["c-gull/std"]
+
+# This makes `setenv` and friends thread-safe by leaking memory.
+threadsafe-setenv = ["c-gull/threadsafe-setenv"]
+
+# Enable logging of program and thread startup and shutdown.
+log = ["c-gull/log"]
+
+# Install `atomic_dbg::log` as a logger.
+atomic-dbg-logger = ["c-gull/atomic-dbg-logger"]
+
+# Install the `env_logger` crate as a logger.
+env_logger = ["c-gull/env_logger", "std"]
+
+# Disable logging.
+max_level_off = ["c-gull/max_level_off"]
+
+# Enable experimental support for performing startup-time relocations, needed
+# to support statically-linked PIE executables.
+experimental-relocate = ["c-gull/experimental-relocate"]
+
+# Have eyra do `use std::*;` so that it can be used as `std`.
+be-std = ["std"]
+
+# This extends the `syscall` function with suppport for more syscalls. This is
+# not enabled by default because it increases the code size of `syscall` by
+# several kibibytes and isn't needed by most Rust programs.
+extra-syscalls = ["c-gull/extra-syscalls"]
+
+# Enable `todo!()` stubs for unimplemented functions.
+todo = ["c-gull/todo"]
+
+# Enable `unimplemented!()` stubs for deprecated functions.
+deprecated-and-unimplemented = ["c-gull/deprecated-and-unimplemented"]
+
+# Provide a `#[lang = eh_personality]` function suitable for unwinding (for
+# no-std).
+#
+# If you know your program never unwinds and want smaller code size, use
+# "eh-personality-continue" instead.
+#
+# This is only needed in no-std builds, as std provides a personality. See
+# [the "personality" feature of the unwinding crate] for more details.
+#
+# [the "personality" feature of the unwinding crate]: https://crates.io/crates/unwinding#personality-and-other-utilities
+eh-personality = ["c-gull/eh-personality"]
+
+# Provide a `#[lang = eh_personality]` function that just returns
+# `CONTINUE_UNWIND` (for no-std). Use this if you know your program will never
+# unwind and don't want any extra code.
+eh-personality-continue = ["c-gull/eh-personality-continue"]
+
+# Provide a `#[panic_handler]` function suitable for unwinding (for no-std).
+#
+# If you know your program never panics and want smaller code size, use
+# "panic-handler-trap" instead.
+#
+# This is only needed in no-std builds, as std provides a panic handler. See
+# [the "panic-handler" feature of the unwinding crate] for more details.
+#
+# [the "panic-handler" feature of the unwinding crate]: https://crates.io/crates/unwinding#personality-and-other-utilities
+panic-handler = ["c-gull/panic-handler"]
+
+# Provide a `#[panic_handler]` function that just traps (for no-std). Use this
+# if you know your program will never panic and don't want any extra code.
+panic-handler-trap = ["c-gull/panic-handler-trap"]
+
+# Provide a `#[global_allocator]` function (for no-std).
+#
+# This is only needed in no-std builds, as std provides a global allocator.
+# Alternatively, you can define the global allocator manually; see the
+# example-crates/custom-allocator example.
+global-allocator = ["c-gull/global-allocator"]

@@ -1,0 +1,8 @@
+[package]
+name = "fortuna-library"
+version = "0.1.0"
+edition = "2021"
+description = "Fortuna's game library: index, as-you-type search, Recently played, NDS banner icons (no_std, no I/O)"
+
+[dependencies]
+fortuna-launch = { path = "../fortuna-launch" }

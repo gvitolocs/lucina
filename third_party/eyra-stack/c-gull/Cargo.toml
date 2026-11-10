@@ -1,0 +1,127 @@
+[package]
+name = "c-gull"
+version = "0.22.3"
+authors = [
+    "Dan Gohman <dev@sunfishcode.online>",
+]
+description = "A libc implementation in Rust"
+documentation = "https://docs.rs/c-gull"
+license = "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+repository = "https://github.com/sunfishcode/c-ward"
+edition = "2021"
+keywords = ["linux", "libc"]
+
+[dependencies]
+# We use the libc crate for C ABI types and constants, but we don't depend on
+# the actual platform libc.
+libc = { version = "0.2.155", default-features = false }
+c-scape = { path = "../c-scape", version = "0.22.3", default-features = false }
+errno = { version = "0.3.3", default-features = false, optional = true }
+tz-rs = { version = "0.7.0", default-features = false, optional = true }
+rustix = { version = "1.0.0", default-features = false, optional = true, features = ["fs", "net", "param", "process", "rand", "termios", "thread", "time"] }
+# LucinaOS: host names as musl resolves them (hosts, then DNS), instead of running glibc's `getent`.
+lucina-resolv = { path = "../../../kernel/lucina-resolv", optional = true }
+# LucinaOS: getifaddrs as musl builds it from netlink.
+lucina-netlink = { path = "../../../kernel/lucina-netlink", optional = true }
+
+[features]
+default = ["thread", "std", "coexist-with-libc", "threadsafe-setenv"]
+thread = ["c-scape/thread"]
+std = ["c-scape/std", "rustix/std", "tz-rs/std", "errno/std", "dep:lucina-resolv", "dep:lucina-netlink"]
+
+# In "take-charge" mode, this enables code in c-scape to define the
+# `origin_start` function documented [here] and call a C ABI-compatible
+# extern `main` function.
+# [here]: https://docs.rs/origin/latest/origin/program/index.html
+call-main = ["c-scape/call-main"]
+
+# Enable logging of program and thread startup and shutdown.
+log = ["c-scape/log"]
+
+# Install `atomic_dbg::log` as a logger.
+atomic-dbg-logger = ["c-scape/atomic-dbg-logger"]
+
+# Install the `env_logger` crate as a logger.
+env_logger = ["c-scape/env_logger"]
+
+# Disable logging.
+max_level_off = ["c-scape/max_level_off"]
+
+# Enable highly experimental support for performing startup-time relocations,
+# needed to support statically-linked PIE executables.
+experimental-relocate = ["c-scape/experimental-relocate"]
+
+# A feature that pulls in all the individual features needed to use
+# c-gull to write Rust programs completely implemented in Rust.
+eyra = ["c-scape/eyra"]
+
+# One of the following two features must be enabled:
+
+# Enable this to tell c-gull to take control of the process.
+take-charge = ["c-scape/take-charge"]
+
+# Enable this to tell c-gull to let a libc be in control of
+# the process.
+coexist-with-libc = ["c-scape/coexist-with-libc"]
+
+# One of the following two features must be enabled:
+
+# Enable this to implement `malloc` using Rust's global allocator.
+malloc-via-rust-global-alloc = ["c-scape/malloc-via-rust-global-alloc"]
+
+# Enable this to implement `malloc` using third-party crates, which
+# is useful to do when using the Rust global allocator is using `malloc`.
+malloc-via-crates = ["c-scape/malloc-via-crates"]
+
+# This makes `setenv` and friends thread-safe by leaking memory.
+threadsafe-setenv = ["c-scape/threadsafe-setenv"]
+
+# Enable `todo!()` stubs for not-yet-implemented functions.
+todo = ["c-scape/todo"]
+
+# Enable `unimplemented!()` stubs for deprecated functions.
+deprecated-and-unimplemented = ["c-scape/deprecated-and-unimplemented"]
+
+# Provide a `#[lang = eh_personality]` function suitable for unwinding (for
+# no-std).
+#
+# If you know your program never unwinds and want smaller code size, use
+# "eh-personality-continue" instead.
+#
+# This is only needed in no-std builds, as std provides a personality. See
+# [the "personality" feature of the unwinding crate] for more details.
+#
+# [the "personality" feature of the unwinding crate]: https://crates.io/crates/unwinding#personality-and-other-utilities
+eh-personality = ["c-scape/eh-personality"]
+
+# Provide a `#[lang = eh_personality]` function that just returns
+# `CONTINUE_UNWIND` (for no-std). Use this if you know your program will never
+# unwind and don't want any extra code.
+eh-personality-continue = ["c-scape/eh-personality-continue"]
+
+# Provide a `#[panic_handler]` function suitable for unwinding (for no-std).
+#
+# If you know your program never panics and want smaller code size, use
+# "panic-handler-trap" instead.
+#
+# This is only needed in no-std builds, as std provides a panic handler. See
+# [the "panic-handler" feature of the unwinding crate] for more details.
+#
+# [the "panic-handler" feature of the unwinding crate]: https://crates.io/crates/unwinding#personality-and-other-utilities
+panic-handler = ["c-scape/panic-handler"]
+
+# Provide a `#[panic_handler]` function that just traps (for no-std). Use this
+# if you know your program will never panic and don't want any extra code.
+panic-handler-trap = ["c-scape/panic-handler-trap"]
+
+# Provide a `#[global_allocator]` function (for no-std).
+#
+# This is only needed in no-std builds, as std provides a global allocator.
+# Alternatively, you can define the global allocator manually; see the
+# example-crates/custom-allocator example.
+global-allocator = ["c-scape/global-allocator"]
+
+# This extends the `syscall` function with suppport for more syscalls. This is
+# not enabled by default because it increases the code size of `syscall` by
+# several kibibytes and isn't needed by most Rust programs.
+extra-syscalls = ["c-scape/extra-syscalls"]

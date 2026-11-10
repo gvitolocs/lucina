@@ -1,0 +1,10 @@
+[package]
+name = "lucina-qcom-soc"
+version = "0.1.0"
+description = "Qualcomm SoC services for remote processors: SMEM, SMP2P, TCSR mutex, cmd-db, AOSS QMP, SCM encoding, MDT firmware parsing, after Linux drivers/soc/qcom: no_std, unsafe-free, host-tested"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt).
+edition = "2024"
+publish = false
+
+[dependencies]

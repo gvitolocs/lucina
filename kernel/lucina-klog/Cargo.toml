@@ -1,0 +1,10 @@
+[package]
+name = "lucina-klog"
+version = "0.1.0"
+description = "The kernel log's ring of records for the LucinaOS kernel: no_std, unsafe-free, allocation-free, tested on the host; /dev/kmsg reads it"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

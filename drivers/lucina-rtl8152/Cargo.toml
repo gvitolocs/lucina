@@ -1,0 +1,9 @@
+[package]
+name = "lucina-rtl8152"
+version = "0.1.0"
+description = "Realtek RTL8152 USB Ethernet driver (no_std) for the LucinaOS kernel"
+edition.workspace = true
+publish = false
+
+[dependencies]
+lucina-usbnet = { version = "0.1.0", path = "../../drivers/lucina-usbnet" }

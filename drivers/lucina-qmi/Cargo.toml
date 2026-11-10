@@ -1,0 +1,10 @@
+[package]
+name = "lucina-qmi"
+version = "0.1.0"
+description = "Qualcomm QMI wire codec (table-driven, after Linux qmi_encdec.c) and the WLFW messages ath10k uses: no_std, unsafe-free, host-tested"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt).
+edition = "2024"
+publish = false
+
+[dependencies]

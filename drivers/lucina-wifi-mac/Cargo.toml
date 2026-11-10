@@ -1,0 +1,10 @@
+[package]
+name = "lucina-wifi-mac"
+version = "0.1.0"
+description = "One WPA2-PSK station above ath10k: 802.11 frames and IEs, scan table, world regulatory, MLME, the 4-way and group handshakes with its own crypto, native-WiFi <-> Ethernet. no_std, unsafe-free, no I/O, no timers of its own"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt).
+edition = "2024"
+publish = false
+
+[dependencies]

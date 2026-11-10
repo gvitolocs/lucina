@@ -1,0 +1,12 @@
+[package]
+name = "lucina-models"
+version = "0.1.0"
+description = "Model-checked protocols of LucinaOS (Stateright): RCU grace periods across CPUs, file-system durability, Juno's A/B boot. Specs in docs/spec; run by scripts/verify-models.sh"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+stateright = "0.31"
+# The models call the shipped state machines where they can, or check themselves against them (conformance tests).
+lucina-rcu = { path = "../../kernel/lucina-rcu" }
+lucina-boot = { path = "../../kernel/lucina-boot", default-features = false }

@@ -1,0 +1,25 @@
+[package]
+name = "lucina-video-play"
+version = "0.1.0"
+description = "The Video app's player as a library: decoders, Venus client, decode thread, pacing and sound"
+edition.workspace = true
+publish.workspace = true
+
+[features]
+default = ["h264-allocator"]
+# rusty_h264's own allocator for the whole program (its default), which the Video app was measured with. A program with an
+# allocator of its own turns this off: LucinaNet, which has Servo's jemalloc (two #[global_allocator]s do not link).
+h264-allocator = ["rusty_h264-decoder/global-alloc"]
+
+[dependencies]
+libc = "0.2"
+lucina-video = { path = "../../drivers/lucina-video" }
+lucina-audio-decode = { path = "../../drivers/lucina-audio-decode" }
+rusty_h264-decoder = { version = "=0.17.0", default-features = false, features = ["std", "asm"] }
+filmcraft-vp9 = "=0.9.0"
+# Main, not the published 1.1.0: that one leaves out src/arm/asm-offsets.h, so its AArch64 assembly does not build.
+rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "2e7216c20ac2a75de204d6c8d7268b75a45959b4", default-features = false, features = ["bitdepth_8"] }
+
+# The assembly only where it runs: on x86 it would need nasm, which the merge gate's host does not have.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "2e7216c20ac2a75de204d6c8d7268b75a45959b4", default-features = false, features = ["asm", "asm_arm64_dotprod", "bitdepth_8", "bitdepth_16"] }

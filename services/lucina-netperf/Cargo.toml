@@ -1,0 +1,9 @@
+[package]
+name = "lucina-netperf"
+version = "0.1.0"
+description = "Measures a network link between Juno and a Linux host: raw TCP and UDP from a chosen source address, round trips, CPU speed, and what /proc/lucina-prof sampled"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc = "0.2"

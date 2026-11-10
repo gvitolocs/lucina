@@ -1,0 +1,23 @@
+[package]
+name = "lucina-armv7"
+version = "0.1.0"
+description = "Phase 0 of the ARMv7-A (Cortex-A9, i.MX6) arch port for LucinaOS on the Kindle Paperwhite 3"
+edition = "2024"
+publish = false
+
+# Built for armv7a-none-eabi only (see .cargo/config.toml); it is not a member of the host workspace.
+[workspace]
+
+[dependencies]
+lucina-fdt = { path = "../../kernel/lucina-fdt", default-features = false }
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+debug = true
+lto = true
+codegen-units = 1

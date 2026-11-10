@@ -1,0 +1,10 @@
+[package]
+name = "lucina-i2c-hid"
+version = "0.1.0"
+description = "HID over I2C for keyboards: descriptor, power and reset commands, input reports, a report-descriptor-driven key decoder with Linux key codes; no_std, unsafe-free, host-tested"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt).
+edition = "2024"
+publish = false
+
+[dependencies]

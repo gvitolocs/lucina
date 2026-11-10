@@ -1,0 +1,11 @@
+[package]
+name = "lucina-q6"
+version = "0.1.0"
+description = "The audio DSP's APR services (AVCS, AFE, ADM, ASM) and the service registry listener, after Linux's qdsp6 drivers, plus the level ceiling and test tone: no_std, unsafe-free, host-tested"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt).
+edition = "2024"
+publish = false
+
+[dependencies]
+lucina-qcom-services = { path = "../../drivers/lucina-qcom-services" }

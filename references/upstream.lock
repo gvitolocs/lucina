@@ -1,0 +1,183 @@
+# LucinaOS upstream lock. Every external dependency, with exact revision.
+# Verified 2026-10-30 with `git ls-remote` and the GitHub API unless noted.
+# verdict: adopt | adapt | reference | reject  (reasons in docs/research/integration-decisions.md)
+
+[asterinas]
+url = "https://github.com/asterinas/asterinas"
+tag = "v0.19.0"
+rev = "c4b7ed575b7b32773475b194d2ad41fb6d03765b"   # 2026-10-12 "Bump project version to 0.19.0"; latest tag on 2026-10-30
+license = "MPL-2.0"
+verdict = "adopt"
+vendored_at = "third_party/asterinas (git submodule, unmodified)"
+reason = "Rust framekernel, Linux syscall ABI, AArch64 Tier 2 port on QEMU virt with GICv3"
+limitations = "AArch64: single CPU, fixed DRAM_BASE 0x40000000, EL1 entry only, PL011 only, no IOMMU, no DT framebuffer"
+
+[asterinas.toolchain]
+rust = "nightly-2026-07-21"                      # third_party/asterinas/rust-toolchain.toml
+docker_image = "asterinas/kernel-dev:0.19.0-20261012"
+docker_digest = "sha256:97d370e2260fec73f59d9ee02a128edb84141789248e4c1c4b18f05da8bf4e51"   # pulled on buildhost 2026-10-30, 16.5 GB
+
+[vostd]
+url = "https://github.com/asterinas/vostd"
+branch = "main"
+rev = "020b85418e2d4edcd5089cbf818e477b1d07f3ea"
+license = "MPL-2.0"
+verdict = "adapt"
+reason = "Verus proofs of OSTD memory management and synchronisation"
+limitations = "Only ostd/src/sync and ostd/libs/id-alloc track v0.19.0; all other modules are proved against v0.16.0 (README, 2026-10-30)"
+
+[kverus]
+url = "https://github.com/asterinas/KVerus"
+branch = "main"
+rev = "55fb0185e42957ac5f1f6e16c8beb9e2093a3a2e"
+license = "MIT"
+verdict = "reference"
+reason = "LLM proof synthesis/repair for Verus; evaluate after our own proof CI exists"
+
+[verus]
+url = "https://github.com/verus-lang/verus"
+release = "0.2026.11.02.8bf68ee"                 # installed 2026-11-04 from verus.zip: /home/user/tools/verus/verus-x86-linux/verus
+binary_sha256 = "1208c995c8e5244577693eba311d34bc2050c4acf984e10c4c7baf2003abff14"   # the `verus` launcher: the same across releases
+verifier_sha256 = "30d4325219c3d84b8d7512087a9068939687f740409d2bcf25cdc3174adb19c6" # rust_verify beside it: what changes per release, 2026-11-08
+rust_toolchain = "1.99.1"
+zip_x86_linux_sha256 = "f3a0119292df8855e4435da8130bee1873b0e6a60c306accf81a08ea687bba3c" # the release asset (GitHub digest), checked by tools/ci/install-verus.sh
+latest_upstream = "release/rolling/0.2026.10.30.3102966 (fcd2b06340390f2f6bb2add8081fe9fc435dcf71)"
+license = "MIT"
+verdict = "adopt"
+limitations = "Pin per proof crate; vostd may need a different Verus revision (T-VER-02)"
+
+[linux-surya]
+url = "https://github.com/pulpoff/linux-surya"
+branch = "main"
+rev = "337c05a80c739f15c09f9d1f714393828e9f5583"
+license = "GPL-2.0 (Linux; GitHub reports NOASSERTION)"
+verdict = "reference"
+reason = "Mainline-based surya kernel; hardware enablement reference only (GPL: no code copied into MPL/MIT crates)"
+
+[surya-pmos]
+url = "https://github.com/woodyst/surya-pmos"
+branch = "main"
+rev = "d7eadb03f230506140839f18a6c0ef3c43016d7e"
+tags = ["kit-2026-09-11 b2db38c5", "kit-2026-09-12 9cd265f2"]
+license = "none declared"
+verdict = "reference"
+
+[sm7150-mainline]
+url = "https://github.com/sm7150-mainline/linux"
+branch = "v7.2"
+rev = "fd78d17954a86ea6ceb0c535e618ea129e09f8dd"
+license = "GPL-2.0"
+verdict = "reference"
+
+[lineageos-device-surya]
+url = "https://github.com/LineageOS/android_device_xiaomi_surya"
+branch = "lineage-22.2"
+rev = "e5a8a8a42c95d8ad588f261bdc9d60c75ca3b3fd"
+license = "Apache-2.0 (per-file headers; repo declares none)"
+verdict = "reference"
+note = "Android baseline details in docs/research/android-reference.md"
+
+[android-baseline]
+rom = "LineageOS 22.2 (Android 15) official nightly"
+build = "lineage-22.2-20261026-nightly-surya-signed.zip"
+kernel = "Linux 4.14.356-openela-rc1 (LineageOS/android_kernel_xiaomi_surya)"
+firmware_global = "V14.0.2.0.SJGMIXM"
+firmware_eea = "V14.0.5.0.SJGEUXM"
+verdict = "reference (differential-testing baseline)"
+note = "Not downloaded. Archiving the zip needs the owner's OK (mirror keeps only 3 builds)."
+
+[mkbootimg]
+url = "https://android.googlesource.com/platform/system/tools/mkbootimg"
+branch = "main"
+rev = "d2bb0af5ba6d3198a3e99529c97eda1be0b5a093"   # 2025-03-02; latest on 2026-10-30 (shallow clone)
+license = "Apache-2.0"
+verdict = "reference (test oracle only, run from ~/scratch/lucinaos/mkbootimg; never vendored)"
+reason = "Byte-exact reference for boot image header v0-v2 (scripts/bootimg-oracle.sh)"
+
+[u-boot-asix88179]
+url = "https://github.com/u-boot/u-boot"
+tag = "v2025.10"
+path = "drivers/usb/eth/asix88179.c"
+sha256 = "27f0f4ace05aa6b893b596084a86810e19e90eaa0a6ba9faab29645d987bd276"
+license = "GPL-2.0+"
+verdict = "reference (source of truth for drivers/lucina-ax88179; behaviour only, nothing copied)"
+note = "docs/research/ax88179.md; copy on buildhost ~/scratch/ax88179-ref/"
+
+[netbsd-if-axen]
+url = "https://github.com/NetBSD/src"
+branch = "trunk"
+path = "sys/dev/usb/if_axen.c, sys/dev/usb/if_axenreg.h"
+sha256 = "6b80310a7be3b543804ca3c0947c44e104702ce602bdf8a042d4c983eb910c6f, a0a7d2080531a9b1044b74a54f60fbc9aeef6e145e4564e60c99dc8b5ced7340"   # fetched 2026-11-01
+license = "BSD-2-Clause"
+verdict = "reference (cross-check for drivers/lucina-ax88179)"
+
+[linux-ax88179]
+path = "drivers/net/usb/ax88179_178a.c"
+source = "LucinaOS branch minerva-linux (was ~/Projects/Lucina/lucinaos-kernel) 9b433e1f"
+sha256 = "b18dc503e0309681fcaca0086b700d671cb5931fedcb3d998e6060eb859361f7"
+license = "GPL-2.0"
+verdict = "reference (cross-check for drivers/lucina-ax88179: RX bounds, dummy headers)"
+
+[crab-usb]
+url = "https://github.com/rcore-os/tgoskits"
+crate = "crab-usb 0.12.1 (crates.io)"
+checksum = "f6f1ee227881d46a76a17e8f377e3ac80091302bb34091c877ce2ffb58671ae3"   # crates.io checksum, kernel tree Cargo.lock (patch 0104)
+license = "Apache-2.0"
+verdict = "adapt (aster-usb, patches 0100-0105; vendored with a small change in third_party/crab-usb, patch 0181)"
+dependencies = "xhci 0.9.2 (09f3f0483969259f2adb6524054400d94ac352e59fa37da6c6ca3b9b3d83ff83, MIT OR Apache-2.0); dma-api 0.10.2 (a622db1d36315a27cd29859e3545899f6f46e910f689de32bf49dbaa3ecd0089); ax-sync 0.6.0 (77adcc1a8aef801a3625b736b45123368f019b10967b398fc6a8fbd413e010b3); ax-crate-interface 0.5.8 (696dd1d6b12dc133997cd94350fe6d5a77bcf8bc59ef674edac6e0bfd775f8be); usb-if 0.8.0 (2456e48ed3141c6d9c9bad3679b6ca2ab3a272b8d28b95f668ced71b7d6f659b); all Apache-2.0"
+
+[voxl]
+url = "https://github.com/tembo/voxl"
+rev = "47bb94ec4d253638c1470eb81906676e1bef4b00"   # audited 2026-11-04 (/home/user/scratch/voxl-audit)
+license = "MIT"
+verdict = "adapt"
+vendored_at = "services/lucina-desk-web/web (the browser client, unchanged; sha256 of each file in its README.md)"
+reason = "Juno's screen in any browser: voxl's web client as is, its server protocol reimplemented on std threads in services/lucina-desk-web"
+limitations = "No audio, microphone, clipboard, files, recordings, resize or cursor images; the page needs a secure context (HTTPS or localhost)"
+
+[filmcraft]
+url = "https://github.com/storytold/filmcraft"
+rev = "68919ed87aa6a097a4d21414ec7c438883f5fe22"
+license = "MIT OR Apache-2.0"
+verdict = "adopt"
+vendored_at = "cargo git dependency of services/lucina-desk-web (filmcraft-h264enc; filmcraft-h264 in its tests)"
+reason = "Pure-Rust H.264 encoder (Constrained Baseline, CRF) for the browser host, already audited for the ArtCraft port"
+limitations = "No forced IDR or rate change on a running encoder: a keyframe or a quality change is a new encoder"
+dependencies = "craft-media 0.1.0 (github.com/storytold/craft-libs rev c5a1cbfb5f9049f9270955caffb5bee5997aebf7, MIT OR Apache-2.0), through filmcraft-bitstream"
+
+[linux-msm-a6xx-gpu3d]
+path = "drivers/gpu/drm/msm/adreno/a6xx_gpu.c (a6xx_set_pagetable, a6xx_submit, a6xx_recover), adreno/adreno_gpu.c (adreno_iommu_create_vm, adreno_private_vm_size), msm_iommu.c (pagetables on ASID 0), drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c (HUPCF, set_ttbr0_cfg)"
+source = "Linux 7.1, buildhost ~/Projects/Lucina/lucinaos-kernel"
+sha256 = "a6xx_gpu.c 29733589c6375930..., adreno_gpu.c 3bd1c6a4d15f1f31..., msm_iommu.c d196c1c9efb4af66..., arm-smmu-qcom.c a768f6fa7cd99fc1... (first 16 hex digits; read 2026-11-08)"
+license = "GPL-2.0"
+verdict = "adapt (Juno 3D GPU stack stage 1, patches 1170-1172, drivers/lucina-adreno gpuvm/submit/gpu_rules): the table switch, submit and recovery sequences; TTBR1 and the memptrs write rejected (no TTBR1 split here, no preemption); docs/research/juno-gpu-3d.md"
+
+[mesa-freedreno-registers]
+path = "src/freedreno/registers/adreno/adreno_pm4.xml, a6xx.xml"
+source = "Mesa 25.2.6, buildhost ~/scratch/juno-video-gpu/mesa-src/mesa-25.2.6"
+sha256 = "adreno_pm4.xml d70caf1564cab641..., a6xx.xml b58f12c23d5655c9... (first 16 hex digits)"
+license = "MIT"
+verdict = "reference (packet and register numbers for drivers/lucina-adreno pm4/submit; nothing copied)"
+
+[noto-sans-scripts]
+url = "https://github.com/notofonts/notofonts.github.io"
+rev = "93fac8abebe6c7fed0c5b7d2456d8fa484fa146c"   # 2026-10-21; files fonts/NotoSans<Script>/full/ttf/NotoSans<Script>-Regular.ttf, Thai Devanagari Bengali Gurmukhi Gujarati Tamil Telugu Kannada Malayalam Sinhala Khmer Myanmar Ethiopic Oriya
+license = "OFL-1.1"
+licence_file = "https://github.com/notofonts/thai/raw/cb0f07f16aacc38e855371b8021866e789d214ce/OFL.txt (sha256 dad6e6abc2bf3fc37cc698af7607c3f4d4235039695713b222e5a034fb5b9b1c); each face carries its own copyright in its name table"
+verdict = "adopt"
+vendored_at = "assets/fonts/noto (14 x Regular TTF, 2.8 MB, SHA256SUMS), installed to /usr/share/fonts/truetype/noto by scripts/juno-fonts.sh (gui-initramfs.sh, juno-root-image.sh)"
+reason = "Script coverage for GridCraft, CADCraft and the other ArtCraft apps, which scan fixed /usr/share/fonts paths"
+limitations = "Regular weight only; checked 2026-11-09 with fc-scan that each face covers its script"
+sha256 = "see assets/fonts/noto/SHA256SUMS"
+
+[noto-cjk-sans]
+url = "https://github.com/notofonts/noto-cjk"
+rev = "165c01b46ea533872e002e0785ff17e44f6d97d8"   # last commit touching Sans/OTC/NotoSansCJK-Regular.ttc (2021-04-30, Sans 2.004)
+file = "Sans/OTC/NotoSansCJK-Regular.ttc"
+sha256 = "b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a"   # 19484784 bytes; identical to the file on the laptop
+license = "OFL-1.1"
+licence_file = "LICENSE at the same rev, sha256 6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+verdict = "adopt"
+vendored_at = "fetched into ~/scratch/juno-disk/fonts and checked by scripts/juno-fonts.sh --cjk (juno-root-image.sh); installed to /usr/share/fonts/noto/NotoSansCJK-Regular.ttc, the path LucinaNet scans"
+reason = "CJK for LucinaNet and the ArtCraft apps; was hand-copied (LucinaNet scripts/juno-tree.sh, from ~/scratch/lucinanet/fonts)"
+limitations = "Regular only: NotoSansCJK-Bold.ttc is not installed by this recipe (LucinaNet's juno-tree.sh still installs it)"

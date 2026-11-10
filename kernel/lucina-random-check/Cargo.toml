@@ -1,0 +1,9 @@
+[package]
+name = "lucina-random-check"
+version = "0.1.0"
+description = "Checks of Juno's randomness from user space: the system calls as Linux has them, and sanity statistics on the raw source. A test tool, not part of an install"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc = "0.2"

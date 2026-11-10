@@ -1,0 +1,10 @@
+[package]
+name = "lucina-rcu"
+version = "0.1.0"
+description = "RCU grace-period bookkeeping for Juno's kernel: which retired items may be freed once every CPU has passed a quiescent point. no_std, unsafe-free, proved by Verus, tested on the host"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

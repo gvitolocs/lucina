@@ -1,0 +1,7 @@
+
+  LucinaOS rescue system: running from memory. The operating system on the disk did not start.
+
+    lucina-install-disk status      what is on the disk
+    lucina-install-disk rollback    back to the previous set, then: reboot -f
+    lucina-recover                  put the loader and BOOT.CFG right
+

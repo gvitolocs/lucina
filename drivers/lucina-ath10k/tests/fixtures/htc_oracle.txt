@@ -1,0 +1,144 @@
+sizeof.struct ath10k_htc_hdr 8
+offsetof.struct ath10k_htc_hdr.eid 0
+offsetof.struct ath10k_htc_hdr.flags 1
+offsetof.struct ath10k_htc_hdr.len 2
+offsetof.struct ath10k_htc_hdr.trailer_len 4
+offsetof.struct ath10k_htc_hdr.seq_no 5
+offsetof.struct ath10k_htc_hdr.pad_len 6
+sizeof.struct ath10k_ath10k_htc_msg_hdr 2
+sizeof.struct ath10k_htc_ready 6
+offsetof.struct ath10k_htc_ready.credit_count 0
+offsetof.struct ath10k_htc_ready.credit_size 2
+offsetof.struct ath10k_htc_ready.max_endpoints 4
+sizeof.struct ath10k_htc_ready_extended 10
+offsetof.struct ath10k_htc_ready_extended.htc_version 6
+offsetof.struct ath10k_htc_ready_extended.max_msgs_per_htc_bundle 7
+offsetof.struct ath10k_htc_ready_extended.reserved 8
+sizeof.struct ath10k_htc_conn_svc 6
+offsetof.struct ath10k_htc_conn_svc.service_id 0
+offsetof.struct ath10k_htc_conn_svc.flags 2
+sizeof.struct ath10k_htc_conn_svc_response 6
+offsetof.struct ath10k_htc_conn_svc_response.service_id 0
+offsetof.struct ath10k_htc_conn_svc_response.status 2
+offsetof.struct ath10k_htc_conn_svc_response.eid 3
+offsetof.struct ath10k_htc_conn_svc_response.max_msg_size 4
+sizeof.struct ath10k_htc_setup_complete_extended 10
+offsetof.struct ath10k_htc_setup_complete_extended.flags 2
+offsetof.struct ath10k_htc_setup_complete_extended.max_msgs_per_bundled_recv 6
+sizeof.struct ath10k_htc_msg 12
+offsetof.struct ath10k_htc_msg.ready 2
+offsetof.struct ath10k_htc_msg.connect_service 2
+sizeof.struct ath10k_ath10k_htc_record_hdr 4
+sizeof.struct ath10k_htc_credit_report 4
+sizeof.struct ath10k_htc_lookahead_report 12
+offsetof.struct ath10k_htc_lookahead_report.lookahead 4
+offsetof.struct ath10k_htc_lookahead_report.post_valid 8
+sizeof.struct ath10k_htc_lookahead_bundle 4
+const.ATH10K_HTC_FLAG_NEED_CREDIT_UPDATE 1
+const.ATH10K_HTC_FLAG_SEND_BUNDLE 2
+const.ATH10K_HTC_FLAGS_RECV_1MORE_BLOCK 1
+const.ATH10K_HTC_FLAG_TRAILER_PRESENT 2
+const.ATH10K_HTC_FLAG_BUNDLE_MASK 240
+const.ATH10K_HTC_BUNDLE_EXTRA_MASK 12
+const.ATH10K_HTC_BUNDLE_EXTRA_SHIFT 4
+const.HTC_HOST_MAX_MSG_PER_RX_BUNDLE 32
+const.ATH10K_HTC_MSG_READY_ID 1
+const.ATH10K_HTC_MSG_CONNECT_SERVICE_ID 2
+const.ATH10K_HTC_MSG_CONNECT_SERVICE_RESP_ID 3
+const.ATH10K_HTC_MSG_SETUP_COMPLETE_ID 4
+const.ATH10K_HTC_MSG_SETUP_COMPLETE_EX_ID 5
+const.ATH10K_HTC_MSG_SEND_SUSPEND_COMPLETE 6
+const.ATH10K_HTC_VERSION_2P0 0
+const.ATH10K_HTC_VERSION_2P1 1
+const.ATH10K_HTC_CONN_FLAGS_THRESHOLD_LEVEL_MASK 3
+const.ATH10K_HTC_CONN_FLAGS_REDUCE_CREDIT_DRIBBLE 4
+const.ATH10K_HTC_CONN_FLAGS_DISABLE_CREDIT_FLOW_CTRL 8
+const.ATH10K_HTC_CONN_FLAGS_RECV_ALLOC_MASK 65280
+const.ATH10K_HTC_CONN_FLAGS_RECV_ALLOC_LSB 8
+const.ATH10K_HTC_MSG_READY_EXT_ALT_DATA_MASK 4095
+const.ATH10K_HTC_CONN_SVC_STATUS_SUCCESS 0
+const.ATH10K_HTC_CONN_SVC_STATUS_NOT_FOUND 1
+const.ATH10K_HTC_CONN_SVC_STATUS_FAILED 2
+const.ATH10K_HTC_CONN_SVC_STATUS_NO_RESOURCES 3
+const.ATH10K_HTC_CONN_SVC_STATUS_NO_MORE_EP 4
+const.ATH10K_HTC_SETUP_COMPLETE_FLAGS_RX_BNDL_EN 1
+const.ATH10K_MAX_MSG_PER_HTC_TX_BUNDLE 32
+const.ATH10K_MIN_MSG_PER_HTC_TX_BUNDLE 2
+const.ATH10K_MIN_CREDIT_PER_HTC_TX_BUNDLE 2
+const.ATH10K_HTC_RECORD_NULL 0
+const.ATH10K_HTC_RECORD_CREDITS 1
+const.ATH10K_HTC_RECORD_LOOKAHEAD 2
+const.ATH10K_HTC_RECORD_LOOKAHEAD_BUNDLE 3
+const.ATH10K_HTC_EP_COUNT 9
+const.ATH10K_HTC_MAX_LEN 4096
+const.ATH10K_HTC_MAX_CTRL_MSG_LEN 256
+const.ATH10K_NUM_CONTROL_TX_BUFFERS 2
+const.ATH10K_HTC_CONTROL_BUFFER_SIZE 264
+const.ATH10K_HTC_SVC_ID_RSVD_CTRL 1
+const.ATH10K_HTC_SVC_ID_WMI_CONTROL 256
+const.ATH10K_HTC_SVC_ID_HTT_DATA_MSG 768
+const.ATH10K_HTC_SVC_ID_HTT_LOG_MSG 1536
+bundle_count.16.0 0
+bundle_count.32.6 16
+bundle_count.16.12 0
+bundle_count.32.18 1
+bundle_count.16.24 1
+bundle_count.32.30 49
+bundle_count.16.36 2
+bundle_count.32.42 34
+bundle_count.16.48 3
+bundle_count.32.54 19
+bundle_count.16.60 3
+bundle_count.32.66 4
+bundle_count.16.72 4
+bundle_count.32.78 52
+bundle_count.16.84 5
+bundle_count.32.90 37
+bundle_count.16.96 6
+bundle_count.32.102 22
+bundle_count.16.108 6
+bundle_count.32.114 7
+bundle_count.16.120 7
+bundle_count.32.126 55
+bundle_count.16.132 8
+bundle_count.32.138 40
+bundle_count.16.144 9
+bundle_count.32.150 25
+bundle_count.16.156 9
+bundle_count.32.162 10
+bundle_count.16.168 10
+bundle_count.32.174 58
+bundle_count.16.180 11
+bundle_count.32.186 43
+bundle_count.16.192 12
+bundle_count.32.198 28
+bundle_count.16.204 12
+bundle_count.32.210 13
+bundle_count.16.216 13
+bundle_count.32.222 61
+bundle_count.16.228 14
+bundle_count.32.234 46
+bytes.hdr_tx 0101230100070000
+bytes.hdr_rx 0202400008000201
+bytes.connect_wmi_control 0200000100010000
+bytes.connect_htt_data 0200000308000000
+bytes.setup_complete_ex 050000000000000000000000
+bytes.ready_ext 0100200000080800012823f1
+wait_target.total_transmit_credits 1
+wait_target.target_credit_size 2048
+wait_target.alt_data_credit_size 291
+wait_target.max_msgs_per_htc_bundle 32
+bytes.connect_resp 0300000100020008
+trailer.1 status=0 la_len=0 la= credits=0,2,0,7,0,0,0,0,0 cb=2
+trailer.2 status=0 la_len=0 la= credits=0,0,0,0,0,0,0,0,0 cb=0
+trailer.3 status=0 la_len=1 la=01020304 credits=0,0,0,0,0,0,0,0,0 cb=0
+trailer.4 status=0 la_len=0 la= credits=0,0,0,0,0,0,0,0,0 cb=0
+trailer.5 status=0 la_len=3 la=0102030405060708090a0b0c credits=0,0,0,0,0,0,0,0,0 cb=0
+trailer.6 status=-22 la_len=0 la= credits=0,0,0,0,0,0,0,0,0 cb=0
+trailer.7 status=-22 la_len=0 la= credits=0,0,0,0,0,0,0,0,0 cb=0
+trailer.8 status=-22 la_len=0 la= credits=0,0,0,0,0,0,0,0,0 cb=0
+trailer.9 status=0 la_len=0 la= credits=0,1,0,0,0,0,0,0,0 cb=1
+trailer.10 status=-22 la_len=0 la= credits=0,0,0,0,0,0,0,0,0 cb=0
+trailer.11 status=0 la_len=0 la= credits=0,0,0,0,0,0,0,0,0 cb=1
+trailer.12 status=0 la_len=0 la= credits=0,2,0,0,0,0,0,0,0 cb=1
+trailer.13 status=-22 la_len=0 la= credits=0,0,0,0,0,0,0,0,0 cb=0

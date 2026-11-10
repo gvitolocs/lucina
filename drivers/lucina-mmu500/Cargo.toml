@@ -1,0 +1,10 @@
+[package]
+name = "lucina-mmu500"
+version = "0.1.0"
+description = "ARM MMU-500 (SMMUv2) driver logic for Qualcomm SoCs (SC7180, SM7150): read-only probe, inherited stream mappings, quirk-safe bypass; no_std, unsafe-free, host-tested"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

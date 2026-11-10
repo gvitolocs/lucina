@@ -1,0 +1,10 @@
+[package]
+name = "lucina-geni"
+version = "0.1.0"
+description = "Qualcomm GENI (QUPv3) serial engine as an I2C master in FIFO mode, polled: no_std, unsafe-free, host-tested"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt).
+edition = "2024"
+publish = false
+
+[dependencies]

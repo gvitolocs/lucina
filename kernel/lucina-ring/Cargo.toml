@@ -1,0 +1,10 @@
+[package]
+name = "lucina-ring"
+version = "0.1.0"
+description = "Index arithmetic of a paged ring buffer (one page per slot, allocated on write, freed when read): byte positions to (page, offset), capacity, which pages a read finished. no_std, unsafe-free, allocation-free, tested on the host, proved by Verus"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

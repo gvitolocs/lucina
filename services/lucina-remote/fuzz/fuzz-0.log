@@ -1,0 +1,23 @@
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 3604101782
+INFO: Loaded 1 modules   (523 inline 8-bit counters): 523 [0x55879404f310, 0x55879404f51b), 
+INFO: Loaded 1 PC tables (523 PCs): 523 [0x55879404f520,0x5587940515d0), 
+INFO:        0 files found in /home/user/Projects/.worktrees/LucinaOS/juno-disk-install-root-partition-data-a-b/services/lucina-remote/fuzz/corpus/ext2_stream
+INFO: -max_len is not provided; libFuzzer will not generate inputs larger than 4096 bytes
+INFO: A corpus is not provided, starting from an empty corpus
+#2	INITED cov: 32 ft: 33 corp: 1/1b exec/s: 0 rss: 34Mb
+#7738	NEW    cov: 35 ft: 36 corp: 2/81b lim: 80 exec/s: 0 rss: 86Mb L: 80/80 MS: 1 InsertRepeatedBytes-
+#524288	pulse  cov: 35 ft: 36 corp: 2/81b lim: 4096 exec/s: 262144 rss: 407Mb
+#1048576	pulse  cov: 35 ft: 36 corp: 2/81b lim: 4096 exec/s: 262144 rss: 407Mb
+#2097152	pulse  cov: 35 ft: 36 corp: 2/81b lim: 4096 exec/s: 262144 rss: 407Mb
+#4194304	pulse  cov: 35 ft: 36 corp: 2/81b lim: 4096 exec/s: 262144 rss: 407Mb
+#8388608	pulse  cov: 35 ft: 36 corp: 2/81b lim: 4096 exec/s: 270600 rss: 407Mb
+#16777216	pulse  cov: 35 ft: 36 corp: 2/81b lim: 4096 exec/s: 262144 rss: 407Mb
+#33554432	pulse  cov: 35 ft: 36 corp: 2/81b lim: 4096 exec/s: 196224 rss: 407Mb
+#34762378	DONE   cov: 35 ft: 36 corp: 2/81b lim: 4096 exec/s: 192057 rss: 407Mb
+Done 34762378 runs in 181 second(s)
+stat::number_of_executed_units: 34762378
+stat::average_exec_per_sec:     192057
+stat::new_units_added:          1
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              407

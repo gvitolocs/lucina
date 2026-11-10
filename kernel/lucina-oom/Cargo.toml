@@ -1,0 +1,10 @@
+[package]
+name = "lucina-oom"
+version = "0.1.0"
+description = "The kernel's out-of-memory killer, its pure part: Linux's oom_badness score, the victim choice, the watermark that keeps a reserve from user page faults, and oom_score_adj at exec. no_std; the rules are proved by Verus"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

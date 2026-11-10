@@ -1,0 +1,17 @@
+[package]
+name = "lucina-ir3"
+version = "0.1.0"
+description = "Juno's own shader compiler for the Adreno 618: naga to ir3. Stage 2 of docs/research/juno-gpu-3d.md. The ISA comes from Mesa's isa/ir3*.xml (MIT), read at build time"
+edition.workspace = true
+publish.workspace = true
+license = "MIT"
+
+[dependencies]
+# The version TextureCraft's wgpu 30 uses; the front end reads its IR (docs/research/juno-gpu-3d.md).
+naga = { version = "=30.0.1", default-features = false }
+
+[dev-dependencies]
+naga = { version = "=30.0.1", default-features = false, features = ["wgsl-in"] }
+
+[build-dependencies]
+roxmltree = "0.20"

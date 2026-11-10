@@ -1,0 +1,6 @@
+# A PE32+ EFI application (subsystem EFI_APPLICATION, entry efi_main), built by rustc's own UEFI target. UEFI runs
+# it at EL1 or EL2 with the MMU on and identity-mapped RAM, so unaligned accesses and FP/SIMD are fine until the
+# trampoline in src/arch.rs turns the MMU off.
+[build]
+target = "aarch64-unknown-uefi"
+target-dir = "../../target/lucina-uefi"

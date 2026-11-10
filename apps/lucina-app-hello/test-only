@@ -1,0 +1,1 @@
+This app proves the toolkit and the app model. Build scripts leave it out unless LUCINA_GUI_TEST_APPS=1.

@@ -1,0 +1,7 @@
+[package]
+name = "fortuna-ring"
+version = "0.1.0"
+edition = "2021"
+description = "Single-producer single-consumer ring between the DSi's CPUs (the microphone): Verus-checked counters, TLC-checked cross-CPU order"
+
+[dependencies]

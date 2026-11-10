@@ -1,0 +1,485 @@
+table 0 c0 18 38 3 3 1 table+c0 1010000 32000 0 0 1 1 1 0 0 0 0 0 1 table+c80c0 1010001 32000 0 0 1 1 1 0 0 0 0 0 1 table+1900c0 1010002 32000 0 0 1 1 0 0 0 0 0 0
+scm set_remote_state 1
+w d2064 table+0
+w d2068 300000
+w d2054 table+0
+w d2050 1
+w d205c table+259000
+w e0010 8
+w d2048 1
+w df018 8000
+cmd c 10001 1
+w df018 8000
+cmd 10 10006 1 6
+w df018 8000
+cmd 18 10005 1 1 18 1
+w df018 8000
+cmd 14 10005 1 5 1
+w d201c 1
+w e0014 4
+core error 0 version 5.4-32
+session
+w df018 8000
+cmd 18 10005 1 1 18 1
+w df018 8000
+cmd 14 10007 5e55 2 2
+w d201c 1
+w e0014 4
+w df018 8000
+cmd 20 11001 5e55 1 1001 1 60 60
+w df018 8000
+cmd 18 11001 5e55 1 2002 1
+w df018 8000
+cmd 1c 11001 5e55 1 1003002 808010 8020010
+w df018 8000
+cmd 18 11001 5e55 1 1015 2
+w df018 8000
+cmd 1c 11001 5e55 1 1003 3 2
+w df018 8000
+cmd 1c 11001 5e55 1 1003001 2 0
+w df018 8000
+cmd 1c 11001 5e55 1 1003001 3 1
+w df018 8000
+cmd 1c 11001 5e55 1 1003 2 8002
+w df018 8000
+cmd 20 11001 5e55 1 1001 3 780 440
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 3248128 min 6 actual 8
+bufreq 3 size 3133440 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd 1c 11001 5e55 1 20100c 3 2fd000
+w df018 8000
+cmd 1c 11001 5e55 1 20100c 2 319000
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 3248128 min 6 actual 8
+bufreq 3 size 3133440 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 3248128 min 6 actual 8
+bufreq 3 size 3133440 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd 20 11001 5e55 1 201001 1 4 4
+w df018 8000
+cmd 20 11001 5e55 1 201001 2 20 20
+w df018 8000
+cmd 20 11001 5e55 1 201001 3 20 20
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 3248128 min 6 actual 8
+bufreq 3 size 3133440 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd 24 11002 5e55 6 300000 0 300000 1 96000000
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 3248128 min 6 actual 8
+bufreq 3 size 3133440 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd 24 11002 5e55 7 80000 0 80000 1 97000000
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 3248128 min 6 actual 8
+bufreq 3 size 3133440 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 3248128 min 6 actual 8
+bufreq 3 size 3133440 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd 24 11002 5e55 4 100000 0 100000 1 94000000
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 3248128 min 6 actual 8
+bufreq 3 size 3133440 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd 24 11002 5e55 5 40000 0 40000 1 95000000
+w df018 8000
+cmd c 211001 5e55
+w d201c 1
+w e0014 4
+w df018 8000
+cmd c 211002 5e55
+w d201c 1
+w e0014 4
+w df018 8000
+cmd 3c 211004 5e55 0 0 0 0 0 0 17f000 9c40 0 91000000 6449 9528b0f0
+w d201c 1
+w e0014 4
+done 1 tag 0 bytes 40000 off 0 flags 0 hfi 0 ts 0
+event 1 type 1000001 w 1920 h 1080 depth 0 pic 1 count 6 crop 0 0 1920 1080
+w df018 8000
+cmd 18 11001 5e55 1 1015 2
+w df018 8000
+cmd 1c 11001 5e55 1 1003 3 2
+w df018 8000
+cmd 1c 11001 5e55 1 1003001 2 0
+w df018 8000
+cmd 1c 11001 5e55 1 1003001 3 1
+w df018 8000
+cmd 1c 11001 5e55 1 1003 2 8002
+w df018 8000
+cmd 20 11001 5e55 1 1001 3 780 440
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 3248128 min 6 actual 8
+bufreq 3 size 3133440 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd 1c 11001 5e55 1 20100c 3 2fd000
+w df018 8000
+cmd 1c 11001 5e55 1 20100c 2 319000
+w df018 8000
+cmd 20 11001 5e55 1 201001 1 4 4
+w df018 8000
+cmd 20 11001 5e55 1 201001 2 20 20
+w df018 8000
+cmd 20 11001 5e55 1 201001 3 20 20
+w df018 8000
+cmd 24 21100b 5e55 6 300000 0 1 1 96000000
+w d201c 1
+w e0014 4
+w df018 8000
+cmd 24 21100b 5e55 7 80000 0 1 1 97000000
+w d201c 1
+w e0014 4
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 3248128 min 6 actual 8
+bufreq 3 size 3133440 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd 24 11002 5e55 6 300000 0 300000 1 96000000
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 3248128 min 6 actual 8
+bufreq 3 size 3133440 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd 24 11002 5e55 7 80000 0 80000 1 97000000
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 3248128 min 6 actual 8
+bufreq 3 size 3133440 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 3248128 min 6 actual 8
+bufreq 3 size 3133440 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd c 21100d 5e55
+w df018 8000
+cmd 2c 211005 5e55 0 0 319000 0 20 9a000000 0 0
+w df018 8000
+cmd 2c 211005 5e55 0 0 319000 0 21 9a400000 0 0
+w df018 8000
+cmd 2c 211005 5e55 0 0 319000 0 22 9a800000 0 0
+w df018 8000
+cmd 2c 211005 5e55 0 0 319000 0 23 9ac00000 0 0
+w df018 8000
+cmd 2c 211005 5e55 0 0 319000 0 24 9b000000 0 0
+w df018 8000
+cmd 2c 211005 5e55 0 0 319000 0 25 9b400000 0 0
+w df018 8000
+cmd 2c 211005 5e55 1 0 2fd000 0 0 93000000 0 0
+w d201c 1
+w e0014 4
+done 3 tag 0 bytes 3133440 off 0 flags 10 hfi 0 ts 40000
+w df018 8000
+cmd 2c 211005 5e55 1 0 2fd000 0 1 93400000 0 0
+w d201c 1
+w e0014 4
+done 3 tag 1 bytes 3133440 off 0 flags 10 hfi 0 ts 80000
+w df018 8000
+cmd 3c 211004 5e55 0 9c40 0 0 0 0 17f000 2328 1 91400000 2fd000 662aa040
+w d201c 1
+w e0014 4
+done 1 tag 1 bytes 9000 off 0 flags 0 hfi 0 ts 0
+w df018 8000
+cmd 10 211008 5e55 1000004
+w d201c 1
+w e0014 4
+flushed
+w df018 8000
+cmd 2c 211005 5e55 0 0 319000 0 20 9a000000 0 0
+w df018 8000
+cmd 2c 211005 5e55 0 0 319000 0 21 9a400000 0 0
+w df018 8000
+cmd 2c 211005 5e55 0 0 319000 0 22 9a800000 0 0
+w df018 8000
+cmd 2c 211005 5e55 0 0 319000 0 23 9ac00000 0 0
+w df018 8000
+cmd 2c 211005 5e55 0 0 319000 0 24 9b000000 0 0
+w df018 8000
+cmd 2c 211005 5e55 0 0 319000 0 25 9b400000 0 0
+w df018 8000
+cmd 2c 211005 5e55 1 0 2fd000 0 0 93000000 0 0
+w d201c 1
+w e0014 4
+done 3 tag 0 bytes 3133440 off 0 flags 10 hfi 0 ts 120000
+w df018 8000
+cmd 2c 211005 5e55 1 0 2fd000 0 1 93400000 0 0
+w d201c 1
+w e0014 4
+done 3 tag 1 bytes 3133440 off 0 flags 10 hfi 0 ts 160000
+w df018 8000
+cmd 3c 211004 5e55 0 13880 0 0 0 0 17f000 1388 2 91800000 2fd000 662aa040
+w d201c 1
+w e0014 4
+done 1 tag 2 bytes 5000 off 0 flags 0 hfi 0 ts 0
+event 1 type 1000001 w 1280 h 720 depth 0 pic 1 count 6 crop 0 0 1280 720
+w df018 8000
+cmd 10 211008 5e55 1000002
+w d201c 1
+w e0014 4
+flushed
+w df018 8000
+cmd 10 211008 5e55 1000002
+w d201c 1
+w e0014 4
+flushed
+w df018 8000
+cmd 18 11001 5e55 1 1015 1
+w df018 8000
+cmd 1c 11001 5e55 1 1003 3 2
+w df018 8000
+cmd 1c 11001 5e55 1 1003001 2 0
+w df018 8000
+cmd 1c 11001 5e55 1 1003001 3 1
+w df018 8000
+cmd 1c 11001 5e55 1 1003 2 8002
+w df018 8000
+cmd 20 11001 5e55 1 1001 3 500 2e0
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 1507328 min 6 actual 8
+bufreq 3 size 1413120 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd 1c 11001 5e55 1 20100c 3 159000
+w df018 8000
+cmd 1c 11001 5e55 1 20100c 2 170000
+w df018 8000
+cmd 20 11001 5e55 1 201001 1 4 4
+w df018 8000
+cmd 20 11001 5e55 1 201001 2 20 20
+w df018 8000
+cmd 20 11001 5e55 1 201001 3 20 20
+w df018 8000
+cmd 24 21100b 5e55 6 300000 0 1 1 96000000
+w d201c 1
+w e0014 4
+w df018 8000
+cmd 24 21100b 5e55 7 80000 0 1 1 97000000
+w d201c 1
+w e0014 4
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 1507328 min 6 actual 8
+bufreq 3 size 1413120 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd 24 11002 5e55 6 300000 0 300000 1 96000000
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 1507328 min 6 actual 8
+bufreq 3 size 1413120 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd 24 11002 5e55 7 80000 0 80000 1 97000000
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 1507328 min 6 actual 8
+bufreq 3 size 1413120 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd 14 211009 5e55 1 202001
+w d201c 1
+w e0014 4
+bufreq 1 size 1568768 min 2 actual 4
+bufreq 2 size 1507328 min 6 actual 8
+bufreq 3 size 1413120 min 6 actual 8
+bufreq 6 size 3145728 min 1 actual 1
+bufreq 7 size 524288 min 1 actual 1
+bufreq 8 size 0 min 0 actual 0
+bufreq 4 size 1048576 min 1 actual 1
+bufreq 5 size 262144 min 1 actual 1
+w df018 8000
+cmd c 21100d 5e55
+w df018 8000
+cmd 2c 211005 5e55 0 0 170000 0 20 9a000000 0 0
+w df018 8000
+cmd 2c 211005 5e55 0 0 170000 0 21 9a400000 0 0
+w df018 8000
+cmd 2c 211005 5e55 0 0 170000 0 22 9a800000 0 0
+w df018 8000
+cmd 2c 211005 5e55 0 0 170000 0 23 9ac00000 0 0
+w df018 8000
+cmd 2c 211005 5e55 0 0 170000 0 24 9b000000 0 0
+w df018 8000
+cmd 2c 211005 5e55 0 0 170000 0 25 9b400000 0 0
+w df018 8000
+cmd 3c 211004 5e55 0 0 1 0 0 0 0 0 0 deadb000 170000 662aa040
+w d201c 1
+w e0014 4
+done 1 tag 0 bytes 0 off 0 flags 0 hfi 0 ts 0
+w df018 8000
+cmd 10 211008 5e55 1000004
+w d201c 1
+w e0014 4
+flushed
+w df018 8000
+cmd c 211003 5e55
+w d201c 1
+w e0014 4
+w df018 8000
+cmd c 21100c 5e55
+w d201c 1
+w e0014 4
+w df018 8000
+cmd 24 21100b 5e55 4 100000 0 1 1 94000000
+w d201c 1
+w e0014 4
+w df018 8000
+cmd 24 21100b 5e55 5 40000 0 1 1 95000000
+w d201c 1
+w e0014 4
+w df018 8000
+cmd 24 21100b 5e55 6 300000 0 1 1 96000000
+w d201c 1
+w e0014 4
+w df018 8000
+cmd 24 21100b 5e55 7 80000 0 1 1 97000000
+w d201c 1
+w e0014 4
+w df018 8000
+cmd c 10008 5e55
+w d201c 1
+w e0014 4

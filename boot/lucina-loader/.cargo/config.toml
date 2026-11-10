@@ -1,0 +1,5 @@
+# A PE32+ EFI application (subsystem EFI_APPLICATION, entry efi_main), built by rustc's own UEFI target. UEFI runs
+# it with the MMU on and identity-mapped RAM; it never leaves boot services (the kernel's EFI stub does).
+[build]
+target = "aarch64-unknown-uefi"
+target-dir = "../../target/lucina-loader"

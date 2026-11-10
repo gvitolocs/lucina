@@ -1,0 +1,9 @@
+[package]
+name = "lucina-ax88179"
+version = "0.1.0"
+description = "ASIX AX88179 USB 3 gigabit Ethernet driver (no_std) for the LucinaOS kernel"
+edition.workspace = true
+publish = false
+
+[dependencies]
+lucina-usbnet = { version = "0.1.0", path = "../../drivers/lucina-usbnet" }

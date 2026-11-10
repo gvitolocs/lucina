@@ -1,0 +1,10 @@
+[package]
+name = "lucina-idle"
+version = "0.1.0"
+description = "Which idle CPU wakes for the system's next timer, which PSCI idle state a CPU and its cluster take (teo, OS-initiated domains), and the broadcast wake-up. no_std, unsafe-free, allocation-free, tested on the host"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

@@ -1,0 +1,17 @@
+[package]
+name = "lucina-intent-host"
+version = "0.1.0"
+description = "lucina-devd's side of Juno app intents: the catalog from manifests and --intents, the decision gate, delivery to apps (socket, shell, headless), the undo journal and undo"
+edition = "2024"
+publish = false
+
+[dependencies]
+lucina-app = { path = "../../apps/lucina-app" }
+lucina-ax = { path = "../../services/lucina-ax" }
+lucina-intents = { path = "../../services/lucina-intents" }
+serde_json = "1"
+sha2 = "0.10"
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

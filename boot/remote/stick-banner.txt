@@ -1,0 +1,10 @@
+
+  LucinaOS recovery stick.
+
+    Type   lucina-recover   and press Enter.
+
+  It restores the loader and goes back to the previous generation, and says what it did. Nothing else on the disk changes.
+  lucina-recover check     says what it would do, writes nothing.
+  lucina-recover loader    only the loader: keeps the generation.
+  lucina-recover old       the same with the previous loader, if the first did not help.
+

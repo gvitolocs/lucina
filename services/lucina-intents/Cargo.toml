@@ -1,0 +1,12 @@
+[package]
+name = "lucina-intents"
+version = "0.1.0"
+description = "Juno app intents and Lucina's undo journal: effect classes, argument checks, undo entries and journal order (rules.rs, checked by Verus), plus the intent specs and journal records the toolkit and lucina-devd share"
+edition = "2024"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+libc = "0.2"

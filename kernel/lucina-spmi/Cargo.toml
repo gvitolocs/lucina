@@ -1,0 +1,10 @@
+[package]
+name = "lucina-spmi"
+version = "0.1.0"
+description = "Reads Qualcomm PMIC registers through the SPMI arbiter v5 and the PMIC real-time clock; writes only the backlight LPG channel and the power key and RTC alarm interrupt and alarm registers (Verus-proved allowlist). no_std, unsafe-free, tested on the host"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

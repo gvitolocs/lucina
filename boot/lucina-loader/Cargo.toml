@@ -1,0 +1,27 @@
+[package]
+name = "lucina-loader"
+version = "0.1.0"
+description = "LucinaLoader: UEFI boot menu (BOOTAA64.EFI) that starts LucinaOS's Linux on the Galaxy Book Go in GRUB's place"
+edition = "2024"
+# No licence field yet: LucinaOS's own licence is open (decision D-006).
+publish = false
+
+# A workspace of its own: it only builds for aarch64-unknown-uefi (see .cargo/config.toml).
+[workspace]
+
+[dependencies]
+lucina-boot = { version = "0.1.0", path = "../../kernel/lucina-boot", default-features = false }
+lucina-fdt = { version = "0.1.0", path = "../../kernel/lucina-fdt", default-features = false }
+
+[build-dependencies]
+# Rasterizes the theme's DejaVu fonts at build time (MIT OR Apache-2.0 OR Zlib); nothing of it is in the binary.
+fontdue = { version = "0.9", default-features = false, features = ["std"] }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"

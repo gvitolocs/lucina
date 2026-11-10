@@ -1,0 +1,9 @@
+[package]
+name = "ceres-ctl"
+version = "0.1.0"
+description = "buildhost side of Ceres: talks to the ESP32 over USB serial (CH340); also installs as dsi-power"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serialport = { version = "4", default-features = false }

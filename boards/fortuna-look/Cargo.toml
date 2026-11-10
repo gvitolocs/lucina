@@ -1,0 +1,20 @@
+[package]
+name = "fortuna-look"
+version = "0.1.0"
+edition = "2021"
+description = "Fortuna (DSi) in the Lucina look: the house palette and the Glass concept's materials in RGB555 with an ordered dither, DejaVu and Lato Light faces, icons, layout with d-pad focus, and the screens, drawn in software. no_std, no I/O."
+
+[features]
+# The sample screens (sample.rs): the mockup and the contrast test draw them.
+sample = []
+
+[dependencies]
+fortuna-library = { path = "../../boards/fortuna-library" }
+
+[dev-dependencies]
+qrcodegen = "1.8"
+png = "0.18"
+
+[[example]]
+name = "mockup"
+required-features = ["sample"]

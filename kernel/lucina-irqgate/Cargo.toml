@@ -1,0 +1,10 @@
+[package]
+name = "lucina-irqgate"
+version = "0.1.0"
+description = "The gate between a device's interrupt handler and the thread that waits for it: arm, fire, take, with the device's interrupt enable kept in step. no_std, unsafe-free, allocation-free, tested on the host, proved by Verus"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

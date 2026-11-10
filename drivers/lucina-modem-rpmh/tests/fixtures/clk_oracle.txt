@@ -1,0 +1,10 @@
+table RPMH_CXO_CLK=0 is_bi_tcxo_div2=1
+clk res_name=xo.lvl res_addr=0 res_on_val=3 div=2 valid_state_mask=0x7
+clk_ao valid_state_mask=0x6
+const CLK_RPMH_ARC_EN_OFFSET 0
+prepare sleep addr=0x30060 data=3 sync=0
+prepare wake addr=0x30060 data=3 sync=0
+prepare active addr=0x30060 data=3 sync=1
+unprepare sleep addr=0x30060 data=0 sync=0
+unprepare wake addr=0x30060 data=0 sync=0
+unprepare active addr=0x30060 data=0 sync=0

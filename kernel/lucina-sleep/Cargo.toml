@@ -1,0 +1,10 @@
+[package]
+name = "lucina-sleep"
+version = "0.1.0"
+description = "Juno's sleep as steps: suspend in order, resume in reverse, a wake turns the suspend back, the CPUs idle only with a wake source armed; and the PDC words the wake setup may write. no_std, no dependencies, proved by Verus, tested on the host"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

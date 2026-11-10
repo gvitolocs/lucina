@@ -1,0 +1,10 @@
+[package]
+name = "lucina-rngb"
+version = "0.1.0"
+description = "The i.MX RNGB random number block of the Kindle's SoloLite, after Linux's imx-rngc.c: self test, seed, reading the FIFO. no_std, unsafe-free, tested on the host"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

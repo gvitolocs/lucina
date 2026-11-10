@@ -1,0 +1,9 @@
+[package]
+name = "lucina-netlink"
+version = "0.1.0"
+description = "getifaddrs as musl builds it from netlink route dumps, for Juno's programs with no C library (Eyra)"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc = "0.2"

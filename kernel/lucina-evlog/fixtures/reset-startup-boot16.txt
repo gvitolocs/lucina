@@ -1,0 +1,75 @@
+The machine reset with no crash report
+reason: nothing recorded a crash: a hardware watchdog, a firmware reset or a hang with interrupts off
+last kernel log:
+
+[    2.766000] POSIX_FADV_WILLNEED is ignored
+[    2.767000] POSIX_FADV_WILLNEED is ignored
+[    2.768000] POSIX_FADV_WILLNEED is ignored
+[    2.770000] POSIX_FADV_WILLNEED is ignored
+[    2.771000] POSIX_FADV_WILLNEED is ignored
+[    2.773000] POSIX_FADV_WILLNEED is ignored
+[    2.774000] POSIX_FADV_WILLNEED is ignored
+[    2.775000] POSIX_FADV_WILLNEED is ignored
+[    2.777000] POSIX_FADV_WILLNEED is ignored
+[    2.778000] POSIX_FADV_WILLNEED is ignored
+[    2.779000] POSIX_FADV_WILLNEED is ignored
+[    2.952000] POSIX_FADV_WILLNEED is ignored
+[    2.953000] POSIX_FADV_WILLNEED is ignored
+[    2.954000] POSIX_FADV_WILLNEED is ignored
+[    2.956000] POSIX_FADV_WILLNEED is ignored
+[    2.957000] POSIX_FADV_WILLNEED is ignored
+[    2.959000] POSIX_FADV_WILLNEED is ignored
+[    2.960000] POSIX_FADV_WILLNEED is ignored
+[    2.961000] POSIX_FADV_WILLNEED is ignored
+[    2.963000] POSIX_FADV_WILLNEED is ignored
+[    2.964000] POSIX_FADV_WILLNEED is ignored
+[    2.965000] POSIX_FADV_WILLNEED is ignored
+[    2.966000] POSIX_FADV_WILLNEED is ignored
+[    2.968000] POSIX_FADV_WILLNEED is ignored
+[    2.969000] POSIX_FADV_WILLNEED is ignored
+[    2.970000] POSIX_FADV_WILLNEED is ignored
+[    2.971000] POSIX_FADV_WILLNEED is ignored
+[    2.973000] POSIX_FADV_WILLNEED is ignored
+[    2.974000] POSIX_FADV_WILLNEED is ignored
+[    2.975000] POSIX_FADV_WILLNEED is ignored
+[    2.976000] POSIX_FADV_WILLNEED is ignored
+[    2.978000] POSIX_FADV_WILLNEED is ignored
+[    2.979000] POSIX_FADV_WILLNEED is ignored
+[    2.980000] POSIX_FADV_WILLNEED is ignored
+[    2.981000] POSIX_FADV_WILLNEED is ignored
+[    2.983000] POSIX_FADV_WILLNEED is ignored
+[    2.984000] POSIX_FADV_WILLNEED is ignored
+[    2.985000] POSIX_FADV_WILLNEED is ignored
+[    2.986000] POSIX_FADV_WILLNEED is ignored
+[    2.988000] POSIX_FADV_WILLNEED is ignored
+[    2.989000] POSIX_FADV_WILLNEED is ignored
+[    2.990000] POSIX_FADV_WILLNEED is ignored
+[    2.991000] POSIX_FADV_WILLNEED is ignored
+[    2.993000] POSIX_FADV_WILLNEED is ignored
+[    2.994000] POSIX_FADV_WILLNEED is ignored
+[    2.995000] POSIX_FADV_WILLNEED is ignored
+[    2.996000] POSIX_FADV_WILLNEED is ignored
+[    2.998000] POSIX_FADV_WILLNEED is ignored
+[    2.999000] POSIX_FADV_WILLNEED is ignored
+[    3.000000] POSIX_FADV_WILLNEED is ignored
+[    3.002000] POSIX_FADV_WILLNEED is ignored
+[    3.003000] POSIX_FADV_WILLNEED is ignored
+[    3.005000] POSIX_FADV_WILLNEED is ignored
+[    3.006000] POSIX_FADV_WILLNEED is ignored
+[    3.007000] POSIX_FADV_WILLNEED is ignored
+[    3.009000] POSIX_FADV_WILLNEED is ignored
+[    3.011000] POSIX_FADV_WILLNEED is ignored
+[    3.012000] POSIX_FADV_WILLNEED is ignored
+[    3.013000] POSIX_FADV_WILLNEED is ignored
+[    3.014000] POSIX_FADV_WILLNEED is ignored
+[    3.016000] POSIX_FADV_WILLNEED is ignored
+[    3.016000] wifi: qrtr: service 51 (0x33) instance 0x301 at 0:31
+[    3.017000] POSIX_FADV_WILLNEED is ignored
+[    3.029000] wifi: qrtr: service 69 (0x45) instance 0x1 at 0:32
+[    3.030000] POSIX_FADV_WILLNEED is ignored
+[    3.032000] wifi: wlfw: the service is up
+[    3.034000] POSIX_FADV_WILLNEED is ignored
+[    3.037000] POSIX_FADV_WILLNEED is ignored
+[    3.038000] POSIX_FADV_WILLNEED is ignored
+[    3.040000] POSIX_FADV_WILLNEED is ignored
+[    3.041000] POSIX_FADV_WILLNEED is ignored

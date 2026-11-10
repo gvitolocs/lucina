@@ -1,0 +1,77 @@
+Lucina Juno crashed
+reason: Heap allocation error, layout = Layout {
+    size: 0x40000,
+    align: 1 (1 << 0),
+}
+where: panic on CPU 6, uptime 5491.524 s, boot 11
+build: 5.13.0-LucinaJuno juno-9672e3f5ecc1
+registers:
+pc ffffffffa08cfe40  lr ffffffffa08cfe24  sp ffffdffffea27ea0  pstate 00000000
+x00 0000000000000000  x01 0000000000000000  x02 0000000000000000  x03 0000000000000000
+x04 0000000000000000  x05 0000000000000000  x06 0000000000000000  x07 0000000000000000
+x08 0000000000000000  x09 0000000000000000  x10 0000000000000000  x11 0000000000000000
+x12 0000000000000000  x13 0000000000000000  x14 0000000000000000  x15 0000000000000000
+x16 0000000000000000  x17 0000000000000000  x18 0000000000000000  x19 ffffffffa0aa4528
+x20 0000000000000020  x21 ffffffffa0aa4428  x22 ffffffffa0aa3a58  x23 ffffffffa0ab05e0
+x24 ffffdffffea27f98  x25 0000000000000754  x26 ffff80013bb1a000  x27 ffffffffa0aa4530
+x28 0000000000000089  x29 ffffdffffea28090
+backtrace (scripts/juno-symbolize.sh names them):
+ffffffffa08a1338 
+ffffffffa08cbcfc 
+ffffffffa08adac8 
+ffffffffa08ad248 
+ffffffffa024fbe4 
+ffffffffa024f0f8 
+ffffffffa0255278 
+ffffffffa05fce78 
+ffffffffa053e4d8 
+ffffffffa061d550 
+ffffffffa03e7d54 
+ffffffffa0344348 
+ffffffffa0362e50 
+ffffffffa041a734 
+ffffffffa06461b0 
+ffffffffa08e317c 
+ffffffffa08e3250 
+ffffffffa08ca568 
+last kernel log:
+[ 5438.851000] net: "wlan0": last 10000 ms: 1344 frames in 1539 polls, longest 155 us, gave way 0
+[ 5440.723000] wifi: alive at 5434712 ms, 43124533 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 509636, rx_in_ord_ind: 498095, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50002, tx_compl_
+[ 5442.723000] wifi: alive at 5436712 ms, 43140478 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 509730, rx_in_ord_ind: 498183, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50024, tx_compl_
+[ 5444.724000] wifi: alive at 5438713 ms, 43159350 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 509993, rx_in_ord_ind: 498442, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50046, tx_compl_
+[ 5446.724000] wifi: alive at 5440713 ms, 43174924 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 510080, rx_in_ord_ind: 498524, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50068, tx_compl_
+[ 5447.214000] audio: alive at 5441201 ms, 967549 loops, stream Idle step Idle, 0 writes, 0 done, mic Idle step Idle, 0 periods in
+[ 5448.723000] wifi: alive at 5442713 ms, 43188660 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 1, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 510275, rx_in_ord_ind: 498716, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50080, tx_compl_
+[ 5450.724000] wifi: alive at 5444713 ms, 43205458 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 510492, rx_in_ord_ind: 498928, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50104, tx_compl_
+[ 5452.724000] wifi: alive at 5446713 ms, 43227768 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 510884, rx_in_ord_ind: 499315, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50127, tx_compl_
+[ 5454.724000] wifi: alive at 5448713 ms, 43246162 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 511087, rx_in_ord_ind: 499514, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50150, tx_compl_
+[ 5456.723000] wifi: alive at 5450713 ms, 43265350 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 511384, rx_in_ord_ind: 499807, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50175, tx_compl_
+[ 5457.219000] audio: alive at 5451206 ms, 969311 loops, stream Idle step Idle, 0 writes, 0 done, mic Idle step Idle, 0 periods in
+[ 5458.724000] wifi: alive at 5452713 ms, 43276286 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 511541, rx_in_ord_ind: 499961, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50186, tx_compl_
+[ 5458.851000] net: "wlan0": last 10000 ms: 1274 frames in 1441 polls, longest 245 us, gave way 0
+[ 5460.725000] wifi: alive at 5454713 ms, 43297905 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 511954, rx_in_ord_ind: 500368, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50210, tx_compl_
+[ 5462.724000] wifi: alive at 5456713 ms, 43318856 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 512351, rx_in_ord_ind: 500759, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50231, tx_compl_
+[ 5464.725000] wifi: alive at 5458714 ms, 43337532 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 512707, rx_in_ord_ind: 501110, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50253, tx_compl_
+[ 5466.724000] wifi: alive at 5460714 ms, 43356274 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 512929, rx_in_ord_ind: 501325, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50285, tx_compl_
+[ 5467.218000] audio: alive at 5461207 ms, 971077 loops, stream Idle step Idle, 0 writes, 0 done, mic Idle step Idle, 0 periods in
+[ 5468.725000] wifi: alive at 5462714 ms, 43371592 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 513351, rx_in_ord_ind: 501743, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50299, tx_compl_
+[ 5468.851000] net: "wlan0": last 10000 ms: 1805 frames in 1927 polls, longest 239 us, gave way 0
+[ 5470.727000] wifi: alive at 5464715 ms, 43391800 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 513647, rx_in_ord_ind: 502033, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50331, tx_compl_
+[ 5472.726000] wifi: alive at 5466715 ms, 43406557 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 513725, rx_in_ord_ind: 502105, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50351, tx_compl_
+[ 5474.727000] wifi: alive at 5468716 ms, 43426956 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 513959, rx_in_ord_ind: 502334, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50375, tx_compl_
+[ 5476.728000] wifi: alive at 5470717 ms, 43438968 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 514099, rx_in_ord_ind: 502471, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50387, tx_compl_
+[ 5477.219000] audio: alive at 5471208 ms, 972861 loops, stream Idle step Idle, 0 writes, 0 done, mic Idle step Idle, 0 periods in
+[ 5478.729000] wifi: alive at 5472718 ms, 43452976 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 514187, rx_in_ord_ind: 502554, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50409, tx_compl_
+[ 5480.729000] wifi: alive at 5474718 ms, 43473537 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 514394, rx_in_ord_ind: 502756, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50429, tx_compl_
+[ 5482.728000] wifi: alive at 5476718 ms, 43490183 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 514481, rx_in_ord_ind: 502838, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50452, tx_compl_
+[ 5484.730000] wifi: alive at 5478719 ms, 43509534 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 514798, rx_in_ord_ind: 503153, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50465, tx_compl_
+[ 5486.730000] wifi: alive at 5480719 ms, 43527950 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 515190, rx_in_ord_ind: 503540, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50485, tx_compl_
+[ 5487.221000] audio: alive at 5481210 ms, 974646 loops, stream Idle step Idle, 0 writes, 0 done, mic Idle step Idle, 0 periods in
+[ 5488.730000] wifi: alive at 5482719 ms, 43545746 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 515427, rx_in_ord_ind: 503771, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50507, tx_compl_
+[ 5488.860000] net: "wlan0": last 10001 ms: 1240 frames in 1386 polls, longest 241 us, gave way 0
+[ 5490.730000] wifi: alive at 5484719 ms, 43567063 loops, stack rx 0 tx 0, 5229 DMA buffers, tx pending 0, rx fill 2047, backlog 0, Stats { bad_msg: 0, htc_drop: 189, stale_tx: 0, mgmt_drop: 0, rx: RxDrops { no_channel: 0, bad_amsdu: 0, unchain: 0, mgmt: 0, fcs: 0, crypto: 0, mic: 0, replay: 0 }, rx_delivered: 515790, rx_in_ord_ind: 504129, rx_addba: 0, rx_delba: 0, tx_compl_msgs: 50529, tx_compl_
+[ 5491.446000] Failed to allocate a large slot
+[ 5491.462000] Heap allocation error, layout = Layout {
+[ 5491.462000]     size: 0x40000,
+[ 5491.462000]     align: 1 (1 << 0),
+[ 5491.462000] }

@@ -1,0 +1,5 @@
+[package]
+name = "fortuna-voice"
+version = "0.1.0"
+edition = "2021"
+description = "Fortuna (DSi) voice notes: IMA-ADPCM in WAV, the ARM7-to-ARM9 sample ring and the level meter (no_std, no alloc)"

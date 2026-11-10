@@ -1,0 +1,18 @@
+membase 0x18800000 0x800000
+irq.ce0 414
+irq.ce1 415
+irq.ce2 416
+irq.ce3 417
+irq.ce4 418
+irq.ce5 419
+irq.ce6 420
+irq.ce7 421
+irq.ce8 422
+irq.ce9 423
+irq.ce10 424
+irq.ce11 425
+snoc.ATH10K_SNOC_RX_POST_RETRY_MS 50
+snoc.CE_POLL_PIPE 4
+snoc.ATH10K_SNOC_WAKE_IRQ 2
+snoc.dma_mask_bits 35
+snoc.msa_size 0x100000

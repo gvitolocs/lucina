@@ -1,0 +1,382 @@
+pd 0 name=cx res=cx.lvl active_only=0 peer=1 parent=3 skip_retention=0
+pd 1 name=cx_ao res=cx.lvl active_only=1 peer=0 parent=4 skip_retention=0
+pd 2 name=gfx res=gfx.lvl active_only=0 peer=-1 parent=-1 skip_retention=0
+pd 3 name=mx res=mx.lvl active_only=0 peer=4 parent=-1 skip_retention=0
+pd 4 name=mx_ao res=mx.lvl active_only=1 peer=3 parent=-1 skip_retention=0
+pd 5 name=lmx res=lmx.lvl active_only=0 peer=-1 parent=-1 skip_retention=0
+pd 6 name=lcx res=lcx.lvl active_only=0 peer=-1 parent=-1 skip_retention=0
+pd 7 name=mss res=mss.lvl active_only=0 peer=-1 parent=-1 skip_retention=0
+const RPMH_ARC_MAX_LEVELS 32
+const RPMH_REGULATOR_LEVEL_RETENTION 16
+const SC7180_CX 0
+const SC7180_CX_AO 1
+const SC7180_GFX 2
+const SC7180_MX 3
+const SC7180_MX_AO 4
+const SC7180_LMX 5
+const SC7180_LCX 6
+const SC7180_MSS 7
+const sc7180_num_pds 8
+levels 0 skip=0 len=24 hex=1000300040008000c0000001400180010000000000000000 ret=0 count=8 enable=0 l=16,48,64,128,192,256,320,384,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+levels 1 skip=0 len=11 hex=1000300040008000c00000 ret=0 count=5 enable=0 l=16,48,64,128,192,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+levels 2 skip=0 len=2 hex=1000 ret=0 count=1 enable=0 l=16,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+levels 3 skip=0 len=0 hex= ret=0 count=0 enable=0 l=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+levels 4 skip=0 len=6 hex=000030004000 ret=0 count=3 enable=1 l=0,48,64,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+levels 5 skip=1 len=10 hex=10001000300000004000 ret=0 count=3 enable=2 l=0,0,48,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+levels 6 skip=0 len=10 hex=10001000300000004000 ret=0 count=3 enable=0 l=16,16,48,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+levels 7 skip=0 len=64 hex=100012001400160018001a001c001e00200022002400260028002a002c002e00300032003400360038003a003c003e00400042004400460048004a004c004e00 ret=0 count=32 enable=0 l=16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62,64,66,68,70,72,74,76,78
+levels 8 skip=0 len=65 hex=100012001400160018001a001c001e00200022002400260028002a002c002e00300032003400360038003a003c003e00400042004400460048004a004c004e0050 ret=0 count=32 enable=0 l=16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62,64,66,68,70,72,74,76,78
+levels 9 skip=0 len=66 hex=100012001400160018001a001c001e00200022002400260028002a002c002e00300032003400360038003a003c003e00400042004400460048004a004c004e005000 ret=-22 count=33 enable=0 l=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+levels 10 skip=0 len=4 hex=fffffeff ret=0 count=2 enable=0 l=65535,65534,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+scenario modem_unsynced
+op load std
+load ret=0
+op pas cx mss
+send mx active addr=0x30010 data=7 sync=1
+send mx wake addr=0x30010 data=7 sync=0
+send mx sleep addr=0x30010 data=7 sync=0
+send cx active addr=0x30000 data=7 sync=1
+send cx wake addr=0x30000 data=7 sync=0
+send cx sleep addr=0x30000 data=7 sync=0
+send mss active addr=0x30050 data=7 sync=1
+st cx corner=7 active=7 enabled=1
+st cx_ao corner=0 active=7 enabled=0
+st mx corner=7 active=7 enabled=1
+st mx_ao corner=0 active=7 enabled=0
+st mss corner=7 active=7 enabled=1
+end
+scenario modem_synced
+op load std
+load ret=0
+op synced 1
+op pas cx mss
+send mx active addr=0x30010 data=7 sync=1
+send mx wake addr=0x30010 data=7 sync=0
+send mx sleep addr=0x30010 data=7 sync=0
+send cx active addr=0x30000 data=7 sync=1
+send cx wake addr=0x30000 data=7 sync=0
+send cx sleep addr=0x30000 data=7 sync=0
+send mss active addr=0x30050 data=7 sync=1
+st cx corner=7 active=7 enabled=1
+st cx_ao corner=0 active=7 enabled=0
+st mx corner=7 active=7 enabled=1
+st mx_ao corner=0 active=7 enabled=0
+st mss corner=7 active=7 enabled=1
+end
+scenario modem_mixed_tables
+op load mixed
+load ret=0
+op pas cx mss
+send mx active addr=0x30010 data=4 sync=1
+send mx wake addr=0x30010 data=4 sync=0
+send mx sleep addr=0x30010 data=4 sync=0
+send cx active addr=0x30000 data=6 sync=1
+send cx wake addr=0x30000 data=6 sync=0
+send cx sleep addr=0x30000 data=6 sync=0
+send mss active addr=0x30050 data=2 sync=1
+st cx corner=6 active=6 enabled=1
+st cx_ao corner=0 active=6 enabled=0
+st mx corner=4 active=4 enabled=1
+st mx_ao corner=0 active=4 enabled=0
+st mss corner=2 active=2 enabled=1
+end
+scenario modem_reverse_order
+op load std
+load ret=0
+op pas mss cx
+send mss active addr=0x30050 data=7 sync=1
+send mx active addr=0x30010 data=7 sync=1
+send mx wake addr=0x30010 data=7 sync=0
+send mx sleep addr=0x30010 data=7 sync=0
+send cx active addr=0x30000 data=7 sync=1
+send cx wake addr=0x30000 data=7 sync=0
+send cx sleep addr=0x30000 data=7 sync=0
+st cx corner=7 active=7 enabled=1
+st cx_ao corner=0 active=7 enabled=0
+st mx corner=7 active=7 enabled=1
+st mx_ao corner=0 active=7 enabled=0
+st mss corner=7 active=7 enabled=1
+end
+scenario modem_release_synced
+op load std
+load ret=0
+op pas cx mss
+send mx active addr=0x30010 data=7 sync=1
+send mx wake addr=0x30010 data=7 sync=0
+send mx sleep addr=0x30010 data=7 sync=0
+send cx active addr=0x30000 data=7 sync=1
+send cx wake addr=0x30000 data=7 sync=0
+send cx sleep addr=0x30000 data=7 sync=0
+send mss active addr=0x30050 data=7 sync=1
+st cx corner=7 active=7 enabled=1
+st cx_ao corner=0 active=7 enabled=0
+st mx corner=7 active=7 enabled=1
+st mx_ao corner=0 active=7 enabled=0
+st mss corner=7 active=7 enabled=1
+op synced 1
+op unpas cx mss
+send cx active addr=0x30000 data=0 sync=0
+send cx wake addr=0x30000 data=0 sync=0
+send cx sleep addr=0x30000 data=0 sync=0
+send mx active addr=0x30010 data=0 sync=0
+send mx wake addr=0x30010 data=0 sync=0
+send mx sleep addr=0x30010 data=0 sync=0
+send cx active addr=0x30000 data=0 sync=0
+send cx wake addr=0x30000 data=0 sync=0
+send cx sleep addr=0x30000 data=0 sync=0
+send mx active addr=0x30010 data=0 sync=0
+send mx wake addr=0x30010 data=0 sync=0
+send mx sleep addr=0x30010 data=0 sync=0
+send mss active addr=0x30050 data=0 sync=0
+send mss active addr=0x30050 data=0 sync=0
+st cx corner=0 active=0 enabled=0
+st cx_ao corner=0 active=0 enabled=0
+st mx corner=0 active=0 enabled=0
+st mx_ao corner=0 active=0 enabled=0
+st mss corner=0 active=0 enabled=0
+end
+scenario modem_release_unsynced
+op load std
+load ret=0
+op pas cx mss
+send mx active addr=0x30010 data=7 sync=1
+send mx wake addr=0x30010 data=7 sync=0
+send mx sleep addr=0x30010 data=7 sync=0
+send cx active addr=0x30000 data=7 sync=1
+send cx wake addr=0x30000 data=7 sync=0
+send cx sleep addr=0x30000 data=7 sync=0
+send mss active addr=0x30050 data=7 sync=1
+st cx corner=7 active=7 enabled=1
+st cx_ao corner=0 active=7 enabled=0
+st mx corner=7 active=7 enabled=1
+st mx_ao corner=0 active=7 enabled=0
+st mss corner=7 active=7 enabled=1
+op unpas cx mss
+send cx active addr=0x30000 data=7 sync=0
+send cx wake addr=0x30000 data=7 sync=0
+send cx sleep addr=0x30000 data=7 sync=0
+send mx active addr=0x30010 data=7 sync=0
+send mx wake addr=0x30010 data=7 sync=0
+send mx sleep addr=0x30010 data=7 sync=0
+send cx active addr=0x30000 data=7 sync=0
+send cx wake addr=0x30000 data=7 sync=0
+send cx sleep addr=0x30000 data=7 sync=0
+send mx active addr=0x30010 data=7 sync=0
+send mx wake addr=0x30010 data=7 sync=0
+send mx sleep addr=0x30010 data=7 sync=0
+send mss active addr=0x30050 data=7 sync=0
+send mss active addr=0x30050 data=7 sync=0
+st cx corner=0 active=7 enabled=0
+st mx corner=0 active=7 enabled=0
+st mss corner=0 active=7 enabled=0
+end
+scenario modem_release_mixed
+op load mixed
+load ret=0
+op pas cx mss
+send mx active addr=0x30010 data=4 sync=1
+send mx wake addr=0x30010 data=4 sync=0
+send mx sleep addr=0x30010 data=4 sync=0
+send cx active addr=0x30000 data=6 sync=1
+send cx wake addr=0x30000 data=6 sync=0
+send cx sleep addr=0x30000 data=6 sync=0
+send mss active addr=0x30050 data=2 sync=1
+st cx corner=6 active=6 enabled=1
+st cx_ao corner=0 active=6 enabled=0
+st mx corner=4 active=4 enabled=1
+st mx_ao corner=0 active=4 enabled=0
+st mss corner=2 active=2 enabled=1
+op synced 1
+op unpas cx mss
+send cx active addr=0x30000 data=0 sync=0
+send cx wake addr=0x30000 data=0 sync=0
+send cx sleep addr=0x30000 data=0 sync=0
+send mx active addr=0x30010 data=0 sync=0
+send mx wake addr=0x30010 data=0 sync=0
+send mx sleep addr=0x30010 data=0 sync=0
+send cx active addr=0x30000 data=0 sync=0
+send cx wake addr=0x30000 data=0 sync=0
+send cx sleep addr=0x30000 data=0 sync=0
+send mx active addr=0x30010 data=0 sync=0
+send mx wake addr=0x30010 data=0 sync=0
+send mx sleep addr=0x30010 data=0 sync=0
+send mss active addr=0x30050 data=0 sync=0
+send mss active addr=0x30050 data=0 sync=0
+st cx corner=0 active=0 enabled=0
+st cx_ao corner=0 active=0 enabled=0
+st mx corner=0 active=0 enabled=0
+st mx_ao corner=0 active=0 enabled=0
+st mss corner=0 active=0 enabled=0
+end
+scenario perf_mapping_mx
+op load std
+load ret=0
+op synced 1
+op on mx
+send mx active addr=0x30010 data=0 sync=0
+send mx wake addr=0x30010 data=0 sync=0
+send mx sleep addr=0x30010 data=0 sync=0
+st mx corner=0 active=0 enabled=1
+op perf mx 100
+send mx active addr=0x30010 data=3 sync=1
+send mx wake addr=0x30010 data=3 sync=0
+send mx sleep addr=0x30010 data=3 sync=0
+st mx corner=3 active=3 enabled=1
+st mx_ao corner=0 active=3 enabled=0
+op perf mx 5
+send mx active addr=0x30010 data=0 sync=0
+send mx wake addr=0x30010 data=0 sync=0
+send mx sleep addr=0x30010 data=0 sync=0
+st mx corner=0 active=0 enabled=1
+st mx_ao corner=0 active=0 enabled=0
+op perf mx 384
+send mx active addr=0x30010 data=7 sync=1
+send mx wake addr=0x30010 data=7 sync=0
+send mx sleep addr=0x30010 data=7 sync=0
+st mx corner=7 active=7 enabled=1
+st mx_ao corner=0 active=7 enabled=0
+op perf mx 999999
+send mx active addr=0x30010 data=7 sync=0
+send mx wake addr=0x30010 data=7 sync=0
+send mx sleep addr=0x30010 data=7 sync=0
+op perf mx 0
+send mx active addr=0x30010 data=0 sync=0
+send mx wake addr=0x30010 data=0 sync=0
+send mx sleep addr=0x30010 data=0 sync=0
+st mx corner=0 active=0 enabled=1
+st mx_ao corner=0 active=0 enabled=0
+op off mx
+send mx active addr=0x30010 data=0 sync=0
+send mx wake addr=0x30010 data=0 sync=0
+send mx sleep addr=0x30010 data=0 sync=0
+st mx corner=0 active=0 enabled=0
+end
+scenario peer_aggregation_mx
+op load std
+load ret=0
+op synced 1
+op on mx_ao
+send mx_ao active addr=0x30010 data=0 sync=0
+send mx_ao wake addr=0x30010 data=0 sync=0
+send mx_ao sleep addr=0x30010 data=0 sync=0
+st mx_ao corner=0 active=0 enabled=1
+op perf mx_ao 192
+send mx_ao active addr=0x30010 data=4 sync=1
+send mx_ao wake addr=0x30010 data=4 sync=0
+send mx_ao sleep addr=0x30010 data=0 sync=0
+st mx corner=0 active=4 enabled=0
+st mx_ao corner=4 active=4 enabled=1
+op on mx
+send mx active addr=0x30010 data=4 sync=0
+send mx wake addr=0x30010 data=4 sync=0
+send mx sleep addr=0x30010 data=0 sync=0
+st mx corner=0 active=4 enabled=1
+op perf mx 64
+send mx active addr=0x30010 data=4 sync=0
+send mx wake addr=0x30010 data=4 sync=0
+send mx sleep addr=0x30010 data=2 sync=0
+st mx corner=2 active=4 enabled=1
+op perf mx 256
+send mx active addr=0x30010 data=5 sync=1
+send mx wake addr=0x30010 data=5 sync=0
+send mx sleep addr=0x30010 data=5 sync=0
+st mx corner=5 active=5 enabled=1
+st mx_ao corner=4 active=5 enabled=1
+op off mx_ao
+send mx_ao active addr=0x30010 data=5 sync=0
+send mx_ao wake addr=0x30010 data=5 sync=0
+send mx_ao sleep addr=0x30010 data=5 sync=0
+st mx_ao corner=4 active=5 enabled=0
+op off mx
+send mx active addr=0x30010 data=0 sync=0
+send mx wake addr=0x30010 data=0 sync=0
+send mx sleep addr=0x30010 data=0 sync=0
+st mx corner=5 active=0 enabled=0
+st mx_ao corner=4 active=0 enabled=0
+end
+scenario cx_alone_synced
+op load std
+load ret=0
+op synced 1
+op perf cx 128
+st cx corner=3 active=0 enabled=0
+op on cx
+send cx active addr=0x30000 data=3 sync=1
+send cx wake addr=0x30000 data=3 sync=0
+send cx sleep addr=0x30000 data=3 sync=0
+st cx corner=3 active=3 enabled=1
+st cx_ao corner=0 active=3 enabled=0
+op perf cx 320
+send cx active addr=0x30000 data=6 sync=1
+send cx wake addr=0x30000 data=6 sync=0
+send cx sleep addr=0x30000 data=6 sync=0
+st cx corner=6 active=6 enabled=1
+st cx_ao corner=0 active=6 enabled=0
+op off cx
+send cx active addr=0x30000 data=0 sync=0
+send cx wake addr=0x30000 data=0 sync=0
+send cx sleep addr=0x30000 data=0 sync=0
+st cx corner=6 active=0 enabled=0
+st cx_ao corner=0 active=0 enabled=0
+end
+scenario unsynced_clamps_everything
+op load std
+load ret=0
+op on mx
+send mx active addr=0x30010 data=7 sync=1
+send mx wake addr=0x30010 data=7 sync=0
+send mx sleep addr=0x30010 data=7 sync=0
+st mx corner=0 active=7 enabled=1
+st mx_ao corner=0 active=7 enabled=0
+op perf mx 64
+send mx active addr=0x30010 data=7 sync=0
+send mx wake addr=0x30010 data=7 sync=0
+send mx sleep addr=0x30010 data=7 sync=0
+st mx corner=2 active=7 enabled=1
+op off mx
+send mx active addr=0x30010 data=7 sync=0
+send mx wake addr=0x30010 data=7 sync=0
+send mx sleep addr=0x30010 data=7 sync=0
+st mx corner=2 active=7 enabled=0
+end
+scenario zero_first_level
+op load zero_first
+load ret=0
+op synced 1
+op on mx
+send mx active addr=0x30010 data=1 sync=1
+send mx wake addr=0x30010 data=1 sync=0
+send mx sleep addr=0x30010 data=1 sync=0
+st mx corner=0 active=1 enabled=1
+st mx_ao corner=0 active=1 enabled=0
+op perf mx 0
+send mx active addr=0x30010 data=1 sync=0
+send mx wake addr=0x30010 data=1 sync=0
+send mx sleep addr=0x30010 data=1 sync=0
+st mx corner=1 active=1 enabled=1
+op perf mx 48
+send mx active addr=0x30010 data=1 sync=0
+send mx wake addr=0x30010 data=1 sync=0
+send mx sleep addr=0x30010 data=1 sync=0
+op off mx
+send mx active addr=0x30010 data=0 sync=0
+send mx wake addr=0x30010 data=0 sync=0
+send mx sleep addr=0x30010 data=0 sync=0
+st mx corner=1 active=0 enabled=0
+st mx_ao corner=0 active=0 enabled=0
+end
+scenario single_level
+op load single
+load ret=0
+op synced 1
+op on mss
+send mss active addr=0x30050 data=0 sync=0
+st mss corner=0 active=0 enabled=1
+op perf mss 1
+send mss active addr=0x30050 data=0 sync=0
+op perf mss 100
+send mss active addr=0x30050 data=0 sync=0
+op off mss
+send mss active addr=0x30050 data=0 sync=0
+st mss corner=0 active=0 enabled=0
+end

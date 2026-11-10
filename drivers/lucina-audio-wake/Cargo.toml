@@ -1,0 +1,10 @@
+[package]
+name = "lucina-audio-wake"
+version = "0.1.0"
+description = "When Juno's audio thread runs: interrupt sources raised into one pending word, drained before a pass, sleep only when nothing is left, and the earliest deadline (none with no stream open). no_std, no dependencies, tested on the host, proved by Verus"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

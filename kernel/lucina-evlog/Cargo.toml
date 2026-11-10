@@ -1,0 +1,21 @@
+[package]
+name = "lucina-evlog"
+version = "0.1.0"
+description = "Juno's event log: typed events with a provider, ID, level and fields kept on /data with retention; the reset and crash reports built from the saved crash log and the PMIC's reasons, with a plain summary, a likely cause and its evidence; crash buckets; the daily stability timeline; JSON for agents (docs/research/juno-event-log.md)"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lucina-watchd = { path = "../../services/lucina-watchd" }
+lucina-pon = { path = "../../kernel/lucina-pon" }
+lucina-events = { path = "../../services/lucina-events" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+[[bin]]
+name = "lucina-evlog"
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

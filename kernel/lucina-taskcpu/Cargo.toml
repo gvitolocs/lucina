@@ -1,0 +1,10 @@
+[package]
+name = "lucina-taskcpu"
+version = "0.1.0"
+description = "The task-CPU slot of Juno's scheduler: NONE, DEAD and the waker's claim, so an exited task is never woken. no_std, no dependencies, proved by Verus, tested on the host"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

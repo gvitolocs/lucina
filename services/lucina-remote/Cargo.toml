@@ -1,0 +1,69 @@
+[package]
+name = "lucina-remote"
+version = "0.1.0"
+description = "Remote access to LucinaOS: an SSH server (sunset) and the in-RAM kernel reload client"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# third_party/sunset is sunset 0.6.0 plus LucinaOS's server additions (exit status, pty size, window); see
+# third_party/sunset/LUCINA.md.
+sunset = { path = "../../third_party/sunset", default-features = false, features = ["std"] }
+rustix = { version = "1", features = ["event", "fs", "process", "pty", "stdio", "system", "termios"] }
+libc = "0.2"
+sha2 = "0.10"
+# BOOT.CFG as the loader reads it, and the GPT, for lucina-install-disk.
+lucina-boot = { path = "../../kernel/lucina-boot", default-features = false }
+lucina-ufs = { path = "../../drivers/lucina-ufs" }
+# The seed file's rules, proved with the kernel's (verification/juno-random).
+lucina-random = { path = "../../kernel/lucina-random" }
+zeroize = "1"
+log = "0.4"
+
+[[bin]]
+name = "lucina-sshd"
+path = "src/bin/lucina-sshd.rs"
+
+[[bin]]
+name = "lucina-reload"
+path = "src/bin/lucina-reload.rs"
+
+[[bin]]
+name = "lucina-audio"
+path = "src/bin/lucina-audio.rs"
+
+[[bin]]
+name = "lucina-send-keys"
+path = "src/bin/lucina-send-keys.rs"
+
+[[bin]]
+name = "lucina-wifi"
+path = "src/bin/lucina-wifi.rs"
+
+[[bin]]
+name = "juno-wifi-push"
+path = "src/bin/juno-wifi-push.rs"
+
+[[bin]]
+name = "lucina-install-disk"
+path = "src/bin/lucina-install-disk.rs"
+
+[[bin]]
+name = "lucina-recover"
+path = "src/bin/lucina-recover.rs"
+
+[[bin]]
+name = "lucina-trial"
+path = "src/bin/lucina-trial.rs"
+
+[[bin]]
+name = "lucina-data"
+path = "src/bin/lucina-data.rs"
+
+[[bin]]
+name = "lucina-rootimg"
+path = "src/bin/lucina-rootimg.rs"
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

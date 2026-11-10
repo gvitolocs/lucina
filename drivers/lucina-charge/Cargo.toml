@@ -1,0 +1,11 @@
+[package]
+name = "lucina-charge"
+version = "0.1.0"
+description = "Galaxy Book Go charge logic: SBS gauge, BQ25710 charger, the stop rules and caps, a power_supply view: no_std, unsafe-free, host-tested"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), and userspace/crates/lucina-chargerd uses it from its own workspace.
+edition = "2024"
+publish = false
+
+[dependencies]
+lucina-geni = { path = "../../drivers/lucina-geni" }

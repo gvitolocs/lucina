@@ -1,0 +1,172 @@
+# Proof CI: docs/ci/VERUS.md. One runner per job, a cgroup memory cap per proof, a report per proof.
+# The only required check is `verus-gate`: it always runs and passes only if every planned proof has a `verified` report for this
+# commit. A skipped, cancelled, or missing job therefore cannot look like a pass.
+name: verus
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run per branch and commit; an older commit's proofs keep running, because their result is still wanted.
+  group: verus-${{ github.ref }}-${{ github.sha }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+env:
+  VERUS_SMALL_RUNNER_CAP_GIB: ${{ vars.VERUS_SMALL_RUNNER_CAP_GIB }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      any: ${{ steps.plan.outputs.any }}
+      scope: ${{ steps.plan.outputs.scope }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build the launcher
+        run: cargo build --release --locked --manifest-path tools/ci/lucina-ci/Cargo.toml
+      - name: Launcher tests
+        run: cargo test --release --locked --manifest-path tools/ci/lucina-ci/Cargo.toml
+      - name: Every proof is in the inventory
+        run: tools/ci/lucina-ci/target/release/lucina-ci inventory --check
+      - id: plan
+        name: Choose the proofs this commit needs
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          mkdir -p plan
+          tools/ci/lucina-ci/target/release/lucina-ci plan --event "$EVENT" --ref "$REF" --before "$BEFORE" --sha "$SHA" \
+            --plan plan/plan.txt --output "$GITHUB_OUTPUT"
+          cp tools/ci/lucina-ci/target/release/lucina-ci plan/lucina-ci
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan
+          path: plan/
+          retention-days: 7
+
+  selftest:
+    # Proves on a real runner that the cap holds, timeouts fire and a false proof fails. No selftest, no gate.
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan
+          path: plan
+      - run: chmod +x plan/lucina-ci tools/ci/install-verus.sh
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/verus/*.zip
+          key: verus-zip-${{ hashFiles('references/upstream.lock') }}
+      - run: tools/ci/install-verus.sh ~/verus
+      - run: plan/lucina-ci selftest --out reports-selftest --verus ~/verus/verus-x86-linux/verus
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: selftest-reports
+          path: reports-selftest/
+          retention-days: 30
+
+  prove:
+    needs: plan
+    if: needs.plan.outputs.any == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(vars.VERUS_MAX_PARALLEL || '4') }}
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: ${{ matrix.group }} (${{ matrix.phase }})
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan
+          path: plan
+      - run: chmod +x plan/lucina-ci tools/ci/install-verus.sh
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/verus/*.zip
+          key: verus-zip-${{ hashFiles('references/upstream.lock') }}
+      - run: tools/ci/install-verus.sh ~/verus
+      - name: Keep only the workspace members that can build here
+        if: matrix.phase == 'models'
+        run: |
+          # Some members need sibling repositories by absolute path, and Cargo cannot load a workspace with one missing.
+          # This also prunes Cargo.lock, so that the --locked in scripts/verify-models.sh still holds. This checkout only.
+          plan/lucina-ci portable-workspace --write
+          cargo metadata --format-version 1 > /dev/null
+      - name: TLA+ checkers
+        if: matrix.phase == 'tla'
+        run: |
+          cargo install tla-mc --version 0.3.0 --locked
+          cargo install tla-checker --version 0.24.11 --locked
+      - name: Run
+        env:
+          GROUP: ${{ matrix.group }}
+          PHASE: ${{ matrix.phase }}
+        run: |
+          plan/lucina-ci run --group "$GROUP" --phase "$PHASE" --plan plan/plan.txt \
+            --verus ~/verus/verus-x86-linux/verus --out reports --unit-timeout-min 60
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: reports-${{ matrix.group }}-${{ matrix.phase }}
+          path: reports/
+          retention-days: 30
+
+  verus-gate:
+    needs: [plan, selftest, prove]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Every job finished as it had to
+        env:
+          PLAN: ${{ needs.plan.result }}
+          SELFTEST: ${{ needs.selftest.result }}
+          PROVE: ${{ needs.prove.result }}
+          ANY: ${{ needs.plan.outputs.any }}
+        run: |
+          echo "plan=$PLAN selftest=$SELFTEST prove=$PROVE any=$ANY"
+          if [ "$PLAN" != success ]; then echo "::error::the plan job failed, so no proof ran"; exit 1; fi
+          if [ "$SELFTEST" != success ]; then echo "::error::the self-test failed: the cap or the verdicts cannot be trusted on this runner"; exit 1; fi
+          if [ "$ANY" = true ]; then want=success; else want=skipped; fi
+          if [ "$PROVE" != "$want" ]; then echo "::error::the proof jobs ended as $PROVE, expected $want"; exit 1; fi
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan
+          path: plan
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.plan.outputs.any == 'true'
+        with:
+          pattern: reports-*
+          path: all-reports
+          merge-multiple: true
+      - name: Every planned proof verified on this commit
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          chmod +x plan/lucina-ci
+          mkdir -p all-reports
+          plan/lucina-ci gate --plan plan/plan.txt --reports all-reports --sha "$SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "${PIPESTATUS[0]}" = 0

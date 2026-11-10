@@ -1,0 +1,15 @@
+[package]
+name = "lucina-camera"
+version = "0.1.0"
+description = "User space of the kernel's /dev/lucina-camera0: /proc/lucina-camera, the frame stream, YUY2 and MJPEG to pixels, photos"
+edition.workspace = true
+publish = false
+
+[dependencies]
+lucina-uvc = { path = "../../drivers/lucina-uvc" }
+zune-jpeg = "0.5"
+libc = "0.2"
+
+[dev-dependencies]
+# Encoding test JPEGs only; the crate itself decodes with zune-jpeg.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

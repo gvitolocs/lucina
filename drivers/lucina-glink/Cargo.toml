@@ -1,0 +1,10 @@
+[package]
+name = "lucina-glink"
+version = "0.1.0"
+description = "Qualcomm GLINK over SMEM (FIFO transport and native channel protocol), after Linux qcom_glink_smem.c and qcom_glink_native.c: no_std, unsafe-free, host-tested"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt).
+edition = "2024"
+publish = false
+
+[dependencies]

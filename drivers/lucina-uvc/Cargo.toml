@@ -1,0 +1,8 @@
+[package]
+name = "lucina-uvc"
+version = "0.1.0"
+description = "USB Video Class (UVC) camera protocol (no_std) for the LucinaOS kernel: descriptors, probe/commit, payload decoding, frame assembly"
+edition.workspace = true
+publish = false
+
+[dependencies]

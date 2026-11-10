@@ -1,0 +1,10 @@
+[package]
+name = "lucina-ext4"
+version = "0.1.0"
+description = "ext4's extent trees, for reading: from the 60 bytes in an inode to a map of a file's blocks"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into its own tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["apps/lucina-app", "apps/lucina-app-camera", "apps/lucina-app-glass", "apps/lucina-app-hello", "apps/lucina-app-reliability", "apps/lucina-glass", "boards/ceres-core", "boards/ceres-ctl", "boards/fortuna-ring", "boards/fortuna-secretary", "boards/fortuna-tls", "boards/fortuna-voice", "drivers/lucina-adreno", "drivers/lucina-ath10k", "drivers/lucina-audio-decode", "drivers/lucina-audio-ledger", "drivers/lucina-audio-wake", "drivers/lucina-ax88179", "drivers/lucina-camera", "drivers/lucina-charge", "drivers/lucina-epdc", "drivers/lucina-geni", "drivers/lucina-glink", "drivers/lucina-gpu3d", "drivers/lucina-i2c-hid", "drivers/lucina-ir3", "drivers/lucina-mmu500", "drivers/lucina-modem-rpmh", "drivers/lucina-q6", "drivers/lucina-qcom-services", "drivers/lucina-qcom-soc", "drivers/lucina-qmi", "drivers/lucina-qrtr", "drivers/lucina-rngb", "drivers/lucina-rpmh", "drivers/lucina-rtl8152", "drivers/lucina-sdhci", "drivers/lucina-ufs", "drivers/lucina-usbnet", "drivers/lucina-usdhc", "drivers/lucina-uvc", "drivers/lucina-venus", "drivers/lucina-video", "drivers/lucina-video-play", "drivers/lucina-voice-stream", "drivers/lucina-vp8", "drivers/lucina-wifi", "drivers/lucina-wifi-mac", "drivers/lucina-wifi-wake", "kernel/lucina-boot", "kernel/lucina-bootimg", "kernel/lucina-bootlog", "kernel/lucina-cpufreq", "kernel/lucina-crash", "kernel/lucina-evlog", "kernel/lucina-ext4", "kernel/lucina-fat", "kernel/lucina-fdt", "kernel/lucina-hostname", "kernel/lucina-idle", "kernel/lucina-initramfs", "kernel/lucina-irqgate", "kernel/lucina-kexec", "kernel/lucina-klog", "kernel/lucina-ksyms", "kernel/lucina-ksyms-build", "kernel/lucina-memfrag", "kernel/lucina-netlink", "kernel/lucina-nolibc-probe", "kernel/lucina-oom", "kernel/lucina-parse-caps", "kernel/lucina-pon", "kernel/lucina-power", "kernel/lucina-random", "kernel/lucina-random-check", "kernel/lucina-rcu", "kernel/lucina-resolv", "kernel/lucina-ring", "kernel/lucina-sleep", "kernel/lucina-spmi", "kernel/lucina-standby", "kernel/lucina-structmap", "kernel/lucina-taskcpu", "kernel/lucina-timesync", "kernel/lucina-wdt", "services/lucina-account-link", "services/lucina-ax", "services/lucina-ci-gadget", "services/lucina-desk-web", "services/lucina-eventd", "services/lucina-events", "services/lucina-inject", "services/lucina-intent-host", "services/lucina-intents", "services/lucina-nav", "services/lucina-netperf", "services/lucina-remote", "services/lucina-watchd", "specs/lucina-models"]
+# userspace/ is its own Cargo workspace: its own profiles, .cargo config and edition 2021 (docs/rename-lucinaos.md).
+exclude = ["third_party", "boot", "userspace", "minerva", "office", "artcraft", "ceres", "tools/lucina-video-bench", "tools/lucina-vault-docs"]
+
+[workspace.package]
+edition = "2024"
+# Our own code is MIT (LICENSE, decision D-006). No licence field here: some crates hold files under the GPL, so one value would be wrong.
+publish = false
+
+# Every program on Juno's screen: small and fast on one CPU. A panic ends the process, and the shell reports it.
+[profile.juno-app]
+inherits = "release"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

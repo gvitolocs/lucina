@@ -1,0 +1,18 @@
+[package]
+name = "lucina-account-link"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "How Juno's programs talk to lucina-accountd, which holds the system's sign-in: light enough for the shell, no TLS here"
+
+[dependencies]
+libc = "0.2"
+lucina-app = { path = "../../apps/lucina-app", optional = true }
+qrcode = { version = "0.14", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = "1"
+
+[features]
+# The sign-in screen on the Juno toolkit.
+ui = ["dep:lucina-app"]

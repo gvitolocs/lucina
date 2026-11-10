@@ -1,0 +1,8 @@
+[package]
+name = "lucina-epdc"
+version = "0.1.0"
+description = "The Kindle Paperwhite 3's e-ink panel: the i.MX6SL EPDC, its panel power on the MAX77696, waveforms"
+edition.workspace = true
+publish = false
+
+[dependencies]

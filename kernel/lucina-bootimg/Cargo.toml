@@ -1,0 +1,18 @@
+[package]
+name = "lucina-bootimg"
+version = "0.1.0"
+description = "Android boot image (header v0-v2) parser and builder for LucinaBoot packaging"
+edition.workspace = true
+publish.workspace = true
+
+[features]
+default = ["std"]
+# The parser is no_std and allocation-free; building images and the CLI need std.
+std = ["dep:sha1_smol"]
+
+[dependencies]
+sha1_smol = { version = "1", optional = true }
+
+[[bin]]
+name = "lucina-bootimg"
+required-features = ["std"]

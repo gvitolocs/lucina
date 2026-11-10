@@ -1,0 +1,28 @@
+# cargo-deny policy for LucinaOS's own crates (third_party/asterinas is excluded from the workspace and audited
+# separately: task T-SEC-01).
+
+[graph]
+all-features = true
+
+[advisories]
+# Unmaintained or yanked crates are errors too; add exceptions here with a reason.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licences and MPL-2.0 (Asterinas), matching LICENSE: MIT for our code, each upstream its own (D-006). GPL code is reference-only.
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "BSD-2-Clause", "ISC", "Zlib", "MPL-2.0", "Unicode-3.0"]
+confidence-threshold = 0.9
+# lucina-app-desk only, served to the owner only: docs/research/juno-desk.md.
+exceptions = [{ allow = ["AGPL-3.0-only"], crate = "lucinadesk-core" }]
+# Our own crates are unpublished, so no licence field: see LICENSE (MIT for our code, each upstream its own; decision D-006).
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

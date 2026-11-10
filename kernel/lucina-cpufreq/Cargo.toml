@@ -1,0 +1,9 @@
+[package]
+name = "lucina-cpufreq"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+description = "SC7180 CPU frequency hardware (OSM) and temperature sensors (TSENS): register logic, testable on the host"
+
+[lib]
+path = "src/lib.rs"

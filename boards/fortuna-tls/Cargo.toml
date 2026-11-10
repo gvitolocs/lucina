@@ -1,0 +1,32 @@
+[package]
+name = "fortuna-tls"
+version = "0.1.0"
+edition = "2021"
+description = "TLS 1.3 for Fortuna (DSi): embedded-tls, rustls-webpki to ISRG Root X1/X2 with RustCrypto ECDSA/RSA, a seeded ChaCha20 generator (no_std)"
+
+[dependencies]
+# TLS 1.3 client, no_std and no allocator (Apache-2.0). Its own certificate check is not used: verify.rs replaces it.
+embedded-tls = { version = "0.19", default-features = false }
+embedded-io = "0.7"
+heapless = { version = "0.9", default-features = false }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "sha256"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "sha384"] }
+ecdsa = { version = "0.16", default-features = false, features = ["der", "verifying"] }
+# The certificate check: rustls-webpki (reviewed; the coordinator's choice, 2026-11-08) without ring or aws-lc, which do
+# not build for ARMv5; its signature algorithms come from RustCrypto (algs.rs).
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"] }
+pki-types = { package = "rustls-pki-types", version = "1", default-features = false, features = ["alloc"] }
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }
+sha2 = { version = "0.10", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+rand_chacha = { version = "0.3", default-features = false }
+
+[dev-dependencies]
+embedded-io-adapters = { version = "0.7", features = ["std"] }
+# the mock TLS 1.3 server and the test PKI (src/mock_tests.rs)
+rcgen = "0.14"
+aes-gcm = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
+rand_core = { version = "0.6", features = ["getrandom"] }

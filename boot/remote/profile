@@ -1,0 +1,11 @@
+# /etc/profile of a machine with remote access: the image's own, and what a person logging in should hear first. A login shell
+# on the console, over SSH or in lucina-shell's terminal reads this.
+
+# FIXME: Mounting FSes via /etc/profile is fragile (risk of multiple mounts from
+# login shells). Throw away this operation when we have a proper initial process.
+
+if [ -f /etc/profile.d/init.sh ]; then
+    . /etc/profile.d/init.sh
+fi
+
+[ ! -x /sbin/lucina-crash ] || /sbin/lucina-crash notice

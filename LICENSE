@@ -1,0 +1,39 @@
+LucinaOS is under the MIT licence below, except for the code listed after it, which keeps its own licence.
+
+MIT License
+
+Copyright (c) 2026 LucinaOS contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------------
+Code that is NOT under the MIT licence above
+
+The MIT licence covers only the code written for LucinaOS. Anything taken from another project stays under that project's
+licence, and nothing here relicenses it:
+
+- A file with its own licence or SPDX notice is under that licence. That notice decides, not this file.
+- Code derived from Asterinas is under the Mozilla Public License 2.0, as Asterinas is.
+- third_party/ holds other projects, each under the licence in its own folder or files.
+- Code ported from Linux and other GPL projects stays under the GPL with its notices. Today that is files in
+  drivers/lucina-adreno, drivers/lucina-venus, drivers/lucina-qrtr, drivers/lucina-qmi, fortuna/sim and office/engine (AGPL).
+  A program built from such a file is itself bound by that licence.
+- Fonts and other assets are under the licence files next to them.
+
+Each file or folder's own notice says where it came from and under which licence.

@@ -1,0 +1,11 @@
+[package]
+name = "lucina-parse-caps"
+version = "0.1.0"
+description = "The guards in front of the Craft apps' file parsers on Juno: budgets, capped reads, zip entries, counts, areas, ranges, nesting. no_std, no dependencies, proved by Verus, tested on the host"
+# Spelled out rather than taken from the workspace: the Craft apps (artcraft/upstream/<app>, their own workspaces) depend on
+# it by path.
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]

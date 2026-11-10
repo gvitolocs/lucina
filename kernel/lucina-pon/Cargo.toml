@@ -1,0 +1,10 @@
+[package]
+name = "lucina-pon"
+version = "0.1.0"
+description = "The PM6150's power-on and power-off reasons (PON registers), decoded as Qualcomm's qpnp-power-on driver does: shared by lucina-evlog and the kernel's crash record. no_std with alloc; the reason choice is proved by Verus"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

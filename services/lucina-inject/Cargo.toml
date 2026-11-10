@@ -1,0 +1,9 @@
+[package]
+name = "lucina-inject"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Input as a person gives it: evdev key, button, wheel and pointer events written to /dev/input (kernel patch 0406), shared by lucina-app-desk and lucina-devd"
+
+[dependencies]
+lucina-app = { path = "../../apps/lucina-app" }

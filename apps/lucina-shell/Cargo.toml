@@ -1,0 +1,38 @@
+[package]
+name = "lucina-shell"
+version = "0.1.0"
+description = "LucinaOS's graphical shell: home screen, terminal and settings on the firmware framebuffer (/dev/fb0), keys and pointer from evdev"
+edition.workspace = true
+publish.workspace = true
+
+# Built as a static musl program for the initramfs (scripts/gui-initramfs.sh):
+#   cargo build --release -p lucina-shell --target aarch64-unknown-linux-musl
+# The drawing, the terminal emulator and the key map are plain Rust and are tested on the host.
+
+[dependencies]
+lucina-app = { path = "../../apps/lucina-app" }
+# The home dashboard: the glass concept drawn from real data (src/dash.rs, src/home_feed.rs).
+lucina-glass = { path = "../../apps/lucina-glass" }
+# Idle standby: when the screen goes off and the machine sleeps by itself, and what holds it off (src/standby.rs), Verus-proved.
+lucina-standby = { path = "../../kernel/lucina-standby" }
+# The shell's own screen as an AccessKit tree, for Lucina (stage B).
+lucina-ax = { path = "../../services/lucina-ax" }
+# The AccessKit tree and the control socket's JSON lines (src/control.rs).
+serde_json = "1"
+# The EFI partition, where apps live: only its reading part ends up in the program.
+lucina-remote = { path = "../../services/lucina-remote" }
+# The home feed (src/home_feed.rs): the machine account (calendar, decisions, tasks, agents routes), the calendar engine
+# that the calendar app pins, and the agents client for the pipeline board. Events come through lucina-app.
+lucina-account = { path = "../../services/lucina-account" }
+lucina-agents-client = { path = "../../services/lucina-agents-client" }
+secretary-calendar = { git = "file:///home/user/Projects/Lucina/SecretaryIOS", rev = "1dd77a2b109c30a0ded12a9df2bc3da5f006d633" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+# The Linux ABI: poll and the pty.
+libc = "0.2"
+# Alacritty's escape-sequence parser; the screen model on top of it is ours (src/term.rs).
+vte = "0.15"
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

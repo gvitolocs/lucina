@@ -1,0 +1,12 @@
+[package]
+name = "lucina-wifi"
+version = "0.1.0"
+description = "One Wi-Fi station on Juno: lucina-ath10k's driver and lucina-wifi-mac's station in the order Linux keeps between them: no_std, unsafe-free, host-tested"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt).
+edition = "2024"
+publish = false
+
+[dependencies]
+lucina-ath10k = { path = "../../drivers/lucina-ath10k" }
+lucina-wifi-mac = { path = "../../drivers/lucina-wifi-mac" }

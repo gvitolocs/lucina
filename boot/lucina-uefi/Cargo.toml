@@ -1,0 +1,23 @@
+[package]
+name = "lucina-uefi"
+version = "0.1.0"
+description = "LucinaUEFI: UEFI loader (BOOTAA64.EFI) that boots the LucinaOS kernel on AArch64 laptops (Galaxy Book Go)"
+edition = "2024"
+# No licence field yet: LucinaOS's own licence is open (decision D-006).
+publish = false
+
+# A workspace of its own: it only builds for aarch64-unknown-uefi (see .cargo/config.toml).
+[workspace]
+
+[dependencies]
+lucina-boot = { version = "0.1.0", path = "../../kernel/lucina-boot", default-features = false }
+lucina-fdt = { version = "0.1.0", path = "../../kernel/lucina-fdt", default-features = false }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"

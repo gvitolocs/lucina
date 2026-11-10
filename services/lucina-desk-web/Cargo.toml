@@ -1,0 +1,23 @@
+[package]
+name = "lucina-desk-web"
+version = "0.1.0"
+description = "Juno's screen in a browser: voxl's server protocol (H.264 stripes over one WebSocket) on plain std threads"
+# MIT, as voxl, whose browser client (web/) this serves unchanged and whose server behaviour it copies.
+license = "MIT"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# getifaddrs, getrandom: the same calls lucina-app-desk's RustDesk host makes.
+libc = "0.2"
+httparse = "1.10"
+# The WebSocket handshake's SHA-1. The framing is our own (ws.rs says why).
+sha1_smol = "1"
+png = "0.18"
+# FilmCraft's clean-room H.264 encoder, MIT OR Apache-2.0, audited for the ArtCraft port. No rayon: one thread per encoder.
+filmcraft-h264enc = { git = "https://github.com/storytold/filmcraft", rev = "68919ed87aa6a097a4d21414ec7c438883f5fe22", default-features = false }
+
+[dev-dependencies]
+# Checks the stream with FilmCraft's own decoder, and the server with an independent WebSocket client.
+filmcraft-h264 = { git = "https://github.com/storytold/filmcraft", rev = "68919ed87aa6a097a4d21414ec7c438883f5fe22", default-features = false }
+tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }

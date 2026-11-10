@@ -1,0 +1,8 @@
+[package]
+name = "lucina-ci-gadget"
+version = "0.1.0"
+description = "The Kindle's USB port as a CDC Ethernet and serial gadget: i.MX6SL bring-up and a ChipIdea device driver (no_std)"
+edition.workspace = true
+publish = false
+
+[dependencies]

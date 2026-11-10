@@ -1,0 +1,16 @@
+# Each entry was read by hand. Add one only after doing the same (docs/ci/SHIFT-LEFT.md).
+[extend]
+useDefault = true
+
+[allowlist]
+description = "checked by hand"
+paths = [
+  # A test key, used only by the tests in keys.rs. Nothing accepts it.
+  '''services/lucina-remote/tests/data/test_ed25519$''',
+  # The made-up password of an accessibility test.
+  '''(serein|artcraft)/platform/eframe/tests/ax\.rs$''',
+  # The sample key from RFC 6455.
+  '''boards/fortuna-secretary/src/ws\.rs$''',
+  # Device logs and build outputs; never published (tools/ci/public-snapshot.rules).
+  '''^evidence/''',
+]

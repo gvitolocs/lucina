@@ -1,0 +1,8 @@
+[package]
+name = "lucina-kexec"
+version = "0.1.0"
+description = "Checks and device tree edit for reloading the LucinaOS kernel from RAM (no_std, tested on the host)"
+edition = "2024"
+publish = false
+
+[dependencies]

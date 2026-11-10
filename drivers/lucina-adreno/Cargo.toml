@@ -1,0 +1,11 @@
+[package]
+name = "lucina-adreno"
+version = "0.1.0"
+description = "The Adreno 618 on SC7180, after Linux drivers/gpu/drm/msm/adreno and Scarlet's qcom-adreno-a618 (GPL-2.0): clocks, the GPU's SMMU, GMU boot and HFI, CP start, A2D blits: no_std, unsafe-free, host-tested"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt).
+edition = "2024"
+publish = false
+
+[dependencies]
+lucina-qcom-soc = { path = "../../drivers/lucina-qcom-soc" }

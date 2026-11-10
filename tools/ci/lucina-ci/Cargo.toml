@@ -1,0 +1,13 @@
+# The CI launcher (docs/ci/VERUS.md). Its own workspace and no dependencies, so that it builds in seconds on a clean runner
+# and adds nothing to the root Cargo.lock.
+[package]
+name = "lucina-ci"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[profile.release]
+opt-level = 1
+debug = false

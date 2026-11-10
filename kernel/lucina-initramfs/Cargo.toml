@@ -1,0 +1,9 @@
+[package]
+name = "lucina-initramfs"
+version = "0.1.0"
+description = "Adds a directory tree to a gzip'd newc initramfs (host tool for LucinaOS QEMU and device builds)"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+flate2 = "1"

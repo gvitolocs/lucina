@@ -1,0 +1,6 @@
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILKv2pQKzxjtEAutV4+FkMnzNTV3Iugl6Xa2ip40HDaa owner@mac-nas-setup
+# CodeCor's juno_bash tool on buildhost (lucina-agentd 'lagent juno-mcp', key ~/.config/lucina-agentd/juno_bash_ed25519).
+# The owner, 2026-11-07: every call is an Allow/Deny card first, nothing auto-allowed; lucina_decide too once Lucina is up.
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDmnBnz1SLEm7UkXtip/hGP5iQnkvmcpCSiBLqC7q95U codecor-juno-bash@buildhost
+# buildhost itself (~/.ssh/id_ed25519, comment buildhost-migration): the buildhost-side Juno tools and sessions. Coordinator request 2026-11-08.
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDOoU6APEraJ/tKXOefkzKlvoy5Pa9FdRiekASya/WRv buildhost-migration

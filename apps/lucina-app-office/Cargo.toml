@@ -1,0 +1,18 @@
+[package]
+name = "lucina-app-office"
+version = "0.1.0"
+description = "Office documents on Juno: the document list; office/ holds the editor it starts"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lucina-account = { path = "../../services/lucina-account", features = ["ui"] }
+lucina-app = { path = "../../apps/lucina-app" }
+lucina-files = { path = "../../services/lucina-files" }
+libc = "0.2"
+serde_json = "1"
+sha2 = "0.10"
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

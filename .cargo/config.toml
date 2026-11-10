@@ -1,0 +1,25 @@
+# Static AArch64 Linux-ABI programs for the initramfs (apps/lucina-shell), linked offline with the rust-lld that
+# ships with rustup against the musl libc and crt objects bundled with the aarch64-unknown-linux-musl rust-std
+# component ("self-contained"): no cross C toolchain is needed. Asterinas runs them through its Linux ABI.
+#   rustup target add aarch64-unknown-linux-musl
+#   cargo build --release -p lucina-shell --target aarch64-unknown-linux-musl
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "linker-flavor=ld.lld", "-C", "link-self-contained=yes", "-C", "target-feature=+crt-static"]
+
+# Juno with no C library (docs/research/juno-pure-rust.md): the -gnu target only for its Rust std, which is built against
+# Eyra's libc in Rust (third_party/eyra-stack), never against glibc. Static and not PIE: origin starts the program and does no
+# relocations. c-scape's empty libc.a and friends keep the linker from finding a system libc. Needs the pinned nightly:
+# scripts/juno-nolibc.sh builds with it and checks the result.
+[target.aarch64-unknown-linux-gnu]
+linker = "rust-lld"
+rustflags = ["-C", "linker-flavor=ld.lld", "-C", "target-feature=+crt-static", "-C", "relocation-model=static"]
+
+# C for ring (TLS in crates/lucina-secretary), which has no cross gcc here: clang with the target, no libc headers needed.
+[env]
+CC_aarch64_unknown_linux_musl = "clang"
+CFLAGS_aarch64_unknown_linux_musl = "--target=aarch64-unknown-linux-musl"
+AR_aarch64_unknown_linux_musl = "llvm-ar-18"
+CC_aarch64_unknown_linux_gnu = "clang"
+CFLAGS_aarch64_unknown_linux_gnu = "--target=aarch64-unknown-linux-gnu -ffreestanding"
+AR_aarch64_unknown_linux_gnu = "llvm-ar-18"

@@ -1,0 +1,10 @@
+[package]
+name = "lucina-qrtr"
+version = "0.1.0"
+description = "Qualcomm IPC router (QRTR) packets, control messages and a small router with name service, after Linux net/qrtr: no_std, unsafe-free, host-tested"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt).
+edition = "2024"
+publish = false
+
+[dependencies]

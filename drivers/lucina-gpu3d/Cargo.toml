@@ -1,0 +1,14 @@
+[package]
+name = "lucina-gpu3d"
+version = "0.1.0"
+description = "A program's own GPU work on Juno's Adreno 618: buffer objects, command buffers, fences through /dev/lucina-gpu (lucina_adreno::uapi); the base of the wgpu backend, and the stage 1 proof tool"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lucina-adreno = { path = "../../drivers/lucina-adreno" }
+libc = "0.2"
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

@@ -1,0 +1,1 @@
+A design concept for review (docs/design/phone-concept.md), not wired into the shell. Build scripts leave it out unless LUCINA_GUI_TEST_APPS=1.

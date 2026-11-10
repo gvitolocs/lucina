@@ -1,0 +1,81 @@
+# Build and test checks for the Rust workspace: docs/ci/VERUS.md. `rust-gate` is the required check and always runs.
+# 22 workspace members depend on sibling repositories by absolute path (/home/user/...). They cannot build on a runner, so the
+# launcher removes them, and whatever depends on them, in this checkout only, and prints the list. Nothing here deploys anything.
+name: rust-ci
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.ref }}-${{ github.sha }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_TERM_COLOR: never
+  RUST_CI_TOOLCHAIN: 1.99.0
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        step: [fmt, clippy, test, nostd]
+    name: ${{ matrix.step }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_CI_TOOLCHAIN" --profile minimal -c rustfmt -c clippy --no-self-update
+          rustup default "$RUST_CI_TOOLCHAIN"
+          rustup target add aarch64-unknown-none
+      - name: Keep only the members that can build here
+        run: |
+          cargo run --quiet --release --locked --manifest-path tools/ci/lucina-ci/Cargo.toml -- portable-workspace --write | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: fmt
+        if: matrix.step == 'fmt'
+        run: bash tools/ci/ratchet.sh fmt
+      - name: clippy
+        if: matrix.step == 'clippy'
+        run: bash tools/ci/ratchet.sh clippy
+      - name: test
+        if: matrix.step == 'test'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -yqq ffmpeg
+          cargo test --workspace --no-fail-fast
+      - name: nostd
+        if: matrix.step == 'nostd'
+        run: |
+          for p in lucina-mmu500 lucina-geni lucina-charge lucina-i2c-hid lucina-kexec lucina-fat lucina-klog lucina-ufs; do
+            cargo check -p "$p" --target aarch64-unknown-none
+          done
+          cargo check -p lucina-bootimg -p lucina-fdt -p lucina-boot --no-default-features --target aarch64-unknown-none
+
+  rust-gate:
+    needs: check
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          RESULT: ${{ needs.check.result }}
+        run: |
+          echo "check=$RESULT"
+          [ "$RESULT" = success ]

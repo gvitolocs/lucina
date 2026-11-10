@@ -1,0 +1,10 @@
+[package]
+name = "lucina-sdhci"
+version = "0.1.0"
+description = "SD card over an SDHCI host (ADMA2, polled), with the Qualcomm SDCC v5 additions; no_std, unsafe-free, host-tested against a controller and card model"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

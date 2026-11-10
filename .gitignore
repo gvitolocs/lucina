@@ -1,0 +1,12 @@
+/target/
+/out/
+/build/
+*.img
+*.elf
+qemu.log
+/evidence/**/raw/
+fortuna/target/
+/minerva/first-stage/target/
+fortuna/container/build/
+fortuna/container/*.nds
+/minerva/boot/target/

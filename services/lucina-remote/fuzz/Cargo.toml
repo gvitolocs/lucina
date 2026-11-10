@@ -1,0 +1,30 @@
+[package]
+name = "lucina-remote-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lucina-remote = { path = ".." }
+lucina-ufs = { path = "../../../drivers/lucina-ufs" }
+
+# Not part of the repo's workspace: nightly and sanitizers only here.
+[workspace]
+
+[[bin]]
+name = "gpt"
+path = "fuzz_targets/gpt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ext2_stream"
+path = "fuzz_targets/ext2_stream.rs"
+test = false
+doc = false
+bench = false

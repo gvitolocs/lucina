@@ -1,0 +1,32 @@
+[package]
+name = "lucina-app"
+version = "0.1.0"
+description = "The toolkit every Juno app is built on: framebuffer, evdev input, keys and text, shared with lucina-shell"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Semantic events and the present report (stage D of docs/research/juno-ai-native.md): apps reach them as `lucina_app::events`.
+lucina-events = { path = "../../services/lucina-events" }
+# Which row a key moves to in a list: pure and proved by Verus (verification/juno-files-keys).
+lucina-nav = { path = "../../services/lucina-nav" }
+# Text: skrifa (Google's fontations) reads the DejaVu outlines, from /usr/share/fonts/dejavu (fonts/ here), when a glyph is
+# first drawn; ab_glyph_rasterizer turns them into coverage. (ab_glyph was dropped: its ttf-parser is
+# unmaintained, RUSTSEC-2026-0192.)
+ab_glyph_rasterizer = "0.1.10"
+skrifa = { version = "0.49", default-features = false, features = ["libm"] }
+# The Linux ABI: framebuffer and evdev ioctls, mmap, poll.
+libc = "0.2"
+# App intents (crate::intent): the specs and the rules Verus checks; their JSON goes through serde_json, below.
+lucina-intents = { path = "../../services/lucina-intents" }
+# Pictures: decoders only, each pure Rust (the image crate would bring all its formats).
+image-webp = "0.2"
+png = "0.18"
+zune-jpeg = "0.5"
+# The tree Lucina reads (docs/research/juno-ai-native.md, Layer 1): the builder, its rules and the socket. serde_json for the replies.
+lucina-ax = { path = "../../services/lucina-ax" }
+serde_json = "1"
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

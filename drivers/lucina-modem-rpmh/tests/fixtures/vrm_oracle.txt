@@ -1,0 +1,150 @@
+const RPMH_REGULATOR_REG_VRM_VOLTAGE 0
+const RPMH_REGULATOR_REG_ENABLE 4
+const RPMH_REGULATOR_REG_VRM_MODE 8
+const PMIC5_LDO_MODE_RETENTION 3
+const PMIC5_LDO_MODE_LPM 4
+const PMIC5_LDO_MODE_HPM 7
+const RPMH_REGULATOR_MODE_RET 0
+const RPMH_REGULATOR_MODE_LPM 1
+const RPMH_REGULATOR_MODE_AUTO 2
+const RPMH_REGULATOR_MODE_HPM 3
+const REGULATOR_MODE_STANDBY 8
+mode_map pmic5_ldo -22 -22 7 0 4 0 0 0 3
+of_map_mode ldo 0 -> 8
+of_map_mode ldo 1 -> 4
+of_map_mode ldo 2 -> 0
+of_map_mode ldo 3 -> 2
+of_map_mode ldo 4 -> 0
+of_map_mode ldo 5 -> 0
+hw pmic5_nldo n_ranges=1 ranges=320000:0:123:8000 n_voltages=124 hpm_min_load_uA=30000 mode_map=pmic_mode_map_pmic5_ldo
+hw pmic5_pldo n_ranges=1 ranges=1504000:0:255:8000 n_voltages=256 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo
+hw pmic5_pldo_lv n_ranges=1 ranges=1504000:0:62:8000 n_voltages=63 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo
+vreg pm6150 ldo1 index=1 supply=vdd-l1 res=ldoa1 hw=pmic5_nldo regulator_type=0 n_ranges=1 ranges=320000:0:123:8000 n_voltages=124 hpm_min_load_uA=30000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo2 index=2 supply=vdd-l2-l3 res=ldoa2 hw=pmic5_nldo regulator_type=0 n_ranges=1 ranges=320000:0:123:8000 n_voltages=124 hpm_min_load_uA=30000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo3 index=3 supply=vdd-l2-l3 res=ldoa3 hw=pmic5_nldo regulator_type=0 n_ranges=1 ranges=320000:0:123:8000 n_voltages=124 hpm_min_load_uA=30000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo4 index=4 supply=vdd-l4-l7-l8 res=ldoa4 hw=pmic5_nldo regulator_type=0 n_ranges=1 ranges=320000:0:123:8000 n_voltages=124 hpm_min_load_uA=30000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo5 index=5 supply=vdd-l5-l16-l17-l18-l19 res=ldoa5 hw=pmic5_pldo regulator_type=0 n_ranges=1 ranges=1504000:0:255:8000 n_voltages=256 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo6 index=6 supply=vdd-l6 res=ldoa6 hw=pmic5_nldo regulator_type=0 n_ranges=1 ranges=320000:0:123:8000 n_voltages=124 hpm_min_load_uA=30000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo7 index=7 supply=vdd-l4-l7-l8 res=ldoa7 hw=pmic5_nldo regulator_type=0 n_ranges=1 ranges=320000:0:123:8000 n_voltages=124 hpm_min_load_uA=30000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo8 index=8 supply=vdd-l4-l7-l8 res=ldoa8 hw=pmic5_nldo regulator_type=0 n_ranges=1 ranges=320000:0:123:8000 n_voltages=124 hpm_min_load_uA=30000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo9 index=9 supply=vdd-l9 res=ldoa9 hw=pmic5_nldo regulator_type=0 n_ranges=1 ranges=320000:0:123:8000 n_voltages=124 hpm_min_load_uA=30000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo10 index=10 supply=vdd-l10-l14-l15 res=ldoa10 hw=pmic5_pldo_lv regulator_type=0 n_ranges=1 ranges=1504000:0:62:8000 n_voltages=63 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo11 index=11 supply=vdd-l11-l12-l13 res=ldoa11 hw=pmic5_pldo_lv regulator_type=0 n_ranges=1 ranges=1504000:0:62:8000 n_voltages=63 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo12 index=12 supply=vdd-l11-l12-l13 res=ldoa12 hw=pmic5_pldo_lv regulator_type=0 n_ranges=1 ranges=1504000:0:62:8000 n_voltages=63 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo13 index=13 supply=vdd-l11-l12-l13 res=ldoa13 hw=pmic5_pldo_lv regulator_type=0 n_ranges=1 ranges=1504000:0:62:8000 n_voltages=63 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo14 index=14 supply=vdd-l10-l14-l15 res=ldoa14 hw=pmic5_pldo_lv regulator_type=0 n_ranges=1 ranges=1504000:0:62:8000 n_voltages=63 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo15 index=15 supply=vdd-l10-l14-l15 res=ldoa15 hw=pmic5_pldo_lv regulator_type=0 n_ranges=1 ranges=1504000:0:62:8000 n_voltages=63 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo16 index=16 supply=vdd-l5-l16-l17-l18-l19 res=ldoa16 hw=pmic5_pldo regulator_type=0 n_ranges=1 ranges=1504000:0:255:8000 n_voltages=256 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo17 index=17 supply=vdd-l5-l16-l17-l18-l19 res=ldoa17 hw=pmic5_pldo regulator_type=0 n_ranges=1 ranges=1504000:0:255:8000 n_voltages=256 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo18 index=18 supply=vdd-l5-l16-l17-l18-l19 res=ldoa18 hw=pmic5_pldo regulator_type=0 n_ranges=1 ranges=1504000:0:255:8000 n_voltages=256 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150 ldo19 index=19 supply=vdd-l5-l16-l17-l18-l19 res=ldoa19 hw=pmic5_pldo regulator_type=0 n_ranges=1 ranges=1504000:0:255:8000 n_voltages=256 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150l ldo1 index=1 supply=vdd-l1-l8 res=ldoc1 hw=pmic5_pldo_lv regulator_type=0 n_ranges=1 ranges=1504000:0:62:8000 n_voltages=63 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150l ldo2 index=2 supply=vdd-l2-l3 res=ldoc2 hw=pmic5_nldo regulator_type=0 n_ranges=1 ranges=320000:0:123:8000 n_voltages=124 hpm_min_load_uA=30000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150l ldo3 index=3 supply=vdd-l2-l3 res=ldoc3 hw=pmic5_nldo regulator_type=0 n_ranges=1 ranges=320000:0:123:8000 n_voltages=124 hpm_min_load_uA=30000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150l ldo4 index=4 supply=vdd-l4-l5-l6 res=ldoc4 hw=pmic5_pldo regulator_type=0 n_ranges=1 ranges=1504000:0:255:8000 n_voltages=256 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150l ldo5 index=5 supply=vdd-l4-l5-l6 res=ldoc5 hw=pmic5_pldo regulator_type=0 n_ranges=1 ranges=1504000:0:255:8000 n_voltages=256 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150l ldo6 index=6 supply=vdd-l4-l5-l6 res=ldoc6 hw=pmic5_pldo regulator_type=0 n_ranges=1 ranges=1504000:0:255:8000 n_voltages=256 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150l ldo7 index=7 supply=vdd-l7-l11 res=ldoc7 hw=pmic5_pldo regulator_type=0 n_ranges=1 ranges=1504000:0:255:8000 n_voltages=256 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150l ldo8 index=8 supply=vdd-l1-l8 res=ldoc8 hw=pmic5_pldo regulator_type=0 n_ranges=1 ranges=1504000:0:255:8000 n_voltages=256 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150l ldo9 index=9 supply=vdd-l9-l10 res=ldoc9 hw=pmic5_pldo regulator_type=0 n_ranges=1 ranges=1504000:0:255:8000 n_voltages=256 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150l ldo10 index=10 supply=vdd-l9-l10 res=ldoc10 hw=pmic5_pldo regulator_type=0 n_ranges=1 ranges=1504000:0:255:8000 n_voltages=256 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+vreg pm6150l ldo11 index=11 supply=vdd-l7-l11 res=ldoc11 hw=pmic5_pldo regulator_type=0 n_ranges=1 ranges=1504000:0:255:8000 n_voltages=256 hpm_min_load_uA=10000 mode_map=pmic_mode_map_pmic5_ldo of_map_mode=rpmh_regulator_pmic4_ldo_of_map_mode
+name fmt1 a 9 ldoa9
+name fmt _E1 9 L9_E1
+name fmt_str L%d%s | ldo%s%d
+list pmic5_nldo 0 320000
+list pmic5_nldo 1 328000
+list pmic5_nldo 14 432000
+list pmic5_nldo 21 488000
+list pmic5_nldo 62 816000
+list pmic5_nldo 63 824000
+list pmic5_nldo 106 1168000
+list pmic5_nldo 123 1304000
+list pmic5_nldo 124 -22
+list pmic5_nldo 187 -22
+list pmic5_nldo 255 -22
+list pmic5_nldo 256 -22
+map pmic5_nldo 488000 800000 sel=21 uv=488000 mv=488
+map pmic5_nldo 1616000 1984000 sel=-22 uv=0 mv=0
+map pmic5_nldo 1168000 1304000 sel=106 uv=1168000 mv=1168
+map pmic5_nldo 3000000 3400000 sel=-22 uv=0 mv=0
+map pmic5_nldo 0 0 sel=-22 uv=0 mv=0
+map pmic5_nldo 1 1 sel=-22 uv=0 mv=0
+map pmic5_nldo 320000 320000 sel=0 uv=320000 mv=320
+map pmic5_nldo 320001 320001 sel=-22 uv=0 mv=0
+map pmic5_nldo 319999 320000 sel=0 uv=320000 mv=320
+map pmic5_nldo 1000000 1100000 sel=85 uv=1000000 mv=1000
+map pmic5_nldo 1504000 1504000 sel=-22 uv=0 mv=0
+map pmic5_nldo 1503999 1504001 sel=-22 uv=0 mv=0
+map pmic5_nldo 2000000 2000000 sel=-22 uv=0 mv=0
+map pmic5_nldo 2000001 2000007 sel=-22 uv=0 mv=0
+map pmic5_nldo 3544000 3544000 sel=-22 uv=0 mv=0
+map pmic5_nldo 3544001 4000000 sel=-22 uv=0 mv=0
+map pmic5_nldo 900000 800000 sel=-22 uv=0 mv=0
+map pmic5_nldo 1170000 1180000 sel=107 uv=1176000 mv=1176
+map pmic5_nldo 1305000 1310000 sel=-22 uv=0 mv=0
+map pmic5_nldo 1304000 1304000 sel=123 uv=1304000 mv=1304
+list pmic5_pldo 0 1504000
+list pmic5_pldo 1 1512000
+list pmic5_pldo 14 1616000
+list pmic5_pldo 21 1672000
+list pmic5_pldo 62 2000000
+list pmic5_pldo 63 2008000
+list pmic5_pldo 106 2352000
+list pmic5_pldo 123 2488000
+list pmic5_pldo 124 2496000
+list pmic5_pldo 187 3000000
+list pmic5_pldo 255 3544000
+list pmic5_pldo 256 -22
+map pmic5_pldo 488000 800000 sel=-22 uv=0 mv=0
+map pmic5_pldo 1616000 1984000 sel=14 uv=1616000 mv=1616
+map pmic5_pldo 1168000 1304000 sel=-22 uv=0 mv=0
+map pmic5_pldo 3000000 3400000 sel=187 uv=3000000 mv=3000
+map pmic5_pldo 0 0 sel=-22 uv=0 mv=0
+map pmic5_pldo 1 1 sel=-22 uv=0 mv=0
+map pmic5_pldo 320000 320000 sel=-22 uv=0 mv=0
+map pmic5_pldo 320001 320001 sel=-22 uv=0 mv=0
+map pmic5_pldo 319999 320000 sel=-22 uv=0 mv=0
+map pmic5_pldo 1000000 1100000 sel=-22 uv=0 mv=0
+map pmic5_pldo 1504000 1504000 sel=0 uv=1504000 mv=1504
+map pmic5_pldo 1503999 1504001 sel=0 uv=1504000 mv=1504
+map pmic5_pldo 2000000 2000000 sel=62 uv=2000000 mv=2000
+map pmic5_pldo 2000001 2000007 sel=-22 uv=0 mv=0
+map pmic5_pldo 3544000 3544000 sel=255 uv=3544000 mv=3544
+map pmic5_pldo 3544001 4000000 sel=-22 uv=0 mv=0
+map pmic5_pldo 900000 800000 sel=-22 uv=0 mv=0
+map pmic5_pldo 1170000 1180000 sel=-22 uv=0 mv=0
+map pmic5_pldo 1305000 1310000 sel=-22 uv=0 mv=0
+map pmic5_pldo 1304000 1304000 sel=-22 uv=0 mv=0
+list pmic5_pldo_lv 0 1504000
+list pmic5_pldo_lv 1 1512000
+list pmic5_pldo_lv 14 1616000
+list pmic5_pldo_lv 21 1672000
+list pmic5_pldo_lv 62 2000000
+list pmic5_pldo_lv 63 -22
+list pmic5_pldo_lv 106 -22
+list pmic5_pldo_lv 123 -22
+list pmic5_pldo_lv 124 -22
+list pmic5_pldo_lv 187 -22
+list pmic5_pldo_lv 255 -22
+list pmic5_pldo_lv 256 -22
+map pmic5_pldo_lv 488000 800000 sel=-22 uv=0 mv=0
+map pmic5_pldo_lv 1616000 1984000 sel=14 uv=1616000 mv=1616
+map pmic5_pldo_lv 1168000 1304000 sel=-22 uv=0 mv=0
+map pmic5_pldo_lv 3000000 3400000 sel=-22 uv=0 mv=0
+map pmic5_pldo_lv 0 0 sel=-22 uv=0 mv=0
+map pmic5_pldo_lv 1 1 sel=-22 uv=0 mv=0
+map pmic5_pldo_lv 320000 320000 sel=-22 uv=0 mv=0
+map pmic5_pldo_lv 320001 320001 sel=-22 uv=0 mv=0
+map pmic5_pldo_lv 319999 320000 sel=-22 uv=0 mv=0
+map pmic5_pldo_lv 1000000 1100000 sel=-22 uv=0 mv=0
+map pmic5_pldo_lv 1504000 1504000 sel=0 uv=1504000 mv=1504
+map pmic5_pldo_lv 1503999 1504001 sel=0 uv=1504000 mv=1504
+map pmic5_pldo_lv 2000000 2000000 sel=62 uv=2000000 mv=2000
+map pmic5_pldo_lv 2000001 2000007 sel=-22 uv=0 mv=0
+map pmic5_pldo_lv 3544000 3544000 sel=-22 uv=0 mv=0
+map pmic5_pldo_lv 3544001 4000000 sel=-22 uv=0 mv=0
+map pmic5_pldo_lv 900000 800000 sel=-22 uv=0 mv=0
+map pmic5_pldo_lv 1170000 1180000 sel=-22 uv=0 mv=0
+map pmic5_pldo_lv 1305000 1310000 sel=-22 uv=0 mv=0
+map pmic5_pldo_lv 1304000 1304000 sel=-22 uv=0 mv=0

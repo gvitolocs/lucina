@@ -1,0 +1,12 @@
+[package]
+name = "lucina-ksyms-build"
+version = "0.1.0"
+description = "Fills the kernel's LUCINA_KSYMS placeholder with the table of the ELF just linked: what OSDK runs before it makes the Image. Host-only (std)"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), where OSDK depends on it by path.
+edition = "2024"
+publish = false
+
+[dependencies]
+lucina-ksyms = { path = "../../kernel/lucina-ksyms" }
+rustc-demangle = "0.1"

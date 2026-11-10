@@ -1,0 +1,9 @@
+[package]
+name = "lucina-memfrag"
+version = "0.1.0"
+description = "QEMU test tool: leaves free memory in single pages, then opens and fills many pipes (scripts/qemu-crash.sh, frag)"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc = "0.2"

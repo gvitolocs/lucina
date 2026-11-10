@@ -1,0 +1,15 @@
+power
+w df018 8000
+cmd 8 10002
+scm set_remote_state 0
+w e2008 10000
+suspend 0
+scm set_remote_state 1
+w d2064 table+0
+w d2068 300000
+w d2054 table+0
+w d2050 1
+w d205c table+259000
+w e0010 8
+w d2048 1
+resume 0

@@ -1,0 +1,8 @@
+[package]
+name = "lucina-usbnet"
+version = "0.1.0"
+description = "Moves Ethernet frames between the LucinaOS network stack and a USB Ethernet adapter's driver (no_std)"
+edition.workspace = true
+publish = false
+
+[dependencies]

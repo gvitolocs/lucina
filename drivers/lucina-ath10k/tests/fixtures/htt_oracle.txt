@@ -1,0 +1,337 @@
+sizeof.struct htt_cmd_hdr 1
+sizeof.struct htt_ver_req 3
+sizeof.struct htt_resp_hdr 1
+sizeof.struct htt_ver_resp 3
+offsetof.struct htt_ver_resp.minor 0
+offsetof.struct htt_ver_resp.major 1
+sizeof.struct htt_rx_ring_rx_desc_offsets 20
+offsetof.struct htt_rx_ring_rx_desc_offsets.frag_info_offset 18
+sizeof.struct htt_rx_ring_setup_ring32 36
+sizeof.struct htt_rx_ring_setup_ring64 44
+offsetof.struct htt_rx_ring_setup_ring32.rx_ring_base_paddr 4
+offsetof.struct htt_rx_ring_setup_ring32.rx_ring_len 8
+offsetof.struct htt_rx_ring_setup_ring32.rx_ring_bufsize 10
+offsetof.struct htt_rx_ring_setup_ring32.flags 12
+offsetof.struct htt_rx_ring_setup_ring32.fw_idx_init_val 14
+offsetof.struct htt_rx_ring_setup_ring32.offsets 16
+offsetof.struct htt_rx_ring_setup_ring64.rx_ring_base_paddr 8
+offsetof.struct htt_rx_ring_setup_ring64.rx_ring_len 16
+offsetof.struct htt_rx_ring_setup_ring64.rx_ring_bufsize 18
+offsetof.struct htt_rx_ring_setup_ring64.flags 20
+offsetof.struct htt_rx_ring_setup_ring64.fw_idx_init_val 22
+offsetof.struct htt_rx_ring_setup_ring64.offsets 24
+sizeof.struct htt_rx_ring_setup_hdr 3
+offsetof.struct htt_rx_ring_setup_hdr.num_rings 0
+offsetof.struct htt_rx_ring_setup_hdr.rsvd0 1
+offsetof.struct htt_rx_ring_setup_32.rings 3
+offsetof.struct htt_rx_ring_setup_64.rings 3
+sizeof.struct htt_data_tx_desc 15
+sizeof.struct htt_data_tx_desc_64 19
+offsetof.struct htt_data_tx_desc.flags0 0
+offsetof.struct htt_data_tx_desc.flags1 1
+offsetof.struct htt_data_tx_desc.len 3
+offsetof.struct htt_data_tx_desc.id 5
+offsetof.struct htt_data_tx_desc.frags_paddr 7
+offsetof.struct htt_data_tx_desc.peerid 11
+offsetof.struct htt_data_tx_desc_64.flags0 0
+offsetof.struct htt_data_tx_desc_64.flags1 1
+offsetof.struct htt_data_tx_desc_64.len 3
+offsetof.struct htt_data_tx_desc_64.id 5
+offsetof.struct htt_data_tx_desc_64.frags_paddr 7
+offsetof.struct htt_data_tx_desc_64.peerid 15
+offsetof.struct htt_data_tx_desc_64.offchan_tx.freq 17
+offsetof.struct htt_data_tx_desc_64.prefetch 19
+sizeof.struct htt_data_tx_desc_frag 8
+offsetof.struct htt_data_tx_desc_frag.tword_addr.paddr_lo 0
+offsetof.struct htt_data_tx_desc_frag.tword_addr.paddr_hi 4
+offsetof.struct htt_data_tx_desc_frag.tword_addr.len_16 6
+sizeof.struct htt_msdu_ext_desc_64 72
+offsetof.struct htt_msdu_ext_desc_64.tso_flag 0
+offsetof.struct htt_msdu_ext_desc_64.ip_identification 20
+offsetof.struct htt_msdu_ext_desc_64.flags 22
+offsetof.struct htt_msdu_ext_desc_64.frags 24
+sizeof.struct ath10k_htt_txbuf_64 44
+offsetof.struct ath10k_htt_txbuf_64.frags 0
+offsetof.struct ath10k_htt_txbuf_64.htc_hdr 16
+offsetof.struct ath10k_htt_txbuf_64.cmd_hdr 24
+offsetof.struct ath10k_htt_txbuf_64.cmd_tx 25
+sizeof.struct htt_data_tx_completion 3
+offsetof.struct htt_data_tx_completion.num_msdus 1
+offsetof.struct htt_data_tx_completion.flags2 2
+offsetof.struct htt_data_tx_completion.msdus 3
+sizeof.struct htt_rx_offload_msdu 7
+offsetof.struct htt_rx_offload_msdu.msdu_len 0
+offsetof.struct htt_rx_offload_msdu.peer_id 2
+offsetof.struct htt_rx_offload_msdu.vdev_id 4
+offsetof.struct htt_rx_offload_msdu.tid 5
+offsetof.struct htt_rx_offload_msdu.fw_desc 6
+offsetof.struct htt_rx_offload_msdu.payload 7
+sizeof.struct htt_rx_offload_ind 3
+offsetof.struct htt_rx_offload_ind.msdu_count 1
+sizeof.struct htt_rx_in_ord_msdu_desc 8
+sizeof.struct htt_rx_in_ord_msdu_desc_ext 12
+offsetof.struct htt_rx_in_ord_msdu_desc_ext.msdu_len 8
+offsetof.struct htt_rx_in_ord_msdu_desc_ext.fw_desc 10
+sizeof.struct htt_rx_in_ord_ind 7
+offsetof.struct htt_rx_in_ord_ind.info 0
+offsetof.struct htt_rx_in_ord_ind.peer_id 1
+offsetof.struct htt_rx_in_ord_ind.vdev_id 3
+offsetof.struct htt_rx_in_ord_ind.msdu_count 5
+offsetof.struct htt_rx_in_ord_ind.msdu_descs64 7
+offsetof.struct htt_resp.rx_in_ord_ind 1
+offsetof.struct htt_resp.data_tx_completion 1
+offsetof.struct htt_resp.ver_resp 1
+sizeof.struct htt_data_tx_ppdu_dur 8
+const.HTT_H2T_MSG_TYPE_VERSION_REQ 0
+const.HTT_H2T_MSG_TYPE_TX_FRM 1
+const.HTT_H2T_MSG_TYPE_RX_RING_CFG 2
+const.HTT_H2T_MSG_TYPE_STATS_REQ 3
+const.HTT_H2T_MSG_TYPE_SYNC 4
+const.HTT_H2T_MSG_TYPE_AGGR_CFG 5
+const.HTT_H2T_MSG_TYPE_FRAG_DESC_BANK_CFG 6
+const.HTT_H2T_MSG_TYPE_MGMT_TX 7
+const.HTT_H2T_MSG_TYPE_TX_FETCH_RESP 11
+const.HTT_TLV_T2H_MSG_TYPE_VERSION_CONF 0
+const.HTT_TLV_T2H_MSG_TYPE_RX_IND 1
+const.HTT_TLV_T2H_MSG_TYPE_RX_FLUSH 2
+const.HTT_TLV_T2H_MSG_TYPE_PEER_MAP 3
+const.HTT_TLV_T2H_MSG_TYPE_PEER_UNMAP 4
+const.HTT_TLV_T2H_MSG_TYPE_RX_ADDBA 5
+const.HTT_TLV_T2H_MSG_TYPE_RX_DELBA 6
+const.HTT_TLV_T2H_MSG_TYPE_TX_COMPL_IND 7
+const.HTT_TLV_T2H_MSG_TYPE_PKTLOG 8
+const.HTT_TLV_T2H_MSG_TYPE_STATS_CONF 9
+const.HTT_TLV_T2H_MSG_TYPE_RX_FRAG_IND 10
+const.HTT_TLV_T2H_MSG_TYPE_SEC_IND 11
+const.HTT_TLV_T2H_MSG_TYPE_RC_UPDATE_IND 12
+const.HTT_TLV_T2H_MSG_TYPE_TX_INSPECT_IND 13
+const.HTT_TLV_T2H_MSG_TYPE_MGMT_TX_COMPL_IND 14
+const.HTT_TLV_T2H_MSG_TYPE_TX_CREDIT_UPDATE_IND 15
+const.HTT_TLV_T2H_MSG_TYPE_RX_PN_IND 16
+const.HTT_TLV_T2H_MSG_TYPE_RX_OFFLOAD_DELIVER_IND 17
+const.HTT_TLV_T2H_MSG_TYPE_RX_IN_ORD_PADDR_IND 18
+const.HTT_TLV_T2H_MSG_TYPE_WDI_IPA_OP_RESPONSE 20
+const.HTT_TLV_T2H_MSG_TYPE_CHAN_CHANGE 21
+const.HTT_TLV_T2H_MSG_TYPE_RX_OFLD_PKT_ERR 22
+const.HTT_TLV_T2H_MSG_TYPE_TEST 23
+const.HTT_TLV_T2H_NUM_MSGS 24
+const.HTT_DATA_TX_DESC_FLAGS0_MAC_HDR_PRESENT 1
+const.HTT_DATA_TX_DESC_FLAGS0_NO_AGGR 2
+const.HTT_DATA_TX_DESC_FLAGS0_NO_ENCRYPT 4
+const.HTT_DATA_TX_DESC_FLAGS0_NO_CLASSIFY 8
+const.HTT_DATA_TX_DESC_FLAGS0_PKT_TYPE_MASK 224
+const.HTT_DATA_TX_DESC_FLAGS0_PKT_TYPE_LSB 5
+const.HTT_DATA_TX_DESC_FLAGS1_VDEV_ID_MASK 63
+const.HTT_DATA_TX_DESC_FLAGS1_VDEV_ID_LSB 0
+const.HTT_DATA_TX_DESC_FLAGS1_EXT_TID_MASK 1984
+const.HTT_DATA_TX_DESC_FLAGS1_EXT_TID_LSB 6
+const.HTT_DATA_TX_DESC_FLAGS1_POSTPONED 2048
+const.HTT_DATA_TX_DESC_FLAGS1_MORE_IN_BATCH 4096
+const.HTT_DATA_TX_DESC_FLAGS1_CKSUM_L3_OFFLOAD 8192
+const.HTT_DATA_TX_DESC_FLAGS1_CKSUM_L4_OFFLOAD 16384
+const.HTT_DATA_TX_DESC_FLAGS1_TX_COMPLETE 32768
+const.HTT_DATA_TX_EXT_TID_NON_QOS_MCAST_BCAST 16
+const.HTT_DATA_TX_EXT_TID_MGMT 17
+const.HTT_DATA_TX_EXT_TID_INVALID 31
+const.HTT_INVALID_PEERID 65535
+const.HTT_MSDU_CHECKSUM_ENABLE_64 2031616
+const.HTT_MSDU_CHECKSUM_ENABLE 31
+const.HTT_RX_RING_FLAGS_MAC80211_HDR 1
+const.HTT_RX_RING_FLAGS_PHY_DATA_RX 32768
+const.HTT_RX_RING_SIZE_MIN 128
+const.HTT_RX_RING_SIZE_MAX 2048
+const.HTT_RX_RING_SIZE 2048
+const.HTT_RX_RING_FILL_LEVEL 1023
+const.HTT_RX_RING_FILL_LEVEL_DUAL_MAC 2047
+const.HTT_DATA_TX_STATUS_OK 0
+const.HTT_DATA_TX_STATUS_DISCARD 1
+const.HTT_DATA_TX_STATUS_NO_ACK 2
+const.HTT_DATA_TX_STATUS_POSTPONE 3
+const.HTT_DATA_TX_STATUS_MASK 7
+const.HTT_DATA_TX_STATUS_LSB 0
+const.HTT_DATA_TX_TID_MASK 120
+const.HTT_DATA_TX_TID_LSB 3
+const.HTT_DATA_TX_TID_INVALID 128
+const.HTT_TX_COMPL_INV_MSDU_ID 65535
+const.HTT_TX_CMPL_FLAG_DATA_RSSI 1
+const.HTT_TX_CMPL_FLAG_PPID_PRESENT 2
+const.HTT_TX_CMPL_FLAG_PA_PRESENT 4
+const.HTT_TX_CMPL_FLAG_PPDU_DURATION_PRESENT 8
+const.HTT_TX_DATA_RSSI_ENABLE_WCN3990 8
+const.HTT_TX_DATA_APPEND_RETRIES 1
+const.HTT_TX_DATA_APPEND_TIMESTAMP 2
+const.HTT_RX_IN_ORD_IND_INFO_TID_MASK 31
+const.HTT_RX_IN_ORD_IND_INFO_OFFLOAD_MASK 32
+const.HTT_RX_IN_ORD_IND_INFO_FRAG_MASK 64
+const.HTT_TX_CREDIT_DELTA_ABS_M 4294901760
+const.HTT_TX_CREDIT_SIGN_BIT_M 256
+const.RX_HTT_HDR_STATUS_LEN 64
+const.ATH10K_HW_TXRX_RAW 0
+const.ATH10K_HW_TXRX_NATIVE_WIFI 1
+const.ATH10K_HW_TXRX_ETHERNET 2
+const.ATH10K_HW_TXRX_MGMT 3
+bytes.wcn3990_rx_desc_offsets 4a005a001b00250004001a0007000c0001000200
+wcn3990_rx_desc.size 360
+wcn3990_rx_desc.msdu_payload_offset 360
+wcn3990_rx_desc.attention 4
+wcn3990_rx_desc.frag_info 8
+wcn3990_rx_desc.mpdu_start 16
+wcn3990_rx_desc.msdu_start 28
+wcn3990_rx_desc.msdu_end 48
+wcn3990_rx_desc.mpdu_end 104
+wcn3990_rx_desc.ppdu_start 108
+wcn3990_rx_desc.ppdu_end 148
+wcn3990_rx_desc.rx_hdr_status 296
+bytes.ver_req 00000000
+rx_ring_cfg.flags_all 0xffff
+bytes.rx_ring_cfg_64 02010000806745230100000000badcfe0100000000080008ffff34124a005a001b00250004001a0007000c0001000200
+bytes.rx_ring_cfg_32 020100008067452300badcfe00040008a5a534120100020003000400050006000700080009000a00
+bytes.tx_frm_64_0 01003400000000000121410964002a00000000f007000000ffff0000
+bytes.tx_frm_64_1 01003400000000000121426965002b00000100f007000000ffff0000
+bytes.tx_frm_64_2 01003800000000000165430c66002c00000200f007000000ffff3c14
+bytes.msdu_ext_desc_64 000000000000000000000000000000000000000000000000806745230100dc0500000000000000000000000000000000000000000000000000000000000000000000000000000000
+bytes.msdu_ext_desc_64_csum 00000000000000000000000000001f000000000000000000806745230100dc0500000000000000000000000000000000000000000000000000000000000000000000000000000000
+bytes.ver_conf 00030200
+ver_conf.major 2
+ver_conf.minor 3
+credit_update.0 word=0x0064000f delta=100
+credit_update.1 word=0x0065010f delta=-101
+credit_update.2 word=0x0066000f delta=102
+credit_update.3 word=0x0067010f delta=-103
+bytes.tx_compl_even 072804000001010102010301
+tx_compl_even.msdu.0 id=0x100 ack_rssi=0x0
+tx_compl_even.msdu.1 id=0x101 ack_rssi=0x0
+tx_compl_even.msdu.2 id=0x102 ack_rssi=0x0
+tx_compl_even.msdu.3 id=0x103 ack_rssi=0x0
+bytes.tx_compl_odd 072a0300000101010201ffff
+tx_compl_odd.msdu.0 id=0x100 ack_rssi=0x0
+tx_compl_odd.msdu.1 id=0x101 ack_rssi=0x0
+tx_compl_odd.msdu.2 id=0x102 ack_rssi=0x0
+bytes.tx_compl_rssi_even 0728040800010101020103015000510052005300
+tx_compl_rssi_even.msdu.0 id=0x100 ack_rssi=0x50
+tx_compl_rssi_even.msdu.1 id=0x101 ack_rssi=0x51
+tx_compl_rssi_even.msdu.2 id=0x102 ack_rssi=0x52
+tx_compl_rssi_even.msdu.3 id=0x103 ack_rssi=0x53
+bytes.tx_compl_rssi_odd 07280308000101010201ffff500051005200
+tx_compl_rssi_odd.msdu.0 id=0x100 ack_rssi=0x50
+tx_compl_rssi_odd.msdu.1 id=0x101 ack_rssi=0x51
+tx_compl_rssi_odd.msdu.2 id=0x102 ack_rssi=0x52
+bytes.tx_compl_rssi_retries_ts 0728020b0001010100e001e002e003e050005100
+tx_compl_rssi_retries_ts.msdu.0 id=0x100 ack_rssi=0x50
+tx_compl_rssi_retries_ts.msdu.1 id=0x101 ack_rssi=0x51
+bytes.rx_in_ord_ind_2 124534120200020000beadde01000000dc05110000f0feca020000003c002233
+rx_in_ord_ind_2.header_len 8
+bytes.rx_in_ord_ind_2_offload 122334120200020000beadde01000000dc05110000f0feca020000003c002233
+bytes.rx_offload_msdu 0c007700010640303132333435363738396162
+sizeof.struct htt_frag_desc_bank_cfg64 63
+sizeof.struct htt_q_state_conf 12
+sizeof.struct htt_aggr_conf_v2 3
+offsetof.struct htt_frag_desc_bank_cfg64.bank_base_addrs 3
+offsetof.struct htt_frag_desc_bank_cfg64.bank_id 35
+offsetof.struct htt_frag_desc_bank_cfg64.q_state 51
+const.HTT_FRAG_DESC_BANK_MAX 4
+const.ATH10K_HTT_MAX_NUM_AMSDU_DEFAULT 3
+const.ATH10K_HTT_MAX_NUM_AMPDU_DEFAULT 64
+const.HTT_H2T_MSG_TYPE_FRAG_DESC_BANK_CFG 6
+const.HTT_H2T_MSG_TYPE_AGGR_CFG 5
+bytes.frag_desc_bank_cfg_64 06000148006745230100000000000000000000000000000000000000000000000000000000007f00000000000000000000000000000000000000000001000000
+bytes.aggr_cfg_v2 05400300
+offsetof.struct htt_rx_peer_map.vdev_id 0
+offsetof.struct htt_rx_peer_map.peer_id 1
+offsetof.struct htt_rx_peer_map.addr 3
+sizeof.struct htt_rx_peer_map 11
+offsetof.struct htt_rx_peer_unmap.peer_id 1
+sizeof.struct htt_rx_peer_unmap 3
+offsetof.struct htt_mgmt_tx_completion.flags 2
+offsetof.struct htt_mgmt_tx_completion.desc_id 3
+offsetof.struct htt_mgmt_tx_completion.status 7
+offsetof.struct htt_mgmt_tx_completion.info 15
+sizeof.struct htt_mgmt_tx_completion 19
+offsetof.struct htt_security_indication.flags 0
+offsetof.struct htt_security_indication.peer_id 1
+sizeof.struct htt_security_indication 27
+const.HTT_SECURITY_IS_UNICAST 128
+const.HTT_SECURITY_TYPE_MASK 127
+const.HTT_MGMT_TX_STATUS_OK 0
+const.HTT_MGMT_TX_STATUS_RETRY 1
+const.HTT_MGMT_TX_STATUS_DROP 2
+sizeof.struct htt_rx_indication_hdr 7
+sizeof.struct htt_rx_indication_ppdu 36
+sizeof.struct htt_rx_indication_prefix 4
+sizeof.struct htt_rx_indication_mpdu_range 4
+offsetof.struct htt_rx_indication_hdr.info0 0
+offsetof.struct htt_rx_indication_hdr.peer_id 1
+offsetof.struct htt_rx_indication_hdr.info1 3
+offsetof.struct htt_rx_indication_prefix.fw_rx_desc_bytes 0
+offsetof.struct htt_rx_indication_mpdu_range.mpdu_count 0
+offsetof.struct htt_rx_indication_mpdu_range.mpdu_range_status 1
+const.HTT_RX_INDICATION_INFO0_EXT_TID_MASK 31
+const.HTT_RX_INDICATION_INFO1_NUM_MPDU_RANGES_MASK 4278190080
+const.HTT_RX_INDICATION_INFO1_NUM_MPDU_RANGES_LSB 24
+bytes.peer_map 03022301deadbeef00010000
+bytes.peer_unmap 04002301
+bytes.mgmt_tx_compl 0e000001090000000100000005000000aa000000
+bytes.sec_ind 0b864500000000000000000000000000000000000000000000000000
+rx_ind.ranges_off 56
+bytes.rx_ind_2ranges 010577000000000200000000000000000000000000000000000000000000000000000000000000000000000006000000000000000000000003010000fa020000
+rxd.attention 4
+rxd.frag_info 8
+rxd.mpdu_start 16
+rxd.msdu_start 28
+rxd.msdu_end 48
+rxd.mpdu_end 104
+rxd.ppdu_start 108
+rxd.ppdu_end 148
+rxd.rx_hdr_status 296
+rxd.msdu_payload 360
+rxd.frag_info.common.ring2_more_count 10
+rxd.mpdu_start.info0 16
+rxd.mpdu_start.pn31_0 20
+rxd.mpdu_start.info1 24
+rxd.mpdu_start.pn 20
+rxd.msdu_start.common.info0 28
+rxd.msdu_start.common.info1 36
+rxd.msdu_end.common.info0 64
+rxd.ppdu_start.rssi_chains 108
+rxd.ppdu_start.rssi_comb 124
+rxd.ppdu_start.info1 128
+rxd.ppdu_start.info2 132
+rxd.ppdu_start.info3 136
+const.RX_ATTENTION_FLAGS_FIRST_MPDU 1
+const.RX_ATTENTION_FLAGS_LAST_MPDU 2
+const.RX_ATTENTION_FLAGS_MCAST_BCAST 4
+const.RX_ATTENTION_FLAGS_PEER_IDX_INVALID 8
+const.RX_ATTENTION_FLAGS_MGMT_TYPE 256
+const.RX_ATTENTION_FLAGS_MSDU_LENGTH_ERR 131072
+const.RX_ATTENTION_FLAGS_MPDU_LENGTH_ERR 134217728
+const.RX_ATTENTION_FLAGS_TKIP_MIC_ERR 268435456
+const.RX_ATTENTION_FLAGS_DECRYPT_ERR 536870912
+const.RX_ATTENTION_FLAGS_FCS_ERR 1073741824
+const.RX_ATTENTION_FLAGS_MSDU_DONE 2147483648
+const.RX_MPDU_START_INFO0_ENCRYPT_TYPE_MASK 4026531840
+const.RX_MPDU_START_INFO0_ENCRYPT_TYPE_LSB 28
+const.RX_MPDU_START_INFO0_PEER_IDX_MASK 2047
+const.RX_MPDU_START_INFO1_TID_MASK 4026531840
+const.RX_MPDU_START_INFO1_TID_LSB 28
+const.RX_MSDU_START_INFO0_MSDU_LENGTH_MASK 16383
+const.RX_MSDU_START_INFO1_DECAP_FORMAT_MASK 768
+const.RX_MSDU_START_INFO1_DECAP_FORMAT_LSB 8
+const.RX_MSDU_END_INFO0_FIRST_MSDU 16384
+const.RX_MSDU_END_INFO0_LAST_MSDU 32768
+const.RX_PPDU_START_INFO1_PREAMBLE_TYPE_MASK 4278190080
+const.RX_PPDU_START_INFO1_PREAMBLE_TYPE_LSB 24
+const.RX_PPDU_START_INFO1_L_SIG_RATE_MASK 15
+const.RX_PPDU_START_INFO1_L_SIG_RATE_SELECT 16
+const.RX_PPDU_START_RATE_FLAG 8
+const.HTT_RX_LEGACY 4
+const.HTT_RX_HT 8
+const.HTT_RX_HT_WITH_TXBF 9
+const.HTT_RX_VHT 12
+const.HTT_RX_VHT_WITH_TXBF 13
+const.RX_MSDU_DECAP_RAW 0
+const.RX_MSDU_DECAP_NATIVE_WIFI 1
+const.RX_MSDU_DECAP_ETHERNET2_DIX 2
+const.RX_MSDU_DECAP_8023_SNAP_LLC 3
+const.HTT_RX_MPDU_ENCRYPT_NONE 7
+const.HTT_RX_MPDU_ENCRYPT_AES_CCM_WPA2 6
+const.HTT_RX_MPDU_ENCRYPT_TKIP_WPA 4

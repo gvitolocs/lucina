@@ -1,0 +1,13 @@
+[package]
+name = "lucina-watchd"
+version = "0.1.0"
+description = "Juno's service supervisor: restarts what dies, pets /dev/watchdog, reboots a machine whose network stayed dead; and lucina-crash, which shows the crashes the kernel saved"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc = "0.2"
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

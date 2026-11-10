@@ -1,0 +1,10 @@
+[package]
+name = "fortuna-secretary"
+version = "0.1.0"
+edition = "2021"
+description = "Fortuna (DSi) to the owner's Secretary account: HTTP/1.1 framing, QR pairing, the device token file, chat, voice-note shares and Lucina Agents (no_std + alloc, no I/O)"
+
+[dependencies]
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+# the voice socket's Sec-WebSocket-Accept (RFC 6455; RustCrypto, MIT/Apache-2.0)
+sha1 = { version = "0.10", default-features = false }

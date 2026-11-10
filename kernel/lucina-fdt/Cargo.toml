@@ -1,0 +1,15 @@
+[package]
+name = "lucina-fdt"
+version = "0.1.0"
+description = "Flattened device tree (DTB) reader (no_std) and host-side editor for LucinaOS kernel tests"
+edition.workspace = true
+publish.workspace = true
+
+[features]
+default = ["std"]
+# The reader is no_std, allocation-free and unsafe-free; the editor, the report and the CLI need std.
+std = []
+
+[[bin]]
+name = "lucina-fdt"
+required-features = ["std"]

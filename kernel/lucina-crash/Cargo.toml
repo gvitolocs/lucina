@@ -1,0 +1,11 @@
+[package]
+name = "lucina-crash"
+version = "0.1.0"
+description = "What the LucinaOS kernel shows and keeps when it crashes: the report, the crash screen, the saved log format. no_std, unsafe-free, allocation-free, tested on the host"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]
+font8x8 = { version = "0.2.5", default-features = false }

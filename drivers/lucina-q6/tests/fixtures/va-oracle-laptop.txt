@@ -1,0 +1,54 @@
+clk macro on
+clk dcodec on
+clk mclk on
+clk mclk off
+-- open
+lpi r 0c000 00000000
+lpi w 0c000 00000004
+lpi w 0c004 00000002
+lpi r 0c000 00000004
+lpi w 0c000 000002c5
+lpi r 0d000 00000000
+lpi w 0d000 00000004
+lpi r 0d000 00000004
+lpi w 0d000 000000c5
+clk mclk on
+va w 110 00000060
+va w 504 00000090
+-- afe port config, port start
+va w 000 00000001
+va w 004 00000003
+va w 004 00000001
+va w 080 00000002
+va w 000 00000001
+va w 004 00000001
+va w 080 00000002
+va w 110 00000060
+va w 504 00000090
+va w 500 00000024
+va w 518 00000000
+delay 1000
+va w 504 000000d0
+va w 518 00000002
+delay 1000
+va w 518 00000000
+delay 1000
+va w 518 00000001
+delay 6000
+va w 50c 00000000
+va w 094 00000000
+va r 08c 00000000
+va r 08c 00000000
+va w 08c 00000001
+-- asm map, open read, adm open, matrix, encoder config, reads, run
+-- eos
+va w 500 00000034
+va r 08c 00000001
+va w 08c 00000000
+va r 08c 00000000
+va w 500 00000014
+va w 000 00000000
+va w 004 00000000
+va w 080 00000000
+-- afe port stop, asm close, unmap, adm close
+clk mclk off

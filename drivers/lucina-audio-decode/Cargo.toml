@@ -1,0 +1,17 @@
+[package]
+name = "lucina-audio-decode"
+version = "0.1.0"
+description = "Audio files to 16-bit stereo at 48 kHz, the one format Juno's speakers play: symphonia to decode, a small polyphase filter to resample"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Adopted: pure Rust, MPL-2.0, no C (docs/research/juno-audio.md). No Opus decoder exists in it.
+# Adopted for AAC: pure Rust, MIT, no dependencies. symphonia 0.6.1 decodes only the LC core of HE-AAC, which most of the library's
+# videos carry (docs/research/juno-audio.md section 14).
+syom = "=0.9.0"
+# Adopted for Opus (symphonia 0.6.1 demuxes Opus but has no decoder): pure Rust, BSD-3-Clause, no C. Measured in
+# /home/user/scratch/lucinanet-media/opus-eval/REPORT.md: 103-110 dB SNR against libopus on CELT clips, 530x realtime,
+# libopus-bit-exact on 64-bit ARM per its README.
+opus1 = "=0.3.0"
+symphonia = { version = "=0.6.1", default-features = false, features = ["mp3", "aac", "alac", "flac", "pcm", "vorbis", "isomp4", "ogg", "mkv", "wav", "aiff", "id3v2"] }

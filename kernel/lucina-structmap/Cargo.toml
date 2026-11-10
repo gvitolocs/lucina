@@ -1,0 +1,10 @@
+[package]
+name = "lucina-structmap"
+version = "0.1.0"
+edition.workspace = true
+license = "MPL-2.0"
+description = "Named fields of a running program, read through a per-build map (stage G of docs/research/juno-ai-native.md)"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

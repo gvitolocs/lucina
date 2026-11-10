@@ -1,0 +1,104 @@
+host_ce.count 12
+host_ce.0 flags=0 src_nentries=16 src_sz_max=2048 dest_nentries=0 send_cb=htc_tx recv_cb=none
+host_ce.1 flags=0 src_nentries=0 src_sz_max=2048 dest_nentries=512 send_cb=none recv_cb=htt_htc_rx
+host_ce.2 flags=0 src_nentries=0 src_sz_max=2048 dest_nentries=64 send_cb=none recv_cb=htc_rx
+host_ce.3 flags=0 src_nentries=32 src_sz_max=2048 dest_nentries=0 send_cb=htc_tx recv_cb=none
+host_ce.4 flags=8 src_nentries=2048 src_sz_max=256 dest_nentries=0 send_cb=htt_tx recv_cb=none
+host_ce.5 flags=0 src_nentries=0 src_sz_max=512 dest_nentries=512 send_cb=none recv_cb=htt_rx
+host_ce.6 flags=0 src_nentries=0 src_sz_max=0 dest_nentries=0 send_cb=none recv_cb=none
+host_ce.7 flags=0 src_nentries=2 src_sz_max=2048 dest_nentries=2 send_cb=none recv_cb=none
+host_ce.8 flags=0 src_nentries=0 src_sz_max=2048 dest_nentries=128 send_cb=none recv_cb=none
+host_ce.9 flags=0 src_nentries=0 src_sz_max=2048 dest_nentries=512 send_cb=none recv_cb=htt_htc_rx
+host_ce.10 flags=0 src_nentries=0 src_sz_max=2048 dest_nentries=512 send_cb=none recv_cb=htt_htc_rx
+host_ce.11 flags=0 src_nentries=0 src_sz_max=2048 dest_nentries=512 send_cb=none recv_cb=pktlog_rx
+target_ce.count 12
+target_ce.0 pipenum=0 pipedir=2 nentries=32 nbytes_max=2048 flags=0 reserved=0
+target_ce.1 pipenum=1 pipedir=1 nentries=32 nbytes_max=2048 flags=0 reserved=0
+target_ce.2 pipenum=2 pipedir=1 nentries=64 nbytes_max=2048 flags=0 reserved=0
+target_ce.3 pipenum=3 pipedir=2 nentries=32 nbytes_max=2048 flags=0 reserved=0
+target_ce.4 pipenum=4 pipedir=2 nentries=256 nbytes_max=256 flags=8 reserved=0
+target_ce.5 pipenum=5 pipedir=2 nentries=1024 nbytes_max=64 flags=8 reserved=0
+target_ce.6 pipenum=6 pipedir=3 nentries=32 nbytes_max=16384 flags=0 reserved=0
+target_ce.7 pipenum=7 pipedir=4 nentries=0 nbytes_max=0 flags=8 reserved=0
+target_ce.8 pipenum=8 pipedir=1 nentries=32 nbytes_max=2048 flags=0 reserved=0
+target_ce.9 pipenum=9 pipedir=1 nentries=32 nbytes_max=2048 flags=0 reserved=0
+target_ce.10 pipenum=10 pipedir=1 nentries=32 nbytes_max=2048 flags=0 reserved=0
+target_ce.11 pipenum=11 pipedir=1 nentries=32 nbytes_max=2048 flags=0 reserved=0
+svc_map.count 21
+svc_map.0 service_id=0x104 pipedir=2 pipenum=3
+svc_map.1 service_id=0x104 pipedir=1 pipenum=2
+svc_map.2 service_id=0x102 pipedir=2 pipenum=3
+svc_map.3 service_id=0x102 pipedir=1 pipenum=2
+svc_map.4 service_id=0x101 pipedir=2 pipenum=3
+svc_map.5 service_id=0x101 pipedir=1 pipenum=2
+svc_map.6 service_id=0x103 pipedir=2 pipenum=3
+svc_map.7 service_id=0x103 pipedir=1 pipenum=2
+svc_map.8 service_id=0x100 pipedir=2 pipenum=3
+svc_map.9 service_id=0x100 pipedir=1 pipenum=2
+svc_map.10 service_id=0x1 pipedir=2 pipenum=0
+svc_map.11 service_id=0x1 pipedir=1 pipenum=2
+svc_map.12 service_id=0xfe00 pipedir=2 pipenum=0
+svc_map.13 service_id=0xfe00 pipedir=1 pipenum=2
+svc_map.14 service_id=0x300 pipedir=2 pipenum=4
+svc_map.15 service_id=0x300 pipedir=1 pipenum=1
+svc_map.16 service_id=0xfe00 pipedir=2 pipenum=5
+svc_map.17 service_id=0x301 pipedir=1 pipenum=9
+svc_map.18 service_id=0x302 pipedir=1 pipenum=10
+svc_map.19 service_id=0x600 pipedir=1 pipenum=11
+svc_map.20 service_id=0x0 pipedir=0 pipenum=0
+shadow.count 12
+shadow.0 ce_id=0 reg_offset=0x3c
+shadow.1 ce_id=3 reg_offset=0x3c
+shadow.2 ce_id=4 reg_offset=0x3c
+shadow.3 ce_id=5 reg_offset=0x3c
+shadow.4 ce_id=7 reg_offset=0x3c
+shadow.5 ce_id=1 reg_offset=0x40
+shadow.6 ce_id=2 reg_offset=0x40
+shadow.7 ce_id=7 reg_offset=0x40
+shadow.8 ce_id=8 reg_offset=0x40
+shadow.9 ce_id=9 reg_offset=0x40
+shadow.10 ce_id=10 reg_offset=0x40
+shadow.11 ce_id=11 reg_offset=0x40
+sizeof.ce_pipe_config 24
+sizeof.ce_service_to_pipe 12
+sizeof.ath10k_shadow_reg_cfg 4
+const.PIPEDIR_NONE 0
+const.PIPEDIR_IN 1
+const.PIPEDIR_OUT 2
+const.PIPEDIR_INOUT 3
+const.CE_ATTR_NO_SNOOP 1
+const.CE_ATTR_BYTE_SWAP_DATA 2
+const.CE_ATTR_SWIZZLE_DESCRIPTORS 4
+const.CE_ATTR_DIS_INTR 8
+const.CE_ATTR_POLL 16
+const.CE_ATTR_FLAGS 0
+const.WCN3990_SRC_WR_IDX_OFFSET 0x3c
+const.WCN3990_DST_WR_IDX_OFFSET 0x40
+svc.RSVD_CTRL 0x1
+svc.WMI_CONTROL 0x100
+svc.WMI_DATA_BE 0x101
+svc.WMI_DATA_BK 0x102
+svc.WMI_DATA_VI 0x103
+svc.WMI_DATA_VO 0x104
+svc.NMI_CONTROL 0x200
+svc.NMI_DATA 0x201
+svc.HTT_DATA_MSG 0x300
+svc.HTT_DATA2_MSG 0x301
+svc.HTT_DATA3_MSG 0x302
+svc.HTT_LOG_MSG 0x600
+svc.TEST_RAW_STREAMS 0xfe00
+map.0x0 enoent
+map.0x1 ul=0 dl=2
+map.0x100 ul=3 dl=2
+map.0x101 ul=3 dl=2
+map.0x102 ul=3 dl=2
+map.0x103 ul=3 dl=2
+map.0x104 ul=3 dl=2
+map.0x200 enoent
+map.0x201 enoent
+map.0x300 ul=4 dl=1
+map.0x301 enoent
+map.0x302 enoent
+map.0x600 enoent
+map.0xfe00 ul=5 dl=2
+map.0xffff enoent

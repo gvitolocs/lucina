@@ -1,0 +1,200 @@
+[package]
+name = "origin"
+version = "0.26.2"
+authors = [
+    "Dan Gohman <dev@sunfishcode.online>",
+]
+description = "Program startup and thread support written in Rust"
+documentation = "https://docs.rs/origin"
+license = "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+repository = "https://github.com/sunfishcode/origin"
+edition = "2024"
+keywords = ["linux"]
+categories = ["no-std"]
+include = ["src", "Cargo.toml", "COPYRIGHT", "LICENSE*", "/*.md"]
+rust-version = "1.88"
+
+[dependencies]
+linux-raw-sys = { version = "0.12.0", default-features = false, optional = true, features = ["general", "no_std", "elf", "auxvec"] }
+rustix = { version = "1.0.0", default-features = false }
+bitflags = { version = "2.4.0", default-features = false }
+log = { version = "0.4.14", default-features = false, optional = true }
+rustix-futex-sync = { version = "0.4.0", optional = true }
+smallvec = { version = "1.11.1", optional = true, features = ["const_new"] }
+
+# Optional logging backends for use with "take-charge". You can use any
+# external logger, but using these features allows origin to initialize the
+# logger before `origin_main`, so that you can see the log messages emitted
+# before `origin_main` is called.
+
+# Enable `env_logger`; eg. recognizing `RUST_LOG=trace`. This requires `std`.
+env_logger = { version = "0.11.0", default-features = false, optional = true }
+
+# Enable `atomic-dbg`'s simple logger. This doesn't require `std`.
+atomic-dbg = { version = "0.1.11", default-features = false, optional = true }
+
+# Enable this when disabling origin's implementations.
+libc = { version = "0.2.149", default-features = false, optional = true }
+errno = { version = "0.3.3", default-features = false, optional = true }
+
+# Special dependencies used in rustc-dep-of-std mode.
+core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core" }
+alloc = { version = "1.0.0", optional = true, package = "rustc-std-workspace-alloc" }
+
+# Use the unwinding crate if support for unwinding is needed. This depends on
+# nightly Rust. And it's not supported on ARM yet.
+[target.'cfg(not(target_arch = "arm"))'.dependencies.unwinding]
+version = "0.2.6"
+default-features = false
+features = ["unwinder"]
+optional = true
+
+# On aarch64, compiler_builtins depends on `getauxval`, so we need rustix with
+# the "param" feature.
+[target.'cfg(target_arch = "aarch64")'.dependencies.rustix]
+version = "1.0.0"
+default-features = false
+features = ["param"]
+
+[dev-dependencies]
+assert_cmd = "2.0.12"
+
+[features]
+# By default, origin coexists with libc and assume std exists and enables most
+# features. To have origin avoid using libc, disable the default features and
+# enable either "origin-start" or "external-start".
+default = ["std", "log", "libc", "errno", "signal", "init-fini-arrays", "program-at-exit", "thread-at-exit"]
+
+# If you're using nightly Rust, enable this feature to let origin use
+# nightly-only features, which include proper support for unwinding (if
+# enabled), better safety checks, and better optimizations.
+nightly = ["unwinding"]
+
+# Enable optimizations that reduce code size (at the cost of performance).
+optimize_for_size = []
+
+# Use origin's implementation of program and thread startup and shutdown as
+# well as signal handler registration. To use this, disable the default
+# features and enable exactly one of "origin-start" or "external-start".
+#
+# To use threads, it is also necessary to enable the "thread" feature.
+# To use signals, it is also necessary to enable the "signal" feature.
+take-charge = ["linux-raw-sys", "rustix/use-explicitly-provided-auxv", "rustix/runtime"]
+
+# Enable "take-charge" mode using origin's `_start` definition.
+origin-start = ["take-charge"]
+
+# Enable "take-charge" mode using an exported `start` function which is meant
+# to be run very early in program startup and passed a pointer to the initial
+# stack. Don't enable this when enabling "origin-start".
+external-start = ["take-charge"]
+
+# Enable support for threads.
+thread = ["rustix/thread", "rustix/mm", "param", "rustix/process", "rustix/runtime", "rustix-futex-sync"]
+
+# Enable support for signal handlers.
+signal = ["rustix/runtime"]
+
+# Enable support for ELF `.init_array` and `.fini_array`.
+init-fini-arrays = ["init-array", "fini-array"]
+
+# Enable support for ELF `.init_array`.
+init-array = []
+
+# Enable support for ELF `.fini_array`.
+fini-array = []
+
+# Enable support for `origin::program::at_exit`.
+program-at-exit = ["alloc"]
+
+# Enable support for `origin::thread::at_exit`.
+thread-at-exit = ["alloc", "thread"]
+
+# Have origin call `atomic_dbg::log::init()` on startup.
+#
+# To have origin emit log messages for the things it does, additionally enable the
+# "log" feature.
+atomic-dbg-logger = ["atomic-dbg/log", "init-array"]
+
+# Have origin call `env_logger::init()` on startup.
+#
+# To have origin emit log messages for the things it does, additionally enable the
+# "log" feature.
+env_logger = ["dep:env_logger", "init-array"]
+
+# Disable logging.
+max_level_off = ["log/max_level_off"]
+
+# Enable highly experimental support for performing startup-time relocations,
+# needed to support statically-linked PIE executables.
+experimental-relocate = ["rustix/mm", "rustix/runtime"]
+
+# Enable unstable support for storing C errno values in the TLS header. This
+# will likely be removed in the future and only exists to make it easier to
+# possibly integrate a dynamic linker written in C in the near future before
+# until a dynamic linker is written in Rust.
+unstable-errno = ["thread"]
+
+# Have origin call `rustix::param::init` on startup.
+param = ["rustix/param"]
+
+# Provide a `#[lang = eh_personality]` function suitable for unwinding (for
+# no-std).
+#
+# If you know your program never unwinds and want smaller code size, use
+# "eh-personality-continue" instead.
+#
+# This is only needed in no-std builds, as std provides a personality. See
+# [the "personality" feature of the unwinding crate] for more details.
+#
+# [the "personality" feature of the unwinding crate]: https://crates.io/crates/unwinding#personality-and-other-utilities
+eh-personality = ["unwinding/personality"]
+
+# Provide a `#[lang = eh_personality]` function that just returns
+# `CONTINUE_UNWIND` (for no-std). Use this if you know your program will never
+# unwind and don't want any extra code.
+eh-personality-continue = ["unwinding?/personality-dummy"]
+
+# Provide a `#[panic_handler]` function suitable for unwinding (for no-std).
+#
+# If you know your program never panics and want smaller code size, use
+# "panic-handler-trap" instead.
+#
+# This is only needed in no-std builds, as std provides a panic handler. See
+# [the "panic-handler" feature of the unwinding crate] for more details.
+#
+# [the "panic-handler" feature of the unwinding crate]: https://crates.io/crates/unwinding#personality-and-other-utilities
+panic-handler = ["unwinding/panic-handler"]
+
+# Provide a `#[panic_handler]` function that just traps (for no-std). Use this
+# if you know your program will never panic and don't want any extra code.
+panic-handler-trap = ["unwinding?/panic-handler-dummy"]
+
+# Enable this to define a C ABI-compatible `getauxval` function. Most Rust code
+# should use functions in [`rustix::param`] instead.
+#
+# [`rustix::param`]: https://docs.rs/rustix/latest/rustix/param/index.html
+getauxval = ["rustix/param"]
+
+# Enable features which depend on Rust's std.
+std = ["rustix/std", "bitflags/std", "alloc"]
+
+# Enable features which depend on the Rust global allocator, such as functions
+# that return owned strings or `Vec`s.
+alloc = ["rustix/alloc", "smallvec"]
+
+# Use this iff you're experimenting with using origin from within Rust's
+# standard library implementation.
+rustc-dep-of-std = [
+    "dep:core",
+    "dep:alloc",
+    "linux-raw-sys/rustc-dep-of-std",
+    "bitflags/rustc-dep-of-std",
+    "rustix/rustc-dep-of-std",
+    "unwinding?/rustc-dep-of-std",
+    "libc?/rustc-dep-of-std",
+    "rustix-futex-sync/rustc-dep-of-std",
+]
+
+[package.metadata.docs.rs]
+features = ["origin-start", "signal", "program-at-exit", "thread-at-exit", "nightly"]

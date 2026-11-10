@@ -1,0 +1,10 @@
+[package]
+name = "lucina-audio-ledger"
+version = "0.1.0"
+description = "Juno audio bookkeeping that must not miscount: the periods handed to the DSP (each slot out once, back in order, which hold samples), the microphone queue's overrun, and the order power steps are undone in. no_std, no dependencies, tested on the host, proved by Verus"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

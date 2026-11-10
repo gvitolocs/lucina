@@ -1,0 +1,201 @@
+# LucinaOS on the Samsung Galaxy Book Go: the boot menu (lucinaos/boot.toml, on the stick and, once installed, on
+# the laptop's EFI partition) for LucinaLoader, the Rust UEFI boot menu that takes GRUB's place (build.sh
+# --loader lucina; LucinaOS boot/lucina-loader). It is grub.cfg, entry for entry, including the automatic
+# diagnosis and its GRUB environment block (lucinaos/grubenv, read and rewritten in place as GRUB's save_env does).
+# LucinaLoader starts the kernel with the same command line (BOOT_IMAGE=<path> first, as GRUB's linux command
+# does), the device tree as the firmware's DTB table and the initrd through LoadFile2. grub.cfg's gfxpayload has no
+# effect on arm64 UEFI (GRUB's arm64 linux loader leaves the screen to the EFI stub), so the variants' v_gfx is only
+# recorded, as GRUB records it.
+#
+# Kernel: Debian 13's arm64 kernel. The laptop has no device tree in mainline and resets when booted through ACPI,
+# so every Book Go entry loads the community device tree with clk_ignore_unused pd_ignore_unused, as xbill9's
+# working Debian port does (boards/gbgo/README.md).
+#
+# A stick holding lucinaos/install-pending runs the automatic diagnosis and install (below) by itself. The installed
+# copy never has install-pending.
+#
+# The stick keeps the boot files in lucinaos/ itself. The installed copy keeps them in two update slots, lucinaos/a/
+# and lucinaos/b/, and grubenv says which (docs/OTA-UPDATES.md section 11; grub.cfg has the rules): lucina_slot is
+# home, lucina_trial boots a slot once, cleared and recorded in lucina_tried first. LucinaLoader makes that choice
+# itself (slots =) and sets lucina_dir, lucina_other, lucina_esp, lucina_title and slot_args.
+title = "Juno"
+subtitle = "Samsung Galaxy Book Go"
+default = "gbgo"
+timeout = 8
+# The panel's own modes first; without a match the firmware's mode stays, and Linux keeps it.
+modes = ["1920x1080", "1366x768", "1280x800", "1024x768"]
+# Only in the throwaway copies qemu-test.sh --install boots (its test.cfg for GRUB).
+include = ["/lucinaos/test.toml"]
+# The breadcrumbs (lucina_entry: what was started last), the diagnosis state, and on the laptop the kernel arguments
+# the diagnosis chose (lucina_args, lucina_gfx). Written only when the file exists.
+env = "/lucinaos/grubenv"
+save = ["lucina_entry=menu"]
+slots = "/lucinaos"
+
+[vars]
+# The kernel arguments that booted this very kernel (6.12.107+deb13-arm64) and device tree (5c08a267) on the laptop:
+# Debian's installer entry, 2026-10-30. rdinit= and lucinaos.* are read only after the kernel has started.
+gbgo_args = "console=tty0 clk_ignore_unused pd_ignore_unused rdinit=/init lucinaos.board=galaxy-book-go"
+# The installer needs no GPU or DSP: their drivers stay out of its way.
+safe_args = "modprobe.blacklist=msm,qcom_q6v5_pas,qcom_q6v5_mss"
+xbill_args = "efi=novamap,noruntime deferred_probe_timeout=30"
+early_args = "earlycon=efifb ignore_loglevel"
+# From grubenv when set there.
+lucina_step = "v1"
+lucina_ok = ""
+lucina_args = ""
+lucina_gfx = "keep"
+# Without update slots (the stick), the boot files are in lucinaos/ itself.
+lucina_dir = "/lucinaos"
+lucina_other = ""
+lucina_title = ""
+lucina_esp = ""
+slot_args = ""
+# The diagnosis' kernel, device tree and extra initrd; test.toml switches them to QEMU's (grub.cfg lucina_linux).
+kargs = "$gbgo_args"
+kargs_tail = "$qemu_args"
+dtb = "/lucinaos/gbgo.dtb"
+overlay = ""
+qemu_args = ""
+# grub.cfg lucina_variant: what each variant changes.
+v_args = ""
+v_gfx = "keep"
+v_initrd = "/lucinaos/initrd.gz"
+
+[vars.v1]
+v_next = "v2"
+v_label = "1 of 5: Debian's arguments, graphics kept"
+
+[vars.v2]
+v_gfx = "text"
+v_next = "v3"
+v_label = "2 of 5: Debian's arguments, text mode"
+
+[vars.v3]
+v_args = "$xbill_args"
+v_next = "v4"
+v_label = "3 of 5: with efi=novamap,noruntime"
+
+[vars.v4]
+v_args = "$early_args"
+v_next = "v5"
+v_label = "4 of 5: early kernel console"
+
+[vars.v5]
+v_initrd = "/lucinaos/initrd-mini.gz"
+v_next = "done"
+v_label = "5 of 5: small initramfs"
+
+[[when]]
+exists = "/lucinaos/install-pending"
+default = "auto"
+timeout = 5
+
+[[when]]
+# Only in the throwaway copies that qemu-test.sh boots.
+exists = "/lucinaos/test-overlay.cpio"
+unless = "/lucinaos/install-pending"
+default = "qemu"
+timeout = 1
+
+# ---- Automatic diagnosis and install --------------------------------------------------------------------------
+# Twice (2026-11-01) the laptop reset to Windows right after GRUB started the installer, before the kernel printed
+# anything. The diagnosis tries one variant per boot. It moves lucina_step on BEFORE starting Linux, so a variant
+# that resets the laptop leaves the next one for the next boot (the stick must be first in the firmware's boot
+# order). A variant that reaches Linux runs lucinaos-install diag: it records lucina_ok in grubenv, saves the logs and a
+# read-only survey of the laptop's disk to the stick, and restarts. After the last variant, the install runs with
+# the first variant that reached Linux; if none did, a screen says so and nothing is erased.
+# The three entries below are grub.cfg's one `auto` entry: exactly one of them shows.
+[[entry]]
+id = "auto"
+title = "Juno: automatic diagnosis, then INSTALL (ERASES Windows)"
+if = "/lucinaos/install-pending"
+if_env = ["lucina_step!=done"]
+with = "$lucina_step"
+save = ["lucina_entry=$lucina_step", "lucina_step=$v_next"]
+message = "LucinaOS diagnosis, variant $v_label"
+linux = "/lucinaos/vmlinuz"
+cmdline = "$kargs $safe_args $v_args panic=20 lucinaos.diag=$lucina_step $kargs_tail"
+devicetree = "$dtb"
+initrd = ["$v_initrd", "$overlay"]
+
+[[entry]]
+id = "auto-install"
+title = "Juno: automatic diagnosis, then INSTALL (ERASES Windows)"
+if = "/lucinaos/install-pending"
+if_env = ["lucina_step=done", "lucina_ok"]
+with = "$lucina_ok"
+save = ["lucina_args=$v_args", "lucina_gfx=$v_gfx", "lucina_entry=install"]
+message = "Diagnosis done. Installing with variant $v_label"
+linux = "/lucinaos/vmlinuz"
+# kargs_tail last: under QEMU its lucinaos.disk=vdb picks the installer's disk.
+cmdline = "$kargs $safe_args $v_args lucinaos.install=internal $kargs_tail"
+devicetree = "$dtb"
+initrd = ["$v_initrd", "$overlay"]
+
+[[entry]]
+id = "auto-none"
+title = "Juno: automatic diagnosis, then INSTALL (ERASES Windows)"
+if = "/lucinaos/install-pending"
+if_env = ["lucina_step=done", "!lucina_ok"]
+save = ["lucina_entry=none"]
+action = "message"
+message = ["None of the 5 variants started Linux on this laptop.", "Nothing was erased. Take the stick to the Mac: its logs say what was tried."]
+wait = 600
+
+[[entry]]
+id = "rediag"
+title = "Start the diagnosis again from variant 1"
+if = "/lucinaos/install-pending"
+save = ["lucina_step=v1", "lucina_ok="]
+action = "message"
+message = "Diagnosis reset. Restart the laptop to run it again."
+wait = 5
+
+# ---- LucinaOS -------------------------------------------------------------------------------------------------
+[[entry]]
+id = "gbgo"
+title = "Juno (Galaxy Book Go)$lucina_title"
+save = ["lucina_entry=gbgo"]
+message = "Loading Linux and the Galaxy Book Go device tree ..."
+linux = "$lucina_dir/vmlinuz"
+cmdline = "$gbgo_args $lucina_args $slot_args"
+devicetree = "$lucina_dir/gbgo.dtb"
+initrd = ["$lucina_dir/initrd.gz"]
+
+[[entry]]
+id = "gbgo-safe"
+title = "Juno (Galaxy Book Go)$lucina_title, SAFE: no GPU/DSP drivers, verbose"
+save = ["lucina_entry=gbgo-safe"]
+linux = "$lucina_dir/vmlinuz"
+cmdline = "$gbgo_args $lucina_args $safe_args ignore_loglevel $slot_args"
+devicetree = "$lucina_dir/gbgo.dtb"
+initrd = ["$lucina_dir/initrd.gz"]
+
+# The other update slot, for this start only (the environment block's slots are not changed).
+[[entry]]
+id = "gbgo-other"
+title = "Juno, the other version (slot $lucina_other), this start only"
+if_env = ["lucina_other"]
+if = "/lucinaos/$lucina_other/vmlinuz"
+save = ["lucina_entry=gbgo-other"]
+linux = "/lucinaos/$lucina_other/vmlinuz"
+cmdline = "$gbgo_args $lucina_args lucinaos.slot=$lucina_other lucinaos.boot=manual lucinaos.esp=$lucina_esp"
+devicetree = "/lucinaos/$lucina_other/gbgo.dtb"
+initrd = ["/lucinaos/$lucina_other/initrd.gz"]
+
+# Only on the throwaway copies qemu-test.sh boots: on the laptop it resets it.
+[[entry]]
+id = "qemu"
+title = "QEMU test only (firmware device tree; resets a real Book Go)"
+if = "/lucinaos/test-overlay.cpio"
+save = ["lucina_entry=qemu"]
+linux = "$lucina_dir/vmlinuz"
+cmdline = "console=ttyAMA0 rdinit=/init lucinaos.board=galaxy-book-go $qemu_args $slot_args"
+initrd = ["$lucina_dir/initrd.gz", "/lucinaos/test-overlay.cpio"]
+
+[[entry]]
+id = "fwsetup"
+title = "Firmware setup (F2)"
+save = ["lucina_entry=fwsetup"]
+action = "firmware-setup"

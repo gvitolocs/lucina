@@ -1,0 +1,10 @@
+[package]
+name = "lucina-wifi-wake"
+version = "0.1.0"
+description = "When Juno's Wi-Fi thread runs: copy-engine, GLINK, SMP2P, send-queue and control sources raised into one pending word, drained before a pass, sleep only when nothing is left, until the earliest driver deadline (none when idle). no_std, no dependencies, tested on the host, proved by Verus"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

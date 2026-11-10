@@ -1,0 +1,17 @@
+[package]
+name = "lucina-app-camera"
+version = "0.1.0"
+description = "Camera on Juno: a live preview of the webcam and photos, through /dev/lucina-camera0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lucina-app = { path = "../../apps/lucina-app" }
+lucina-camera = { path = "../../drivers/lucina-camera" }
+lucina-uvc = { path = "../../drivers/lucina-uvc" }
+libc = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

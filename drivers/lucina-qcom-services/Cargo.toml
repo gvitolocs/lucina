@@ -1,0 +1,11 @@
+[package]
+name = "lucina-qcom-services"
+version = "0.1.0"
+description = "pd-mapper, tqftpserv and read-only rmtfs as state machines on a lucina-qrtr router, for the in-kernel Wi-Fi of the Galaxy Book Go: no_std, unsafe-free, host-tested"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt).
+edition = "2024"
+publish = false
+
+[dependencies]
+lucina-qrtr = { path = "../../drivers/lucina-qrtr" }

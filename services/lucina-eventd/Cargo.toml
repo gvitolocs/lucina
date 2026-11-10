@@ -1,0 +1,15 @@
+[package]
+name = "lucina-eventd"
+version = "0.1.0"
+description = "Juno's one queue of semantic events, as a program: the hub of services/lucina-events. Its own crate, because the kernel copies lucina-events into its tree (kernel/inject.txt) and builds no programs"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lucina-events = { path = "../../services/lucina-events" }
+serde = "1"
+serde_json = "1"
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }
