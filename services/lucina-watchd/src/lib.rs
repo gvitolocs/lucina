@@ -726,7 +726,7 @@ mod tests {
     #[test]
     fn default_routes_of_every_link() {
         let route = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
-                     wlan0\t00000000\t01B2A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
+                     wlan0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
                      eth0\t00000000\t0202000A\t0003\t0\t0\t0\t00000000\t0\t0\t0\n";
         assert_eq!(
             default_routes(route),

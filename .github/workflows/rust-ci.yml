@@ -30,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        step: [fmt, clippy, test, nostd]
+        step: [fmt, clippy, nostd]
     name: ${{ matrix.step }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -55,11 +55,6 @@ jobs:
       - name: clippy
         if: matrix.step == 'clippy'
         run: bash tools/ci/ratchet.sh clippy
-      - name: test
-        if: matrix.step == 'test'
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -yqq ffmpeg
-          cargo test --workspace --no-fail-fast
       - name: nostd
         if: matrix.step == 'nostd'
         run: |
@@ -68,14 +63,45 @@ jobs:
           done
           cargo check -p lucina-bootimg -p lucina-fdt -p lucina-boot --no-default-features --target aarch64-unknown-none
 
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    # The media tests check our demuxers against FFmpeg's own reading, which differs between FFmpeg versions. This is the Ubuntu,
+    # and so the FFmpeg (8.0.1), of the machine the tests were written on.
+    container: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
+    steps:
+      - name: Tools
+        run: |
+          # The tests start ffmpeg and ffprobe, mkfs.fat and fsck.fat, ssh-keygen and kill.
+          apt-get update -qq
+          apt-get install -yqq --no-install-recommends ca-certificates curl git build-essential pkg-config clang ffmpeg dosfstools openssh-client procps
+          base=https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu
+          curl -fsSL -o rustup-init "$base/rustup-init"
+          echo "$(curl -fsSL "$base/rustup-init.sha256" | cut -d' ' -f1)  rustup-init" | sha256sum -c --status
+          chmod +x rustup-init && ./rustup-init -y --profile minimal --default-toolchain "$RUST_CI_TOOLCHAIN" --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rm rustup-init
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Trust the checkout (the container runs as root, the files belong to the runner)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Keep only the members that can build here
+        run: |
+          cargo run --quiet --release --locked --manifest-path tools/ci/lucina-ci/Cargo.toml -- portable-workspace --write
+      - name: test
+        run: cargo test --workspace --no-fail-fast
+
   rust-gate:
-    needs: check
+    needs: [check, test]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - env:
-          RESULT: ${{ needs.check.result }}
+          CHECK: ${{ needs.check.result }}
+          TEST: ${{ needs.test.result }}
         run: |
-          echo "check=$RESULT"
-          [ "$RESULT" = success ]
+          echo "check=$CHECK test=$TEST"
+          if [ "$CHECK" != success ]; then echo "::error::fmt, clippy or nostd failed"; exit 1; fi
+          if [ "$TEST" != success ]; then echo "::error::the tests failed"; exit 1; fi

@@ -317,8 +317,8 @@ mod tests {
     #[test]
     fn default_routes() {
         let s = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
-                 eth0\t00000000\t01B2A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
-                 eth0\t00B2A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+                 eth0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
+                 eth0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
         assert_eq!(
             parse_routes(s),
             vec![("eth0".to_string(), "192.168.1.1".to_string())]
