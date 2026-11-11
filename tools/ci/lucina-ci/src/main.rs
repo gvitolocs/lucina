@@ -8,6 +8,7 @@
 //!   lucina-ci selftest ...                     prove the cap, timeouts and verdicts work on this machine
 //!   lucina-ci gate --plan F --reports D        every planned unit verified on this commit?
 //!   lucina-ci merge-check ...                  the lagent merge gate: did GitHub verify this commit?
+//!   lucina-ci spec --check [--base REF] [--allow WHY] [--merge-gate] | --list [--json]   freeze proof specifications against the base commit (src/spec.rs)
 //!   lucina-ci green-commit|sync-plan|sync-gate the automatic public sync and the install gate (docs/ci/PUBLIC-SYNC.md)
 
 mod coverage;
@@ -15,6 +16,7 @@ mod fast;
 mod inventory;
 mod runner;
 mod snapshot;
+mod spec;
 mod sync;
 mod trust;
 mod verdict;
@@ -1140,6 +1142,7 @@ fn main() -> ExitCode {
         "alert-plan" => cmd_alert_plan(&a),
         "portable-workspace" => cmd_portable_workspace(&a),
         "snapshot" => cmd_snapshot(&a),
+        "spec" => spec::cmd(&a.0),
         "check-fast" => cmd_check_fast(&a),
         "perf" => cmd_perf(&a),
         "__alloc" => cmd_alloc(&a),
@@ -1186,7 +1189,25 @@ fn fast_step(
             Path::new(out).join(format!("fast__{}.log", name.replace('/', "__"))),
         )
         .unwrap_or_default();
-        for l in t.lines().rev().take(30).collect::<Vec<_>>().iter().rev() {
+        let lines: Vec<&str> = t.lines().collect();
+        // A refused spec change must show its whole list (the reviewer reads it): up to 300 lines, else the first 240 and the last 3.
+        let shown: Vec<String> = if name == "spec" && lines.len() <= 300 {
+            lines.iter().map(|l| l.to_string()).collect()
+        } else if name == "spec" {
+            let mut v: Vec<String> = lines[..240].iter().map(|l| l.to_string()).collect();
+            v.push(format!(
+                "... {} lines omitted: run `lucina-ci spec --check` for all of them ...",
+                lines.len() - 243
+            ));
+            v.extend(lines[lines.len() - 3..].iter().map(|l| l.to_string()));
+            v
+        } else {
+            lines[lines.len().saturating_sub(30)..]
+                .iter()
+                .map(|l| l.to_string())
+                .collect()
+        };
+        for l in &shown {
             println!("    {l}");
         }
     }
@@ -1374,6 +1395,18 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
             &format!("{exe} inventory --check"),
             "script",
             30,
+            &none,
+            &mut failed,
+        )?;
+        // The proof specifications may not be weakened silently (src/spec.rs): compared with the base commit's tree.
+        step(
+            "spec",
+            &format!(
+                "{exe} spec --check --base {base}{}",
+                if merge_gate { " --merge-gate" } else { "" }
+            ),
+            "script",
+            60,
             &none,
             &mut failed,
         )?;
