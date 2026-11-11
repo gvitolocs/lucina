@@ -325,12 +325,11 @@ pub fn saved_event(saved: &Saved, text: &[u8], ctx: &Context) -> Event {
     let mut active: Vec<&str> = Vec::new();
     if let Some(end) = last_ms {
         for l in &rec.log {
-            if l.uptime_ms.is_some_and(|t| t + 30_000 >= end) {
-                if let Some(s) = record::subsystem(&l.text) {
-                    if !active.contains(&s) {
-                        active.push(s);
-                    }
-                }
+            if l.uptime_ms.is_some_and(|t| t + 30_000 >= end)
+                && let Some(s) = record::subsystem(&l.text)
+                && !active.contains(&s)
+            {
+                active.push(s);
             }
         }
     }
@@ -396,15 +395,15 @@ pub fn saved_event(saved: &Saved, text: &[u8], ctx: &Context) -> Event {
             if let Some(i) = log
                 .iter()
                 .rposition(|l| l.mark.as_deref().is_some_and(|m| m.starts_with("repeated")))
+                && i + 1 == log.len()
+                && !is_heartbeat(&log[i].text)
             {
-                if i + 1 == log.len() && !is_heartbeat(&log[i].text) {
-                    ev.push(Evidence {
+                ev.push(Evidence {
                         fact: format!("The last line was logged over and over ({}); it filled the saved tail but is not itself a fault.", log[i].mark.clone().unwrap_or_default()),
                         source: format!("saved crash log, record {}", saved.seq),
                         line: Some(i),
                         observed: true,
                     });
-                }
             }
             // Patch 0842's line: a program asked for a restart, power-off or reload, and the boot still did not end cleanly.
             if let Some((i, who, cmd)) = log.iter().enumerate().rev().find_map(|(i, l)| {
@@ -442,7 +441,7 @@ pub fn saved_event(saved: &Saved, text: &[u8], ctx: &Context) -> Event {
                     observed: true,
                 });
                 let tail_from = last_ms.map_or(0, |e| e.saturating_sub(3_000));
-                for k in KNOWN.iter().filter(|k| {
+                if let Some(k) = KNOWN.iter().find(|k| {
                     record::subsystem(&log[*i].text)
                         .is_some_and(|s| s == k.sub || s.starts_with(k.sub))
                 }) {
@@ -467,7 +466,6 @@ pub fn saved_event(saved: &Saved, text: &[u8], ctx: &Context) -> Event {
                             k.next_step.to_string(),
                         ));
                     }
-                    break;
                 }
             }
             if let (true, Some((ms, exact)), Some(end)) = (idle, quiet, last_ms) {
@@ -500,9 +498,11 @@ pub fn saved_event(saved: &Saved, text: &[u8], ctx: &Context) -> Event {
             let key_restart = ctx
                 .next_pon
                 .is_some_and(|p| p.on_bits().contains(&OnBit::PowerKey));
-            if ps_hold && !key_restart {
-                if let Some(ms) = last_ms {
-                    ev.push(Evidence {
+            if ps_hold
+                && !key_restart
+                && let Some(ms) = last_ms
+            {
+                ev.push(Evidence {
                         fact: format!(
                             "With every CPU stuck, this laptop's firmware resets it about {} s later (measured 2026-11-04), so the hang likely began right after the last line, around {}.",
                             FIRMWARE_STALL_RESET_MS / 1000,
@@ -512,7 +512,6 @@ pub fn saved_event(saved: &Saved, text: &[u8], ctx: &Context) -> Event {
                         line: None,
                         observed: false,
                     });
-                }
             }
             let what = activity
                 .as_ref()

@@ -33,7 +33,9 @@ pub mod pdic_rules;
 pub mod rules;
 #[cfg(test)]
 mod sim;
+pub mod sleep_drain;
 pub mod supply;
+pub mod supply_state;
 #[cfg(test)]
 mod tests;
 
@@ -41,8 +43,9 @@ use core::fmt;
 use core::time::Duration;
 
 pub use rules::{
-    Action, BATTERY_MAX_MV, BATTERY_MIN_MV, Band, Blocked, DEFAULT_CAP_MA, DESIGN_MAX_MA, Decision, Facts, Plan, Reading, Stop,
-    TEMP_MAX_DK, TEMP_MIN_DK, V_REQ_MAX_MV, V_REQ_MIN_MV, VMAX_MV, decide, next_band, plan,
+    Action, BATTERY_MAX_MV, BATTERY_MIN_MV, Band, Blocked, DEFAULT_CAP_MA, DESIGN_MAX_MA, Decision,
+    Facts, Plan, Reading, Stop, TEMP_MAX_DK, TEMP_MIN_DK, V_REQ_MAX_MV, V_REQ_MIN_MV, VMAX_MV,
+    decide, next_band, plan,
 };
 
 /// Keep-alive period: one pass, so one ChargeCurrent write, per minute.
@@ -142,7 +145,12 @@ pub trait Smbus {
     fn write_word(&mut self, addr: u16, reg: u8, value: u16) -> Result<(), Self::Error>;
 
     /// An SMBus block read: the length byte goes first in `buf`. `None`: this bus has no such read. For a name in the log only.
-    fn read_block(&mut self, _addr: u16, _reg: u8, _buf: &mut [u8]) -> Option<Result<(), Self::Error>> {
+    fn read_block(
+        &mut self,
+        _addr: u16,
+        _reg: u8,
+        _buf: &mut [u8],
+    ) -> Option<Result<(), Self::Error>> {
         None
     }
 
@@ -246,13 +254,18 @@ impl Options {
         let value = |name: &str| raw(name).and_then(|v| v.parse::<u64>().ok());
         Options {
             mode: Mode::from_args(args.clone()),
-            cap_ma: value("lucina.charge.cap").map_or(DEFAULT_CAP_MA, |ma| ma.min(u64::from(DEFAULT_CAP_MA)) as u16),
+            cap_ma: value("lucina.charge.cap").map_or(DEFAULT_CAP_MA, |ma| {
+                ma.min(u64::from(DEFAULT_CAP_MA)) as u16
+            }),
             window_ms: value("lucina.charge.window").map(|s| s.saturating_mul(1000)),
             trace_ms: value("lucina.charge.trace").map(|ms| ms.clamp(200, control::READ_PERIOD_MS)),
             adc_ms: if raw("lucina.charge.adc") == Some("off") {
                 None
             } else {
-                Some(value("lucina.charge.adc").map_or(control::ADC_PERIOD_MS, |ms| ms.clamp(200, 60_000)))
+                Some(
+                    value("lucina.charge.adc")
+                        .map_or(control::ADC_PERIOD_MS, |ms| ms.clamp(200, 60_000)),
+                )
             },
             // On since the laptop run of 2026-11-08 (IIN_HOST 0x3c00 read back after an attach; Lucina dc-1e6753f3881f: default
             // on if it holds): `off` or `report` only says it.

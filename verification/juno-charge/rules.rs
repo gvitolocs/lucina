@@ -7,5 +7,9 @@ pub mod rules;
 pub mod adc;
 #[path = "../../drivers/lucina-charge/src/pdic_rules.rs"]
 pub mod pdic_rules;
+#[path = "../../drivers/lucina-charge/src/sleep_drain.rs"]
+pub mod sleep_drain;
+#[path = "../../drivers/lucina-charge/src/supply_state.rs"]
+pub mod supply_state;
 
 fn main() {}

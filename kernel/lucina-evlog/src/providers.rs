@@ -47,6 +47,8 @@ pub mod id {
     // Juno-Power
     pub const BATTERY_LOW: u32 = 2;
     pub const POWER_SOURCE: u32 = 105;
+    pub const SLEEP_ENTERED: u32 = 42;
+    pub const SLEEP_LEFT: u32 = 107;
     // Juno-Setup
     pub const GENERATION_INSTALLED: u32 = 2;
     // Juno-EventLog
@@ -171,6 +173,24 @@ pub const DEFS: &[Def] = &[
         channel: Channel::System,
         windows: "Kernel-Power 42 (sleep), Battery warnings",
         meaning: "the battery fell to 10 % or less without a charger",
+    },
+    Def {
+        provider: POWER,
+        id: id::SLEEP_ENTERED,
+        name: "Went to sleep",
+        level: Level::Info,
+        channel: Channel::System,
+        windows: "Kernel-Power 42",
+        meaning: "the machine went to sleep; the battery as it stood",
+    },
+    Def {
+        provider: POWER,
+        id: id::SLEEP_LEFT,
+        name: "Woke from sleep",
+        level: Level::Info,
+        channel: Channel::System,
+        windows: "Kernel-Power 107, Power-Troubleshooter 1",
+        meaning: "the machine woke; how long it slept, what woke it, and what the sleep cost the battery",
     },
     Def {
         provider: POWER,

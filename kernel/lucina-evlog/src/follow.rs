@@ -157,7 +157,10 @@ impl Follower {
             "proc.oom_killed" => {
                 let pid = int("pid")?;
                 let exe = self.exe.remove(&pid).or_else(|| {
-                    fields.get("exe").and_then(|v| v.as_str()).map(str::to_string)
+                    fields
+                        .get("exe")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
                 });
                 let exe = exe.unwrap_or_else(|| format!("pid {pid}"));
                 let prog = exe.rsplit('/').next().unwrap_or(&exe).to_string();
@@ -168,7 +171,10 @@ impl Follower {
                     .unwrap_or_else(|| prog.clone());
                 let rss_mb = int("rss_kb").unwrap_or(0) / 1024;
                 let b = bucket::make(
-                    &[("program", prog.clone()), ("reason", "out of memory".to_string())],
+                    &[
+                        ("program", prog.clone()),
+                        ("reason", "out of memory".to_string()),
+                    ],
                     format!("{prog} · out of memory"),
                 );
                 let held = self.throttle(&b.id, now_ms)?;
@@ -226,6 +232,10 @@ impl Follower {
             }
             "power.charger" => {
                 let online = fields.get("online").and_then(|v| v.as_bool())?;
+                // The first report of a boot says what is true, it is not a change: no event (patch 1197).
+                if fields.get("first").and_then(|v| v.as_bool()) == Some(true) {
+                    return None;
+                }
                 let mut e = Event::new(
                     providers::POWER,
                     id::POWER_SOURCE,
@@ -238,6 +248,77 @@ impl Follower {
                     },
                 )
                 .field("online", online);
+                // When the PD controller's interrupt came, if the kernel says.
+                e.uptime_ms = Some(
+                    int("irq_ms")
+                        .filter(|ms| *ms > 0)
+                        .map_or(t_ms, |ms| ms as u64),
+                );
+                Some(self.stamp(e, now_ms))
+            }
+            "power.sleep" => {
+                let charger = fields
+                    .get("charger")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let summary = match (int("level"), int("mah"), int("mv")) {
+                    (Some(l), Some(m), Some(v)) => format!(
+                        "Went to sleep at {l} % ({m} mAh, {:.2} V), {}.",
+                        v as f64 / 1000.0,
+                        if charger { "charger in" } else { "on battery" }
+                    ),
+                    _ => "Went to sleep.".to_string(),
+                };
+                let mut e = Event::new(
+                    providers::POWER,
+                    id::SLEEP_ENTERED,
+                    Level::Info,
+                    Channel::System,
+                    summary,
+                )
+                .field("charger", charger);
+                for key in ["level", "mah", "mv"] {
+                    if let Some(v) = int(key) {
+                        e = e.field(key, v);
+                    }
+                }
+                e.uptime_ms = Some(t_ms);
+                Some(self.stamp(e, now_ms))
+            }
+            "power.wake" => {
+                let asleep = int("asleep_ms")?;
+                let reason = fields.get("reason").and_then(|v| v.as_str())?.to_string();
+                let during = fields
+                    .get("charger_during")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let tail = match (int("avg_mw"), int("drain_pct"), int("drain_mah")) {
+                    (Some(w), Some(p), Some(m)) => {
+                        format!(": used {p} % ({m} mAh), {w} mW on average.")
+                    }
+                    _ if during => ": the charger was in, so no drain figure.".to_string(),
+                    (_, _, Some(_)) => ": no measurable drain.".to_string(),
+                    _ => ".".to_string(),
+                };
+                let summary = format!(
+                    "Slept {} (woken by the {reason}){tail}",
+                    sleep_length(asleep)
+                );
+                let mut e = Event::new(
+                    providers::POWER,
+                    id::SLEEP_LEFT,
+                    Level::Info,
+                    Channel::System,
+                    summary,
+                )
+                .field("reason", reason)
+                .field("asleep_ms", asleep)
+                .field("charger_during", during);
+                for key in ["level", "mah", "mv", "drain_pct", "drain_mah", "avg_mw"] {
+                    if let Some(v) = int(key) {
+                        e = e.field(key, v);
+                    }
+                }
                 e.uptime_ms = Some(t_ms);
                 Some(self.stamp(e, now_ms))
             }
@@ -333,6 +414,18 @@ fn capitalize(s: &str) -> String {
     }
 }
 
+/// A sleep's length for a person: hours and minutes, minutes, or seconds.
+fn sleep_length(ms: i64) -> String {
+    let s = ms / 1000;
+    if s >= 3600 {
+        format!("{} h {} min", s / 3600, s % 3600 / 60)
+    } else if s >= 60 {
+        format!("{} min", s / 60)
+    } else {
+        format!("{s} s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,17 +452,31 @@ mod tests {
                 1000,
             )
             .unwrap();
-        assert_eq!(e.summary, "Video was ended because memory ran out (2929 MB in use).");
+        assert_eq!(
+            e.summary,
+            "Video was ended because memory ran out (2929 MB in use)."
+        );
         assert_eq!(e.channel, Channel::Apps);
         assert_eq!(e.fields["oom"], json!(true));
         // Without its start seen, the kernel's name is used.
         let e = fo
-            .on_hub("proc.oom_killed", &f(json!({"pid": 77, "exe": "lucinajs", "rss_kb": 1024})), 30, 2000)
+            .on_hub(
+                "proc.oom_killed",
+                &f(json!({"pid": 77, "exe": "lucinajs", "rss_kb": 1024})),
+                30,
+                2000,
+            )
             .unwrap();
-        assert_eq!(e.summary, "lucinajs was ended because memory ran out (1 MB in use).");
+        assert_eq!(
+            e.summary,
+            "lucinajs was ended because memory ran out (1 MB in use)."
+        );
         assert_eq!(e.channel, Channel::System);
         // Its exit with SIGKILL afterwards is not a second crash.
-        assert!(fo.on_hub("proc.exited", &f(json!({"pid": 77, "signal": 9})), 30, 2100).is_none());
+        assert!(
+            fo.on_hub("proc.exited", &f(json!({"pid": 77, "signal": 9})), 30, 2100)
+                .is_none()
+        );
     }
 
     #[test]
@@ -490,13 +597,114 @@ mod tests {
     }
 
     #[test]
+    fn a_sleep_records_its_cost() {
+        assert_eq!(sleep_length(40_000), "40 s");
+        assert_eq!(sleep_length(720_000), "12 min");
+        assert_eq!(sleep_length(15_593_452), "4 h 19 min");
+        let mut fo = Follower::new(None);
+        let e = fo
+            .on_hub(
+                "power.sleep",
+                &f(serde_json::json!({"level": 74, "mah": 3120, "mv": 3920, "charger": false})),
+                1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            e.summary,
+            "Went to sleep at 74 % (3120 mAh, 3.92 V), on battery."
+        );
+        let e = fo
+            .on_hub(
+                "power.sleep",
+                &f(serde_json::json!({"charger": true})),
+                1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(e.summary, "Went to sleep.");
+        let wake = |v| f(v);
+        let e = fo.on_hub("power.wake", &wake(serde_json::json!({"asleep_ms": 15593452, "reason": "power key", "drain_pct": 3, "drain_mah": 142, "avg_mw": 127})), 2, 0).unwrap();
+        assert_eq!(
+            e.summary,
+            "Slept 4 h 19 min (woken by the power key): used 3 % (142 mAh), 127 mW on average."
+        );
+        let e = fo.on_hub("power.wake", &wake(serde_json::json!({"asleep_ms": 40000, "reason": "lid", "charger_during": true, "drain_mah": -5})), 2, 0).unwrap();
+        assert_eq!(
+            e.summary,
+            "Slept 40 s (woken by the lid): the charger was in, so no drain figure."
+        );
+        let e = fo
+            .on_hub(
+                "power.wake",
+                &wake(serde_json::json!({"asleep_ms": 40000, "reason": "shell", "drain_mah": 0})),
+                2,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            e.summary,
+            "Slept 40 s (woken by the shell): no measurable drain."
+        );
+        let e = fo
+            .on_hub(
+                "power.wake",
+                &wake(serde_json::json!({"asleep_ms": 40000, "reason": "keyboard"})),
+                2,
+                0,
+            )
+            .unwrap();
+        assert_eq!(e.summary, "Slept 40 s (woken by the keyboard).");
+    }
+
+    #[test]
+    fn the_first_charger_report_is_no_event() {
+        let mut fo = Follower::new(None);
+        assert!(
+            fo.on_hub(
+                "power.charger",
+                &f(serde_json::json!({"online": false, "first": true})),
+                1,
+                0
+            )
+            .is_none()
+        );
+        let e = fo
+            .on_hub(
+                "power.charger",
+                &f(serde_json::json!({"online": false, "first": false, "irq_ms": 77})),
+                500,
+                0,
+            )
+            .unwrap();
+        assert_eq!(e.uptime_ms, Some(77));
+    }
+
+    #[test]
     fn the_charger_in_and_out_is_logged() {
         let mut fo = Follower::new(Some(17));
-        let e = fo.on_hub("power.charger", &f(serde_json::json!({"online": true})), 422_000, 0).unwrap();
+        let e = fo
+            .on_hub(
+                "power.charger",
+                &f(serde_json::json!({"online": true})),
+                422_000,
+                0,
+            )
+            .unwrap();
         assert_eq!(e.id, id::POWER_SOURCE);
         assert!(e.summary.contains("plugged in"));
-        let e = fo.on_hub("power.charger", &f(serde_json::json!({"online": false})), 430_000, 0).unwrap();
+        let e = fo
+            .on_hub(
+                "power.charger",
+                &f(serde_json::json!({"online": false})),
+                430_000,
+                0,
+            )
+            .unwrap();
         assert!(e.summary.contains("on battery"));
-        assert!(fo.on_hub("power.charger", &f(serde_json::json!({})), 431_000, 0).is_none());
+        assert!(
+            fo.on_hub("power.charger", &f(serde_json::json!({})), 431_000, 0)
+                .is_none()
+        );
     }
 }

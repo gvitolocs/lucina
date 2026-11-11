@@ -7,7 +7,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/juno-charge-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
 fail=0
 refused=0
-files="rules.rs adc.rs pdic_rules.rs"
+files="rules.rs adc.rs pdic_rules.rs sleep_drain.rs supply_state.rs"
 fresh() {
     rm -rf "$work/crates" "$work/verification"
     mkdir -p "$work/drivers/lucina-charge/src" "$work/verification/juno-charge"
@@ -173,6 +173,78 @@ tryp "pub fn rearm(flags: u32) -> bool {
 try "        Some(c) => Some(c),
         None => ac," "        Some(_) => ac,
         None => ac,"
+# Patch 1197: what a sleep cost.
+mutate sleep_drain.rs "    start as i32 - end as i32" "    end as i32 - start as i32"
+mutate sleep_drain.rs "    start as i16 - end as i16" "    end as i16 - start as i16"
+mutate sleep_drain.rs "    Some((drained_mah as u64 * mean) * 3600 / asleep_ms)" "    Some((drained_mah as u64 * mean) * 360 / asleep_ms)"
+mutate sleep_drain.rs "    if drained_mah == 0 || asleep_ms == 0 {
+        return None;" "    if asleep_ms == 0 {
+        return None;"
+mutate sleep_drain.rs "    let mean = (start_mv as u64 + end_mv as u64) / 2;" "    let mean = start_mv as u64;"
+# Both the code and its spec, so only the numbers in the lemma can refuse it.
+both() {
+    fresh
+    local target=$work/drivers/lucina-charge/src/sleep_drain.rs text
+    text=$(<"$target")
+    text=${text/"$1"/"$2"}
+    text=${text/"$3"/"$4"}
+    printf "%s\n" "$text" > "$target"
+    if "$verus" "$work/verification/juno-charge/rules.rs" > "$work/out" 2>&1; then
+        echo "NOT REFUSED (both): $2"; fail=1
+    else
+        refused=$((refused + 1)); echo "refused (both): $2"
+    fi
+}
+# Patch 1197: the adapter's state.
+mutate supply_state.rs "        Pd::Sink => Some(true),
+        Pd::NoSink => match ac {
+            // Power" "        Pd::Sink => ac,
+        Pd::NoSink => match ac {
+            // Power"
+mutate supply_state.rs "(None, Some(n)) => Publish::First(n),
+        (Some(p), Some(n)) if" "(None, Some(n)) => Publish::Changed(n),
+        (Some(p), Some(n)) if"
+sbth() {
+    fresh
+    local target=$work/drivers/lucina-charge/src/supply_state.rs text
+    text=$(<"$target")
+    case "$text" in *"$1"*) ;; *) echo "NOT FOUND: $1"; fail=1; return ;; esac
+    case "$text" in *"$3"*) ;; *) echo "NOT FOUND: $3"; fail=1; return ;; esac
+    text=${text/"$1"/"$2"}
+    text=${text/"$3"/"$4"}
+    printf "%s\n" "$text" > "$target"
+    if "$verus" "$work/verification/juno-charge/rules.rs" > "$work/out" 2>&1; then
+        echo "NOT REFUSED (both): $2"; fail=1
+    else
+        refused=$((refused + 1)); echo "refused (both): $2"
+    fi
+}
+sbth "        Pd::Unsettled => match prev {
+            Some(p) => Some(p),
+            None => ac,
+        }," "        Pd::Unsettled => ac," "        Pd::Unsettled => match prev { Some(p) => Some(p), None => ac }," "        Pd::Unsettled => ac,"
+sbth "            None => match prev {
+                Some(_) => Some(false),
+                None => None,
+            }," "            None => Some(false)," "            None => match prev { Some(_) => Some(false), None => None }," "            None => Some(false),"
+sbth "            Some(a) => Some(a),
+            // Nothing" "            Some(_a) => Some(false),
+            // Nothing" "            Some(a) => Some(a),
+            None => match prev { Some(_)" "            Some(_a) => Some(false),
+            None => match prev { Some(_)"
+sbth "        (None, Some(n)) => Publish::First(n),
+        (Some(p), Some(n)) if p != n" "        (None, Some(n)) => Publish::Changed(n),
+        (Some(p), Some(n)) if p != n" "        (None, Some(n)) => Publish::First(n),
+        (Some(p), Some(n)) => if" "        (None, Some(n)) => Publish::Changed(n),
+        (Some(p), Some(n)) => if"
+sbth "        Some(s) if (15 <= s && s <= 25) || s == 29 => 2,
+        Some(0) | Some(3) | Some(6) | Some(7) => 0,
+        _ => 1," "        Some(s) if (15 <= s && s <= 25) || s == 29 => 2,
+        _ => 0," "else if s == 0 || s == 3 || s == 6 || s == 7 { 0 } else { 1 }," "else { 0 },"
+both "    Some((drained_mah as u64 * mean) * 3600 / asleep_ms)" "    Some((drained_mah as u64 * mean) * 3000 / asleep_ms)" \
+    "(((start_mv as int) + (end_mv as int)) / 2) * 3600)" "(((start_mv as int) + (end_mv as int)) / 2) * 3000)"
+both "    let mean = (start_mv as u64 + end_mv as u64) / 2;" "    let mean = start_mv as u64;" \
+    "(((start_mv as int) + (end_mv as int)) / 2)" "(start_mv as int)"
 echo "$refused refused"
 [ "$fail" = 0 ] && echo "all refused"
 exit "$fail"

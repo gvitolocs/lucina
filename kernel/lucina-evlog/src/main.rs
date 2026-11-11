@@ -93,10 +93,10 @@ fn data_ready(dir: &std::path::Path, wait_s: u64) -> bool {
         return true;
     }
     for _ in 0..=wait_s {
-        if let (Ok(d), Ok(r)) = (fs::metadata("/data"), fs::metadata("/")) {
-            if d.dev() != r.dev() {
-                return true;
-            }
+        if let (Ok(d), Ok(r)) = (fs::metadata("/data"), fs::metadata("/"))
+            && d.dev() != r.dev()
+        {
+            return true;
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
@@ -395,10 +395,10 @@ fn follow(store: Store, boot: Option<u32>) -> ExitCode {
     let write = {
         let store = store.clone();
         move |e: Event| {
-            if let Ok(mut s) = store.lock() {
-                if let Err(err) = s.append(e, now_ms()) {
-                    eprintln!("lucina-evlog: append: {err}");
-                }
+            if let Ok(mut s) = store.lock()
+                && let Err(err) = s.append(e, now_ms())
+            {
+                eprintln!("lucina-evlog: append: {err}");
             }
         }
     };
@@ -409,7 +409,14 @@ fn follow(store: Store, boot: Option<u32>) -> ExitCode {
             use lucina_events::client::Reader;
             use lucina_events::wire::Filter as HubFilter;
             let filter = HubFilter {
-                kind: vec!["proc.*".into(), "net.down".into(), "power.battery".into(), "power.charger".into()],
+                kind: vec![
+                    "proc.*".into(),
+                    "net.down".into(),
+                    "power.battery".into(),
+                    "power.charger".into(),
+                    "power.sleep".into(),
+                    "power.wake".into(),
+                ],
                 ..Default::default()
             };
             let mut since = 0u64;
