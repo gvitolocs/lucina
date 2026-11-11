@@ -9,9 +9,11 @@
 
 mod ecc;
 pub mod frames;
+pub mod layout;
 pub mod mmio;
 pub mod report;
 pub mod screen;
 pub mod store;
 pub mod text;
+pub mod waits;
 pub mod witness;

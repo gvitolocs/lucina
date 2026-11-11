@@ -17,6 +17,10 @@ skrifa = { version = "0.49", default-features = false, features = ["libm"] }
 # Writing PNG frames for review, off the device.
 png = "0.18"
 
+[dev-dependencies]
+# frame_bench pins itself to one CPU.
+libc = "0.2"
+
 # The review renders and the canvas's pixel reference draw the fixture data.
 [[example]]
 name = "home_render"
@@ -28,4 +32,8 @@ required-features = ["fixture"]
 
 [[example]]
 name = "home_review"
+required-features = ["fixture"]
+
+[[example]]
+name = "frame_bench"
 required-features = ["fixture"]

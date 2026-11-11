@@ -340,6 +340,8 @@ pub struct Status {
     pub boot: u32,
     pub crashes_in_a_row: u32,
     pub last_boot: String,
+    /// The format the saved log had before this boot moved it to the current one, if it did.
+    pub format_upgraded_from: Option<u32>,
     pub saved: Vec<Saved>,
 }
 
@@ -359,6 +361,9 @@ impl Status {
                     status.crashes_in_a_row = value.parse().unwrap_or(0);
                 }
                 (Some("last_boot"), Some(value)) => status.last_boot = value.to_string(),
+                (Some("format_upgraded_from"), Some(value)) => {
+                    status.format_upgraded_from = value.parse().ok();
+                }
                 _ => {}
             }
         }
@@ -437,13 +442,22 @@ mod tests {
     #[test]
     fn a_standby_with_wifi_down_is_no_dead_network() {
         let mut n = NetWatch::default();
-        assert_eq!(n.probed(counts_alive(true, false, false), 0, 600), NetVerdict::Fine);
+        assert_eq!(
+            n.probed(counts_alive(true, false, false), 0, 600),
+            NetVerdict::Fine
+        );
         // Wi-Fi down by the standby, no cable: alive for the judge, so no restart however long it lasts.
         for now in [30, 630, 6000] {
-            assert_eq!(n.probed(counts_alive(false, false, true), now, 600), NetVerdict::Fine);
+            assert_eq!(
+                n.probed(counts_alive(false, false, true), now, 600),
+                NetVerdict::Fine
+            );
         }
         // Out of standby and still dead: the dead time counts from then, not from the standby's start.
-        assert_eq!(n.probed(counts_alive(false, false, false), 6030, 600), NetVerdict::JustDied);
+        assert_eq!(
+            n.probed(counts_alive(false, false, false), 6030, 600),
+            NetVerdict::JustDied
+        );
         assert!(counts_alive(false, true, false));
         assert!(!counts_alive(false, false, false));
     }
@@ -567,6 +581,15 @@ mod tests {
         assert_eq!(s.saved[0].kind, "unexplained reset");
         assert_eq!(s.saved[1].reason, "boom at x.rs:1");
         assert_eq!((s.saved[1].slot, s.saved[1].len), (1, 900));
+    }
+
+    #[test]
+    fn the_format_upgrade_line_is_read() {
+        assert_eq!(Status::parse(STATUS).format_upgraded_from, None);
+        let s = Status::parse("boot 4\nlast_boot clean\nformat_upgraded_from 3\n");
+        assert_eq!(s.format_upgraded_from, Some(3));
+        let s = Status::parse("boot 4\nformat_upgraded_from x\n");
+        assert_eq!(s.format_upgraded_from, None);
     }
 
     #[test]

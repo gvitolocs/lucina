@@ -16,6 +16,7 @@ mutants/juno-ax	juno-input-apps	mutants	verification/juno-ax/mutants.sh	services
 mutants/juno-camera	juno-gpu-media	mutants	verification/juno-camera/mutants.sh	drivers/lucina-uvc/,verification/juno-camera/
 mutants/juno-charge	juno-power	mutants	verification/juno-charge/mutants.sh	drivers/lucina-charge/,verification/juno-charge/,verification/juno-charge/rules.rs
 mutants/juno-cpufreq	juno-power	mutants	verification/juno-cpufreq/mutants.sh	kernel/lucina-cpufreq/,verification/juno-cpufreq/,verification/juno-cpufreq/rules.rs
+mutants/juno-crash-layout	boot-storage	mutants	verification/juno-crash-layout/mutants.sh	kernel/lucina-crash/,verification/juno-crash-layout/
 mutants/juno-disk	boot-storage	mutants	verification/juno-disk/mutants.sh	boot/gbgo/boot.toml,boot/remote/authorized_keys,drivers/lucina-ufs/,kernel/lucina-boot/,kernel/lucina-fdt/,services/lucina-remote/,verification/fdt/header.rs,verification/juno-disk/,verification/juno-disk/rules.rs
 mutants/juno-ec	juno-power	mutants	verification/juno-ec/mutants.sh	drivers/lucina-i2c-hid/,verification/juno-ec/,verification/juno-ec/rules.rs
 mutants/juno-events	juno-input-apps	mutants	verification/juno-events/mutants.sh	services/lucina-events/,verification/juno-events/
@@ -70,6 +71,8 @@ shipped/fortuna-voice/rules	fortuna	shipped	boards/fortuna-voice/src/rules.rs	bo
 shipped/lucina-adreno/yuv_rules	juno-gpu-media	shipped	drivers/lucina-adreno/src/yuv_rules.rs	drivers/lucina-adreno/
 shipped/lucina-app-office/member_path	juno-input-apps	shipped	apps/lucina-app-office/src/member_path.rs	apps/lucina-app-office/
 shipped/lucina-ax/rules	juno-input-apps	shipped	services/lucina-ax/src/rules.rs	services/lucina-ax/
+shipped/lucina-crash/layout	boot-storage	shipped	kernel/lucina-crash/src/layout.rs	kernel/lucina-crash/
+shipped/lucina-crash/waits	boot-storage	shipped	kernel/lucina-crash/src/waits.rs	kernel/lucina-crash/
 shipped/lucina-events/rules	juno-input-apps	shipped	services/lucina-events/src/rules.rs	services/lucina-events/
 shipped/lucina-evlog/rules	boot-storage	shipped	kernel/lucina-evlog/src/rules.rs	kernel/lucina-evlog/
 shipped/lucina-glass/home_rules	juno-gpu-media	shipped	apps/lucina-glass/src/home_rules.rs	apps/lucina-glass/

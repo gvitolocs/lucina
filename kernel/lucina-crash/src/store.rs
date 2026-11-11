@@ -22,11 +22,18 @@
 
 use crate::{
     ecc::{self, Encoder, MAX_DATA as BLOCK_DATA, PARITY},
+    layout,
     report::Kind,
 };
 
+// The layout's arithmetic lives in `crate::layout` (Verus); these must agree with it.
+const _: () = assert!(
+    FIRST_ZONE == layout::FIRST_ZONE && RECORDS == layout::RECORDS && MIN_SIZE == layout::MIN_SIZE
+);
+
 const MAGIC: &[u8; 8] = b"LUCINAPS";
-const VERSION: u32 = 3;
+/// Format 4 (patch 1213): smaller consoles, a 64 KiB larger tail (`crate::layout`). Format 3 regions are read once and upgraded.
+pub const VERSION: u32 = 4;
 const RECORD_MAGIC: u32 = u32::from_le_bytes(*b"LCRS");
 const CONSOLE_MAGIC: u32 = u32::from_le_bytes(*b"LCON");
 
@@ -439,19 +446,24 @@ struct Geometry {
     size: usize,
     record_size: usize,
     console_size: usize,
+    version: u32,
 }
 
 impl Geometry {
     fn for_size(size: usize) -> Option<Self> {
-        if size < MIN_SIZE {
+        Self::for_version(size, VERSION)
+    }
+
+    /// The layout of format `version` (3 or 4), from [`crate::layout`].
+    fn for_version(size: usize, version: u32) -> Option<Self> {
+        if !(layout::MIN_SIZE..=layout::MAX_SIZE).contains(&size) {
             return None;
         }
-        let record_size = (size / 16) & !4095;
-        let console_size = ((size - FIRST_ZONE - RECORDS * record_size) / 2) & !4095;
         Some(Self {
             size,
-            record_size,
-            console_size,
+            record_size: layout::record_size(size),
+            console_size: layout::console_size(size, version),
+            version,
         })
     }
 
@@ -476,7 +488,7 @@ impl Geometry {
     fn header(&self) -> [u8; HEADER_LEN] {
         let mut h = [0u8; HEADER_LEN];
         h[..8].copy_from_slice(MAGIC);
-        h[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        h[8..12].copy_from_slice(&self.version.to_le_bytes());
         h[12..16].copy_from_slice(&(self.size as u32).to_le_bytes());
         h[16..20].copy_from_slice(&(self.record_size as u32).to_le_bytes());
         h[20..24].copy_from_slice(&(RECORDS as u32).to_le_bytes());
@@ -602,17 +614,31 @@ pub struct Store<M: Mem> {
     pmic_len: Option<usize>,
     extra: [u8; EXTRA_MAX],
     extra_len: usize,
+    /// The format this region had when it was opened, if older than [`VERSION`]: [`Store::begin_boot`] upgrades it.
+    upgrade_from: Option<u32>,
+    /// On the boot that upgraded the region, the record written for a boot that vanished is not rewritten: its console has
+    /// moved and may be partly overwritten by now (patch 1213).
+    frozen: bool,
 }
 
 /// The most that [`Store::append_unexplained`] adds to a vanished boot's record.
 pub const EXTRA_MAX: usize = 1024;
 
 /// The most a vanished boot's note holds.
-pub const NOTE_MAX: usize = 2048;
+pub const NOTE_MAX: usize = 4096;
 
-/// The bytes at the end of a region of `size` that the store leaves alone, if any: the register trace's area (patch 1188).
+/// The bytes at the end of a region of `size` that the store leaves alone, if any: the register trace's area (patch 1188),
+/// 68 KiB in format 4's 2 MiB region (patch 1213).
 pub fn spare_tail(size: usize) -> Option<core::ops::Range<usize>> {
     let g = Geometry::for_size(size)?;
+    let end = g.console_at(2);
+    (end < size).then_some(end..size)
+}
+
+/// Where format 3 kept its spare tail (the register trace of a kernel before patch 1213): read once, on the boot that
+/// upgrades the region.
+pub fn format3_tail(size: usize) -> Option<core::ops::Range<usize>> {
+    let g = Geometry::for_version(size, 3)?;
     let end = g.console_at(2);
     (end < size).then_some(end..size)
 }
@@ -621,11 +647,20 @@ impl<M: Mem> Store<M> {
     /// Takes a region as it is, repairing a header with a few wrong bits. A region that is too small, or whose header is not
     /// close to what it should be, is given back.
     pub fn attach(mut mem: M) -> Result<Self, M> {
-        let Some(geometry) = Geometry::for_size(mem.size()) else {
+        let Some(mut geometry) = Geometry::for_size(mem.size()) else {
             return Err(mem);
         };
+        let mut upgrade_from = None;
         if majority_header_errors(&mem, &geometry) > HEADER_TOLERANCE {
-            return Err(mem);
+            // A format-3 region (a kernel before patch 1213): read it as it is, and upgrade it in `begin_boot`, so that the
+            // boot that brings format 4 loses no record.
+            match Geometry::for_version(mem.size(), 3) {
+                Some(old) if majority_header_errors(&mem, &old) <= HEADER_TOLERANCE => {
+                    geometry = old;
+                    upgrade_from = Some(3);
+                }
+                _ => return Err(mem),
+            }
         }
         if all_header_errors(&mem, &geometry) > 0 {
             Self::write_header(&mut mem, &geometry);
@@ -646,10 +681,22 @@ impl<M: Mem> Store<M> {
             pmic_len: None,
             extra: [0; EXTRA_MAX],
             extra_len: 0,
+            upgrade_from: None,
+            frozen: false,
         };
+        store.upgrade_from = upgrade_from;
         store.state = store.read_state().unwrap_or_default();
         store.console_written = store.read_console_written(store.state.active_console);
         Ok(store)
+    }
+
+    /// The format this region was in before this boot upgraded it, if it did (patch 1213): the kernel says so in its log.
+    pub fn upgraded_from(&self) -> Option<u32> {
+        if self.geometry.version == VERSION {
+            self.upgrade_from
+        } else {
+            None
+        }
     }
 
     fn write_header(mem: &mut M, geometry: &Geometry) {
@@ -687,6 +734,8 @@ impl<M: Mem> Store<M> {
             pmic_len: None,
             extra: [0; EXTRA_MAX],
             extra_len: 0,
+            upgrade_from: None,
+            frozen: false,
         })
     }
 
@@ -800,6 +849,15 @@ impl<M: Mem> Store<M> {
         self.state.boot = self.state.boot.wrapping_add(1);
         self.state.flags = FLAG_RUNNING;
         self.save_state();
+        if self.upgrade_from.is_some() && self.geometry.version != VERSION {
+            // The upgrade (patch 1213): the records stay where they are; this boot's console starts at its format-4 place.
+            // The vanished boot's record, written above from its format-3 console, is not rewritten later this boot.
+            if let Some(new) = Geometry::for_size(self.geometry.size) {
+                self.geometry = new;
+                Self::write_header(&mut self.mem, &self.geometry);
+                self.frozen = true;
+            }
+        }
         self.console_written = 0;
         self.console_encoder = Encoder::new();
         self.save_console_header();
@@ -820,7 +878,11 @@ impl<M: Mem> Store<M> {
         let note = self.note;
         let slot = self.record_console_tail(
             Kind::UnexplainedReset,
-            &[VANISHED_TITLE, &note[..self.note_len], b"last kernel log:\n"],
+            &[
+                VANISHED_TITLE,
+                &note[..self.note_len],
+                b"last kernel log:\n",
+            ],
         );
         self.vanished = Some((slot, seq, boot));
     }
@@ -831,7 +893,7 @@ impl<M: Mem> Store<M> {
     /// as it was or the new one, as any record's writing does. Returns whether there was such a record; once amended it is
     /// not amended again.
     pub fn amend_unexplained(&mut self, line: &[u8]) -> bool {
-        if self.vanished.is_none() || self.pmic_len.is_some() {
+        if self.vanished.is_none() || self.pmic_len.is_some() || self.frozen {
             return false;
         }
         let n = line.len().min(MAX_REASON);
@@ -846,14 +908,17 @@ impl<M: Mem> Store<M> {
     /// such as a remote processor's crash reason left in SMEM. Kept to whole lines within [`EXTRA_MAX`] in all. Returns
     /// whether there was such a record.
     pub fn append_unexplained(&mut self, lines: &[u8]) -> bool {
-        if self.vanished.is_none() {
+        if self.vanished.is_none() || self.frozen {
             return false;
         }
         let room = EXTRA_MAX - self.extra_len;
         let fit = if lines.len() <= room {
             lines.len()
         } else {
-            lines[..room].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1)
+            lines[..room]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |i| i + 1)
         };
         if fit > 0 {
             self.extra[self.extra_len..self.extra_len + fit].copy_from_slice(&lines[..fit]);
@@ -879,7 +944,15 @@ impl<M: Mem> Store<M> {
             slot,
             zone,
             Kind::UnexplainedReset,
-            &[VANISHED_TITLE, prefix, pmic, newline, &note[..note_len], &extra[..extra_len], b"last kernel log:\n"],
+            &[
+                VANISHED_TITLE,
+                prefix,
+                pmic,
+                newline,
+                &note[..note_len],
+                &extra[..extra_len],
+                b"last kernel log:\n",
+            ],
             Some((seq, boot)),
         );
     }
@@ -926,7 +999,14 @@ impl<M: Mem> Store<M> {
 
     /// Writes a record in `slot`: the title's pieces, then the end of console `zone`. `again`: the sequence number and boot of
     /// the record being written again, else the next ones.
-    fn write_console_tail(&mut self, slot: usize, zone: u32, kind: Kind, title: &[&[u8]], again: Option<(u32, u32)>) {
+    fn write_console_tail(
+        &mut self,
+        slot: usize,
+        zone: u32,
+        kind: Kind,
+        title: &[&[u8]],
+        again: Option<(u32, u32)>,
+    ) {
         let total = self.console_len_of(zone);
         let title_len: usize = title.iter().map(|part| part.len()).sum();
         let tail = total
@@ -951,7 +1031,9 @@ impl<M: Mem> Store<M> {
         }
         writer.finish(&mut self.mem);
         match again {
-            Some((seq, boot)) => self.write_record_header(slot, kind, title_len + tail, !crc, seq, boot),
+            Some((seq, boot)) => {
+                self.write_record_header(slot, kind, title_len + tail, !crc, seq, boot)
+            }
             None => self.finish_record(slot, kind, title_len + tail, !crc),
         }
     }
@@ -1012,12 +1094,27 @@ impl<M: Mem> Store<M> {
 
     /// Writes the headers of a record whose text is in place, with the next sequence number.
     fn finish_record(&mut self, slot: usize, kind: Kind, len: usize, text_crc: u32) {
-        self.write_record_header(slot, kind, len, text_crc, self.state.next_seq, self.state.boot);
+        self.write_record_header(
+            slot,
+            kind,
+            len,
+            text_crc,
+            self.state.next_seq,
+            self.state.boot,
+        );
         self.state.next_seq = self.state.next_seq.wrapping_add(1);
     }
 
     /// Writes the headers of a record whose text is in place.
-    fn write_record_header(&mut self, slot: usize, kind: Kind, len: usize, text_crc: u32, seq: u32, boot: u32) {
+    fn write_record_header(
+        &mut self,
+        slot: usize,
+        kind: Kind,
+        len: usize,
+        text_crc: u32,
+        seq: u32,
+        boot: u32,
+    ) {
         self.mem.sync();
         let mut h = [0u8; RECORD_HEADER];
         h[..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
@@ -1575,6 +1672,47 @@ mod tests {
     }
 
     #[test]
+    fn a_format_3_region_is_read_once_and_upgraded() {
+        // A format-3 region as a kernel before patch 1213 left it: a record, and a boot that vanished.
+        let mut mem = fresh();
+        let old = Geometry::for_version(mem.size(), 3).unwrap();
+        Store::<Ram>::write_header(&mut mem, &old);
+        let mut s = Store::attach(mem).ok().unwrap();
+        assert_eq!(s.geometry.version, 3);
+        // Played as the old kernel would: it never upgrades.
+        s.upgrade_from = None;
+        s.begin_boot();
+        assert_eq!(s.geometry.version, 3);
+        s.record_requested_reset(b"before the upgrade");
+        s.console_write(b"[ 7.0] the old boot's last line\n");
+        let mut s = reset(s);
+        // The kernel with format 4 opens it.
+        assert_eq!(s.begin_boot(), LastBoot::Vanished);
+        assert_eq!(s.upgraded_from(), Some(3));
+        assert_eq!(s.geometry.version, 4);
+        let records: Vec<_> = s.records().flatten().collect();
+        assert_eq!(records.len(), 2, "the old record and the vanished boot's");
+        let vanished = records
+            .iter()
+            .find(|r| r.kind == Kind::UnexplainedReset)
+            .unwrap();
+        assert!(text_of(&s, vanished.slot).ends_with("[ 7.0] the old boot's last line\n"));
+        assert!(records.iter().any(|r| r.kind == Kind::RequestedReset));
+        // That record is not rewritten on this boot; its console has moved.
+        assert!(!s.amend_unexplained(b"PS_HOLD"));
+        assert!(!s.append_unexplained(b"mpss: ...\n"));
+        // The next boot finds format 4, upgrades nothing, and still has the records.
+        s.console_write(b"[ 1.0] the first format-4 boot\n");
+        let mut s = reset(s);
+        assert_eq!(s.begin_boot(), LastBoot::Vanished);
+        assert_eq!(s.upgraded_from(), None);
+        assert_eq!(s.records().flatten().count(), 3);
+        let newest = s.records().flatten().max_by_key(|r| r.seq).unwrap();
+        assert!(text_of(&s, newest.slot).ends_with("[ 1.0] the first format-4 boot\n"));
+        assert!(s.amend_unexplained(b"PS_HOLD"), "rewrites work again");
+    }
+
+    #[test]
     fn lines_added_later_go_under_the_pmic_line_in_order() {
         let mut s = Store::open(fresh()).unwrap();
         s.begin_boot();
@@ -1620,21 +1758,30 @@ mod tests {
         let records: Vec<_> = s.records().flatten().collect();
         assert_eq!(records.len(), 1, "amended in place, not a second record");
         let r = records[0];
-        assert_eq!((r.slot, r.seq, r.boot, r.kind), (before.slot, before.seq, before.boot, Kind::UnexplainedReset));
+        assert_eq!(
+            (r.slot, r.seq, r.boot, r.kind),
+            (before.slot, before.seq, before.boot, Kind::UnexplainedReset)
+        );
         let text = text_of(&s, r.slot);
         assert!(
             text.contains("reason: nothing recorded a crash: a hardware watchdog, a firmware reset or a hang with interrupts off\npmic: last power-off by PS_HOLD; this boot by hard reset, cold\nlast kernel log:\n"),
             "{text}"
         );
         assert!(text.ends_with("[ 5.0] xhci: controller fault\n"), "{text}");
-        assert!(!text.contains("this boot\n[") && !text.contains("[ 0.1] this boot"), "{text}");
+        assert!(
+            !text.contains("this boot\n[") && !text.contains("[ 0.1] this boot"),
+            "{text}"
+        );
         assert!(!s.amend_unexplained(b"again"), "once");
         // The next record still numbers after it, and survives a reset.
         s.record_requested_reset(b"later");
         let s = reset(s);
         let seqs: Vec<_> = s.records().flatten().map(|r| r.seq).collect();
         assert_eq!(seqs.len(), 2);
-        assert!(seqs.contains(&before.seq) && seqs.contains(&(before.seq + 1)), "{seqs:?}");
+        assert!(
+            seqs.contains(&before.seq) && seqs.contains(&(before.seq + 1)),
+            "{seqs:?}"
+        );
     }
 
     #[test]
@@ -1672,7 +1819,10 @@ mod tests {
         let mut s = Store::open(fresh()).unwrap();
         s.begin_boot();
         s.console_write(b"[ 3.0] wifi: wlfw: the service is up\n");
-        s.record_modem(b"watchdog", b"err_qdi.c:456:EF:wlan_process:1:cmnos_thread.c:3986:Asserted");
+        s.record_modem(
+            b"watchdog",
+            b"err_qdi.c:456:EF:wlan_process:1:cmnos_thread.c:3986:Asserted",
+        );
         // The board resets before anything else: the next boot finds this one still running.
         let mut s = reset(s);
         assert_eq!(s.begin_boot(), LastBoot::Vanished);
@@ -1680,13 +1830,22 @@ mod tests {
         let records: Vec<_> = s.records().flatten().collect();
         assert_eq!(records.len(), 2);
         let modem = records.iter().find(|r| r.kind == Kind::Modem).unwrap();
-        let vanished = records.iter().find(|r| r.kind == Kind::UnexplainedReset).unwrap();
+        let vanished = records
+            .iter()
+            .find(|r| r.kind == Kind::UnexplainedReset)
+            .unwrap();
         assert_eq!((modem.boot, vanished.boot), (1, 1));
         // The modem's record was numbered before the reset and kept: the next one comes after it.
         assert!(vanished.seq > modem.seq, "{} {}", vanished.seq, modem.seq);
         let text = text_of(&s, modem.slot);
-        assert!(text.starts_with("The modem DSP failed\ncause: watchdog\nreason: err_qdi.c:456:"), "{text}");
-        assert!(text.ends_with("[ 3.0] wifi: wlfw: the service is up\n"), "{text}");
+        assert!(
+            text.starts_with("The modem DSP failed\ncause: watchdog\nreason: err_qdi.c:456:"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("[ 3.0] wifi: wlfw: the service is up\n"),
+            "{text}"
+        );
         assert_eq!(Kind::Modem.name(), "modem");
     }
 

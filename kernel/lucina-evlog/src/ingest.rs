@@ -51,10 +51,21 @@ pub fn build_of(version: &str) -> Option<String> {
 }
 
 /// The last boot-started event of `boot`, if the log has one.
-fn boot_event<'a>(events: &'a [Event], boot: u32) -> Option<&'a Event> {
+fn boot_event(events: &[Event], boot: u32) -> Option<&Event> {
     events.iter().rev().find(|e| {
         e.provider == providers::KERNEL_POWER && e.id == id::BOOT_STARTED && e.boot == Some(boot)
     })
+}
+
+/// Says on the boot-started event that this boot moved the saved crash log from format `from` to 4.
+fn note_format_upgrade(e: &mut Event, from: u32) {
+    e.fields
+        .insert("saved_log_format_from".into(), serde_json::json!(from));
+    e.fields
+        .insert("saved_log_format".into(), serde_json::json!(4));
+    e.summary.push_str(&format!(
+        " The saved crash log moved from format {from} to 4 on this boot; a kernel from before patch 1213 that boots later lays it out again and loses the saved records."
+    ));
 }
 
 /// Reads what the machine kept and writes what is new.
@@ -96,18 +107,18 @@ pub fn ingest(store: &mut Store, src: &Sources) -> io::Result<Report> {
     };
     let boot = status.boot;
     report.boot = Some(boot);
-    add(
-        store,
-        &mut report,
-        analyze::boot_started(
-            boot,
-            src.now_ms,
-            src.uptime_ms,
-            src.build.clone(),
-            pon,
-            &status.last_boot,
-        ),
-    )?;
+    let mut started = analyze::boot_started(
+        boot,
+        src.now_ms,
+        src.uptime_ms,
+        src.build.clone(),
+        pon,
+        &status.last_boot,
+    );
+    if let Some(from) = status.format_upgraded_from {
+        note_format_upgrade(&mut started, from);
+    }
+    add(store, &mut report, started)?;
 
     // The log's own events, for the boots' clocks and PON readings of earlier boots.
     let known = store::read_dir_events(store.dir());
@@ -119,10 +130,10 @@ pub fn ingest(store: &mut Store, src: &Sources) -> io::Result<Report> {
             .collect();
         let tail = &lines[lines.len().saturating_sub(200)..];
         let mut e = analyze::clean_end(boot - 1, tail, Some(start_ms));
-        if let Some(b) = boot_event(&known, boot - 1) {
-            if let (Some(t), Some(up)) = (b.time_ms, e.uptime_ms) {
-                e.time_ms = Some(t + up as i64);
-            }
+        if let Some(b) = boot_event(&known, boot - 1)
+            && let (Some(t), Some(up)) = (b.time_ms, e.uptime_ms)
+        {
+            e.time_ms = Some(t + up as i64);
         }
         add(store, &mut report, e)?;
     }
@@ -277,6 +288,31 @@ mod tests {
         let r = ingest(&mut s, &src).unwrap();
         assert!(r.added.is_empty());
         assert_eq!(r.known, 3);
+        fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_format_upgrade_is_said_on_the_boot_event() {
+        let (dir, ps) = machine("upgrade");
+        fs::write(
+            ps.join("status"),
+            "boot 18\ncrashes_in_a_row 0\nlast_boot clean\nformat_upgraded_from 3\n",
+        )
+        .unwrap();
+        let src = Sources {
+            pstore: ps,
+            kmsg: String::new(),
+            uptime_ms: 1000,
+            now_ms: 2_000_000,
+            build: None,
+        };
+        let mut s = Store::open(&dir, Retention::default()).unwrap();
+        ingest(&mut s, &src).unwrap();
+        let events = store::read_dir_events(&dir);
+        let b = events.iter().find(|e| e.id == id::BOOT_STARTED).unwrap();
+        assert_eq!(b.fields["saved_log_format_from"], 3);
+        assert_eq!(b.fields["saved_log_format"], 4);
+        assert!(b.summary.ends_with(" The saved crash log moved from format 3 to 4 on this boot; a kernel from before patch 1213 that boots later lays it out again and loses the saved records."), "{}", b.summary);
         fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 

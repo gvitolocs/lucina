@@ -1,0 +1,8 @@
+# metric	max ms	note (frame_bench on buildhost, a loaded host; cpu 2, 9 reps; limit = 2x the median of 3 runs)
+copy-frame	1.7	2026-11-11, 2x the median of 3 host runs (median 0.84 ms)
+fill-frame	0.3	2026-11-11, 2x the median of 3 host runs (median 0.14 ms)
+slide-compose	3.1	2026-11-11, 2x the median of 3 host runs (median 1.53 ms)
+sky-backdrop	68.1	2026-11-11, 2x the median of 3 host runs (median 34.05 ms)
+quick-blur	61.6	2026-11-11, 2x the median of 3 host runs (median 30.78 ms)
+home-whole	49.3	2026-11-11, 2x the median of 3 host runs (median 24.64 ms)
+focus-damage	1.6	2026-11-11, 2x the median of 3 host runs (median 0.79 ms; median frame of the focus walk)

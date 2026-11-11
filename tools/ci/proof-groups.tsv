@@ -1,7 +1,7 @@
 # Which CI job a proof belongs to: group<TAB>keys. A key is a verification/ folder name or, for a shipped file, its crate name.
 # Hand-kept. A proof whose key is not here stops CI (lucina-ci inventory) until it gets a group.
 kernel-memory	aarch64-pt armv7-pt vostd-port juno-rcu juno-ring juno-irqgate juno-taskcpu juno-structmap juno-oom lucina-oom
-boot-storage	bootimg fdt juno-kexec juno-disk juno-wdt lucina-wdt juno-pon lucina-pon juno-evlog lucina-evlog juno-hostname lucina-hostname net-installer lucina-release
+boot-storage	bootimg fdt juno-kexec juno-disk juno-wdt lucina-wdt juno-pon lucina-pon juno-evlog lucina-evlog juno-hostname lucina-hostname net-installer lucina-release juno-crash-layout lucina-crash
 juno-power	juno-idle juno-cpufreq juno-sleep juno-standby juno-power juno-rpmh juno-charge juno-ec lucina-modem-rpmh
 juno-gpu-media	juno-ir3-delay juno-gpu-faults juno-gpu-power juno-gpu-vm juno-ir3-pack juno-vsync juno-venus juno-camera phone-glass juno-glass-home lucinanet-mse lucina-adreno lucina-glass lucina-venus lucina-uvc lucina-video
 juno-audio-voice	juno-audio juno-audio-ledger juno-audio-wake voice-stream lucina-voice-stream lucina-q6
