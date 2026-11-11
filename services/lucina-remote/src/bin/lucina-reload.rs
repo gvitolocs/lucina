@@ -241,14 +241,21 @@ fn new_cmdline(args: &[String], from_stream: Option<Vec<u8>>) -> Result<Option<V
         Some(line) => String::from_utf8_lossy(&line).into_owned(),
         None => fs::read_to_string("/proc/cmdline").map_err(|e| format!("/proc/cmdline: {e}"))?,
     };
-    Ok(Some(drop_kernel_arg(&line, "lucina.trial").into_bytes()))
+    Ok(Some(drop_boot_only_args(&line).into_bytes()))
+}
+
+/// The command line without the words only a loader boot has: `lucina.trial` (see `drop_kernel_arg`) and `lucina.loader_ms`
+/// (the loader's stage times of the running boot: a reload has no loader stage, and a stale word would stand next to a new one).
+fn drop_boot_only_args(line: &str) -> String {
+    drop_kernel_arg(&drop_kernel_arg(line, "lucina.trial"), "lucina.loader_ms")
 }
 
 fn receive(args: &[String]) -> Result<(), ReceiveError> {
     // Before any of the stream is read: a refused reload must not consume the files from the sender.
     let (any_uptime, args) = split_any_uptime(args);
     let staging = kexec_staging();
-    reload_allowed(proc_uptime_s(), staging.as_deref(), any_uptime).map_err(ReceiveError::Refused)?;
+    reload_allowed(proc_uptime_s(), staging.as_deref(), any_uptime)
+        .map_err(ReceiveError::Refused)?;
     let mut input = BufReader::with_capacity(1 << 16, io::stdin().lock());
     let header = Header::read(&mut input).map_err(|e| e.to_string())?;
     let cmdline = new_cmdline(&args, header.cmdline.clone())?;
@@ -403,6 +410,21 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_reload_drops_the_loaders_words() {
+        assert_eq!(
+            super::drop_boot_only_args(
+                "a=1 lucina.loader_ms=1,2,3,4 lucina.trial=on:2 b -- /init lucina.loader_ms=9"
+            ),
+            "a=1 b -- /init lucina.loader_ms=9"
+        );
+        assert_eq!(super::drop_boot_only_args("lucina.loader_ms=1,2,3,4"), "");
+        assert_eq!(
+            super::drop_boot_only_args("a lucina.loader_msx=1"),
+            "a lucina.loader_msx=1"
+        );
+    }
+
     use super::*;
 
     fn strings(args: &[&str]) -> Vec<String> {

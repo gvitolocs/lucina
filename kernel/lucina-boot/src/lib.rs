@@ -11,6 +11,7 @@
 //! * [`band`]: the status band LucinaBoot paints on the boot framebuffer, its only output on surya.
 //! * [`board`]: which board LucinaUEFI is on: the device tree's `compatible` and SMBIOS against `\LUCINA\BOARDS`.
 //! * [`menu`]: what LucinaLoader (the UEFI boot menu that replaces GRUB for Linux) decides: menu file, keys, theme.
+//! * [`times`]: the loader's four boot-stage times and the `lucina.loader_ms=` word that carries them to the kernel.
 //! * [`uefi`]: what LucinaUEFI (the UEFI loader for laptops) decides: config, memory map, framebuffer, tree edits.
 //!
 //! The library is `no_std`, allocation-free and `unsafe`-free. With the default `std` feature, [`build`] packs
@@ -28,6 +29,7 @@ pub mod panel;
 pub mod pkg;
 pub mod plan;
 pub mod rng_marker;
+pub mod times;
 pub mod trial;
 pub mod uefi;
 

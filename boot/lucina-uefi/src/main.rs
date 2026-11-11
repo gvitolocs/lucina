@@ -28,6 +28,7 @@ use core::{fmt, fmt::Write, panic::PanicInfo};
 
 use lucina_boot::{
     rng_marker,
+    times::LoaderTimes,
     trial,
     Range,
     band::Status as BandStatus,
@@ -500,6 +501,7 @@ fn prepare(
     band: &mut Option<Screen>,
     stages: &mut u8,
     base: &mut Base,
+    entry_ms: u64,
 ) -> Result<Prepared, Fail> {
     if el == 3 {
         return Err(Fail::El3);
@@ -568,6 +570,8 @@ fn prepare(
         core::str::from_utf8(text).map_err(|_| Fail::Config("not UTF-8", efi::LOAD_ERROR))?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let (text, trial_arg) = trial_step(efi, &dir, &base, text, out);
+    // The configuration is read and the generation is chosen, trial bookkeeping included: the loader's second stage time.
+    let chosen_ms = arch::counter_ms();
     let cfg = Config::parse(text).map_err(Fail::ConfigSyntax)?;
     if !cfg.quiet {
         out.release();
@@ -724,6 +728,8 @@ fn prepare(
         }
         None => None,
     };
+    // The kernel and the initramfs are in memory: the third stage time.
+    let read_ms = arch::counter_ms();
 
     // The board's device tree, unless BOOT.CFG names one.
     let mut board_dtb = TextBuf {
@@ -796,6 +802,29 @@ fn prepare(
         &mut ram,
     )?;
     let ram = &ram[..n_ram];
+    // The loader's stage times join the command line, before ` -- `. The fourth is the last point before the command line goes
+    // into the device tree: the pause countdown comes after the log is written, so it is not in it.
+    let times = LoaderTimes {
+        entry: entry_ms,
+        chosen: chosen_ms,
+        read: read_ms,
+        exit: arch::counter_ms(),
+    };
+    let cmdline: &'static str = {
+        let buf = efi
+            .allocate_pages(Place::Anywhere, 1)
+            .map_err(|s| Fail::Config("cmdline", s))?;
+        match times.add_to_cmdline(cmdline, buf) {
+            Some(joined) => {
+                say!(out, "{}", times.log_line());
+                joined
+            }
+            None => {
+                say!(out, "times: not on the command line (too long)");
+                cmdline
+            }
+        }
+    };
     let mut values = TreeValues::new(&fdt, ram, initrd, cmdline, fb.as_ref())?;
     let (rng, rng_note) = if cfg.rng {
         firmware_seed(efi, &dir, out)
@@ -1065,6 +1094,7 @@ fn stop(band: &Option<Screen>, code: u8) -> ! {
 extern "efiapi" fn efi_main(image: efi::Handle, st: *mut efi::SystemTable) -> Status {
     // SAFETY: the firmware passes our image handle and its live system table to the entry point.
     let efi = unsafe { Efi::new(image, st) };
+    let entry_ms = arch::counter_ms();
     efi.disable_watchdog();
     let el = arch::current_el();
     let log = efi.allocate_pages(Place::Anywhere, 16).ok();
@@ -1090,7 +1120,15 @@ extern "efiapi" fn efi_main(image: efi::Handle, st: *mut efi::SystemTable) -> St
             "counter at the loader's start: {} ms",
             arch::counter_ms()
         );
-        let r = prepare(&efi, &mut out, el, &mut band, &mut stages, &mut base);
+        let r = prepare(
+            &efi,
+            &mut out,
+            el,
+            &mut band,
+            &mut stages,
+            &mut base,
+            entry_ms,
+        );
         if let Err(f) = &r {
             out.release();
             say!(out, "LucinaUEFI: error: {f}");
