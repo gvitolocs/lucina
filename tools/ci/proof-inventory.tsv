@@ -9,6 +9,7 @@ mutants/fortuna-ring	fortuna	mutants	verification/fortuna-ring/mutants.sh	boards
 mutants/fortuna-secretary	fortuna	mutants	verification/fortuna-secretary/mutants.sh	boards/fortuna-secretary/,verification/fortuna-secretary/
 mutants/fortuna-tls	fortuna	mutants	verification/fortuna-tls/mutants.sh	boards/fortuna-tls/,verification/fortuna-tls/
 mutants/fortuna-voice	fortuna	mutants	verification/fortuna-voice/mutants.sh	boards/fortuna-voice/,verification/fortuna-voice/
+mutants/glass-browser	juno-gpu-media	mutants	verification/glass-browser/mutants.sh	apps/lucina-glass/,verification/glass-browser/
 mutants/juno-audio	juno-audio-voice	mutants	verification/juno-audio/mutants.sh	drivers/lucina-q6/,verification/juno-audio/
 mutants/juno-audio-ledger	juno-audio-voice	mutants	verification/juno-audio-ledger/mutants.sh	drivers/lucina-audio-ledger/,verification/juno-audio-ledger/,verification/juno-audio-ledger/rules.rs
 mutants/juno-audio-wake	juno-audio-voice	mutants	verification/juno-audio-wake/mutants.sh	drivers/lucina-audio-wake/,verification/juno-audio-wake/,verification/juno-audio-wake/rules.rs
@@ -25,6 +26,7 @@ mutants/juno-evlog	boot-storage	mutants	verification/juno-evlog/mutants.sh	kerne
 mutants/juno-files-keys	juno-input-apps	mutants	verification/juno-files-keys/mutants.sh	services/lucina-nav/,verification/juno-files-keys/,verification/juno-files-keys/rules.rs
 mutants/juno-fnkeys	juno-input-apps	mutants	verification/juno-fnkeys/mutants.sh	apps/lucina-shell/,verification/juno-fnkeys/,verification/juno-fnkeys/rules.rs
 mutants/juno-fnrow	juno-input-apps	mutants	verification/juno-fnrow/mutants.sh	drivers/lucina-i2c-hid/,verification/juno-fnrow/,verification/juno-fnrow/rules.rs
+mutants/juno-gesture	juno-input-apps	mutants	verification/juno-gesture/mutants.sh	drivers/lucina-gesture/,verification/juno-gesture/
 mutants/juno-glass-home	juno-gpu-media	mutants	verification/juno-glass-home/mutants.sh	apps/lucina-glass/,verification/juno-glass-home/
 mutants/juno-gpu-faults	juno-gpu-media	mutants	verification/juno-gpu-faults/mutants.sh	drivers/lucina-adreno/,verification/juno-gpu-faults/,verification/juno-gpu-faults/rules.rs
 mutants/juno-gpu-power	juno-gpu-media	mutants	verification/juno-gpu-power/mutants.sh	drivers/lucina-adreno/,verification/juno-gpu-power/,verification/juno-gpu-power/rules.rs
@@ -49,6 +51,7 @@ mutants/juno-resolv	juno-net-security	mutants	verification/juno-resolv/mutants.s
 mutants/juno-ring	kernel-memory	mutants	verification/juno-ring/mutants.sh	kernel/lucina-ring/,verification/juno-ring/,verification/juno-ring/rules.rs
 mutants/juno-rpmh	juno-power	mutants	verification/juno-rpmh/mutants.sh	drivers/lucina-modem-rpmh/,verification/juno-rpmh/
 mutants/juno-sleep	juno-power	mutants	verification/juno-sleep/mutants.sh	kernel/lucina-sleep/,verification/juno-sleep/,verification/juno-sleep/rules.rs
+mutants/juno-spinwatch	boot-storage	mutants	verification/juno-spinwatch/mutants.sh	kernel/lucina-spinwatch/,verification/juno-spinwatch/
 mutants/juno-standby	juno-power	mutants	verification/juno-standby/mutants.sh	kernel/lucina-standby/,verification/juno-standby/,verification/juno-standby/rules.rs
 mutants/juno-structmap	kernel-memory	mutants	verification/juno-structmap/mutants.sh	kernel/lucina-structmap/,verification/juno-structmap/,verification/juno-structmap/rules.rs
 mutants/juno-taskcpu	kernel-memory	mutants	verification/juno-taskcpu/mutants.sh	kernel/lucina-taskcpu/,verification/juno-taskcpu/,verification/juno-taskcpu/rules.rs
@@ -77,6 +80,8 @@ shipped/lucina-crash/layout	boot-storage	shipped	kernel/lucina-crash/src/layout.
 shipped/lucina-crash/waits	boot-storage	shipped	kernel/lucina-crash/src/waits.rs	kernel/lucina-crash/
 shipped/lucina-events/rules	juno-input-apps	shipped	services/lucina-events/src/rules.rs	services/lucina-events/
 shipped/lucina-evlog/rules	boot-storage	shipped	kernel/lucina-evlog/src/rules.rs	kernel/lucina-evlog/
+shipped/lucina-gesture/rules	juno-input-apps	shipped	drivers/lucina-gesture/src/rules.rs	drivers/lucina-gesture/
+shipped/lucina-glass/browser_rules	juno-gpu-media	shipped	apps/lucina-glass/src/browser_rules.rs	apps/lucina-glass/
 shipped/lucina-glass/home_rules	juno-gpu-media	shipped	apps/lucina-glass/src/home_rules.rs	apps/lucina-glass/
 shipped/lucina-glass/rules	juno-gpu-media	shipped	apps/lucina-glass/src/rules.rs	apps/lucina-glass/
 shipped/lucina-hostname/rules	boot-storage	shipped	kernel/lucina-hostname/src/rules.rs	kernel/lucina-hostname/
@@ -86,6 +91,7 @@ shipped/lucina-modem-rpmh/vote_rules	juno-power	shipped	drivers/lucina-modem-rpm
 shipped/lucina-oom/rules	kernel-memory	shipped	kernel/lucina-oom/src/rules.rs	kernel/lucina-oom/
 shipped/lucina-pon/rules	boot-storage	shipped	kernel/lucina-pon/src/rules.rs	kernel/lucina-pon/
 shipped/lucina-q6/rules	juno-audio-voice	shipped	drivers/lucina-q6/src/rules.rs	drivers/lucina-q6/
+shipped/lucina-spinwatch/rules	boot-storage	shipped	kernel/lucina-spinwatch/src/rules.rs	kernel/lucina-spinwatch/
 shipped/lucina-uvc/rules	juno-gpu-media	shipped	drivers/lucina-uvc/src/rules.rs	drivers/lucina-uvc/
 shipped/lucina-venus/rules	juno-gpu-media	shipped	drivers/lucina-venus/src/rules.rs	drivers/lucina-venus/
 shipped/lucina-video/mse_rules	juno-gpu-media	shipped	drivers/lucina-video/src/mse_rules.rs	drivers/lucina-video/

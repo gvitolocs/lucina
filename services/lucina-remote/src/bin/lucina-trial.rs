@@ -337,8 +337,19 @@ fn settle_check() -> Result<(), String> {
         );
         kmsg(&line);
         let _ = write_whole(WENT_BACK, &line);
+        // The planned restart of a rollback: /data marked clean first (best effort, 5 s), or the next boot checks all of it.
+        kmsg(&lucina_remote::dataclean::clean_before_restart().describe());
         sync_all();
-        let _ = Command::new("reboot").arg("-f").status();
+        let restarted = Command::new("reboot")
+            .arg("-f")
+            .status()
+            .is_ok_and(|s| s.success());
+        if !restarted {
+            // reboot(2) itself, then, if the machine runs on, /data back to a read-write mount that is not clean.
+            // SAFETY: reboot takes one integer and returns only if it failed.
+            unsafe { libc::reboot(libc::RB_AUTOBOOT) };
+            kmsg(&lucina_remote::dataclean::reopen_after_failed_restart().describe());
+        }
     }
     Ok(())
 }

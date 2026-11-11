@@ -6,6 +6,8 @@ verus=${VERUS:-/home/user/tools/verus/verus-x86-linux/verus}
 work=$(mktemp -d "${TMPDIR:-/tmp}/juno-idle-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
 fail=0
+refused=0
+weak=0
 try() {
     try_in lib.rs "$@"
 }
@@ -27,9 +29,21 @@ try_in() {
     if "$verus" "$work/verification/juno-idle/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED: $from -> $to"; fail=1
     else
-        echo "refused: $from -> $to ($(grep -c "^error" "$work/out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused: $from -> $to ($(grep -c "^error" "$work/out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $from -> $to ($(grep -c "^error" "$work/out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
+# The unchanged files must verify, or every "refused" below would mean nothing.
+if "$verus" verification/juno-idle/rules.rs > "$work/baseline" 2>&1; then
+    echo "baseline: verifies"
+else
+    cat "$work/baseline"; echo "mutants: the unchanged files do not verify"; exit 1
+fi
 # Its own entry must not count.
 try 'if i != me && wake_at[i]' 'if wake_at[i]'
 # A CPU waking after the deadline does not cover it.
@@ -87,4 +101,6 @@ try_in domain.rs '        if !self.all_down() {
             return None;
         }
         choose' '        choose'
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit $fail

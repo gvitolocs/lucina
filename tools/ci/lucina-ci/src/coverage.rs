@@ -123,8 +123,106 @@ pub fn gaps(root: &Path, units: &[Unit], rules: &Rules) -> Vec<(String, String)>
     out
 }
 
+/// Mutant scripts that do not print what the verdict needs: `baseline: verifies` and the closing `refused by verification` line. Caught at
+/// merge time, because the run on GitHub would call such a unit `infra_error`.
+pub fn unguarded_mutant_scripts(root: &Path, units: &[Unit]) -> Vec<String> {
+    let mut out = Vec::new();
+    for u in units.iter().filter(|u| u.kind == "mutants") {
+        let script = u
+            .target
+            .split_whitespace()
+            .rev()
+            .find(|w| w.ends_with(".sh"))
+            .unwrap_or("");
+        let Ok(text) = std::fs::read_to_string(root.join(script)) else {
+            continue;
+        };
+        if !text.contains("baseline: verifies") || !text.contains("refused by verification") {
+            out.push(format!("{} ({script})", u.name));
+        }
+    }
+    out
+}
+
+/// Licence ids a crate carries: its `license` field and the `SPDX-License-Identifier` in the first lines of its sources.
+pub fn licences_of(crate_dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |s: String| {
+        let s = s.trim().trim_matches('"').to_string();
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    if let Ok(t) = std::fs::read_to_string(crate_dir.join("Cargo.toml")) {
+        for l in t.lines() {
+            if let Some(v) = l.trim().strip_prefix("license")
+                && let Some(v) = v.trim_start().strip_prefix('=')
+            {
+                add(v.to_string());
+            }
+        }
+    }
+    fn walk(d: &Path, depth: usize, add: &mut dyn FnMut(String)) {
+        let Ok(rd) = std::fs::read_dir(d) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() && depth < 6 {
+                walk(&p, depth + 1, add);
+            } else if p.extension().is_some_and(|x| x == "rs")
+                && let Ok(t) = std::fs::read_to_string(&p)
+            {
+                for l in t.lines().take(8) {
+                    if let Some(i) = l.find("SPDX-License-Identifier:") {
+                        add(l[i + "SPDX-License-Identifier:".len()..].to_string());
+                    }
+                }
+            }
+        }
+    }
+    walk(&crate_dir.join("src"), 0, &mut add);
+    walk(&crate_dir.join("tests"), 0, &mut add);
+    out
+}
+
+/// `(crate, licences)` for every crate in the snapshot that carries a licence other than MIT and is not named in the LICENSE file, as
+/// `crates/<name>`. The public copy's LICENSE says what keeps its own licence; this keeps that list from drifting (2026-11-11: the Linux
+/// ports lucina-apple-aic, lucina-apple-uart and lucina-errseq, and the MPL crates).
+pub fn licence_gaps(root: &Path, rules: &Rules) -> Vec<(String, String)> {
+    let license = std::fs::read_to_string(root.join("LICENSE")).unwrap_or_default();
+    let mut out = Vec::new();
+    for (name, _) in &rules.groups {
+        let dir = root.join("crates").join(name);
+        if !dir.is_dir() {
+            continue;
+        }
+        let ids = licences_of(&dir);
+        // MIT itself, or an expression that offers MIT ("MIT OR Apache-2.0"): the LucinaOS licence applies, nothing to list.
+        let mit_ok = |i: &String| {
+            i == "MIT" || (i.contains(" OR ") && i.split(" OR ").any(|p| p.trim() == "MIT"))
+        };
+        if ids.iter().any(|i| !mit_ok(i)) && !license.contains(&format!("crates/{name}")) {
+            out.push((name.clone(), ids.join(", ")));
+        }
+    }
+    out
+}
+
 /// Only in the private tree: the public one has the rewritten layout and no `crates/` folder.
 pub fn check(root: &Path, units: &[Unit]) -> Result<Vec<(String, String)>, String> {
+    let r = check_proofs(root, units)?;
+    Ok(r)
+}
+
+pub fn check_licences(root: &Path) -> Result<Vec<(String, String)>, String> {
+    let rules_path = root.join("tools/ci/public-snapshot.rules");
+    if !root.join("crates").is_dir() || !rules_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(&rules_path).map_err(|e| e.to_string())?;
+    Ok(licence_gaps(root, &snapshot::parse_rules(&text)?))
+}
+
+fn check_proofs(root: &Path, units: &[Unit]) -> Result<Vec<(String, String)>, String> {
     let rules_path = root.join("tools/ci/public-snapshot.rules");
     if !root.join("crates").is_dir() || !rules_path.is_file() {
         return Ok(Vec::new());
@@ -145,6 +243,55 @@ mod tests {
         let src = "#![feature(x)]\n#[path = \"../../crates/a/src/r.rs\"]\npub mod r;\n  #[path=\"b.rs\"] mod b;\n#[cfg(test)]\nmod t;";
         assert_eq!(path_attributes(src), ["../../crates/a/src/r.rs", "b.rs"]);
         assert!(path_attributes("fn main() {}").is_empty());
+    }
+
+    #[test]
+    fn a_non_mit_crate_in_the_snapshot_must_be_on_the_licence_list() {
+        let t = std::env::temp_dir().join(format!("lucina-ci-licence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        for (name, lic, spdx) in [
+            ("zzz-ported", "", "GPL-2.0-only"),
+            ("zzz-declared", "GPL-2.0-or-later", ""),
+            ("zzz-own", "MIT", "MIT"),
+            ("zzz-plain", "", ""),
+            ("zzz-listed", "MPL-2.0", ""),
+        ] {
+            let d = t.join("crates").join(name);
+            std::fs::create_dir_all(d.join("src")).unwrap();
+            let mut toml = String::from("[package]\nname = \"x\"\n");
+            if !lic.is_empty() {
+                toml += &format!("license = \"{lic}\"\n");
+            }
+            std::fs::write(d.join("Cargo.toml"), toml).unwrap();
+            let head = if spdx.is_empty() {
+                String::new()
+            } else {
+                format!("// SPDX-License-Identifier: {spdx}\n")
+            };
+            std::fs::write(d.join("src/lib.rs"), format!("{head}pub fn f() {{}}\n")).unwrap();
+        }
+        std::fs::write(
+            t.join("LICENSE"),
+            "MIT ... Code ported from Linux: crates/zzz-listed\n",
+        )
+        .unwrap();
+        let rules = snapshot::parse_rules(
+            "group kernel zzz-ported zzz-declared zzz-own zzz-plain zzz-listed\n",
+        )
+        .unwrap();
+        let mut gaps: Vec<String> = licence_gaps(&t, &rules)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        gaps.sort();
+        assert_eq!(gaps, ["zzz-declared", "zzz-ported"]);
+        std::fs::write(
+            t.join("LICENSE"),
+            "crates/zzz-listed crates/zzz-ported crates/zzz-declared\n",
+        )
+        .unwrap();
+        assert!(licence_gaps(&t, &rules).is_empty());
+        std::fs::remove_dir_all(&t).ok();
     }
 
     #[test]

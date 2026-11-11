@@ -7,6 +7,7 @@ verus=${VERUS:-verus}
 work=$(mktemp -d "${TMPDIR:-/tmp}/juno-fnkeys-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
 fail=0 refused=0 total=0
+weak=0
 src=apps/lucina-shell/src/fnkeys.rs
 try() {
     local from=$1 to=$2
@@ -26,10 +27,21 @@ try() {
     if "$verus" "$work/verification/juno-fnkeys/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED: $shown"; fail=1
     else
-        refused=$((refused + 1))
-        echo "refused: $shown ($(grep -c "^error" "$work/out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused: $shown ($(grep -c "^error" "$work/out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $shown ($(grep -c "^error" "$work/out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
+# The unchanged files must verify, or every "refused" below would mean nothing.
+if "$verus" verification/juno-fnkeys/rules.rs > "$work/baseline" 2>&1; then
+    echo "baseline: verifies"
+else
+    cat "$work/baseline"; echo "mutants: the unchanged files do not verify"; exit 1
+fi
 # Keys swapped or lost.
 try 'KEY_BRIGHTNESSUP => Action::Brightness(true),' 'KEY_BRIGHTNESSUP => Action::Brightness(false),'
 try 'KEY_VOLUMEDOWN => Action::Volume(false),' 'KEY_VOLUMEDOWN => Action::Volume(true),'
@@ -82,4 +94,6 @@ try 'let level = if level > BRIGHTNESS_MAX {
         level
     };' 'let level = level;'
 echo "juno-fnkeys mutants: $refused of $total refused"
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit $fail

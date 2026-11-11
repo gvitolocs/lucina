@@ -14,6 +14,7 @@ use crate::{
     Error,
     cache::CacheReport,
     desc::{self, DeviceDesc, GeometryDesc, UnitDesc},
+    irq_wait,
     policy::{UnitRole, WritePolicy},
     regs::{self, Capabilities},
     scsi::{self, Capacity, Inquiry, ModeSense},
@@ -44,17 +45,31 @@ pub trait Clock {
     fn delay_us(&self, us: u64);
 
     /// Sleeps until the controller interrupts for a request (`IS.UTRCS`, `IS.UE` or a fatal bit; Linux `ufshcd_intr`), for
-    /// at most `timeout_us`. `false`: there is no interrupt to sleep on here (no line, or a caller that may not sleep), and
-    /// the caller polls.
-    fn wait_interrupt(&self, _timeout_us: u64) -> bool {
-        false
+    /// at most `timeout_us` (the host asks for at most [`crate::irq_wait::SLEEP_CAP_US`]). [`IrqWait::Unavailable`]: there is
+    /// no interrupt to sleep on here (no line, or a caller that may not sleep), and the caller polls.
+    fn wait_interrupt(&self, _timeout_us: u64) -> IrqWait {
+        IrqWait::Unavailable
     }
+    /// A request finished although no interrupt woke its thread: found `late_us` at most after it finished. For the
+    /// platform's own count (the kernel's `/proc/lucina-irq`); the host counts and logs it too.
+    fn missed_interrupt(&self, _late_us: u64) {}
     /// One line of the bring-up log, at most about 75 columns: on the laptop it is read on a screen or from
     /// `/dev/kmsg` at 100 columns, after the kernel's timestamp and prefix.
     fn note(&self, _line: fmt::Arguments<'_>) {}
     /// A request failed: logs what only the platform can see, while the request is still pending if it is
     /// (clocks, the IOMMU).
     fn platform_report(&self) {}
+}
+
+/// How [`Clock::wait_interrupt`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IrqWait {
+    /// No interrupt to sleep on: the caller polls.
+    Unavailable,
+    /// The interrupt came (the handler saw one of the bits a request waits for).
+    Interrupted,
+    /// The sleep ended at its timeout with no interrupt.
+    Expired,
 }
 
 /// Layout of the DMA area.
@@ -289,6 +304,12 @@ pub struct Host<R: Regs, D: DmaArea, C: Clock> {
     timing: Timing,
     /// The first request that worked has been described.
     first_done: bool,
+    /// Requests that finished although no interrupt woke their thread (found after a capped sleep).
+    missed_irq: u64,
+    /// The most a missed interrupt's request was found late, in milliseconds (an upper bound: the sleep's length).
+    late_ms_max: u64,
+    /// Rate limit of the log lines about missed interrupts.
+    miss_notes: crate::irq_wait::MissNotes,
 }
 
 /// When a request's door bell cleared and its descriptor changed, in microseconds after the door bell.
@@ -349,6 +370,9 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
             lists_ours: false,
             timing: Timing::default(),
             first_done: false,
+            missed_irq: 0,
+            late_ms_max: 0,
+            miss_notes: Default::default(),
         };
         let reused = match reset {
             ResetPolicy::Always => Err(Error::NotEnabled),
@@ -424,6 +448,16 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
 
     pub fn regs(&self) -> &R {
         &self.regs
+    }
+
+    /// Requests that finished although no interrupt woke their thread, since start.
+    pub fn missed_irq(&self) -> u64 {
+        self.missed_irq
+    }
+
+    /// The most a request with a missed interrupt was found late, in milliseconds (at most the capped sleep's length).
+    pub fn late_ms_max(&self) -> u64 {
+        self.late_ms_max
     }
 
     /// Whether an earlier request ended the host: nothing more goes to the controller.
@@ -1348,7 +1382,10 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
         };
         let mut done = [0u8; UTRD_SIZE];
         let mut spins = 0u32;
+        // When the last sleep on the interrupt began, if it ended with no interrupt.
+        let mut expired_sleep: Option<u64> = None;
         loop {
+            let mut finished = false;
             if self.regs.read32(regs::UTRLDBR) & SLOT0 == 0 {
                 let now = self.clock.now_us().wrapping_sub(start);
                 self.timing.dbr_clear_us.get_or_insert(now);
@@ -1356,11 +1393,24 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
                 self.area.read(UTRL_OFFSET, &mut done);
                 if upiu::ocs(&done) != upiu::OCS_INVALID_COMMAND_STATUS {
                     self.timing.ocs_us = Some(now);
-                    break;
+                    finished = true;
                 }
             } else {
                 // Rung again later, or still pending: the clear above was not the end of this request.
                 self.timing.dbr_clear_us = None;
+            }
+            if let Some(slept_at) = expired_sleep.take() {
+                let now = self.clock.now_us();
+                // WaitAgain and TimeOut need nothing here: the checks below sleep again or time the request out, as
+                // they did before the sleeps were capped.
+                if irq_wait::after_sleep(finished, now.wrapping_sub(start), timeout_us)
+                    == irq_wait::AfterSleep::CompleteMissed
+                {
+                    self.note_missed(now.wrapping_sub(slept_at));
+                }
+            }
+            if finished {
+                break;
             }
             let is = self.regs.read32(regs::IS);
             // A UIC error, as Linux `ufshcd_update_uic_error`: read the UEC registers (they clear on read), log
@@ -1417,13 +1467,19 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
                 self.held = caller_bytes;
                 return Err(Error::Timeout("a transfer request"));
             }
-            // Spin briefly (most requests finish in microseconds), then sleep until the controller interrupts; without an
+            // Spin briefly (most requests finish in microseconds), then sleep until the controller interrupts, at most
+            // 20 ms at a time, so that a request whose interrupt was lost is found soon (`irq_wait`); without an
             // interrupt, back off.
             spins += 1;
             if spins > 64 {
-                let left = timeout_us.saturating_sub(self.clock.now_us().wrapping_sub(start));
-                if !self.clock.wait_interrupt(left.max(1)) {
-                    self.clock.delay_us(if spins > 1024 { 1000 } else { 10 });
+                let at = self.clock.now_us();
+                let sleep = irq_wait::sleep_us(at.wrapping_sub(start), timeout_us);
+                match self.clock.wait_interrupt(sleep) {
+                    IrqWait::Unavailable => {
+                        self.clock.delay_us(if spins > 1024 { 1000 } else { 10 })
+                    }
+                    IrqWait::Interrupted => {}
+                    IrqWait::Expired => expired_sleep = Some(at),
                 }
             }
         }
@@ -1437,6 +1493,28 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
         match upiu::ocs(&done) {
             upiu::OCS_SUCCESS => Ok(()),
             ocs => Err(Error::Ocs(ocs)),
+        }
+    }
+
+    /// A request finished although its sleep on the interrupt ended with none: counts it, tells the platform, and logs it
+    /// (rate-limited; the count is not). `late_us`: since that sleep began, so at most this long after the request finished.
+    fn note_missed(&mut self, late_us: u64) {
+        let is = self.regs.read32(regs::IS);
+        let late_ms = late_us.div_ceil(1000);
+        self.missed_irq += 1;
+        self.late_ms_max = self.late_ms_max.max(late_ms);
+        self.clock.missed_interrupt(late_us);
+        let note = self.miss_notes.miss(self.clock.now_us());
+        if note.more > 0 {
+            self.clock.note(format_args!(
+                "missed completion interrupt: {} more not logged",
+                note.more
+            ));
+        }
+        if note.line {
+            self.clock.note(format_args!(
+                "missed completion interrupt: tag {TAG}, {late_ms} ms late, IS={is:#x}"
+            ));
         }
     }
 

@@ -316,6 +316,71 @@ fn fn_names(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Predicates of `#[cfg(..)]`/`cfg_attr` that are no loosening: tests, and the verus forms already counted as escapes or allowed.
+fn cfg_benign(pred: &str) -> bool {
+    matches!(
+        pred,
+        "test"
+            | "not(test)"
+            | "verus"
+            | "verus_keep_ghost"
+            | "not(verus)"
+            | "not(verus_keep_ghost)"
+            | "any()"
+            | "false"
+            | "not(all())"
+    )
+}
+
+/// How many `#[cfg(..)]`, `#![cfg(..)]`, `#[cfg_attr(..)]`, `#![cfg_attr(..)]` of a whitespace-free line have a predicate that
+/// is not benign (a `cfg_attr` predicate is its first argument).
+fn cfg_gate_count(ws: &str) -> usize {
+    let mut n = 0;
+    for pre in ["#[cfg(", "#![cfg(", "#[cfg_attr(", "#![cfg_attr("] {
+        let attr = pre.contains("cfg_attr");
+        let mut from = 0;
+        while let Some(p) = ws[from..].find(pre) {
+            let open = from + p + pre.len() - 1;
+            if let Some((inner, _)) = balanced(ws, open) {
+                let pred = if attr {
+                    let mut d = 0i32;
+                    let mut cut = inner.len();
+                    for (i, c) in inner.char_indices() {
+                        match c {
+                            '(' | '[' => d += 1,
+                            ')' | ']' => d -= 1,
+                            ',' if d == 0 => {
+                                cut = i;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    &inner[..cut]
+                } else {
+                    inner
+                };
+                if !cfg_benign(pred) {
+                    n += 1;
+                }
+            }
+            from += p + pre.len();
+        }
+    }
+    n
+}
+
+/// Does a cleaned line of a `#[cfg(test)]` region hold verified items (a `proof fn`, `spec fn`, `verus!` or a clause keyword)?
+fn test_gated_proof(l: &str) -> bool {
+    let j = l.split_whitespace().collect::<Vec<_>>().join(" ");
+    j.contains("proof fn")
+        || j.contains("spec fn")
+        || j.contains("verus!")
+        || ["requires", "ensures", "decreases", "invariant"]
+            .iter()
+            .any(|w| !word_at(l, w).is_empty())
+}
+
 type Hit = (&'static str, Class, Option<u64>);
 
 fn markers_in(s: &str, ws: &str) -> Vec<Hit> {
@@ -375,6 +440,17 @@ fn markers_in(s: &str, ws: &str) -> Vec<Hit> {
         "cfg(not(verus))",
         Class::Escape,
     );
+    // Gating that switches the verified code or its proof off without saying `verus`: counted like `cfg(not(verus))`.
+    for (pat, name) in [
+        ("cfg(any())", "cfg(any())"),
+        ("cfg(false)", "cfg(false)"),
+        ("cfg(not(verus_keep_ghost))", "cfg(not(verus_keep_ghost))"),
+        ("cfg(not(all()))", "cfg(not(all()))"),
+    ] {
+        add(count_sub(ws, pat), name, Class::Escape);
+    }
+    // Any other cfg gate of a verified file can switch the verified code off (`feature = ..`, `target_os = ..`): a loosening.
+    add(cfg_gate_count(ws), "cfg-gate", Class::Loosen);
     add(
         count_sub(ws, "by(integer_ring)"),
         "by(integer_ring)",
@@ -744,6 +820,26 @@ pub fn scan_text(path: &str, text: &str) -> FileScan {
 
     // #[cfg(test)] regions: not part of what ships.
     let mut in_test = vec![false; raw.len()];
+    // An inner `#![cfg(test)]` among the file's LEADING inner attributes (before the first item) gates the whole file; one inside a
+    // module, further down, gates only that module and does not blind the scan.
+    let mut leading_cfg_test = false;
+    for (n, l) in cleaned.iter().enumerate() {
+        let w: String = l.split_whitespace().collect();
+        if w.is_empty() || proof[n] {
+            continue;
+        }
+        if !w.starts_with("#![") {
+            break;
+        }
+        if w.contains("#![cfg(test)]") {
+            leading_cfg_test = true;
+        }
+    }
+    if leading_cfg_test {
+        for x in in_test.iter_mut() {
+            *x = true;
+        }
+    }
     let mut pend_test = false;
     let mut tdepth = 0usize;
     for (n, l) in cleaned.iter().enumerate() {
@@ -806,6 +902,17 @@ pub fn scan_text(path: &str, text: &str) -> FileScan {
                     value,
                 });
             }
+        }
+        // Verified items inside a `#[cfg(test)]` region are not verified at all: with a test-only gate on an inline mod or impl one exec
+        // line switches proofs off. Counted as an escape.
+        if in_test[n] && !proof[n] && test_gated_proof(l) {
+            scan.markers.push(Marker {
+                kind: "cfg(test)-gated-proof",
+                class: Class::Escape,
+                file: path.to_string(),
+                line,
+                value: None,
+            });
         }
         let t = raw[n].trim();
         if t.starts_with("//")
@@ -1145,6 +1252,96 @@ pub fn counts(units: &[UnitTrust]) -> Counts {
     m
 }
 
+/// One verified file of a unit at the base commit and now (`None`: absent there).
+#[derive(Debug, Clone)]
+pub struct FileDelta {
+    pub path: String,
+    pub base: Option<String>,
+    pub work: Option<String>,
+}
+
+/// The lines of `base` that `work` has fewer times (multiset difference), in base order, as one text. A line that merely moved
+/// within the file is not removed.
+fn lines_removed(base: &str, work: &str) -> String {
+    let mut left: BTreeMap<&str, usize> = BTreeMap::new();
+    for l in work.lines() {
+        *left.entry(l).or_insert(0) += 1;
+    }
+    let mut out = String::new();
+    for l in base.lines() {
+        match left.get_mut(l) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => {
+                out.push_str(l);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// Markers of `class` in the lines of `text`.
+fn markers_of(path: &str, text: &str, class: Class) -> usize {
+    scan_text(path, text)
+        .markers
+        .iter()
+        .filter(|m| m.class == class)
+        .count()
+}
+
+/// The NET loss of markers of `class` over the files of a unit: occurrences on removed lines minus occurrences on added lines
+/// (multiset line differences per file, summed over the unit, floored at 0). Editing a marker line trivially (a space, a trailing
+/// comment) removes the old line and adds the new one: net zero. A marker moved to another file of the unit nets zero as well.
+pub fn net_marker_loss(deltas: &[FileDelta], class: Class) -> usize {
+    let (mut removed, mut added) = (0usize, 0usize);
+    for d in deltas {
+        let base = d.base.as_deref().unwrap_or("");
+        let work = d.work.as_deref().unwrap_or("");
+        removed += markers_of(&d.path, &lines_removed(base, work), class);
+        added += markers_of(&d.path, &lines_removed(work, base), class);
+    }
+    removed.saturating_sub(added)
+}
+
+/// The silent-loss ratchet: a count that FELL against the base baseline (per unit and class) is accepted only when the verified
+/// files of that unit lost at least that many marker sites as text, net of the sites added on other lines. A scan that stopped seeing sites whose lines are all still
+/// in the source (a file the closure no longer reaches, a parse change, a bad checkout) is refused, with the numbers. `units`
+/// maps each unit to its files at the base and now; units not in it (the flags units) are not checked.
+pub fn silent_drops(
+    base: &Counts,
+    actual: &Counts,
+    units: &BTreeMap<String, Vec<FileDelta>>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for ((unit, class), &b) in base {
+        let Some(deltas) = units.get(unit) else {
+            continue;
+        };
+        let Some(c) = Class::parse(class) else {
+            continue;
+        };
+        let a = actual
+            .get(&(unit.clone(), class.clone()))
+            .copied()
+            .unwrap_or(0);
+        if a >= b {
+            continue;
+        }
+        let gone = net_marker_loss(deltas, c);
+        if gone < b - a {
+            errors.push(format!(
+                "trust: unit `{unit}` class `{class}` fell from {b} site(s) at the base to {a}, but the unit's verified files ({}) lost only {gone} marker site(s) net of the markers added back: the scan lost sites whose lines are still in the source (a file the closure no longer reaches, an extractor change, a broken checkout). Not accepted; if the sites really went away, remove their lines",
+                deltas
+                    .iter()
+                    .map(|d| d.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    errors
+}
+
 pub fn baseline_tsv(c: &Counts) -> String {
     let mut s = String::from(
         "# Generated: lucina-ci trust --write. Do not edit. unit<TAB>class<TAB>count (zero is not listed)\n",
@@ -1370,7 +1567,19 @@ fn ranked_items(units: &[UnitTrust]) -> Vec<Item> {
     m.into_values().collect()
 }
 
+/// Hand-maintained open trust gaps: `docs/ci/open-trust-gaps.md`. Each gap starts with a `### ` heading; the count goes into the totals.
+pub const GAPS: &str = "docs/ci/open-trust-gaps.md";
+
+pub fn count_gaps(text: &str) -> usize {
+    text.lines().filter(|l| l.starts_with("### ")).count()
+}
+
+#[cfg(test)]
 pub fn render_report(units: &[UnitTrust]) -> String {
+    render_report_gaps(units, "")
+}
+
+pub fn render_report_gaps(units: &[UnitTrust], gaps: &str) -> String {
     let mut units: Vec<&UnitTrust> = units.iter().collect();
     units.sort_by(|a, b| a.unit.cmp(&b.unit));
     let all: Vec<UnitTrust> = units.iter().map(|u| (*u).clone()).collect();
@@ -1406,6 +1615,7 @@ pub fn render_report(units: &[UnitTrust]) -> String {
         owned.len(),
         files.len()
     ));
+    s.push_str(&format!("open trust gaps: {}\n\n", count_gaps(gaps)));
     s.push_str("| Class | Count over units | Distinct sites |\n| --- | ---: | ---: |\n");
     for c in ALL_CLASSES {
         s.push_str(&format!(
@@ -1577,6 +1787,16 @@ pub fn render_report(units: &[UnitTrust]) -> String {
     s.push_str("- The TLA+ and Stateright models (`specs/juno`, `specs/lucina-models`) are models of the code, not the code; whether they match it is a manual question.\n");
     s.push_str("- Callers: a `requires` is checked only in verified callers (gap C).\n");
     s.push_str("- The Verus and Z3 trusted core, and rustc: the proof is about the source, not the binary.\n");
+    s.push_str("\n## Open trust gaps\n\n");
+    if gaps.trim().is_empty() {
+        s.push_str("None recorded (`docs/ci/open-trust-gaps.md`).\n");
+    } else {
+        s.push_str(
+            "Hand-maintained in `docs/ci/open-trust-gaps.md`; the count is in the totals.\n\n",
+        );
+        s.push_str(gaps.trim_end());
+        s.push('\n');
+    }
     s
 }
 
@@ -2298,5 +2518,294 @@ echo --no-verify without the tool
         assert!(one.contains("Loosening attributes (1)"));
         // The flags unit is not a proof unit.
         assert!(one.contains("1 units, "));
+    }
+    fn escape_kinds(src: &str) -> Vec<&'static str> {
+        scan_text("f.rs", src)
+            .markers
+            .iter()
+            .filter(|m| m.class.name() == "escape")
+            .map(|m| m.kind)
+            .collect()
+    }
+
+    #[test]
+    fn cfg_any_empty_counts_as_an_escape() {
+        assert_eq!(
+            escape_kinds("#[cfg(any())]\nmod m { fn f() {} }\n"),
+            ["cfg(any())"]
+        );
+        assert_eq!(escape_kinds("#[cfg( any( ) )] mod m {}\n"), ["cfg(any())"]);
+    }
+
+    #[test]
+    fn cfg_false_counts_as_an_escape() {
+        assert_eq!(
+            escape_kinds("#[cfg(false)] proof fn p() {}\n"),
+            ["cfg(false)"]
+        );
+    }
+
+    #[test]
+    fn cfg_not_verus_keep_ghost_counts_as_an_escape() {
+        assert_eq!(
+            escape_kinds("#[cfg(not(verus_keep_ghost))] impl X { fn f() {} }\n"),
+            ["cfg(not(verus_keep_ghost))"]
+        );
+    }
+
+    #[test]
+    fn cfg_not_all_empty_counts_as_an_escape() {
+        assert_eq!(
+            escape_kinds("#![cfg(not(all()))]\nfn f() {}\n"),
+            ["cfg(not(all()))"]
+        );
+    }
+
+    #[test]
+    fn ordinary_cfg_gates_are_not_escapes() {
+        assert!(escape_kinds("#[cfg(test)] mod t {}\n#[cfg(verus_keep_ghost)] use vstd::prelude::*;\n#[cfg(target_os = \"linux\")] fn f() {}\n").is_empty());
+    }
+
+    #[test]
+    fn cfg_feature_gate_counts_as_a_loosening() {
+        let s = scan_text(
+            "f.rs",
+            "#[cfg(feature = \"x\")]\n#[path = \"a.rs\"]\npub mod a;\n",
+        );
+        let k: Vec<(&str, &str)> = s.markers.iter().map(|m| (m.kind, m.class.name())).collect();
+        assert_eq!(k, [("cfg-gate", "loosen")]);
+    }
+
+    #[test]
+    fn cfg_target_os_gate_counts_as_a_loosening() {
+        let s = scan_text(
+            "f.rs",
+            "#[cfg(target_os = \"none\")]\nimpl X { fn f(&self) {} }\n#![cfg(debug_assertions)]\n",
+        );
+        assert_eq!(s.markers.iter().filter(|m| m.kind == "cfg-gate").count(), 2);
+    }
+
+    #[test]
+    fn benign_cfg_forms_are_not_counted_as_loosenings() {
+        let s = scan_text(
+            "f.rs",
+            "#[cfg(test)] mod t {}\n#[cfg(verus_keep_ghost)] use vstd::prelude::*;\n#[cfg_attr(verus_keep_ghost, verus_verify)] pub struct S;\n#[cfg_attr(test, derive(Debug))] pub struct T;\n",
+        );
+        assert_eq!(s.markers.iter().filter(|m| m.kind == "cfg-gate").count(), 0);
+        let s = scan_text(
+            "f.rs",
+            "#[cfg_attr(feature = \"x\", derive(Debug))] pub struct T;\n",
+        );
+        assert_eq!(s.markers.iter().filter(|m| m.kind == "cfg-gate").count(), 1);
+    }
+
+    #[test]
+    fn open_trust_gaps_are_counted_and_printed_from_the_data_file() {
+        let g = "# Open trust gaps\n\n### A builder can type an Opus trailer\nText.\n\n### Second\nMore.\n";
+        assert_eq!(count_gaps(g), 2);
+        let r = render_report_gaps(&[], g);
+        assert!(r.contains("open trust gaps: 2"), "{r}");
+        assert!(
+            r.contains("## Open trust gaps") && r.contains("A builder can type an Opus trailer")
+        );
+        let none = render_report_gaps(&[], "");
+        assert!(none.contains("open trust gaps: 0") && none.contains("None recorded"));
+    }
+
+    #[test]
+    fn verified_items_inside_a_cfg_test_region_count_as_an_escape() {
+        let src = "#[cfg(test)]\nmod hidden {\n    proof fn lemma() ensures true {}\n}\n";
+        assert_eq!(escape_kinds(src), ["cfg(test)-gated-proof"]);
+        assert!(
+            escape_kinds(
+                "#[cfg(test)]\nmod tests {\n    #[test] fn t() { assert_eq!(1, 1); }\n}\n"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_inner_cfg_test_gates_the_whole_file() {
+        let src = "#![cfg(test)]\nuse x::y;\npub proof fn lemma() ensures true {}\n";
+        assert_eq!(escape_kinds(src), ["cfg(test)-gated-proof"]);
+        assert!(escape_kinds("#![cfg(test)]\nuse x::y;\n#[test] fn t() {}\n").is_empty());
+    }
+
+    #[test]
+    fn an_inner_cfg_test_inside_a_module_does_not_blind_the_scan() {
+        let s = scan_text(
+            "f.rs",
+            "mod t {\n    #![cfg(test)]\n}\nproof fn p() { admit(); }\n",
+        );
+        assert!(
+            s.markers.iter().any(|m| m.kind == "admit"),
+            "{:?}",
+            s.markers.iter().map(|m| m.kind).collect::<Vec<_>>()
+        );
+        // but a leading one still gates the file
+        let s = scan_text(
+            "f.rs",
+            "// header\n#![cfg(test)]\nproof fn p() { admit(); }\n",
+        );
+        assert!(!s.markers.iter().any(|m| m.kind == "admit"));
+    }
+}
+
+#[cfg(test)]
+mod silent_loss_tests {
+    use super::*;
+
+    /// The real `drivers/lucina-charge/src/adc.rs` (8 `#[cfg(not(verus_keep_ghost))]` sites, a mid-file `#![allow(..)]` inner attribute)
+    /// and the real cfg lines and surroundings of `kernel/lucina-rcu/src/lib.rs` (3 sites), copied 2026-11-11.
+    const ADC: &str = include_str!("fixtures/adc.rs.txt");
+    const RCU: &str = include_str!("fixtures/rcu_lib.rs.txt");
+
+    fn escapes(path: &str, text: &str) -> usize {
+        scan_text(path, text)
+            .markers
+            .iter()
+            .filter(|m| m.class == Class::Escape)
+            .count()
+    }
+
+    #[test]
+    fn the_real_charge_and_rcu_files_count_their_escape_sites() {
+        assert_eq!(escapes("drivers/lucina-charge/src/adc.rs", ADC), 8);
+        assert_eq!(escapes("kernel/lucina-rcu/src/lib.rs", RCU), 3);
+    }
+
+    fn counts(unit: &str, class: &str, n: usize) -> Counts {
+        [((unit.to_string(), class.to_string()), n)].into()
+    }
+
+    fn deltas(path: &str, base: &str, work: Option<&str>) -> BTreeMap<String, Vec<FileDelta>> {
+        [(
+            "verus/juno-charge/rules".to_string(),
+            vec![FileDelta {
+                path: path.into(),
+                base: Some(base.into()),
+                work: work.map(str::to_string),
+            }],
+        )]
+        .into()
+    }
+
+    #[test]
+    fn a_count_that_falls_while_the_lines_stay_is_refused() {
+        let u = "verus/juno-charge/rules";
+        let base = counts(u, "escape", 8);
+        // the scan lost all eight sites, the file is unchanged
+        let same = deltas("adc.rs", ADC, Some(ADC));
+        let e = silent_drops(&base, &BTreeMap::new(), &same);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].contains("fell from 8") && e[0].contains("lost only 0"),
+            "{e:?}"
+        );
+        // a file the closure no longer reaches (gone from the work side)
+        let gone = deltas("adc.rs", ADC, None);
+        assert!(
+            silent_drops(&base, &counts(u, "escape", 8), &gone).is_empty(),
+            "no fall, no refusal"
+        );
+        // the lines of three sites removed: a fall to five is fine, a fall to four is not
+        let mut cut = String::new();
+        let mut n = 0;
+        for l in ADC.lines() {
+            if l.trim() == "#[cfg(not(verus_keep_ghost))]" && n < 3 {
+                n += 1;
+                continue;
+            }
+            cut.push_str(l);
+            cut.push('\n');
+        }
+        assert_eq!(escapes("adc.rs", &cut), 5);
+        let d = deltas("adc.rs", ADC, Some(&cut));
+        assert!(silent_drops(&base, &counts(u, "escape", 5), &d).is_empty());
+        assert_eq!(silent_drops(&base, &counts(u, "escape", 4), &d).len(), 1);
+        // every marker line edited trivially (a trailing comment): the marker stays on a new line, net loss zero, the drop is refused
+        let edited: String = ADC
+            .lines()
+            .map(|l| {
+                if l.trim() == "#[cfg(not(verus_keep_ghost))]" {
+                    format!("{l} // edited\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        let ed = deltas("adc.rs", ADC, Some(&edited));
+        assert_eq!(
+            net_marker_loss(&ed["verus/juno-charge/rules"], Class::Escape),
+            0
+        );
+        let e = silent_drops(&base, &BTreeMap::new(), &ed);
+        assert_eq!(e.len(), 1, "{e:?}");
+        // a real deletion of all eight marker lines is accepted
+        let nomark: String = ADC
+            .lines()
+            .filter(|l| l.trim() != "#[cfg(not(verus_keep_ghost))]")
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(escapes("adc.rs", &nomark), 0);
+        let del8 = deltas("adc.rs", ADC, Some(&nomark));
+        assert_eq!(
+            net_marker_loss(&del8["verus/juno-charge/rules"], Class::Escape),
+            8
+        );
+        assert!(silent_drops(&base, &BTreeMap::new(), &del8).is_empty());
+        // a marker moved from one file of the unit to another: net zero
+        let moved_unit: BTreeMap<String, Vec<FileDelta>> = [(
+            "verus/juno-charge/rules".to_string(),
+            vec![
+                FileDelta {
+                    path: "a.rs".into(),
+                    base: Some(ADC.into()),
+                    work: Some(nomark.clone()),
+                },
+                FileDelta {
+                    path: "b.rs".into(),
+                    base: Some("fn b() {}\n".into()),
+                    work: Some(format!("fn b() {{}}\n{ADC}")),
+                },
+            ],
+        )]
+        .into();
+        assert_eq!(
+            net_marker_loss(&moved_unit["verus/juno-charge/rules"], Class::Escape),
+            0
+        );
+        // all lines removed (the file deleted): any fall up to eight is accepted
+        let del = deltas("adc.rs", ADC, None);
+        assert!(silent_drops(&base, &BTreeMap::new(), &del).is_empty());
+        // growth, equal counts and unchecked units pass
+        assert!(silent_drops(&base, &counts(u, "escape", 9), &same).is_empty());
+        assert!(silent_drops(&counts("flags/x", "flag", 3), &BTreeMap::new(), &same).is_empty());
+        // a line that merely moves inside the file is not a removal
+        let mut lines: Vec<&str> = ADC.lines().collect();
+        let first = lines.remove(0);
+        lines.push(first);
+        let moved = lines.join("\n") + "\n";
+        let m = deltas("adc.rs", ADC, Some(&moved));
+        assert_eq!(silent_drops(&base, &BTreeMap::new(), &m).len(), 1);
+    }
+
+    #[test]
+    fn rcu_sites_are_checked_the_same_way() {
+        let u = "verus/juno-rcu/rules";
+        let units: BTreeMap<String, Vec<FileDelta>> = [(
+            u.to_string(),
+            vec![FileDelta {
+                path: "lib.rs".into(),
+                base: Some(RCU.into()),
+                work: Some(RCU.into()),
+            }],
+        )]
+        .into();
+        assert_eq!(
+            silent_drops(&counts(u, "escape", 3), &BTreeMap::new(), &units).len(),
+            1
+        );
+        assert!(silent_drops(&counts(u, "escape", 3), &counts(u, "escape", 3), &units).is_empty());
     }
 }

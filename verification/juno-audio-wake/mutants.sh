@@ -6,6 +6,7 @@ verus=${VERUS:-$(command -v verus || echo /home/user/tools/verus/verus-x86-linux
 work=$(mktemp -d "${TMPDIR:-/tmp}/juno-audio-wake-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
 fail=0
+weak=0
 refused=0
 total=0
 try() {
@@ -26,10 +27,21 @@ try() {
     if "$verus" "$work/verification/juno-audio-wake/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED: $shown"; fail=1
     else
-        refused=$((refused + 1))
-        echo "refused: $shown ($(grep -c "^error" "$work/out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused: $shown ($(grep -c "^error" "$work/out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $shown ($(grep -c "^error" "$work/out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
+# The unchanged files must verify, or every "refused" below would mean nothing.
+if "$verus" verification/juno-audio-wake/rules.rs > "$work/baseline" 2>&1; then
+    echo "baseline: verifies"
+else
+    cat "$work/baseline"; echo "mutants: the unchanged files do not verify"; exit 1
+fi
 # A raise must add its own bit: a handler that leaves the word as it was loses the event.
 try '    pending | source
 }' '    pending
@@ -105,4 +117,6 @@ try 'Some(d) if d > now => Sleep::For(d - now),' 'Some(d) if d >= now => Sleep::
 # A timed wait lasts until the deadline, not a millisecond more.
 try 'Some(d) if d > now => Sleep::For(d - now),' 'Some(d) if d > now => Sleep::For(d - now + 1),'
 echo "$refused of $total mutants refused"
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit $fail

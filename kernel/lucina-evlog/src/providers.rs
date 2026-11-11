@@ -12,6 +12,7 @@ pub const NET: &str = "Juno-Net";
 pub const POWER: &str = "Juno-Power";
 pub const SETUP: &str = "Juno-Setup";
 pub const EVENTLOG: &str = "Juno-EventLog";
+pub const STORAGE: &str = "Juno-Storage";
 
 /// One kind of event.
 #[derive(Clone, Copy, Debug)]
@@ -51,6 +52,8 @@ pub mod id {
     pub const SLEEP_LEFT: u32 = 107;
     // Juno-Setup
     pub const GENERATION_INSTALLED: u32 = 2;
+    // Juno-Storage
+    pub const DATA_CHECKED: u32 = 7;
     // Juno-EventLog
     pub const LOG_CLEARED: u32 = 104;
     pub const EVENTS_LOST: u32 = 1101;
@@ -209,6 +212,15 @@ pub const DEFS: &[Def] = &[
         channel: Channel::Setup,
         windows: "WindowsUpdateClient 19",
         meaning: "a new generation of LucinaOS booted for the first time",
+    },
+    Def {
+        provider: STORAGE,
+        id: id::DATA_CHECKED,
+        name: "Disk check on /data",
+        level: Level::Warning,
+        channel: Channel::System,
+        windows: "Chkdsk 26212, Wininit 1001",
+        meaning: "/data had no clean mark at boot (the boot before ended without lucina-data clean), so e2fsck checked it; the event says what it fixed and where the copies of moved or cut files are",
     },
     Def {
         provider: EVENTLOG,

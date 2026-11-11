@@ -13,3 +13,5 @@ publish = false
 lucina-qcom-soc = { path = "../../drivers/lucina-qcom-soc" }
 # The device tree parser the kernel uses (its workspace has the same version), for the tree walk of `tree`.
 fdt = "0.1.5"
+# The lock of the one RSC owner (`rsc::Drv`); the kernel's workspace already has 0.9.
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }

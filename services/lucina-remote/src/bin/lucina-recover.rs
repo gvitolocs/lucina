@@ -68,7 +68,9 @@ fn table(write: bool) -> Result<bool, String> {
         }
         Some(fix) if write => {
             disk::write_lun0_blocks(&fix)?;
-            say("table: one copy was damaged, written again from the sound one. RESTART AND RUN THIS AGAIN: the kernel read the old table.");
+            say(
+                "table: one copy was damaged, written again from the sound one. RESTART AND RUN THIS AGAIN: the kernel read the old table.",
+            );
             Ok(true)
         }
         Some(_) => {
@@ -80,7 +82,11 @@ fn table(write: bool) -> Result<bool, String> {
 
 /// Step 2. Returns the loader's bytes as they are after it.
 fn loader(write: bool, old_one: bool) -> Result<Vec<u8>, String> {
-    let (target, old, new) = (on_esp(LOADER), on_esp(OLD_LOADER), on_esp("EFI/BOOT/BOOTAA64.NEW"));
+    let (target, old, new) = (
+        on_esp(LOADER),
+        on_esp(OLD_LOADER),
+        on_esp("EFI/BOOT/BOOTAA64.NEW"),
+    );
     let carried = Path::new(CARRIED).join("BOOTAA64.EFI");
     let carried_old = Path::new(CARRIED).join("BOOTOLD.EFI");
     let read_carried = |path: &Path| {
@@ -98,7 +104,10 @@ fn loader(write: bool, old_one: bool) -> Result<Vec<u8>, String> {
         match read_carried(&carried) {
             Ok(found) => found,
             // Not on the stick: nothing better to restore than a loader that is whole, so that one stays.
-            Err(e) => match (fs::read(&target).ok().filter(|data| plausible_efi(data)), on_disk_old) {
+            Err(e) => match (
+                fs::read(&target).ok().filter(|data| plausible_efi(data)),
+                on_disk_old,
+            ) {
                 (Some(data), _) => (target.clone(), data),
                 (None, Some(data)) => (old.clone(), data),
                 (None, None) => return Err(e),
@@ -108,13 +117,19 @@ fn loader(write: bool, old_one: bool) -> Result<Vec<u8>, String> {
     let want = hex(&sha(&source.1));
     let now = fs::read(&target).ok();
     if now.as_deref() == Some(source.1.as_slice()) {
-        say(&format!("loader: already the one to restore, sha256 {}", &want[..16]));
+        say(&format!(
+            "loader: already the one to restore, sha256 {}",
+            &want[..16]
+        ));
         return Ok(source.1);
     }
     say(&format!(
         "loader: \\{} is {}, restoring {} (sha256 {})",
         LOADER.replace('/', "\\"),
-        now.as_deref().map_or("missing".to_string(), |d| format!("sha256 {}", &hex(&sha(d))[..16])),
+        now.as_deref().map_or("missing".to_string(), |d| format!(
+            "sha256 {}",
+            &hex(&sha(d))[..16]
+        )),
         source.0,
         &want[..16]
     ));
@@ -163,12 +178,21 @@ fn config(write: bool, only_loader: bool, loader_bytes: &[u8]) -> Result<(), Str
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .ok();
     let keep_quiet = loader_knows_quiet(loader_bytes);
-    let tidy = |t: &str| if keep_quiet { t.to_string() } else { drop_quiet(t) };
+    let tidy = |t: &str| {
+        if keep_quiet {
+            t.to_string()
+        } else {
+            drop_quiet(t)
+        }
+    };
     let wanted = match whole(&tidy(&current)) {
         // Whole is not the same as working: a generation that crashes at every boot has a whole BOOT.CFG. What is written last
         // goes first, then, unless `lucina-recover loader` was asked for: PREV.CFG, if it is whole and another generation.
-        Ok(()) if !only_loader
-            && prev.as_deref().is_some_and(|p| whole(&tidy(p)).is_ok() && generation(p) != generation(&current)) =>
+        Ok(())
+            if !only_loader
+                && prev.as_deref().is_some_and(|p| {
+                    whole(&tidy(p)).is_ok() && generation(p) != generation(&current)
+                }) =>
         {
             let t = tidy(prev.as_deref().unwrap_or(""));
             say(&format!(
@@ -183,7 +207,11 @@ fn config(write: bool, only_loader: bool, loader_bytes: &[u8]) -> Result<(), Str
             say(&format!(
                 "BOOT.CFG: whole, generation {}{}",
                 generation(&t),
-                if t == current { "" } else { "; its quiet line goes, the restored loader does not know it" }
+                if t == current {
+                    ""
+                } else {
+                    "; its quiet line goes, the restored loader does not know it"
+                }
             ));
             t
         }
@@ -191,7 +219,10 @@ fn config(write: bool, only_loader: bool, loader_bytes: &[u8]) -> Result<(), Str
             say(&format!("BOOT.CFG: {why}"));
             match prev.as_deref().map(|p| (tidy(p), whole(&tidy(p)))) {
                 Some((t, Ok(()))) => {
-                    say(&format!("BOOT.CFG: PREV.CFG is whole, generation {}: it takes over", generation(&t)));
+                    say(&format!(
+                        "BOOT.CFG: PREV.CFG is whole, generation {}: it takes over",
+                        generation(&t)
+                    ));
                     t
                 }
                 other => {
@@ -236,12 +267,21 @@ fn rescue_set(write: bool, current: &str) -> Result<String, String> {
     let next = generation(current).max(1) + 1;
     let (kernel, initrd) = (kernel_name(next), initrd_name(next));
     let line = fs::read_to_string(RESCUE_LINE).map_err(|e| format!("{RESCUE_LINE}: {e}"))?;
-    let base = format!("dtb = GBGO.DTB\ncmdline = {}\npause = 3\nlog = LOG.TXT\n", line.trim());
+    let base = format!(
+        "dtb = GBGO.DTB\ncmdline = {}\npause = 3\nlog = LOG.TXT\n",
+        line.trim()
+    );
     let text = new_config(&base, next, DRAM_BASE, None, None, None)?;
-    say(&format!("BOOT.CFG: nothing on the disk can boot; the stick's rescue system goes on it as {kernel} and {initrd}"));
+    say(&format!(
+        "BOOT.CFG: nothing on the disk can boot; the stick's rescue system goes on it as {kernel} and {initrd}"
+    ));
     if write {
         fs::create_dir_all(on_esp(FOLDER)).map_err(|e| format!("{FOLDER}: {e}"))?;
-        for (from, to) in [("KERNEL.IMG", &kernel), ("RESCUE.GZ", &initrd), ("GBGO.DTB", &"GBGO.DTB".to_string())] {
+        for (from, to) in [
+            ("KERNEL.IMG", &kernel),
+            ("RESCUE.GZ", &initrd),
+            ("GBGO.DTB", &"GBGO.DTB".to_string()),
+        ] {
             copy_flushed(&Path::new(CARRIED).join(from), &in_folder(to))?;
         }
         sync_all();
@@ -265,12 +305,20 @@ fn recover(write: bool, old_one: bool, only_loader: bool) -> Result<(), String> 
     drop(esp);
     sync_all();
     let esp = Mounted::new(&device, true)?;
-    say(&format!("loader on the disk: sha256 {}", &hex(&sum_of(&on_esp(LOADER))?)[..16]));
+    say(&format!(
+        "loader on the disk: sha256 {}",
+        &hex(&sum_of(&on_esp(LOADER))?)[..16]
+    ));
     let text = fs::read_to_string(in_folder("BOOT.CFG")).unwrap_or_default();
-    say(&format!("BOOT.CFG on the disk: generation {}", generation(&text)));
+    say(&format!(
+        "BOOT.CFG on the disk: generation {}",
+        generation(&text)
+    ));
     drop(esp);
     if write {
-        say("DONE. Take the stick out, then hold the power button until the screen goes off and press it again.");
+        say(
+            "DONE. Take the stick out, then hold the power button until the screen goes off and press it again.",
+        );
     }
     Ok(())
 }
@@ -303,14 +351,38 @@ fn main() -> ExitCode {
         Some("old") => recover(true, true, false),
         Some("check") => recover(false, false, false),
         Some("console") => console(),
-        Some("reboot") => Command::new("reboot").arg("-f").status().map(|_| ()).map_err(|e| e.to_string()),
-        Some(other) => Err(format!("unknown command {other:?}: lucina-recover [loader|old|check|console]")),
+        Some("reboot") => {
+            // The rescue system has no /data (then this does nothing); a system that has it marks it clean first.
+            println!(
+                "{}",
+                lucina_remote::dataclean::clean_before_restart().describe()
+            );
+            let restarted = Command::new("reboot")
+                .arg("-f")
+                .status()
+                .is_ok_and(|s| s.success());
+            if !restarted {
+                // SAFETY: reboot takes one integer and returns only if it failed.
+                unsafe { libc::reboot(libc::RB_AUTOBOOT) };
+                println!(
+                    "{}",
+                    lucina_remote::dataclean::reopen_after_failed_restart().describe()
+                );
+                return ExitCode::FAILURE;
+            }
+            Ok(())
+        }
+        Some(other) => Err(format!(
+            "unknown command {other:?}: lucina-recover [loader|old|check|console]"
+        )),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             say(&format!("FAILED: {e}"));
-            say("Nothing further was changed. This stick also runs an SSH server, if a cable is in: root@<address>.");
+            say(
+                "Nothing further was changed. This stick also runs an SSH server, if a cable is in: root@<address>.",
+            );
             ExitCode::FAILURE
         }
     }

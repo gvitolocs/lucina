@@ -2980,6 +2980,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "lucina-apple-aic"
+version = "0.1.0"
+
+[[package]]
+name = "lucina-apple-aic-glue"
+version = "0.1.0"
+dependencies = [
+ "lucina-apple-aic",
+]
+
+[[package]]
+name = "lucina-apple-boot"
+version = "0.1.0"
+
+[[package]]
+name = "lucina-apple-uart"
+version = "0.1.0"
+
+[[package]]
 name = "lucina-ath10k"
 version = "0.1.0"
 
@@ -3114,6 +3133,10 @@ name = "lucina-epdc"
 version = "0.1.0"
 
 [[package]]
+name = "lucina-errseq"
+version = "0.1.0"
+
+[[package]]
 name = "lucina-eventd"
 version = "0.1.0"
 dependencies = [
@@ -3175,6 +3198,10 @@ name = "lucina-geni"
 version = "0.1.0"
 
 [[package]]
+name = "lucina-gesture"
+version = "0.1.0"
+
+[[package]]
 name = "lucina-glass"
 version = "0.1.0"
 dependencies = [
@@ -3204,6 +3231,9 @@ version = "0.1.0"
 [[package]]
 name = "lucina-i2c-hid"
 version = "0.1.0"
+dependencies = [
+ "lucina-gesture",
+]
 
 [[package]]
 name = "lucina-idle"
@@ -3319,6 +3349,7 @@ version = "0.1.0"
 dependencies = [
  "fdt",
  "lucina-qcom-soc",
+ "spin",
 ]
 
 [[package]]
@@ -3473,10 +3504,12 @@ dependencies = [
  "libc",
  "log",
  "lucina-boot",
+ "lucina-evlog",
  "lucina-random",
  "lucina-release",
  "lucina-ufs",
  "rustix",
+ "serde_json",
  "sha2 0.10.9",
  "sunset",
  "zeroize",
@@ -3531,6 +3564,10 @@ dependencies = [
 
 [[package]]
 name = "lucina-sleep"
+version = "0.1.0"
+
+[[package]]
+name = "lucina-spinwatch"
 version = "0.1.0"
 
 [[package]]

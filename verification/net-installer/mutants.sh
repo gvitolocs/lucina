@@ -6,6 +6,8 @@ verus=${VERUS:-/home/user/tools/verus/verus-x86-linux/verus}
 work=$(mktemp -d "${TMPDIR:-/tmp}/net-installer-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
 fail=0
+refused=0
+weak=0
 try() {
     local file=$1 from=$2 to=$3
     mkdir -p "$work/services/lucina-release/src" "$work/verification/net-installer"
@@ -24,7 +26,13 @@ try() {
     if "$verus" "$work/verification/net-installer/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED: $from -> $to"; fail=1
     else
-        echo "refused: $from -> $to ($(grep -c '^error' "$work/out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused: $from -> $to ($(grep -c '^error' "$work/out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $from -> $to ($(grep -c '^error' "$work/out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
 # The unchanged files must verify, or every "refused" below would mean nothing.
@@ -62,4 +70,6 @@ try $B 'Some(n) => Some((true, n)),' 'Some(n) => Some((false, n)),'
 try $B $'None => match smbios_line {\n            Some(n) => Some((false, n)),' $'None => match smbios_line {\n            Some(n) => Some((true, n)),'
 try $B $'    match compatible_line {\n        Some(n) => Some((true, n)),\n        None => match smbios_line {\n            Some(n) => Some((false, n)),\n            None => None,\n        },\n    }' $'    match smbios_line {\n        Some(n) => Some((false, n)),\n        None => match compatible_line {\n            Some(n) => Some((true, n)),\n            None => None,\n        },\n    }'
 [ "$fail" = 0 ] && echo "mutants: every planted bug was refused" || echo "mutants: FAILED"
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit $fail

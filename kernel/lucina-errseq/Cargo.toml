@@ -1,0 +1,10 @@
+[package]
+name = "lucina-errseq"
+version = "0.1.0"
+description = "Linux errseq_t (lib/errseq.c) in Rust: record an error once in one place and let any number of holders each see it once. no_std, no alloc, unsafe-free"
+# Spelled out rather than taken from the workspace: the kernel build may copy this crate into the Asterinas tree.
+edition = "2024"
+publish = false
+license = "GPL-2.0-only"
+
+[dependencies]

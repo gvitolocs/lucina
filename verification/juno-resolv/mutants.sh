@@ -6,6 +6,8 @@ verus=${VERUS:-/home/user/tools/verus/verus-x86-linux/verus}
 work=$(mktemp -d "${TMPDIR:-/tmp}/juno-resolv-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
 fail=0
+refused=0
+weak=0
 try() {
     local from=$1 to=$2
     mkdir -p "$work/kernel/lucina-resolv/src" "$work/verification/juno-resolv"
@@ -22,9 +24,21 @@ try() {
     if "$verus" "$work/verification/juno-resolv/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED: $from -> $to"; fail=1
     else
-        echo "refused: $from -> $to ($(grep -c '^error' "$work/out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused: $from -> $to ($(grep -c '^error' "$work/out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $from -> $to ($(grep -c '^error' "$work/out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
+# The unchanged files must verify, or every "refused" below would mean nothing.
+if "$verus" verification/juno-resolv/rules.rs > "$work/baseline" 2>&1; then
+    echo "baseline: verifies"
+else
+    cat "$work/baseline"; echo "mutants: the unchanged files do not verify"; exit 1
+fi
 # Names: length, label length, double dots, a dot at the start.
 try 'n == 0 || n > MAX_NAME ||' 'n == 0 || n > MAX_NAME + 1 ||'
 try 'if run == MAX_LABEL {' 'if run == MAX_LABEL + 1 {'
@@ -44,3 +58,5 @@ try 'if reply.len() - end < 10 {' 'if reply.len() - end < 9 {'
 try 'out.len() < MAX_ANSWERS {' 'out.len() <= MAX_ANSWERS {'
 try 'rdlen == want_len {' 'rdlen <= want_len {'
 [ "$fail" = 0 ] && echo "mutants: every planted bug was refused" || echo "mutants: FAILED"
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi

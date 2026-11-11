@@ -20,7 +20,16 @@ const SUPER_OFFSET: usize = 1024;
 const EXT2_MAGIC: u16 = 0xef53;
 /// `s_state`: cleanly unmounted.
 pub const STATE_VALID: u16 = 1;
+/// `s_state` bit: the kernel found errors in the file system (`EXT2_ERROR_FS`).
+pub const STATE_ERROR: u16 = 2;
 const OFFSET_STATE: usize = SUPER_OFFSET + 58;
+
+/// Whether a file system with this `s_state` goes through e2fsck before it is mounted. Only exactly "cleanly unmounted" skips
+/// the check: "mounted, not marked clean" (0), the error flag (2, also with VALID: 3) and the orphan bit (4) all force it.
+/// /data has no journal, so this check is the only protection after an unclean end.
+pub fn needs_check(state: u16) -> bool {
+    state != STATE_VALID
+}
 
 /// What the superblock says.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -229,7 +238,10 @@ mod tests {
     #[test]
     fn the_superblock_says_what_it_should() {
         let i = parse_superblock(&image()[0]).unwrap();
-        assert_eq!((i.blocks, i.uuid, i.label.as_str(), i.state), (40, [5; 16], "lucina-", 1));
+        assert_eq!(
+            (i.blocks, i.uuid, i.label.as_str(), i.state),
+            (40, [5; 16], "lucina-", 1)
+        );
         assert!(parse_superblock(&vec![0u8; BLOCK]).is_none());
         let dirty = with_state(&image()[0], 0);
         assert_eq!(parse_superblock(&dirty).unwrap().state, 0);
@@ -244,25 +256,79 @@ mod tests {
         assert_eq!(
             e,
             [
-                Extent { first: 1, count: 3, zero: false },
-                Extent { first: 10, count: 1, zero: false },
-                Extent { first: 11, count: 2, zero: true },
-                Extent { first: 13, count: 1, zero: false },
-                Extent { first: 0, count: 1, zero: false },
+                Extent {
+                    first: 1,
+                    count: 3,
+                    zero: false
+                },
+                Extent {
+                    first: 10,
+                    count: 1,
+                    zero: false
+                },
+                Extent {
+                    first: 11,
+                    count: 2,
+                    zero: true
+                },
+                Extent {
+                    first: 13,
+                    count: 1,
+                    zero: false
+                },
+                Extent {
+                    first: 0,
+                    count: 1,
+                    zero: false
+                },
             ]
         );
     }
 
     #[test]
     fn the_stream_reads_back() {
-        let h = Header { blocks: 9, extents: 3, uuid: [1; 16], sha256: [2; 32] };
+        let h = Header {
+            blocks: 9,
+            extents: 3,
+            uuid: [1; 16],
+            sha256: [2; 32],
+        };
         let mut b = Vec::new();
         h.write(&mut b).unwrap();
         assert_eq!(Header::read(&mut b.as_slice()).unwrap(), h);
         assert!(Header::read(&mut [0u8; 80].as_slice()).is_err());
-        let e = Extent { first: 7, count: 2, zero: true };
+        let e = Extent {
+            first: 7,
+            count: 2,
+            zero: true,
+        };
         let mut b = Vec::new();
         write_extent(&mut b, &e).unwrap();
         assert_eq!(read_extent(&mut b.as_slice()).unwrap(), e);
+    }
+}
+
+#[cfg(test)]
+mod needs_check_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_cleanly_unmounted_state_skips_the_check() {
+        assert!(!needs_check(STATE_VALID));
+        // Mounted and not marked clean, as /data is from the first mount until `lucina-data clean`.
+        assert!(needs_check(0));
+    }
+
+    #[test]
+    fn the_error_flag_forces_the_check_even_with_the_valid_bit() {
+        assert!(needs_check(STATE_ERROR));
+        assert!(needs_check(STATE_VALID | STATE_ERROR));
+    }
+
+    #[test]
+    fn any_other_bit_forces_the_check() {
+        for state in 0..=u16::MAX {
+            assert_eq!(needs_check(state), state != 1, "{state}");
+        }
     }
 }

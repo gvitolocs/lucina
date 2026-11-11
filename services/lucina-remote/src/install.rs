@@ -168,9 +168,16 @@ pub fn with_root(line: &str, device: &str, uuid: &str) -> String {
         .split_ascii_whitespace()
         .filter(|a| {
             !matches!(*a, "ro" | "rw")
-                && !["root=", "rootfstype=", "init=", "lucina.root.uuid=", "ufs=", "ufs.write="]
-                    .iter()
-                    .any(|k| a.starts_with(k))
+                && ![
+                    "root=",
+                    "rootfstype=",
+                    "init=",
+                    "lucina.root.uuid=",
+                    "ufs=",
+                    "ufs.write=",
+                ]
+                .iter()
+                .any(|k| a.starts_with(k))
         })
         .map(str::to_string)
         .collect();
@@ -196,8 +203,34 @@ pub fn root_of(config: &str) -> Option<(String, String)> {
             .strip_prefix('=')
     })?;
     let (args, _) = split_line(line.trim());
-    let value = |key: &str| args.split_ascii_whitespace().find_map(|a| a.strip_prefix(key));
-    Some((value("root=")?.to_string(), value("lucina.root.uuid=")?.to_string()))
+    let value = |key: &str| {
+        args.split_ascii_whitespace()
+            .find_map(|a| a.strip_prefix(key))
+    };
+    Some((
+        value("root=")?.to_string(),
+        value("lucina.root.uuid=")?.to_string(),
+    ))
+}
+
+/// What the old BOOT.CFG said about `pause` and `quiet`, in a line for the installer's log: a new value replaces them, and
+/// with `--pause 0` there is no boot-time choice any more. A key the file does not have is "absent" (the loader's default applies).
+pub fn old_boot_values(old: &str) -> String {
+    let find = |name: &str| {
+        old.lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.split_once('='))
+            .filter(|(k, _)| k.trim() == name)
+            .map(|(_, v)| v.trim().to_string())
+            .next_back()
+            .unwrap_or_else(|| "absent".to_string())
+    };
+    format!(
+        "BOOT.CFG had pause = {}, quiet = {} (absent = default)",
+        find("pause"),
+        find("quiet")
+    )
 }
 
 /// The new configuration: the old one with the kernel, the initramfs and, if given, the command line and the pause
@@ -337,7 +370,8 @@ mod tests {
 
     #[test]
     fn the_root_arguments_go_before_the_init_arguments_once() {
-        let line = "PATH=/bin ufs=probe ro maxcpus=1 -- /etc/lucina/remote.sh /etc/lucina/session.sh";
+        let line =
+            "PATH=/bin ufs=probe ro maxcpus=1 -- /etc/lucina/remote.sh /etc/lucina/session.sh";
         let a = with_root(line, "/dev/ufs0lun0p2", "aa");
         assert_eq!(
             a,
@@ -349,7 +383,10 @@ mod tests {
         assert_eq!(b.matches(" ro ").count(), 1);
         assert_eq!(b.matches(" -- ").count(), 1);
         let config = format!("kernel = K.IMG 0x1\ncmdline = {b}\n");
-        assert_eq!(root_of(&config), Some(("/dev/ufs0lun0p3".to_string(), "bb".to_string())));
+        assert_eq!(
+            root_of(&config),
+            Some(("/dev/ufs0lun0p3".to_string(), "bb".to_string()))
+        );
         assert_eq!(root_of("cmdline = maxcpus=1 -- x root=/dev/no\n"), None);
     }
 
@@ -362,13 +399,27 @@ mod tests {
         assert_eq!(rest, "/etc/lucina/remote.sh lucina.hostname=init-only");
         let b = with_root(&a, "/dev/ufs0lun0p3", "bb");
         assert_eq!(b.matches("lucina.hostname=").count(), 2, "{b}");
-        assert_eq!(b.split_once(" -- ").unwrap().0.matches("lucina.hostname=Juno001").count(), 1);
+        assert_eq!(
+            b.split_once(" -- ")
+                .unwrap()
+                .0
+                .matches("lucina.hostname=Juno001")
+                .count(),
+            1
+        );
     }
 
     #[test]
     fn a_given_host_name_stays() {
-        let a = with_root("PATH=/bin lucina.hostname=Other maxcpus=1 -- sh", "/dev/ufs0lun0p2", "aa");
-        assert!(a.starts_with("PATH=/bin lucina.hostname=Other maxcpus=1 "), "{a}");
+        let a = with_root(
+            "PATH=/bin lucina.hostname=Other maxcpus=1 -- sh",
+            "/dev/ufs0lun0p2",
+            "aa",
+        );
+        assert!(
+            a.starts_with("PATH=/bin lucina.hostname=Other maxcpus=1 "),
+            "{a}"
+        );
         assert!(!a.contains("Juno001"), "{a}");
     }
 
@@ -382,7 +433,10 @@ mod tests {
     #[test]
     fn dropping_quiet_leaves_the_rest() {
         let c = "# quiet = 1 in a comment stays\nkernel = K 0x1\nquiet = 1\ncmdline = a lucina.quiet=1 -- b\n";
-        assert_eq!(drop_quiet(c), "# quiet = 1 in a comment stays\nkernel = K 0x1\ncmdline = a lucina.quiet=1 -- b\n");
+        assert_eq!(
+            drop_quiet(c),
+            "# quiet = 1 in a comment stays\nkernel = K 0x1\ncmdline = a lucina.quiet=1 -- b\n"
+        );
     }
 
     #[test]
@@ -556,8 +610,26 @@ mod tests {
 
     #[test]
     fn the_generation_word_is_set_once_before_the_init_arguments() {
-        assert_eq!(with_generation("a lucina.generation=3 b -- /init x", 4), "a b lucina.generation=4 -- /init x");
+        assert_eq!(
+            with_generation("a lucina.generation=3 b -- /init x", 4),
+            "a b lucina.generation=4 -- /init x"
+        );
         assert_eq!(with_generation("a", 12), "a lucina.generation=12");
-        assert_eq!(with_generation("a -- lucina.generation=9", 1), "a lucina.generation=1 -- lucina.generation=9");
+        assert_eq!(
+            with_generation("a -- lucina.generation=9", 1),
+            "a lucina.generation=1 -- lucina.generation=9"
+        );
+    }
+
+    #[test]
+    fn the_old_pause_and_quiet_are_named_for_the_log() {
+        assert_eq!(
+            old_boot_values("kernel = K 0x1\npause = 15\nquiet = 1\n"),
+            "BOOT.CFG had pause = 15, quiet = 1 (absent = default)"
+        );
+        assert_eq!(
+            old_boot_values("# pause = 9\nkernel = K 0x1\n"),
+            "BOOT.CFG had pause = absent, quiet = absent (absent = default)"
+        );
     }
 }

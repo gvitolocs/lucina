@@ -7,6 +7,8 @@ src=drivers/lucina-ir3/src/delay.rs
 work=$(mktemp -d "${TMPDIR:-/tmp}/juno-ir3-delay-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
 fail=0
+refused=0
+weak=0
 try() {
     local from=$1 to=$2
     mkdir -p "$work/drivers/lucina-ir3/src" "$work/verification/juno-ir3-delay"
@@ -23,9 +25,21 @@ try() {
     if "$verus" "$work/verification/juno-ir3-delay/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED: $from -> $to"; fail=1
     else
-        echo "refused: $from -> $to ($(grep -c "^error" "$work/out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused: $from -> $to ($(grep -c "^error" "$work/out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $from -> $to ($(grep -c "^error" "$work/out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
+# The unchanged files must verify, or every "refused" below would mean nothing.
+if "$verus" verification/juno-ir3-delay/rules.rs > "$work/baseline" 2>&1; then
+    echo "baseline: verifies"
+else
+    cat "$work/baseline"; echo "mutants: the unchanged files do not verify"; exit 1
+fi
 try "pub const ALU_TO_ALU: u32 = 3;" "pub const ALU_TO_ALU: u32 = 2;"
 try "pub const NON_ALU: u32 = 6;" "pub const NON_ALU: u32 = 5;"
 try "pub const CAT3_SRC2_READ: u32 = 2;" "pub const CAT3_SRC2_READ: u32 = 1;"
@@ -39,4 +53,6 @@ try "Kind::Flow | Kind::Sfu | Kind::Tex | Kind::Mem => Need::Slots(NON_ALU)," "K
 try "Kind::Mad if src_n == 2 => Need::Slots(ALU_TO_ALU - CAT3_SRC2_READ)," "Kind::Mad if src_n == 1 => Need::Slots(ALU_TO_ALU - CAT3_SRC2_READ),"
 try "if gap > need as u64 { 0 } else { need as u64 + 1 - gap }" "if gap > need as u64 { 0 } else { need as u64 - gap }"
 try "if gap > need as u64 { 0 }" "if gap >= need as u64 { 0 }"
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit $fail

@@ -66,11 +66,7 @@ fn atan(t: f64) -> f64 {
     } else {
         atan_reduced(a)
     };
-    if neg {
-        -r
-    } else {
-        r
-    }
+    if neg { -r } else { r }
 }
 
 /// `atan` for |t| <= 1.
@@ -423,7 +419,11 @@ mod tests {
         let mm_s = v * 1_000_000.0 * 25.4 / 1000.0; // 0.2537 mm/s, below the 7 mm/s knee
         let p = |s: f64| (0.1 * s + 0.3) * 0.2968; // profile in the decel region
         let factor = (p(mm_s) + p(0.0) + 4.0 * p(mm_s / 2.0)) / 6.0; // Simpson over (v, 0)
-        assert!((x - 6.0 * factor).abs() < 1e-12, "x = {x}, expected {}", 6.0 * factor);
+        assert!(
+            (x - 6.0 * factor).abs() < 1e-12,
+            "x = {x}, expected {}",
+            6.0 * factor
+        );
         assert!((y - 8.0 * factor).abs() < 1e-12, "y = {y}");
 
         // After restart, the same first-motion rule, measured from the restart time.
@@ -466,10 +466,14 @@ mod tests {
         // touchpad_constant_filter: normalize_for_dpi, then baseline * TP_MAGIC_SLOWDOWN * normalized
         let ex = 0.9 * 0.2968 * (10.0 * 1000.0 / 406.0);
         let ey = 0.9 * 0.2968 * (-5.0 * 1000.0 / 406.0);
-        assert!((x - ex).abs() < 1e-12 && (y - ey).abs() < 1e-12, "({x}, {y})");
+        assert!(
+            (x - ex).abs() < 1e-12 && (y - ey).abs() < 1e-12,
+            "({x}, {y})"
+        );
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn sqrt_known_values() {
         assert_eq!(sqrt(0.0), 0.0);
         let cases = [

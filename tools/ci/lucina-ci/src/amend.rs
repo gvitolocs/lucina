@@ -13,6 +13,17 @@ use std::collections::BTreeSet;
 
 pub const LOG: &str = "docs/ci/spec-amendments.tsv";
 pub const REQUIRED_ENV: &str = "LUCINA_SPEC_AMEND_REQUIRED";
+/// Are amendments required? Yes, unless the switch is set explicitly to `0` (owner decision 2026-11-11: required by default; the
+/// switch used to be off until set to `1`). Any other value, or none, means required.
+pub fn required(env: Option<&str>) -> bool {
+    env.is_none_or(|v| v.trim() != "0")
+}
+/// The switch as the commands read it. At the MERGE GATE `LUCINA_SPEC_AMEND_REQUIRED=0` counts only together with the explicit token
+/// `legacy-amend:<reason>` in the merge allow (`LAGENT_ALLOW_SPEC_CHANGE`): an environment variable alone cannot reopen the legacy
+/// allow where it matters. Outside the gate (local checks) `=0` alone is enough.
+pub fn required_at(env: Option<&str>, merge_gate: bool, allow: &str) -> bool {
+    required(env) || (merge_gate && !crate::roles::allow_token(allow, "legacy-amend"))
+}
 pub const LEGACY_MARK: &str = "LEGACY ALLOW (no amendment)";
 
 pub const KINDS: &[&str] = &["relax", "change", "remove", "mutant"];
@@ -24,14 +35,18 @@ pub const EVIDENCE: &[&str] = &[
     "original-differs",
 ];
 pub const VERDICTS: &[&str] = &["accepted", "rejected", "escalated"];
+/// `gpt` is a known family (a record may name a GPT reviewer), but the owner bans Codex and GPT models on Lucina work: it is never a
+/// lane there. `qoder` is a family of its own: its default model (`efficient`) is Qoder's, not one of the others.
 pub const FAMILIES: &[&str] = &[
-    "claude", "gemini", "gpt", "qwen", "mistral", "deepseek", "glm", "other",
+    "claude", "gemini", "gpt", "qwen", "mistral", "deepseek", "glm", "qoder", "other",
 ];
 const FIELDS: usize = 12;
 const MUTANT_ALL: &[&str] = &["*mutants*", "*"];
 
 /// The model family of a model name, by substring of the lower-cased name (first match wins). Unknown names are `other`; two
-/// `other` models count as the SAME family, because nothing shows they differ.
+/// `other` models count as the SAME family, because nothing shows they differ. Lanes: claude = Sonnet/Opus/Fable/Haiku; qwen = local
+/// Qwen (`qcode`); mistral = Vibe; glm = ZCode and `zen-glm-flash`; deepseek = the free Zen lane only; qoder = `qodercli`; gpt = Codex
+/// and ChatGPT (banned on Lucina).
 pub fn family(model: &str) -> &'static str {
     let m = model.to_ascii_lowercase();
     let has = |ws: &[&str]| ws.iter().any(|w| m.contains(w));
@@ -49,6 +64,8 @@ pub fn family(model: &str) -> &'static str {
         "deepseek"
     } else if has(&["glm", "zcode", "z.ai"]) {
         "glm"
+    } else if has(&["qoder"]) {
+        "qoder"
     } else {
         "other"
     }

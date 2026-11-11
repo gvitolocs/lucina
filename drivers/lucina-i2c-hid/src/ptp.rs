@@ -272,7 +272,9 @@ impl PtpFormat {
                         }
                     }
                     DG_TIP_SWITCH | DG_IN_RANGE | DG_CONFIDENCE | DG_CONTACT_ID | GD_X | GD_Y => {
-                        let Some(i) = finger_index(&mut finger_logical, &mut f.nfingers, item.logical) else {
+                        let Some(i) =
+                            finger_index(&mut finger_logical, &mut f.nfingers, item.logical)
+                        else {
                             continue;
                         };
                         let finger = &mut f.fingers[i];
@@ -317,7 +319,9 @@ impl PtpFormat {
             }
             None => return,
         };
-        self.features[index].1 = self.features[index].1.max(item.bit_offset + item.size * item.count);
+        self.features[index].1 = self.features[index]
+            .1
+            .max(item.bit_offset + item.size * item.count);
         if item.constant || item.size == 0 {
             return;
         }
@@ -391,32 +395,38 @@ impl PtpFormat {
     /// whole (every other field 0, as Linux's report values start) if `mt_need_to_apply_feature` set a field in it:
     /// Input Mode to [`INPUT_MODE_TOUCHPAD`], Latency Mode, Surface Switch to `report.contacts`, Button Switch to
     /// `report.buttons`. Contact Count Maximum is not written (`MT_CLS_WIN_8` gives no `maxcontacts`).
-    pub fn mode_reports(&self, latency: Latency, report: ReportMode) -> impl Iterator<Item = ModeReport> + '_ {
+    pub fn mode_reports(
+        &self,
+        latency: Latency,
+        report: ReportMode,
+    ) -> impl Iterator<Item = ModeReport> + '_ {
         let values = [
             (self.input_mode, INPUT_MODE_TOUCHPAD),
             (self.latency, latency as u32),
             (self.surface_switch, u32::from(report.contacts)),
             (self.button_switch, u32::from(report.buttons)),
         ];
-        self.features[..self.nfeatures].iter().filter_map(move |&(id, bits)| {
-            let len = bits.div_ceil(8) as usize;
-            if len > MAX_MODE_REPORT {
-                return None;
-            }
-            let mut m = ModeReport {
-                report_id: id,
-                data: [0; MAX_MODE_REPORT],
-                len,
-            };
-            let mut any = false;
-            for (field, value) in values {
-                if let Some(field) = field.filter(|f| f.report_id == id) {
-                    put_bits(&mut m.data[..len], field.bit_offset, field.size, value);
-                    any = true;
+        self.features[..self.nfeatures]
+            .iter()
+            .filter_map(move |&(id, bits)| {
+                let len = bits.div_ceil(8) as usize;
+                if len > MAX_MODE_REPORT {
+                    return None;
                 }
-            }
-            any.then_some(m)
-        })
+                let mut m = ModeReport {
+                    report_id: id,
+                    data: [0; MAX_MODE_REPORT],
+                    len,
+                };
+                let mut any = false;
+                for (field, value) in values {
+                    if let Some(field) = field.filter(|f| f.report_id == id) {
+                        put_bits(&mut m.data[..len], field.bit_offset, field.size, value);
+                        any = true;
+                    }
+                }
+                any.then_some(m)
+            })
     }
 
     /// The maximum number of contacts, as `mt_feature_mapping` and `mt_touch_input_configured` settle it: the Contact
@@ -435,7 +445,10 @@ impl PtpFormat {
     /// Reads a feature field out of a feature report as GET_REPORT returned it (its ID first if it has one).
     pub fn read_feature(&self, field: FeatureField, report: &[u8]) -> Option<u32> {
         let payload = if field.report_id != 0 {
-            report.split_first().filter(|(id, _)| **id == field.report_id)?.1
+            report
+                .split_first()
+                .filter(|(id, _)| **id == field.report_id)?
+                .1
         } else {
             report
         };
@@ -449,7 +462,11 @@ impl PtpFormat {
 }
 
 /// The finger slot for an item in Logical collection `logical`: the one already filled from it, else the next.
-fn finger_index(logical: &mut [u32; MAX_FINGERS_PER_REPORT], n: &mut usize, of: u32) -> Option<usize> {
+fn finger_index(
+    logical: &mut [u32; MAX_FINGERS_PER_REPORT],
+    n: &mut usize,
+    of: u32,
+) -> Option<usize> {
     if let Some(i) = logical[..*n].iter().position(|&l| l == of) {
         return Some(i);
     }
@@ -475,7 +492,6 @@ fn put_bits(data: &mut [u8], offset: u32, size: u32, value: u32) {
         }
     }
 }
-
 
 /// `MT_TOOL_FINGER`, `MT_TOOL_PALM` (`include/uapi/linux/input.h`).
 pub const MT_TOOL_FINGER: i32 = 0;
@@ -521,7 +537,10 @@ pub struct Frame {
 impl Frame {
     /// Active slots, palms included.
     pub fn count(&self) -> usize {
-        self.slots[..self.num_slots].iter().filter(|s| s.active()).count()
+        self.slots[..self.num_slots]
+            .iter()
+            .filter(|s| s.active())
+            .count()
     }
 }
 
@@ -648,7 +667,11 @@ impl Contacts {
         if !self.format.is_touch_report(report) {
             return;
         }
-        let payload = if self.format.report_id != 0 { &report[1..] } else { report };
+        let payload = if self.format.report_id != 0 {
+            &report[1..]
+        } else {
+            report
+        };
         let f = self.format;
         let read = |s: Option<Scalar>| s.and_then(|s| s.read(payload));
         let scantime = read(f.scan_time).map(|v| v as u32).unwrap_or(0);
@@ -705,8 +728,17 @@ impl Contacts {
 
     /// `mt_process_slot` with MT_QUIRK_ALWAYS_VALID, _IGNORE_DUPLICATES, _HOVERING, _CONTACT_CNT_ACCURATE and
     /// _CONFIDENCE (the Win8 class on a Touch Pad application). Returns whether the contact counts as received.
-    fn process_slot(&mut self, finger: &FingerFields, payload: &[u8], event: &mut dyn FnMut(MtEvent)) -> bool {
-        if !takes_contact(self.format.contact_count.is_some(), self.num_received, self.num_expected) {
+    fn process_slot(
+        &mut self,
+        finger: &FingerFields,
+        payload: &[u8],
+        event: &mut dyn FnMut(MtEvent),
+    ) -> bool {
+        if !takes_contact(
+            self.format.contact_count.is_some(),
+            self.num_received,
+            self.num_expected,
+        ) {
             return false;
         }
         let read = |s: Option<Scalar>| s.and_then(|s| s.read(payload));
@@ -756,7 +788,13 @@ impl Contacts {
     }
 
     /// `input_mt_report_slot_state`.
-    fn report_slot_state(&mut self, n: usize, tool: i32, active: bool, event: &mut dyn FnMut(MtEvent)) {
+    fn report_slot_state(
+        &mut self,
+        n: usize,
+        tool: i32,
+        active: bool,
+        event: &mut dyn FnMut(MtEvent),
+    ) {
         self.slot_frame[n] = self.frame;
         if !active {
             self.slots[n].tracking_id = -1;
@@ -778,7 +816,14 @@ impl Contacts {
         self.staged_slot = n as i32;
     }
 
-    fn send_mt(&mut self, n: usize, which: usize, code: u16, value: i32, event: &mut dyn FnMut(MtEvent)) {
+    fn send_mt(
+        &mut self,
+        n: usize,
+        which: usize,
+        code: u16,
+        value: i32,
+        event: &mut dyn FnMut(MtEvent),
+    ) {
         if self.sent_mt[n][which] != Some(value) {
             if self.sent_slot != self.staged_slot {
                 self.sent_slot = self.staged_slot;
@@ -894,7 +939,12 @@ impl Contacts {
     }
 
     /// The sticky-finger timer at `now_us`: releases the contacts if no report came for [`STICKY_RELEASE_US`].
-    pub fn tick(&mut self, now_us: u64, frame: &mut dyn FnMut(&Frame), event: &mut dyn FnMut(MtEvent)) {
+    pub fn tick(
+        &mut self,
+        now_us: u64,
+        frame: &mut dyn FnMut(&Frame),
+        event: &mut dyn FnMut(MtEvent),
+    ) {
         if self.sticky_deadline().is_some_and(|d| now_us >= d) {
             self.release_all(frame, event);
         }
@@ -902,4 +952,4 @@ impl Contacts {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

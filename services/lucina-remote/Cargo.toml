@@ -20,6 +20,9 @@ lucina-release = { path = "../../services/lucina-release" }
 # The seed file's rules, proved with the kernel's (verification/juno-random).
 lucina-random = { path = "../../kernel/lucina-random" }
 zeroize = "1"
+# lucina-data writes one event when it had to check /data after an unclean end.
+lucina-evlog = { path = "../../kernel/lucina-evlog" }
+serde_json = "1"
 log = "0.4"
 
 [features]

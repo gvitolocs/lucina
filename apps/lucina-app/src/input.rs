@@ -44,6 +44,25 @@ pub const ABS_X: u16 = 0x00;
 pub const ABS_Y: u16 = 0x01;
 pub const ABS_MT_SLOT: u16 = 0x2f;
 
+/// Linux `struct input_event` (64-bit): macOS has no evdev, but the toolkit still compiles.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MacInputEvent {
+    time: MacTimeval,
+    type_: u16,
+    code: u16,
+    value: i32,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MacTimeval {
+    tv_sec: i64,
+    tv_usec: i64,
+}
+
 /// One `struct input_event`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Event {
@@ -213,7 +232,10 @@ impl Inputs {
                 self.skipped.push(node);
                 continue;
             }
+            #[cfg(not(target_os = "macos"))]
             let clock = libc::CLOCK_MONOTONIC;
+            #[cfg(target_os = "macos")]
+            let clock = libc::CLOCK_MONOTONIC as libc::c_int;
             // SAFETY: EVIOCSCLOCKID reads an int. Failing only leaves the event times in real time.
             unsafe { libc::ioctl(fd, eviocs(0xa0, 4) as _, &clock as *const libc::c_int) };
             let (name, name_ioctl) = device_name(fd).unwrap_or_else(|| ("input device".into(), -1));
@@ -257,7 +279,10 @@ impl Inputs {
     /// Everything readable now, per device index. Devices that fail (unplugged) are dropped;
     /// returns whether one was.
     pub fn read(&mut self, out: &mut Vec<(usize, Event)>) -> bool {
+        #[cfg(not(target_os = "macos"))]
         const SIZE: usize = std::mem::size_of::<libc::input_event>();
+        #[cfg(target_os = "macos")]
+        const SIZE: usize = std::mem::size_of::<MacInputEvent>();
         let mut buf = [0u8; SIZE * 32];
         let mut gone = Vec::new();
         for (i, d) in self.devices.iter_mut().enumerate() {
@@ -271,7 +296,11 @@ impl Inputs {
                         for chunk in buf[..n].as_chunks::<SIZE>().0 {
                             // SAFETY: input_event is plain integers; read_unaligned copes with the
                             // byte buffer's alignment.
+                            #[cfg(not(target_os = "macos"))]
                             let ev: libc::input_event =
+                                unsafe { std::ptr::read_unaligned(chunk.as_ptr().cast()) };
+                            #[cfg(target_os = "macos")]
+                            let ev: MacInputEvent =
                                 unsafe { std::ptr::read_unaligned(chunk.as_ptr().cast()) };
                             out.push((
                                 i,
@@ -354,6 +383,7 @@ mod tests {
         // EVIOCGBIT(EV_REL, 2), as the kernel headers spell it.
         assert_eq!(eviocg(0x20 + EV_REL as u32, 2), 0x8002_4522);
         assert_eq!(eviocs(0xa0, 4), 0x4004_45a0);
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(std::mem::size_of::<libc::input_event>(), 24);
     }
 
@@ -385,8 +415,10 @@ mod tests {
         assert_eq!(inputs.next_rescan(start + Duration::from_secs(20)), None);
         assert!(!inputs.rescan(start + Duration::from_secs(20)));
 
-        let mut inputs = Inputs::default();
-        inputs.started = Some(start);
+        let inputs = Inputs {
+            started: Some(start),
+            ..Default::default()
+        };
         assert_eq!(
             inputs.next_rescan(start + Duration::from_secs(20)),
             Some(start + Duration::from_secs(20) + Duration::from_secs(2))

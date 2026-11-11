@@ -15,7 +15,9 @@ make_verus_input() {
     printf 'use vstd::prelude::*;\nverus! {\n%s\n}\nfn main() {}\n' "$body"
 }
 
-# The unchanged file must verify, or nothing below means anything.
+# Each unchanged file must verify, or nothing below means anything. Both baselines run before the first
+# mutant: the verdict wants the one `baseline: verifies` line ahead of any `refused` it can attribute to
+# neither file in particular.
 base() {
     make_verus_input "$rules" > "$work/base.rs"
     if ! "$verus" "$work/base.rs" > "$work/base.out" 2>&1; then
@@ -23,11 +25,17 @@ base() {
         cat "$work/base.out"
         exit 1
     fi
-    echo "base verifies: $rules"
+    echo "baseline file ok: $rules"
 }
 base
+rules=kernel/lucina-crash/src/waits.rs
+base
+rules=kernel/lucina-crash/src/layout.rs
+echo "baseline: verifies"
 
 fail=0
+refused=0
+weak=0
 try() {
     local from=$1 to=$2
     local text; text=$(<"$rules")
@@ -45,7 +53,13 @@ try() {
         cat "$work/verus.out"
         fail=1
     else
-        echo "refused: $from -> $to ($(grep -c "^error" "$work/verus.out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/verus.out" && ! grep -q 'error\[E' "$work/verus.out"; then
+            refused=$((refused + 1))
+            echo "refused: $from -> $to ($(grep -c "^error" "$work/verus.out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $from -> $to ($(grep -c "^error" "$work/verus.out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
 # Records stay a sixteenth in whole pages, consoles leave room for the records and the reserve, format 4's tail is reserved.
@@ -66,7 +80,6 @@ try "    v4 <= v3" "    v4 < v3"
 # The wait-chain reader: a holder neither waits nor idles, the search starts at `from` and names the CPU it checked, and one
 # lock is reported only when every waiter waits on it.
 rules=kernel/lucina-crash/src/waits.rs
-base
 try "        && waiting[cpu] == 0
         && !in_wfi[cpu]" \
     "        && waiting[cpu] == 0"
@@ -79,4 +92,6 @@ try "            } else if lock != found {" "            } else if lock == found
 try "                found = lock;
                 first = k;" "                found = lock;"
 try "        Some(waiting[first])" "        Some(waiting[0])"
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit "$fail"

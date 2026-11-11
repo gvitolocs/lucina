@@ -6,6 +6,8 @@ verus=${VERUS:-/home/user/tools/verus/verus-x86-linux/verus}
 work=$(mktemp -d "${TMPDIR:-/tmp}/juno-disk-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
 fail=0
+refused=0
+weak=0
 try() {
     local file=$1 from=$2 to=$3
     mkdir -p "$work/services/lucina-remote/src" "$work/drivers/lucina-ufs/src" "$work/kernel/lucina-boot/src" "$work/verification/juno-disk"
@@ -24,9 +26,21 @@ try() {
     if "$verus" "$work/verification/juno-disk/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED: $from -> $to"; fail=1
     else
-        echo "refused: $from -> $to ($(grep -c '^error' "$work/out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused: $from -> $to ($(grep -c '^error' "$work/out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $from -> $to ($(grep -c '^error' "$work/out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
+# The unchanged files must verify, or every "refused" below would mean nothing.
+if "$verus" verification/juno-disk/rules.rs > "$work/baseline" 2>&1; then
+    echo "baseline: verifies"
+else
+    cat "$work/baseline"; echo "mutants: the unchanged files do not verify"; exit 1
+fi
 R=services/lucina-remote/src/disk_rules.rs
 U=drivers/lucina-ufs/src/write_rule.rs
 B=kernel/lucina-boot/src/trial.rs
@@ -70,4 +84,6 @@ try $B '} else if have_previous {' '} else if false {'
 try $B 'tries: SETTLE_BAD, settle: r.settle - 1' 'tries: SETTLE_BAD, settle: r.settle'
 try $B 'tries: SETTLE_BAD, settle: SETTLE_BOOTS }' 'tries: SETTLE_BAD, settle: 0 }'
 [ "$fail" = 0 ] && echo "mutants: every planted bug was refused" || echo "mutants: FAILED"
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit $fail

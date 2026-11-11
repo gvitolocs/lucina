@@ -9,9 +9,7 @@ use crate::mru_rules;
 /// How many live apps the switcher order can hold at most.
 pub const MAX_APPS: usize = mru_rules::MAX;
 
-/// A running application.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AppId(pub u16);
+pub use crate::mru_rules::AppId;
 
 /// The most-recently-used order of the live apps: `ids[0]` is the focused app, the rest are ordered by how recently they were
 /// focused. GNOME Shell's `Alt+Tab` list.
@@ -62,14 +60,7 @@ impl Mru {
 
     /// The place of `id` in the order, None when the app does not run.
     pub fn index_of(&self, id: AppId) -> Option<usize> {
-        let mut i = 0;
-        while i < self.len {
-            if self.ids[i] == id {
-                return Some(i);
-            }
-            i += 1;
-        }
-        None
+        mru_rules::index_of(&self.ids, self.len, id)
     }
 
     /// Whether `id` runs.
@@ -81,28 +72,12 @@ impl Mru {
     /// order of the others is kept (GNOME Shell). Returns false, leaving the order untouched, only when the app is absent and
     /// the list is already full.
     pub fn focus(&mut self, id: AppId) -> bool {
-        match self.index_of(id) {
-            Some(i) => mru_rules::move_to_front(&mut self.ids, self.len, i),
-            None => {
-                if self.len == MAX_APPS {
-                    return false;
-                }
-                mru_rules::push_front(&mut self.ids, self.len, id);
-                self.len += 1;
-            }
-        }
-        true
+        mru_rules::focus(&mut self.ids, &mut self.len, id)
     }
 
     /// App ended: it leaves the order, the others keep their places. Returns whether the app was live.
     pub fn remove(&mut self, id: AppId) -> bool {
-        let from = match self.index_of(id) {
-            Some(i) => i,
-            None => return false,
-        };
-        mru_rules::remove_at(&mut self.ids, self.len, from);
-        self.len -= 1;
-        true
+        mru_rules::remove(&mut self.ids, &mut self.len, id).is_some()
     }
 }
 
@@ -165,33 +140,15 @@ impl Switcher {
     /// An app ended while the switcher was open: it leaves the snapshot and the selection stays on the same app when that is
     /// still possible, otherwise it lands on the next app, wrapping around at the end.
     pub fn remove(&mut self, id: AppId) {
-        let from = match self.index_of(id) {
+        let from = match mru_rules::remove(&mut self.items, &mut self.len, id) {
             Some(i) => i,
             None => return,
         };
-        let mut i = from;
-        while i + 1 < self.len {
-            self.items[i] = self.items[i + 1];
-            i += 1;
-        }
-        self.len -= 1;
         if from < self.sel {
             self.sel -= 1;
         } else if from == self.sel && self.sel >= self.len {
             self.sel = 0;
         }
-    }
-
-    /// Index of `id` in the snapshot, None when it is not there.
-    fn index_of(&self, id: AppId) -> Option<usize> {
-        let mut i = 0;
-        while i < self.len {
-            if self.items[i] == id {
-                return Some(i);
-            }
-            i += 1;
-        }
-        None
     }
 }
 
@@ -288,6 +245,55 @@ mod tests {
         assert!(m.focus(AppId(999)));
         assert_eq!(m.front(), Some(AppId(999)));
         assert_eq!(m.len(), MAX_APPS);
+    }
+
+    #[test]
+    fn index_of_finds_the_first_place_or_none() {
+        let m = mru_back(&[A, B, C]);
+        assert_eq!(m.index_of(A), Some(0));
+        assert_eq!(m.index_of(C), Some(2));
+        assert_eq!(m.index_of(D), None);
+        assert_eq!(Mru::new().index_of(A), None);
+    }
+
+    #[test]
+    fn focus_through_the_rules_reports_whether_the_app_is_first() {
+        let mut m = Mru::new();
+        assert!(m.focus(A));
+        assert!(m.focus(B));
+        assert!(m.focus(A));
+        assert_eq!(m.as_slice(), &[A, B]);
+        let mut full = Mru::new();
+        let mut k: u16 = 0;
+        while k < MAX_APPS as u16 {
+            assert!(full.focus(AppId(k)));
+            k += 1;
+        }
+        let before = full;
+        assert!(!full.focus(D));
+        assert_eq!(full, before);
+        assert!(full.focus(AppId(3)));
+        assert_eq!(full.front(), Some(AppId(3)));
+        assert_eq!(full.len(), MAX_APPS);
+    }
+
+    #[test]
+    fn remove_returns_the_place_the_app_had() {
+        let mut ids = [AppId(0); MAX_APPS];
+        let mut len = 0;
+        let mut k = 0;
+        while k < 4 {
+            ids[k] = AppId(k as u16 + 1);
+            len += 1;
+            k += 1;
+        }
+        assert_eq!(mru_rules::remove(&mut ids, &mut len, AppId(3)), Some(2));
+        assert_eq!(len, 3);
+        assert_eq!(&ids[0..len], &[AppId(1), AppId(2), AppId(4)]);
+        assert_eq!(mru_rules::remove(&mut ids, &mut len, AppId(3)), None);
+        assert_eq!(len, 3);
+        assert_eq!(mru_rules::remove(&mut ids, &mut len, AppId(1)), Some(0));
+        assert_eq!(&ids[0..len], &[AppId(2), AppId(4)]);
     }
 
     #[test]

@@ -21,8 +21,10 @@ if ! "$verus" "$work/base.rs" > "$work/base.out" 2>&1; then
     cat "$work/base.out"
     exit 1
 fi
+echo "baseline: verifies"
 
 fail=0
+weak=0
 killed=0
 try() {
     local from=$1 to=$2
@@ -39,8 +41,13 @@ try() {
         echo "NOT REFUSED: $from -> $to"
         fail=1
     else
-        echo "refused: $from -> $to"
-        killed=$((killed + 1))
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/verus.out" && ! grep -q 'error\[E' "$work/verus.out"; then
+            echo "refused: $from -> $to"
+            killed=$((killed + 1))
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $from -> $to"
+            weak=$((weak+1))
+        fi
     fi
 }
 # Progress and interpolation: done must be exactly done, the ends exact, nothing past them.
@@ -71,4 +78,6 @@ try "    Box2 { x: a.start, y: b.start, w: a.len, h: b.len }" "    Box2 { x: a.s
 try "    Box2 { x: a.start, y: b.start, w: a.len, h: b.len }" "    Box2 { x: a.start, y: a.start, w: a.len, h: b.len }"
 try "&& y as i64 <= b.y as i64 && b.y as i64 + b.h as i64 <= y as i64 + h as i64" "&& y as i64 <= b.y as i64"
 echo "$killed mutants refused"
+echo "mutants: $killed refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit "$fail"

@@ -101,12 +101,15 @@ impl Tracker {
         (self.head + i) % MAX_SAMPLES
     }
 
-    /// Adds a delta. A timestamp older than the newest sample is ignored; samples older than `newest - HISTORY_US` are dropped.
-    /// When the ring is full the oldest sample is overwritten.
+    /// Adds a delta. A timestamp older than the newest sample (a timer-emitted record can overtake the next frame's) keeps its
+    /// delta and is stored with the newest timestamp, so `pos` is always the sum of all deltas and the window stays ordered.
+    /// Samples older than `newest - HISTORY_US` are dropped. When the ring is full the oldest sample is overwritten.
     pub fn push(&mut self, delta: f64, time_us: u64) {
-        if self.len > 0 && time_us < self.times[self.idx(self.len - 1)] {
-            return;
-        }
+        let time_us = if self.len > 0 {
+            time_us.max(self.times[self.idx(self.len - 1)])
+        } else {
+            time_us
+        };
         self.pos += delta;
         if self.len == MAX_SAMPLES {
             self.head = (self.head + 1) % MAX_SAMPLES;
@@ -259,12 +262,30 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_ignored() {
+    fn out_of_order_keeps_delta_with_newest_time() {
         let mut t = steady();
         let pos = t.pos();
         t.push(50.0, 5_000);
-        assert_eq!(t.pos(), pos);
-        assert!(close(t.velocity(), 200.0));
+        assert!(close(t.pos(), pos + 50.0));
+        // stored at 100 ms: the span is unchanged, the late delta joins the sum.
+        assert!(t.velocity().is_finite());
+        assert!(close(t.velocity(), (20.0 + 50.0) / 0.1));
+        // zero time span still gives 0
+        let mut z = Tracker::new();
+        z.push(1.0, 1000);
+        z.push(2.0, 500);
+        assert!(close(z.pos(), 3.0));
+        assert_eq!(z.velocity(), 0.0);
+        // the window still drops samples older than 150 ms relative to the newest time
+        let mut w = steady();
+        w.push(1.0, 5_000);
+        w.push(1.0, 260_000);
+        // newest 260 ms: the samples at 100 ms (the late one included) are 160 ms old and go.
+        assert_eq!(w.len(), 1);
+        assert_eq!(w.velocity(), 0.0);
+        w.push(1.0, 250_000);
+        assert_eq!(w.len(), 2);
+        assert!(w.velocity().is_finite());
     }
 
     #[test]

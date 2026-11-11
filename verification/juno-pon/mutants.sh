@@ -22,8 +22,11 @@ if ! "$verus" "$work/base.rs" > "$work/base.out" 2>&1; then
     cat "$work/base.out"
     exit 1
 fi
+echo "baseline: verifies"
 
 fail=0
+refused=0
+weak=0
 try() {
     local from=$1 to=$2
     local text; text=$(<"$rules")
@@ -41,7 +44,13 @@ try() {
         cat "$work/verus.out"
         fail=1
     else
-        echo "refused: $from -> $to ($(grep -c "^error" "$work/verus.out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/verus.out" && ! grep -q 'error\[E' "$work/verus.out"; then
+            refused=$((refused + 1))
+            echo "refused: $from -> $to ($(grep -c "^error" "$work/verus.out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $from -> $to ($(grep -c "^error" "$work/verus.out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
 # The PMIC: the POFF sequence wins over FAULT, each register has its own place in the reason table, the first set bit is the reason.
@@ -50,4 +59,6 @@ try "        Some((fault, 16))" "        Some((fault, 15))"
 try "        if (v >> b) & 1 == 1 {" "        if (v >> b) & 1 == 0 {"
 try "        b += 1;" "        b += 2;"
 try "            Some(b) => Some(o + b)," "            Some(b) => Some(o + b + 1),"
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit "$fail"

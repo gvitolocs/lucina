@@ -7,6 +7,8 @@ src=drivers/lucina-adreno/src/power.rs
 work=$(mktemp -d "${TMPDIR:-/tmp}/juno-gpu-power-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
 fail=0
+refused=0
+weak=0
 try() {
     local from=$1 to=$2
     mkdir -p "$work/drivers/lucina-adreno/src" "$work/verification/juno-gpu-power"
@@ -23,9 +25,21 @@ try() {
     if "$verus" "$work/verification/juno-gpu-power/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED: $from -> $to"; fail=1
     else
-        echo "refused: $from -> $to ($(grep -c "^error" "$work/out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused: $from -> $to ($(grep -c "^error" "$work/out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $from -> $to ($(grep -c "^error" "$work/out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
+# The unchanged files must verify, or every "refused" below would mean nothing.
+if "$verus" verification/juno-gpu-power/rules.rs > "$work/baseline" 2>&1; then
+    echo "baseline: verifies"
+else
+    cat "$work/baseline"; echo "mutants: the unchanged files do not verify"; exit 1
+fi
 # A suspended GPU written to without a resume: the submit-against-suspend race.
 try 'State::Suspended => Action::ResumeThenRun,' 'State::Suspended => Action::Run,'
 # A failed GPU taking batches.
@@ -46,4 +60,6 @@ try 'let last_busy_ms = if now_ms > p.last_busy_ms { now_ms } else { p.last_busy
 try 'if active && !p.busy && p.idle_ms > 0 {' 'if p.idle_ms > 0 {'
 # The command line taking more than a minute.
 try 'if ms == 0 || ms > 60000 { None } else { Some(ms) }' 'if ms == 0 { None } else { Some(ms) }'
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit $fail

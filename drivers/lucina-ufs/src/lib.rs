@@ -12,6 +12,7 @@
 //! * [`gpt`]: the partition table, read for the bring-up log.
 //! * [`cache`]: whether a unit keeps writes in a volatile cache (MODE SENSE page 08), read for the boot log.
 //! * [`policy`]: which logical unit may be written (only the main user LUN) and which commands may reach a unit.
+//! * [`irq_wait`]: the capped sleep on the controller's interrupt and what a sleep that ended without one means.
 //! * [`host`]: the controller: probe, reuse of the firmware's link or full bring-up, queries, SCSI commands.
 //!
 //! One request is in flight at a time, in slot 0, and completion is polled: enough for a block device served by one
@@ -32,6 +33,7 @@ pub mod desc;
 mod error;
 pub mod gpt;
 pub mod host;
+pub mod irq_wait;
 pub mod policy;
 pub mod regs;
 pub mod scsi;
@@ -45,6 +47,7 @@ mod tests;
 
 pub use error::Error;
 pub use host::{
-    Clock, DataSegment, DmaArea, Host, LinkState, Options, Probe, Regs, ResetPolicy, Started, Unit,
+    Clock, DataSegment, DmaArea, Host, IrqWait, LinkState, Options, Probe, Regs, ResetPolicy,
+    Started, Unit,
 };
 pub use policy::{UnitRole, WritePolicy};

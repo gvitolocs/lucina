@@ -10,6 +10,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/juno-sleep-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
 src=kernel/lucina-sleep/src/lib.rs
 fail=0 refused=0 total=0
+weak=0
 try() {
     local name=$1; shift
     total=$((total + 1))
@@ -31,10 +32,21 @@ try() {
     if "$verus" "$work/verification/juno-sleep/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED: $name"; fail=1
     else
-        refused=$((refused + 1))
-        echo "refused: $name ($(grep -c "^error" "$work/out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused: $name ($(grep -c "^error" "$work/out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $name ($(grep -c "^error" "$work/out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
+# The unchanged files must verify, or every "refused" below would mean nothing.
+if "$verus" verification/juno-sleep/rules.rs > "$work/baseline" 2>&1; then
+    echo "baseline: verifies"
+else
+    cat "$work/baseline"; echo "mutants: the unchanged files do not verify"; exit 1
+fi
 # The order.
 try "two steps swapped in step_at" '    } else if i == 1 {
         Step::Input' '    } else if i == 1 {
@@ -84,4 +96,6 @@ try "the other port's PD pin wrong" 'pub const PDIC0_PIN: u32 = 50;' 'pub const 
 try "the PD pins' CFG words dropped from the spec" '        || offset == 0x110 + 4 * 42 || offset == 0x110 + 4 * 50
 ' ''
 echo "$refused of $total refused"
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit $fail

@@ -12,6 +12,9 @@
 //! - [`layouts`]: the same concept on Juno (the laptop), Diana as a tablet (both orientations) and Fortuna (the DSi).
 
 pub mod anim;
+// browser_rules.rs is what Verus reads, as rules.rs is.
+#[allow(clippy::manual_is_multiple_of, clippy::manual_div_ceil)]
+pub mod browser_rules;
 pub mod canvas;
 pub mod home;
 // home_rules.rs is what Verus reads, as rules.rs is.
@@ -44,16 +47,42 @@ pub struct Paint<'a> {
 impl Paint<'_> {
     /// Text with its baseline at `y`.
     #[allow(clippy::too_many_arguments)]
-    pub fn text(&mut self, f: Font, (size, tracking): (f32, f32), x: f32, y: f32, c: Color, s: &str) -> f32 {
+    pub fn text(
+        &mut self,
+        f: Font,
+        (size, tracking): (f32, f32),
+        x: f32,
+        y: f32,
+        c: Color,
+        s: &str,
+    ) -> f32 {
         self.ty.draw(self.cv, f, size, tracking, x, y, c, s)
     }
 
-    pub fn text_right(&mut self, f: Font, (size, tracking): (f32, f32), right: f32, y: f32, c: Color, s: &str) {
-        self.ty.draw_right(self.cv, f, size, tracking, right, y, c, s)
+    pub fn text_right(
+        &mut self,
+        f: Font,
+        (size, tracking): (f32, f32),
+        right: f32,
+        y: f32,
+        c: Color,
+        s: &str,
+    ) {
+        self.ty
+            .draw_right(self.cv, f, size, tracking, right, y, c, s)
     }
 
-    pub fn text_centered(&mut self, f: Font, (size, tracking): (f32, f32), cx: f32, y: f32, c: Color, s: &str) {
-        self.ty.draw_centered(self.cv, f, size, tracking, cx, y, c, s)
+    pub fn text_centered(
+        &mut self,
+        f: Font,
+        (size, tracking): (f32, f32),
+        cx: f32,
+        y: f32,
+        c: Color,
+        s: &str,
+    ) {
+        self.ty
+            .draw_centered(self.cv, f, size, tracking, cx, y, c, s)
     }
 
     pub fn measure(&mut self, f: Font, (size, tracking): (f32, f32), s: &str) -> f32 {
@@ -70,10 +99,24 @@ impl Paint<'_> {
         // The longest prefix that fits with the ellipsis, by halving.
         while lo < hi {
             let mid = (lo + hi).div_ceil(2);
-            let t: String = chars[..mid].iter().collect::<String>().trim_end().to_string() + "…";
-            if self.measure(f, st, &t) <= max { lo = mid } else { hi = mid - 1 }
+            let t: String = chars[..mid]
+                .iter()
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+                + "…";
+            if self.measure(f, st, &t) <= max {
+                lo = mid
+            } else {
+                hi = mid - 1
+            }
         }
-        chars[..lo].iter().collect::<String>().trim_end().to_string() + "…"
+        chars[..lo]
+            .iter()
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+            + "…"
     }
 
     /// A glass panel: the backdrop through it when there is one, else a translucent fill.
@@ -89,6 +132,7 @@ impl Paint<'_> {
 
     /// A soft shadow under a floating rectangle.
     pub fn shadow(&mut self, r: R, rad: f32, lift: f32) {
-        self.cv.fill_rrect_soft(r.offset(0.0, lift * 0.6), rad, lift, tokens::color::SHADOW);
+        self.cv
+            .fill_rrect_soft(r.offset(0.0, lift * 0.6), rad, lift, tokens::color::SHADOW);
     }
 }

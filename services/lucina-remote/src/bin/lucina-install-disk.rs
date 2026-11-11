@@ -84,7 +84,8 @@ use lucina_remote::{
     image::{self, Extent, read_extent, sum_extent_head, uuid_hex},
     install::{
         LAPTOP_ESP, config_block, generation, initrd_name, is_generated, kernel_name,
-        loader_knows_quiet, named_files, new_config, root_of, with_generation, with_root,
+        loader_knows_quiet, named_files, new_config, old_boot_values, root_of, with_generation,
+        with_root,
     },
     netinst::{self, VerifiedChunks},
     netinst_rules,
@@ -731,6 +732,8 @@ fn install_from(opts: &Options, mut input: impl BufRead) -> Result<(), String> {
         Some((slot, a, b, line)) => Some(with_root(line, &device_of(*slot, a, b), &"0".repeat(32))),
         None => opts.cmdline.clone(),
     };
+    // The values this install replaces, for the log: with --pause 0 the boot has no choice menu any more.
+    println!("{}", old_boot_values(&old));
     let probe = new_config(
         &old,
         next,

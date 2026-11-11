@@ -1,0 +1,13 @@
+[package]
+name = "lucina-apple-uart"
+version = "0.1.0"
+description = "Apple S5L UART (MacBook Air M4 = apple,s5l-uart at 0x3ad200000): polled transmit and receive and the S5L interrupt bits over a register trait; no_std, unsafe-free, host-tested"
+# Derived behaviour from Asahi Linux's drivers/tty/serial/samsung_tty.c, which says SPDX GPL-2.0 (only), so this crate is
+# GPL-2.0-only and not "or later"; see README.md.
+license = "GPL-2.0-only"
+# Spelled out rather than taken from the workspace, like the other kernel-side crates: the kernel build copies such a crate into
+# the Asterinas tree (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

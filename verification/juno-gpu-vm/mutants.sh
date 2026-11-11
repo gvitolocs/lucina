@@ -7,6 +7,8 @@ src=drivers/lucina-adreno/src/gpu_rules.rs
 work=$(mktemp -d "${TMPDIR:-/tmp}/juno-gpu-vm-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
 fail=0
+refused=0
+weak=0
 try() {
     local from=$1 to=$2
     mkdir -p "$work/drivers/lucina-adreno/src" "$work/verification/juno-gpu-vm"
@@ -23,9 +25,21 @@ try() {
     if "$verus" "$work/verification/juno-gpu-vm/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED: $from -> $to"; fail=1
     else
-        echo "refused: $from -> $to ($(grep -c "^error" "$work/out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused: $from -> $to ($(grep -c "^error" "$work/out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $from -> $to ($(grep -c "^error" "$work/out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
+# The unchanged files must verify, or every "refused" below would mean nothing.
+if "$verus" verification/juno-gpu-vm/rules.rs > "$work/baseline" 2>&1; then
+    echo "baseline: verifies"
+else
+    cat "$work/baseline"; echo "mutants: the unchanged files do not verify"; exit 1
+fi
 # A program's object over the kernel's first 2 MiB (its fence page) or the stub's slots.
 try "&& iova >= BO_BASE && len <= VA_END" "&& iova >= FENCE_IOVA && len <= VA_END"
 try "&& iova >= BO_BASE && len <= VA_END" "&& len <= VA_END"
@@ -63,4 +77,6 @@ try "    last_use <= retired
 try "        0x20_0000
     } else {" "        0x40_0000
     } else {"
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit $fail

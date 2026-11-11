@@ -60,9 +60,11 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use lucina_qcom_soc::io::{Delay, RegIo};
 
-/// What Linux keeps once per DRV in `struct rsc_drv`: `drv->lock` and `drv->tcs_in_use`. The kernel builds an [`Rsc`] in
-/// each driver that votes (Wi-Fi's modem, audio, Venus, the SD rails), all on the same DRV; without one lock and one
-/// in-use mask they took TCS 0 at the same time. Every [`Rsc`] whose [`RscConfig::bus`] names this shares both.
+/// What Linux keeps once per DRV in `struct rsc_drv`: `drv->lock` and `drv->tcs_in_use`. The kernel used to build an [`Rsc`]
+/// in each driver that votes (Wi-Fi's modem, audio, Venus, the SD rails), all on the same DRV; without one lock and one
+/// in-use mask they took TCS 0 at the same time. Every [`Rsc`] whose [`RscConfig::bus`] names this shares both. The kernel
+/// now has one [`Rsc`] for the DRV, in a [`Drv`], whose lock is the one its transactions wait on; this stays as the guard
+/// should a second handle ever be made.
 ///
 /// Linux holds the lock while it claims a TCS and writes it, and releases it before the wait, so two requests can be in
 /// flight on the two ACTIVE TCSes. Here the lock is held through the wait too (no interrupt to finish a request from),
@@ -152,6 +154,76 @@ pub const RPMH_TIMEOUT_MS: u32 = 10_000;
 
 /// The [`Bus`] of the Galaxy Book Go's `drv-2`, the one DRV every voting driver of this kernel uses.
 pub static GALAXY_BOOK_GO_DRV2_BUS: Bus = Bus::new();
+
+/// A DRV's register window behind a box, so that drivers whose own register types differ can share one [`Drv`].
+pub struct Window(pub alloc::boxed::Box<dyn RegIo + Send>);
+
+impl RegIo for Window {
+    fn read32(&self, off: u32) -> u32 {
+        self.0.read32(off)
+    }
+
+    fn write32(&self, off: u32, value: u32) {
+        self.0.write32(off, value)
+    }
+}
+
+/// Linux's one `struct rsc_drv` per DRV, for a whole kernel: the one [`Rsc`] every driver voting on the DRV uses, probed once
+/// (`rpmh_rsc_probe`), and the lock each transaction takes (`drv->lock` of `rpmh_rsc_send_data`).
+///
+/// [`Drv::with`] holds the lock for what its closure does, and callers give it one transaction: a request's TCS write, trigger
+/// and wait for completion ([`Rsc::send`]), one `rpmh_flush` ([`crate::rpmh::Cache::flush`]) or one read of the slots
+/// ([`Rsc::slots`]). Linux lets go of `drv->lock` before the wait, which its interrupt ends; here nothing but the poll ends a
+/// request, so the lock is held through the wait, as [`Bus`] already was. Waiting for the lock sleeps in 1 ms steps of the
+/// caller's [`Delay`]: it may sleep, so never from interrupt context or the idle path.
+pub struct Drv {
+    rsc: spin::Mutex<Option<Rsc<Window>>>,
+}
+
+impl Drv {
+    pub const fn new() -> Self {
+        Drv {
+            rsc: spin::Mutex::new(None),
+        }
+    }
+
+    fn lock(&self, delay: &impl Delay) -> spin::MutexGuard<'_, Option<Rsc<Window>>> {
+        loop {
+            if let Some(held) = self.rsc.try_lock() {
+                return held;
+            }
+            delay.sleep_ms(1);
+        }
+    }
+
+    /// The probe, once: the first caller's `probe` makes the [`Rsc`], under the lock; a later call finds it and probes nothing.
+    pub fn open<E>(
+        &self,
+        delay: &impl Delay,
+        probe: impl FnOnce() -> Result<Rsc<Window>, E>,
+    ) -> Result<(), E> {
+        let mut held = self.lock(delay);
+        if held.is_none() {
+            *held = Some(probe()?);
+        }
+        Ok(())
+    }
+
+    /// `f` on the one [`Rsc`] with the lock held, then the lock let go; `None` before [`Drv::open`]. Give it one transaction.
+    pub fn with<T>(&self, delay: &impl Delay, f: impl FnOnce(&mut Rsc<Window>) -> T) -> Option<T> {
+        self.lock(delay).as_mut().map(f)
+    }
+}
+
+impl Default for Drv {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The one [`Rsc`] of the Galaxy Book Go's `drv-2`, for every driver of the kernel (Wi-Fi's modem, the vote table, Venus, the SD
+/// rails).
+pub static GALAXY_BOOK_GO_DRV2_RSC: Drv = Drv::new();
 
 /// Register offsets of layout version 2.7 (`rpmh_rsc_reg_offset_ver_2_7`) and the fixed `RSC_DRV_ID`.
 ///

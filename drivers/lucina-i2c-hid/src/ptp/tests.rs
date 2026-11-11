@@ -26,7 +26,17 @@ pub(crate) fn format() -> PtpFormat {
 
 /// Report 1 as the descriptor lays it out: tip bit 0, confidence bit 1, contact ID bits 2-4, X 8-23, Y 24-39, scan time
 /// 40-55, contact count 56-63, button 1 bit 64.
-pub(crate) fn report(tip: bool, confidence: bool, id: u8, x: u16, y: u16, scan: u16, count: u8, button: bool) -> [u8; 10] {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn report(
+    tip: bool,
+    confidence: bool,
+    id: u8,
+    x: u16,
+    y: u16,
+    scan: u16,
+    count: u8,
+    button: bool,
+) -> [u8; 10] {
     let b0 = u8::from(tip) | u8::from(confidence) << 1 | (id & 7) << 2;
     let [x0, x1] = x.to_le_bytes();
     let [y0, y1] = y.to_le_bytes();
@@ -40,13 +50,33 @@ fn the_book_go_touchpad_is_a_precision_touchpad() {
     assert_eq!(f.report_id, 1);
     assert_eq!(f.fingers().len(), 1, "hybrid mode: one contact per report");
     let finger = f.fingers()[0];
-    let s = |bit_offset, size| Some(Scalar { bit_offset, size, signed: false });
+    let s = |bit_offset, size| {
+        Some(Scalar {
+            bit_offset,
+            size,
+            signed: false,
+        })
+    };
     assert_eq!(finger.tip, s(0, 1));
     assert_eq!(finger.confidence, s(1, 1));
     assert_eq!(finger.contact_id, s(2, 3));
     assert_eq!(finger.in_range, None);
-    assert_eq!(f.x.field, Scalar { bit_offset: 8, size: 16, signed: false });
-    assert_eq!(f.y.field, Scalar { bit_offset: 24, size: 16, signed: false });
+    assert_eq!(
+        f.x.field,
+        Scalar {
+            bit_offset: 8,
+            size: 16,
+            signed: false
+        }
+    );
+    assert_eq!(
+        f.y.field,
+        Scalar {
+            bit_offset: 24,
+            size: 16,
+            signed: false
+        }
+    );
     assert_eq!((f.x.min, f.x.max, f.y.min, f.y.max), (0, 1876, 0, 1164));
     // hidinput_calc_abs_res: 1876 units over 4.69 in = 1876000 / 119126 -> 16; 1164000 / 73914 -> 16.
     assert_eq!((f.x.resolution, f.y.resolution), (16, 16));
@@ -60,7 +90,14 @@ fn the_book_go_touchpad_is_a_precision_touchpad() {
 #[test]
 fn the_feature_reports_are_found() {
     let f = format();
-    let ff = |report_id, bit_offset, size, logical_max| Some(FeatureField { report_id, bit_offset, size, logical_max });
+    let ff = |report_id, bit_offset, size, logical_max| {
+        Some(FeatureField {
+            report_id,
+            bit_offset,
+            size,
+            logical_max,
+        })
+    };
     assert_eq!(f.input_mode, ff(4, 0, 8, 10));
     assert_eq!(f.surface_switch, ff(9, 0, 1, 1));
     assert_eq!(f.button_switch, ff(9, 1, 1, 1));
@@ -78,7 +115,16 @@ fn probe_reads_contact_max_and_pad_type_then_the_blob() {
     let reads: Vec<_> = format().probe_reads().collect();
     assert_eq!(
         reads,
-        [ProbeRead { report_id: 2, len: 2 }, ProbeRead { report_id: 5, len: 257 }]
+        [
+            ProbeRead {
+                report_id: 2,
+                len: 2
+            },
+            ProbeRead {
+                report_id: 5,
+                len: 257
+            }
+        ]
     );
 }
 
@@ -109,7 +155,10 @@ fn max_contacts_follows_mt_feature_mapping() {
     assert_eq!(f.max_contacts(None), MAX_SLOTS);
     let blob = [2u8, 0x05];
     assert_eq!(f.read_feature(f.contact_max.unwrap(), &blob), Some(5));
-    assert_eq!(f.read_feature(f.button_type.unwrap(), &blob), Some(BUTTON_TYPE_CLICKPAD));
+    assert_eq!(
+        f.read_feature(f.button_type.unwrap(), &blob),
+        Some(BUTTON_TYPE_CLICKPAD)
+    );
 }
 
 #[test]
@@ -161,7 +210,11 @@ fn one_finger_gives_linux_protocol_b_events() {
         ]
     );
     // Lift: tracking ID -1, BTN_TOUCH and the tool key off.
-    let (frames, events) = run(&mut c, &[report(false, true, 0, 100, 200, 20, 1, false)], 1000);
+    let (frames, events) = run(
+        &mut c,
+        &[report(false, true, 0, 100, 200, 20, 1, false)],
+        1000,
+    );
     assert!(active(&frames[0]).is_empty());
     assert_eq!(
         events,
@@ -180,7 +233,10 @@ fn hybrid_mode_frames_wait_for_the_contact_count() {
     // Two fingers down: the first report says 2, the second 0, same scan time.
     let (frames, _) = run(
         &mut c,
-        &[report(true, true, 0, 100, 200, 10, 2, false), report(true, true, 1, 900, 210, 10, 0, false)],
+        &[
+            report(true, true, 0, 100, 200, 10, 2, false),
+            report(true, true, 1, 900, 210, 10, 0, false),
+        ],
         0,
     );
     assert_eq!(frames.len(), 1, "one frame for two reports");
@@ -188,7 +244,10 @@ fn hybrid_mode_frames_wait_for_the_contact_count() {
     // They move: still one frame per pair, same tracking IDs.
     let (frames, events) = run(
         &mut c,
-        &[report(true, true, 0, 110, 230, 90, 2, false), report(true, true, 1, 910, 240, 90, 0, false)],
+        &[
+            report(true, true, 0, 110, 230, 90, 2, false),
+            report(true, true, 1, 910, 240, 90, 0, false),
+        ],
         8000,
     );
     assert_eq!(active(&frames[0]), [(0, 0, 110, 230), (1, 0, 910, 240)]);
@@ -199,7 +258,10 @@ fn hybrid_mode_frames_wait_for_the_contact_count() {
     // Both lift.
     let (frames, _) = run(
         &mut c,
-        &[report(false, true, 0, 110, 230, 170, 2, false), report(false, true, 1, 910, 240, 170, 0, false)],
+        &[
+            report(false, true, 0, 110, 230, 170, 2, false),
+            report(false, true, 1, 910, 240, 170, 0, false),
+        ],
         16000,
     );
     assert_eq!(frames.len(), 1);
@@ -212,7 +274,11 @@ fn a_button_only_report_with_count_zero_starts_a_frame_if_the_scan_time_changed(
     let (frames, _) = run(&mut c, &[report(true, true, 0, 100, 200, 10, 1, false)], 0);
     assert_eq!(frames.len(), 1);
     // A first packet with count 0 but a new scan time is a frame of its own (MT_QUIRK_WIN8_PTP_BUTTONS).
-    let (frames, events) = run(&mut c, &[report(true, true, 0, 100, 200, 20, 0, true)], 1000);
+    let (frames, events) = run(
+        &mut c,
+        &[report(true, true, 0, 100, 200, 20, 0, true)],
+        1000,
+    );
     assert_eq!(frames.len(), 1);
     assert!(frames[0].left);
     assert!(events.contains(&ev(EV_KEY, BTN_LEFT, 1)));
@@ -223,11 +289,19 @@ fn a_contact_without_confidence_is_a_palm_and_lifts_in_its_own_frame() {
     let mut c = Contacts::new(format(), 5);
     run(&mut c, &[report(true, true, 0, 100, 200, 10, 1, false)], 0);
     // Confidence lost while down: a palm.
-    let (frames, events) = run(&mut c, &[report(true, false, 0, 120, 220, 20, 1, false)], 1000);
+    let (frames, events) = run(
+        &mut c,
+        &[report(true, false, 0, 120, 220, 20, 1, false)],
+        1000,
+    );
     assert_eq!(active(&frames[0]), [(0, MT_TOOL_PALM, 120, 220)]);
     assert!(events.contains(&ev(EV_ABS, ABS_MT_TOOL_TYPE, MT_TOOL_PALM)));
     // Lifted without confidence: still reported active as a palm in this frame, then released in a second frame.
-    let (frames, _) = run(&mut c, &[report(false, false, 0, 120, 220, 30, 1, false)], 2000);
+    let (frames, _) = run(
+        &mut c,
+        &[report(false, false, 0, 120, 220, 30, 1, false)],
+        2000,
+    );
     assert_eq!(frames.len(), 2);
     assert_eq!(active(&frames[0]), [(0, MT_TOOL_PALM, 120, 220)]);
     assert_eq!(frames[1].count(), 0);
@@ -239,7 +313,10 @@ fn a_duplicate_contact_in_one_frame_is_ignored() {
     // Count 2, but the same contact twice: the second is MT_QUIRK_IGNORE_DUPLICATES' -EAGAIN and not received.
     let (frames, _) = run(
         &mut c,
-        &[report(true, true, 0, 100, 200, 10, 2, false), report(true, true, 0, 300, 300, 10, 0, false)],
+        &[
+            report(true, true, 0, 100, 200, 10, 2, false),
+            report(true, true, 0, 300, 300, 10, 0, false),
+        ],
         0,
     );
     assert!(frames.is_empty(), "still waiting for the second contact");
@@ -250,7 +327,11 @@ fn a_duplicate_contact_in_one_frame_is_ignored() {
 #[test]
 fn sticky_fingers_are_released_after_100_ms() {
     let mut c = Contacts::new(format(), 5);
-    run(&mut c, &[report(true, true, 0, 100, 200, 10, 1, false)], 5_000);
+    run(
+        &mut c,
+        &[report(true, true, 0, 100, 200, 10, 1, false)],
+        5_000,
+    );
     assert_eq!(c.sticky_deadline(), Some(105_000));
     let mut frames = Vec::new();
     c.tick(104_999, &mut |f| frames.push(*f), &mut |_| {});
@@ -266,11 +347,26 @@ fn the_timestamp_restarts_after_a_second_without_reports() {
     let mut c = Contacts::new(format(), 5);
     let (f1, _) = run(&mut c, &[report(true, true, 0, 1, 1, 100, 1, false)], 0);
     let (f2, _) = run(&mut c, &[report(true, true, 0, 2, 2, 180, 1, false)], 8_000);
-    let (f3, _) = run(&mut c, &[report(false, true, 0, 2, 2, 200, 1, false)], 1_100_000);
-    assert_eq!((f1[0].timestamp_us, f2[0].timestamp_us, f3[0].timestamp_us), (0, 8000, 0));
+    let (f3, _) = run(
+        &mut c,
+        &[report(false, true, 0, 2, 2, 200, 1, false)],
+        1_100_000,
+    );
+    assert_eq!(
+        (f1[0].timestamp_us, f2[0].timestamp_us, f3[0].timestamp_us),
+        (0, 8000, 0)
+    );
     // Wrap at the scan time's logical maximum.
-    let (f4, _) = run(&mut c, &[report(true, true, 0, 1, 1, 65530, 1, false)], 1_101_000);
-    let (f5, _) = run(&mut c, &[report(true, true, 0, 1, 1, 10, 1, false)], 1_102_000);
+    let (f4, _) = run(
+        &mut c,
+        &[report(true, true, 0, 1, 1, 65530, 1, false)],
+        1_101_000,
+    );
+    let (f5, _) = run(
+        &mut c,
+        &[report(true, true, 0, 1, 1, 10, 1, false)],
+        1_102_000,
+    );
     // 10 - 65530 + 65535 (`delta += app->scantime_logical_max`) = 15 scan units.
     assert_eq!(f5[0].timestamp_us - f4[0].timestamp_us, 15 * 100);
 }

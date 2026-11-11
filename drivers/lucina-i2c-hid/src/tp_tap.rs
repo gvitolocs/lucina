@@ -48,8 +48,8 @@ impl TapConfig {
     pub fn libinput_default(enabled: bool) -> TapConfig {
         TapConfig {
             enabled,
-            map: TapMap::Lrm,       // tp_tap_config_get_default_map
-            drag: true,             // tp_drag_default: LIBINPUT_CONFIG_DRAG_ENABLED
+            map: TapMap::Lrm,         // tp_tap_config_get_default_map
+            drag: true,               // tp_drag_default: LIBINPUT_CONFIG_DRAG_ENABLED
             drag_lock: DragLock::Off, // tp_drag_lock_default: LIBINPUT_CONFIG_DRAG_LOCK_DISABLED
         }
     }
@@ -176,6 +176,8 @@ pub struct Tap {
     /// `tp->tap.nfingers_down` (excludes thumb/palm).
     nfingers_down: u32,
     touches: [SlotTap; MAX_TOUCHES],
+    /// A tap timeout reached a hold state, where libinput calls `tp_gesture_tap_timeout`.
+    gesture_timeout: bool,
 }
 
 impl Tap {
@@ -189,6 +191,7 @@ impl Tap {
             timer: None,
             nfingers_down: 0,
             touches: [SlotTap::NEW; MAX_TOUCHES],
+            gesture_timeout: false,
         }
     }
 
@@ -310,12 +313,40 @@ impl Tap {
     pub fn timeout(&mut self, now_us: u64, out: &mut dyn FnMut(TapEvent)) {
         // A libinput timer fires once: libinput_timer_handler clears its expiry before calling the handler.
         self.timer = None;
+        self.gesture_timeout = false;
         self.handle_event(None, Event::Timeout, now_us, out);
         for ts in &mut self.touches {
             if ts.state != TouchState::Idle {
                 ts.state = TouchState::Dead;
             }
         }
+    }
+
+    /// Whether the last [`Tap::timeout`] made libinput call `tp_gesture_tap_timeout` (the touch timed out into HOLD,
+    /// TOUCH_2_HOLD or TOUCH_3_HOLD); reading it clears it.
+    pub fn take_gesture_timeout(&mut self) -> bool {
+        core::mem::take(&mut self.gesture_timeout)
+    }
+
+    /// `tp->tap.state` is HOLD, TOUCH_2_HOLD or TOUCH_3_HOLD (`tp_gesture_use_hold_timer`).
+    pub fn holding(&self) -> bool {
+        matches!(
+            self.state,
+            State::Hold | State::Touch2Hold | State::Touch3Hold
+        )
+    }
+
+    /// `tp->tap.state` is DEAD (`tp_gesture_use_hold_timer`).
+    pub fn dead(&self) -> bool {
+        self.state == State::Dead
+    }
+
+    /// tp_tap_dragging_or_double_tapping.
+    pub fn dragging_or_double_tapping(&self) -> bool {
+        matches!(
+            self.state,
+            State::Drag1OrDoubletap | State::Drag2OrDoubletap | State::Drag3OrDoubletap
+        )
     }
 
     /// tp_tap_dragging.
@@ -374,7 +405,13 @@ impl Tap {
 
     // ---- tp_tap_notify ----
 
-    fn notify(&mut self, time_us: u64, nfingers: u32, pressed: bool, out: &mut dyn FnMut(TapEvent)) {
+    fn notify(
+        &mut self,
+        time_us: u64,
+        nfingers: u32,
+        pressed: bool,
+        out: &mut dyn FnMut(TapEvent),
+    ) {
         if !(1..=3).contains(&nfingers) {
             return;
         }
@@ -409,7 +446,8 @@ impl Tap {
 
     fn set_drag_timer(&mut self, time: u64, nfingers_tapped: u32) {
         self.timer = Some(
-            time + DRAG_TIMEOUT_PERIOD_BASE_US + u64::from(nfingers_tapped) * DRAG_TIMEOUT_PERIOD_PERFINGER_US,
+            time + DRAG_TIMEOUT_PERIOD_BASE_US
+                + u64::from(nfingers_tapped) * DRAG_TIMEOUT_PERIOD_PERFINGER_US,
         );
     }
 
@@ -444,7 +482,13 @@ impl Tap {
 
     // ---- tp_tap_handle_event and the per-state handlers ----
 
-    fn handle_event(&mut self, slot: Option<usize>, event: Event, time: u64, out: &mut dyn FnMut(TapEvent)) {
+    fn handle_event(
+        &mut self,
+        slot: Option<usize>,
+        event: Event,
+        time: u64,
+        out: &mut dyn FnMut(TapEvent),
+    ) {
         match self.state {
             State::Idle => self.idle_handle_event(slot, event, time, out),
             State::Touch => self.touch_handle_event(slot, event, time, out),
@@ -459,9 +503,15 @@ impl Tap {
             State::Touch3Hold => self.touch3_hold_handle_event(slot, event, time, out),
             State::Touch3Release => self.touch3_release_handle_event(slot, event, time, out),
             State::Touch3Release2 => self.touch3_release2_handle_event(slot, event, time, out),
-            State::Drag1OrDoubletap => self.dragging_or_doubletap_handle_event(slot, event, time, 1, out),
-            State::Drag2OrDoubletap => self.dragging_or_doubletap_handle_event(slot, event, time, 2, out),
-            State::Drag3OrDoubletap => self.dragging_or_doubletap_handle_event(slot, event, time, 3, out),
+            State::Drag1OrDoubletap => {
+                self.dragging_or_doubletap_handle_event(slot, event, time, 1, out)
+            }
+            State::Drag2OrDoubletap => {
+                self.dragging_or_doubletap_handle_event(slot, event, time, 2, out)
+            }
+            State::Drag3OrDoubletap => {
+                self.dragging_or_doubletap_handle_event(slot, event, time, 3, out)
+            }
             State::Drag1 => self.dragging_handle_event(slot, event, time, 1, out),
             State::Drag2 => self.dragging_handle_event(slot, event, time, 2, out),
             State::Drag3 => self.dragging_handle_event(slot, event, time, 3, out),
@@ -481,7 +531,13 @@ impl Tap {
         }
     }
 
-    fn idle_handle_event(&mut self, _slot: Option<usize>, event: Event, time: u64, _out: &mut dyn FnMut(TapEvent)) {
+    fn idle_handle_event(
+        &mut self,
+        _slot: Option<usize>,
+        event: Event,
+        time: u64,
+        _out: &mut dyn FnMut(TapEvent),
+    ) {
         match event {
             Event::Touch => {
                 self.state = State::Touch;
@@ -495,7 +551,13 @@ impl Tap {
         }
     }
 
-    fn touch_handle_event(&mut self, slot: Option<usize>, event: Event, time: u64, out: &mut dyn FnMut(TapEvent)) {
+    fn touch_handle_event(
+        &mut self,
+        slot: Option<usize>,
+        event: Event,
+        time: u64,
+        out: &mut dyn FnMut(TapEvent),
+    ) {
         match event {
             Event::Touch => {
                 self.state = State::Touch2;
@@ -517,7 +579,8 @@ impl Tap {
             Event::Timeout => {
                 self.state = State::Hold;
                 self.clear_timer();
-                // tp_gesture_tap_timeout is the gesture side, outside this machine.
+                // tp_gesture_tap_timeout is called here; the gesture side reads it with take_gesture_timeout.
+                self.gesture_timeout = true;
             }
             Event::Button => self.state = State::Dead,
             Event::Thumb => {
@@ -539,7 +602,13 @@ impl Tap {
         }
     }
 
-    fn hold_handle_event(&mut self, slot: Option<usize>, event: Event, time: u64, _out: &mut dyn FnMut(TapEvent)) {
+    fn hold_handle_event(
+        &mut self,
+        slot: Option<usize>,
+        event: Event,
+        time: u64,
+        _out: &mut dyn FnMut(TapEvent),
+    ) {
         match event {
             Event::Touch => {
                 self.state = State::Touch2;
@@ -594,7 +663,13 @@ impl Tap {
         }
     }
 
-    fn touch2_handle_event(&mut self, slot: Option<usize>, event: Event, time: u64, _out: &mut dyn FnMut(TapEvent)) {
+    fn touch2_handle_event(
+        &mut self,
+        slot: Option<usize>,
+        event: Event,
+        time: u64,
+        _out: &mut dyn FnMut(TapEvent),
+    ) {
         match event {
             Event::Touch => {
                 self.state = State::Touch3;
@@ -609,7 +684,8 @@ impl Tap {
             Event::Motion => self.move_to_dead(slot, _out),
             Event::Timeout => {
                 self.state = State::Touch2Hold;
-                // tp_gesture_tap_timeout is the gesture side, outside this machine.
+                // tp_gesture_tap_timeout is called here; the gesture side reads it with take_gesture_timeout.
+                self.gesture_timeout = true;
             }
             Event::Button => self.state = State::Dead,
             Event::Thumb => {}
@@ -618,7 +694,13 @@ impl Tap {
         }
     }
 
-    fn touch2_hold_handle_event(&mut self, slot: Option<usize>, event: Event, time: u64, _out: &mut dyn FnMut(TapEvent)) {
+    fn touch2_hold_handle_event(
+        &mut self,
+        slot: Option<usize>,
+        event: Event,
+        time: u64,
+        _out: &mut dyn FnMut(TapEvent),
+    ) {
         match event {
             Event::Touch => {
                 self.state = State::Touch3;
@@ -635,7 +717,13 @@ impl Tap {
         }
     }
 
-    fn touch2_release_handle_event(&mut self, slot: Option<usize>, event: Event, time: u64, out: &mut dyn FnMut(TapEvent)) {
+    fn touch2_release_handle_event(
+        &mut self,
+        slot: Option<usize>,
+        event: Event,
+        time: u64,
+        out: &mut dyn FnMut(TapEvent),
+    ) {
         match event {
             Event::Touch => {
                 self.state = State::Touch2Hold;
@@ -673,7 +761,13 @@ impl Tap {
         }
     }
 
-    fn touch3_handle_event(&mut self, slot: Option<usize>, event: Event, time: u64, _out: &mut dyn FnMut(TapEvent)) {
+    fn touch3_handle_event(
+        &mut self,
+        slot: Option<usize>,
+        event: Event,
+        time: u64,
+        _out: &mut dyn FnMut(TapEvent),
+    ) {
         match event {
             Event::Touch => {
                 self.state = State::Dead;
@@ -683,7 +777,8 @@ impl Tap {
             Event::Timeout => {
                 self.state = State::Touch3Hold;
                 self.clear_timer();
-                // tp_gesture_tap_timeout is the gesture side, outside this machine.
+                // tp_gesture_tap_timeout is called here; the gesture side reads it with take_gesture_timeout.
+                self.gesture_timeout = true;
             }
             Event::Release => {
                 self.state = State::Touch3Release;
@@ -697,7 +792,13 @@ impl Tap {
         }
     }
 
-    fn touch3_hold_handle_event(&mut self, slot: Option<usize>, event: Event, time: u64, _out: &mut dyn FnMut(TapEvent)) {
+    fn touch3_hold_handle_event(
+        &mut self,
+        slot: Option<usize>,
+        event: Event,
+        time: u64,
+        _out: &mut dyn FnMut(TapEvent),
+    ) {
         match event {
             Event::Touch => {
                 self.state = State::Dead;
@@ -713,7 +814,13 @@ impl Tap {
         }
     }
 
-    fn touch3_release_handle_event(&mut self, slot: Option<usize>, event: Event, time: u64, out: &mut dyn FnMut(TapEvent)) {
+    fn touch3_release_handle_event(
+        &mut self,
+        slot: Option<usize>,
+        event: Event,
+        time: u64,
+        out: &mut dyn FnMut(TapEvent),
+    ) {
         match event {
             Event::Touch => {
                 self.notify(self.saved_press_time, 3, true, out);
@@ -747,7 +854,13 @@ impl Tap {
         }
     }
 
-    fn touch3_release2_handle_event(&mut self, slot: Option<usize>, event: Event, time: u64, out: &mut dyn FnMut(TapEvent)) {
+    fn touch3_release2_handle_event(
+        &mut self,
+        slot: Option<usize>,
+        event: Event,
+        time: u64,
+        out: &mut dyn FnMut(TapEvent),
+    ) {
         match event {
             Event::Touch => {
                 self.notify(self.saved_press_time, 3, true, out);
@@ -995,7 +1108,13 @@ impl Tap {
         }
     }
 
-    fn dead_handle_event(&mut self, _slot: Option<usize>, event: Event, _time: u64, _out: &mut dyn FnMut(TapEvent)) {
+    fn dead_handle_event(
+        &mut self,
+        _slot: Option<usize>,
+        event: Event,
+        _time: u64,
+        _out: &mut dyn FnMut(TapEvent),
+    ) {
         match event {
             Event::Release => {
                 if self.nfingers_down == 0 {
@@ -1069,7 +1188,13 @@ mod tests {
         }
     }
 
-    fn run(tap: &mut Tap, now: u64, touches: &[TapTouch], button: Option<bool>, fingers: u32) -> (Vec<TapEvent>, bool) {
+    fn run(
+        tap: &mut Tap,
+        now: u64,
+        touches: &[TapTouch],
+        button: Option<bool>,
+        fingers: u32,
+    ) -> (Vec<TapEvent>, bool) {
         let mut events = Vec::new();
         let filter = tap.handle_frame(now, touches, button, fingers, &mut |e| events.push(e));
         (events, filter)
@@ -1084,15 +1209,31 @@ mod tests {
     #[test]
     fn one_finger_tap() {
         let mut tap = Tap::new(enabled());
-        let (ev, _) = run(&mut tap, 0, &[touch(0, TouchPhase::Begin, 10.0, 10.0)], None, 1);
+        let (ev, _) = run(
+            &mut tap,
+            0,
+            &[touch(0, TouchPhase::Begin, 10.0, 10.0)],
+            None,
+            1,
+        );
         assert!(ev.is_empty());
         assert_eq!(tap.state_name(), "TOUCH");
         assert_eq!(tap.deadline(), Some(180_000));
 
-        let (ev, _) = run(&mut tap, 100_000, &[touch(0, TouchPhase::End, 10.0, 10.0)], None, 0);
+        let (ev, _) = run(
+            &mut tap,
+            100_000,
+            &[touch(0, TouchPhase::End, 10.0, 10.0)],
+            None,
+            0,
+        );
         assert_eq!(
             ev,
-            vec![TapEvent { time_us: 0, button: TapButton::Left, pressed: true }]
+            vec![TapEvent {
+                time_us: 0,
+                button: TapButton::Left,
+                pressed: true
+            }]
         );
         assert_eq!(tap.state_name(), "1FGTAP_TAPPED");
         // drag timeout: 160 ms + 1 * 20 ms after the release
@@ -1102,7 +1243,11 @@ mod tests {
         tap.timeout(280_000, &mut |e| ev.push(e));
         assert_eq!(
             ev,
-            vec![TapEvent { time_us: 100_000, button: TapButton::Left, pressed: false }]
+            vec![TapEvent {
+                time_us: 100_000,
+                button: TapButton::Left,
+                pressed: false
+            }]
         );
         assert_eq!(tap.state_name(), "IDLE");
     }
@@ -1111,24 +1256,59 @@ mod tests {
     // two fingers tap the right button with LRM, the middle button with LMR.
     #[test]
     fn two_finger_tap() {
-        for (map, want) in [(TapMap::Lrm, TapButton::Right), (TapMap::Lmr, TapButton::Middle)] {
+        for (map, want) in [
+            (TapMap::Lrm, TapButton::Right),
+            (TapMap::Lmr, TapButton::Middle),
+        ] {
             let mut cfg = enabled();
             cfg.map = map;
             let mut tap = Tap::new(cfg);
-            run(&mut tap, 0, &[touch(0, TouchPhase::Begin, 10.0, 10.0)], None, 1);
-            run(&mut tap, 10_000, &[touch(1, TouchPhase::Begin, 20.0, 10.0)], None, 2);
-            run(&mut tap, 50_000, &[touch(0, TouchPhase::End, 10.0, 10.0)], None, 1);
-            let (ev, _) = run(&mut tap, 60_000, &[touch(1, TouchPhase::End, 20.0, 10.0)], None, 0);
+            run(
+                &mut tap,
+                0,
+                &[touch(0, TouchPhase::Begin, 10.0, 10.0)],
+                None,
+                1,
+            );
+            run(
+                &mut tap,
+                10_000,
+                &[touch(1, TouchPhase::Begin, 20.0, 10.0)],
+                None,
+                2,
+            );
+            run(
+                &mut tap,
+                50_000,
+                &[touch(0, TouchPhase::End, 10.0, 10.0)],
+                None,
+                1,
+            );
+            let (ev, _) = run(
+                &mut tap,
+                60_000,
+                &[touch(1, TouchPhase::End, 20.0, 10.0)],
+                None,
+                0,
+            );
             assert_eq!(
                 ev,
-                vec![TapEvent { time_us: 10_000, button: want, pressed: true }]
+                vec![TapEvent {
+                    time_us: 10_000,
+                    button: want,
+                    pressed: true
+                }]
             );
             let mut ev = Vec::new();
             tap.timeout(tap.deadline().unwrap(), &mut |e| ev.push(e));
             assert_eq!(
                 ev,
                 // saved_release_time is the first finger's release (TOUCH_2_RELEASE), as in libinput
-                vec![TapEvent { time_us: 50_000, button: want, pressed: false }]
+                vec![TapEvent {
+                    time_us: 50_000,
+                    button: want,
+                    pressed: false
+                }]
             );
         }
     }
@@ -1137,15 +1317,55 @@ mod tests {
     #[test]
     fn three_finger_tap() {
         let mut tap = Tap::new(enabled());
-        run(&mut tap, 0, &[touch(0, TouchPhase::Begin, 10.0, 10.0)], None, 1);
-        run(&mut tap, 10_000, &[touch(1, TouchPhase::Begin, 20.0, 10.0)], None, 2);
-        run(&mut tap, 20_000, &[touch(2, TouchPhase::Begin, 30.0, 10.0)], None, 3);
-        run(&mut tap, 50_000, &[touch(0, TouchPhase::End, 10.0, 10.0)], None, 2);
-        run(&mut tap, 60_000, &[touch(1, TouchPhase::End, 20.0, 10.0)], None, 1);
-        let (ev, _) = run(&mut tap, 70_000, &[touch(2, TouchPhase::End, 30.0, 10.0)], None, 0);
+        run(
+            &mut tap,
+            0,
+            &[touch(0, TouchPhase::Begin, 10.0, 10.0)],
+            None,
+            1,
+        );
+        run(
+            &mut tap,
+            10_000,
+            &[touch(1, TouchPhase::Begin, 20.0, 10.0)],
+            None,
+            2,
+        );
+        run(
+            &mut tap,
+            20_000,
+            &[touch(2, TouchPhase::Begin, 30.0, 10.0)],
+            None,
+            3,
+        );
+        run(
+            &mut tap,
+            50_000,
+            &[touch(0, TouchPhase::End, 10.0, 10.0)],
+            None,
+            2,
+        );
+        run(
+            &mut tap,
+            60_000,
+            &[touch(1, TouchPhase::End, 20.0, 10.0)],
+            None,
+            1,
+        );
+        let (ev, _) = run(
+            &mut tap,
+            70_000,
+            &[touch(2, TouchPhase::End, 30.0, 10.0)],
+            None,
+            0,
+        );
         assert_eq!(
             ev,
-            vec![TapEvent { time_us: 20_000, button: TapButton::Middle, pressed: true }]
+            vec![TapEvent {
+                time_us: 20_000,
+                button: TapButton::Middle,
+                pressed: true
+            }]
         );
     }
 
@@ -1154,12 +1374,30 @@ mod tests {
     #[test]
     fn no_tap_after_move() {
         let mut tap = Tap::new(enabled());
-        run(&mut tap, 0, &[touch(0, TouchPhase::Begin, 10.0, 10.0)], None, 1);
-        let (ev, filter) = run(&mut tap, 10_000, &[touch(0, TouchPhase::Update, 12.0, 10.0)], None, 1);
+        run(
+            &mut tap,
+            0,
+            &[touch(0, TouchPhase::Begin, 10.0, 10.0)],
+            None,
+            1,
+        );
+        let (ev, filter) = run(
+            &mut tap,
+            10_000,
+            &[touch(0, TouchPhase::Update, 12.0, 10.0)],
+            None,
+            1,
+        );
         assert!(ev.is_empty());
         assert_eq!(tap.state_name(), "DEAD");
         assert!(!filter);
-        let (ev, _) = run(&mut tap, 20_000, &[touch(0, TouchPhase::End, 12.0, 10.0)], None, 0);
+        let (ev, _) = run(
+            &mut tap,
+            20_000,
+            &[touch(0, TouchPhase::End, 12.0, 10.0)],
+            None,
+            0,
+        );
         assert!(ev.is_empty());
         assert_eq!(tap.state_name(), "IDLE");
     }
@@ -1169,12 +1407,24 @@ mod tests {
     #[test]
     fn no_tap_after_timeout() {
         let mut tap = Tap::new(enabled());
-        run(&mut tap, 0, &[touch(0, TouchPhase::Begin, 10.0, 10.0)], None, 1);
+        run(
+            &mut tap,
+            0,
+            &[touch(0, TouchPhase::Begin, 10.0, 10.0)],
+            None,
+            1,
+        );
         let mut ev = Vec::new();
         tap.timeout(180_000, &mut |e| ev.push(e));
         assert!(ev.is_empty());
         assert_eq!(tap.state_name(), "HOLD");
-        let (ev, _) = run(&mut tap, 200_000, &[touch(0, TouchPhase::End, 10.0, 10.0)], None, 0);
+        let (ev, _) = run(
+            &mut tap,
+            200_000,
+            &[touch(0, TouchPhase::End, 10.0, 10.0)],
+            None,
+            0,
+        );
         assert!(ev.is_empty());
         assert_eq!(tap.state_name(), "IDLE");
     }
@@ -1184,20 +1434,54 @@ mod tests {
     #[test]
     fn tap_and_drag() {
         let mut tap = Tap::new(enabled());
-        run(&mut tap, 0, &[touch(0, TouchPhase::Begin, 10.0, 10.0)], None, 1);
-        let (ev, _) = run(&mut tap, 100_000, &[touch(0, TouchPhase::End, 10.0, 10.0)], None, 0);
+        run(
+            &mut tap,
+            0,
+            &[touch(0, TouchPhase::Begin, 10.0, 10.0)],
+            None,
+            1,
+        );
+        let (ev, _) = run(
+            &mut tap,
+            100_000,
+            &[touch(0, TouchPhase::End, 10.0, 10.0)],
+            None,
+            0,
+        );
         assert_eq!(ev.len(), 1);
         // second touch within the drag timeout (deadline 280_000)
-        run(&mut tap, 200_000, &[touch(0, TouchPhase::Begin, 10.0, 10.0)], None, 1);
+        run(
+            &mut tap,
+            200_000,
+            &[touch(0, TouchPhase::Begin, 10.0, 10.0)],
+            None,
+            1,
+        );
         assert_eq!(tap.state_name(), "1FGTAP_DRAGGING_OR_DOUBLETAP");
-        let (ev, _) = run(&mut tap, 250_000, &[touch(0, TouchPhase::Update, 15.0, 10.0)], None, 1);
+        let (ev, _) = run(
+            &mut tap,
+            250_000,
+            &[touch(0, TouchPhase::Update, 15.0, 10.0)],
+            None,
+            1,
+        );
         assert!(ev.is_empty());
         assert_eq!(tap.state_name(), "1FGTAP_DRAGGING");
         assert!(tap.dragging());
-        let (ev, _) = run(&mut tap, 300_000, &[touch(0, TouchPhase::End, 15.0, 10.0)], None, 0);
+        let (ev, _) = run(
+            &mut tap,
+            300_000,
+            &[touch(0, TouchPhase::End, 15.0, 10.0)],
+            None,
+            0,
+        );
         assert_eq!(
             ev,
-            vec![TapEvent { time_us: 300_000, button: TapButton::Left, pressed: false }]
+            vec![TapEvent {
+                time_us: 300_000,
+                button: TapButton::Left,
+                pressed: false
+            }]
         );
         assert_eq!(tap.state_name(), "IDLE");
         assert!(!tap.dragging());
@@ -1225,11 +1509,23 @@ mod tests {
     #[test]
     fn click_during_tap() {
         let mut tap = Tap::new(enabled());
-        run(&mut tap, 0, &[touch(0, TouchPhase::Begin, 10.0, 10.0)], None, 1);
+        run(
+            &mut tap,
+            0,
+            &[touch(0, TouchPhase::Begin, 10.0, 10.0)],
+            None,
+            1,
+        );
         let (ev, _) = run(&mut tap, 50_000, &[], Some(true), 1);
         assert!(ev.is_empty());
         assert_eq!(tap.state_name(), "DEAD");
-        let (ev, _) = run(&mut tap, 100_000, &[touch(0, TouchPhase::End, 10.0, 10.0)], None, 0);
+        let (ev, _) = run(
+            &mut tap,
+            100_000,
+            &[touch(0, TouchPhase::End, 10.0, 10.0)],
+            None,
+            0,
+        );
         assert!(ev.is_empty());
         assert_eq!(tap.state_name(), "IDLE");
     }

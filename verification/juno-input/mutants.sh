@@ -9,6 +9,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/juno-input-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
 src=drivers/lucina-i2c-hid/src/setup.rs
 fail=0 refused=0 total=0
+weak=0
 try() {
     local name=$1; shift
     total=$((total + 1))
@@ -27,9 +28,21 @@ try() {
     if "$verus" "$work/verification/juno-input/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED: $name"; fail=1
     else
-        refused=$((refused + 1)); echo "refused: $name ($(grep -c "^error" "$work/out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused: $name ($(grep -c "^error" "$work/out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $name ($(grep -c "^error" "$work/out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
+# The unchanged files must verify, or every "refused" below would mean nothing.
+if "$verus" verification/juno-input/rules.rs > "$work/baseline" 2>&1; then
+    echo "baseline: verifies"
+else
+    cat "$work/baseline"; echo "mutants: the unchanged files do not verify"; exit 1
+fi
 try "a retry past the last try (code)" 'failed == 0 || failed >= SETUP_TRIES { None } else { Some(SETUP_RETRY_MS) }
 }
 
@@ -60,15 +73,15 @@ try "test reports wait for a line that never fires (code)" '    if !line_irq || 
     } else {
         match deadline_us {
             None => Wait::Line,
-            Some(d) => Wait::LineFor(if d > now_us { d - now_us } else { 0 }),' '    if !line_irq || !line_moved {
+            Some(d) => Wait::LineFor(d.saturating_sub(now_us)),' '    if !line_irq || !line_moved {
         Wait::Tick
     } else {
         match deadline_us {
             None => Wait::Line,
-            Some(d) => Wait::LineFor(if d > now_us { d - now_us } else { 0 }),'
-try "a timer ignored (code)" '            Some(d) => Wait::LineFor(if d > now_us { d - now_us } else { 0 }),' '            Some(_d) => Wait::Line,'
+            Some(d) => Wait::LineFor(d.saturating_sub(now_us)),'
+try "a timer ignored (code)" '            Some(d) => Wait::LineFor(d.saturating_sub(now_us)),' '            Some(_d) => Wait::Line,'
 try "both: wakes after the timer" \
-    '            Some(d) => Wait::LineFor(if d > now_us { d - now_us } else { 0 }),' '            Some(d) => Wait::LineFor(if d > now_us { d - now_us + 1 } else { 0 }),' \
+    '            Some(d) => Wait::LineFor(d.saturating_sub(now_us)),' '            Some(d) => Wait::LineFor(if d > now_us { d - now_us + 1 } else { 0 }),' \
     '            Some(d) => Wait::LineFor(if d > now_us { (d - now_us) as u64 } else { 0 }),' '            Some(d) => Wait::LineFor(if d > now_us { (d - now_us + 1) as u64 } else { 0 }),'
 try "both: an unmoved line trusted" \
     '    if !line_irq || !line_moved || test_on {
@@ -76,12 +89,12 @@ try "both: an unmoved line trusted" \
     } else {
         match deadline_us {
             None => Wait::Line,
-            Some(d) => Wait::LineFor(if d > now_us { d - now_us } else { 0 }),' '    if !line_irq || test_on {
+            Some(d) => Wait::LineFor(d.saturating_sub(now_us)),' '    if !line_irq || test_on {
         Wait::Tick
     } else {
         match deadline_us {
             None => Wait::Line,
-            Some(d) => Wait::LineFor(if d > now_us { d - now_us } else { 0 }),' \
+            Some(d) => Wait::LineFor(d.saturating_sub(now_us)),' \
     '    if !line_irq || !line_moved || test_on {
         Wait::Tick
     } else {
@@ -144,4 +157,6 @@ try "both: one timer dropped" \
 
 } // verus!'
 echo "$refused of $total refused"
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit $fail

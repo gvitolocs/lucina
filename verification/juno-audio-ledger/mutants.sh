@@ -6,6 +6,7 @@ verus=${VERUS:-/home/user/tools/verus/verus-x86-linux/verus}
 work=$(mktemp -d "${TMPDIR:-/tmp}/juno-audio-ledger-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
 fail=0
+weak=0
 refused=0
 total=0
 try() {
@@ -26,10 +27,21 @@ try() {
     if "$verus" "$work/verification/juno-audio-ledger/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED: $shown"; fail=1
     else
-        refused=$((refused + 1))
-        echo "refused: $shown ($(grep -c "^error" "$work/out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused: $shown ($(grep -c "^error" "$work/out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $shown ($(grep -c "^error" "$work/out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
+# The unchanged files must verify, or every "refused" below would mean nothing.
+if "$verus" verification/juno-audio-ledger/rules.rs > "$work/baseline" 2>&1; then
+    echo "baseline: verifies"
+else
+    cat "$work/baseline"; echo "mutants: the unchanged files do not verify"; exit 1
+fi
 # The next slot wraps at the ring's end, not one past it.
 try 'if s >= periods { s - periods } else { s }' 'if s > periods { s - periods } else { s }'
 # The next slot is the one after the last out, not one further.
@@ -74,4 +86,6 @@ try 'pub const MAX_PERIODS: u32 = 32;' 'pub const MAX_PERIODS: u32 = 33;'
 # A slot is out only when it is among the `count` after the oldest.
 try 's < p && dist(l.oldest, s, p) < l.count as int' 's < p && dist(l.oldest, s, p) <= l.count as int'
 echo "$refused of $total mutants refused"
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit $fail

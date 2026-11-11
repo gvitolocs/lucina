@@ -12,10 +12,11 @@
 extern crate alloc;
 
 pub mod rules;
+pub mod schedutil;
 
 use alloc::vec::Vec;
 
-pub use rules::{CpuLoad, BUSY_RUN_FOR_MAX, Step, step_for, wanted_khz};
+pub use rules::{BUSY_RUN_FOR_MAX, CpuLoad, Step, step_for, wanted_khz};
 
 /// Registers of one clock domain ("OSM", `qcom_soc_data` in Linux), as offsets from the domain's base.
 pub const REG_ENABLE: usize = 0x0;
@@ -46,7 +47,11 @@ pub fn read_table(read32: impl Fn(usize) -> u32) -> Vec<Step> {
         let lval = freq & 0xff;
         let core_count = (freq >> 16) & 0x7;
         let millivolts = volt & 0xfff;
-        let khz = if src != 0 { XO_KHZ * lval } else { ALTERNATE_KHZ };
+        let khz = if src != 0 {
+            XO_KHZ * lval
+        } else {
+            ALTERNATE_KHZ
+        };
 
         if row > 0 && khz == prev_khz {
             break;
@@ -129,14 +134,54 @@ const CRITICAL: Trip = Trip {
 
 /// `sc7180.dtsi`'s `cpu0-thermal` to `cpu7-thermal`: sensors 1 to 6 on the silver domain, 9 and 10 on the gold one.
 pub const ZONES: [ZoneDef; 8] = [
-    ZoneDef { sensor: 1, passive: PASSIVE, critical: CRITICAL, domain: 0 },
-    ZoneDef { sensor: 2, passive: PASSIVE, critical: CRITICAL, domain: 0 },
-    ZoneDef { sensor: 3, passive: PASSIVE, critical: CRITICAL, domain: 0 },
-    ZoneDef { sensor: 4, passive: PASSIVE, critical: CRITICAL, domain: 0 },
-    ZoneDef { sensor: 5, passive: PASSIVE, critical: CRITICAL, domain: 0 },
-    ZoneDef { sensor: 6, passive: PASSIVE, critical: CRITICAL, domain: 0 },
-    ZoneDef { sensor: 9, passive: PASSIVE, critical: CRITICAL, domain: 6 },
-    ZoneDef { sensor: 10, passive: PASSIVE, critical: CRITICAL, domain: 6 },
+    ZoneDef {
+        sensor: 1,
+        passive: PASSIVE,
+        critical: CRITICAL,
+        domain: 0,
+    },
+    ZoneDef {
+        sensor: 2,
+        passive: PASSIVE,
+        critical: CRITICAL,
+        domain: 0,
+    },
+    ZoneDef {
+        sensor: 3,
+        passive: PASSIVE,
+        critical: CRITICAL,
+        domain: 0,
+    },
+    ZoneDef {
+        sensor: 4,
+        passive: PASSIVE,
+        critical: CRITICAL,
+        domain: 0,
+    },
+    ZoneDef {
+        sensor: 5,
+        passive: PASSIVE,
+        critical: CRITICAL,
+        domain: 0,
+    },
+    ZoneDef {
+        sensor: 6,
+        passive: PASSIVE,
+        critical: CRITICAL,
+        domain: 0,
+    },
+    ZoneDef {
+        sensor: 9,
+        passive: PASSIVE,
+        critical: CRITICAL,
+        domain: 6,
+    },
+    ZoneDef {
+        sensor: 10,
+        passive: PASSIVE,
+        critical: CRITICAL,
+        domain: 6,
+    },
 ];
 
 /// How the zone's temperature moved since the last poll, as `get_tz_trend` works it out.
@@ -177,7 +222,11 @@ impl StepWise {
     /// One poll of a zone that has its cooling device to itself (a test, or a domain with one zone): [`StepWise::poll_shared`]
     /// with this zone's last result as the device's state.
     pub fn poll(&mut self, temperature: i32, max_state: u32) -> u32 {
-        let state = device_state(core::iter::once(self.poll_shared(temperature, self.cooling, max_state)));
+        let state = device_state(core::iter::once(self.poll_shared(
+            temperature,
+            self.cooling,
+            max_state,
+        )));
         self.cooling = state;
         state
     }
@@ -213,11 +262,9 @@ impl StepWise {
             } else if throttle {
                 match trend {
                     Trend::Raising => Some((cur + 1).min(max_state)),
-                    Trend::Dropping => Some(
-                        cur.saturating_sub(1)
-                            .max(1.min(max_state))
-                            .min(max_state),
-                    ),
+                    Trend::Dropping => {
+                        Some(cur.saturating_sub(1).max(1.min(max_state)).min(max_state))
+                    }
                     Trend::Stable => self.targets[i],
                 }
             } else {
@@ -265,7 +312,11 @@ impl DomainCooling {
 
     /// One poll: `temperature(zone)` in millidegrees for each zone index (`None`: not read, the zone is skipped as
     /// Linux skips a zone whose read fails). Returns the device's new cooling state.
-    pub fn poll(&mut self, mut temperature: impl FnMut(usize) -> Option<i32>, max_state: u32) -> u32 {
+    pub fn poll(
+        &mut self,
+        mut temperature: impl FnMut(usize) -> Option<i32>,
+        max_state: u32,
+    ) -> u32 {
         let cur = self.state;
         let requests: alloc::vec::Vec<Option<u32>> = self
             .zones
@@ -287,8 +338,7 @@ impl DomainCooling {
 /// The position in `steps` (ascending) that a cooling state allows: state 0 is the top row, each step of cooling one row
 /// lower.
 pub fn cap_for(cooling: u32, rows: usize) -> usize {
-    rows.saturating_sub(1)
-        .saturating_sub(cooling as usize)
+    rows.saturating_sub(1).saturating_sub(cooling as usize)
 }
 
 #[cfg(test)]
@@ -301,7 +351,10 @@ mod tests {
     fn table(rows: &[(u32, u32, u32, u32)]) -> impl Fn(usize) -> u32 {
         let mut regs = BTreeMap::new();
         for (i, &(src, lval, cores, mv)) in rows.iter().enumerate() {
-            regs.insert(REG_FREQ_LUT + i * LUT_ROW_SIZE, (src << 30) | (cores << 16) | lval);
+            regs.insert(
+                REG_FREQ_LUT + i * LUT_ROW_SIZE,
+                (src << 30) | (cores << 16) | lval,
+            );
             regs.insert(REG_VOLT_LUT + i * LUT_ROW_SIZE, mv);
         }
         move |offset| *regs.get(&offset).unwrap_or(&0)
@@ -309,13 +362,33 @@ mod tests {
 
     #[test]
     fn alternate_clock_then_multiples_of_the_crystal_then_end() {
-        let steps = read_table(table(&[(0, 0, 8, 600), (1, 34, 8, 650), (1, 52, 8, 700), (1, 52, 8, 700)]));
+        let steps = read_table(table(&[
+            (0, 0, 8, 600),
+            (1, 34, 8, 650),
+            (1, 52, 8, 700),
+            (1, 52, 8, 700),
+        ]));
         assert_eq!(
             steps,
             vec![
-                Step { index: 0, khz: 300_000, millivolts: 600, boost: false },
-                Step { index: 1, khz: 652_800, millivolts: 650, boost: false },
-                Step { index: 2, khz: 998_400, millivolts: 700, boost: false },
+                Step {
+                    index: 0,
+                    khz: 300_000,
+                    millivolts: 600,
+                    boost: false
+                },
+                Step {
+                    index: 1,
+                    khz: 652_800,
+                    millivolts: 650,
+                    boost: false
+                },
+                Step {
+                    index: 2,
+                    khz: 998_400,
+                    millivolts: 700,
+                    boost: false
+                },
             ]
         );
     }
@@ -329,7 +402,10 @@ mod tests {
             (1, 133, 1, 950), // one core, last: the boost, filtered as boost stays off
             (1, 133, 1, 950),
         ]));
-        assert_eq!(steps.iter().map(|s| s.index).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(
+            steps.iter().map(|s| s.index).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
         assert_eq!(steps[1].khz, 1_190_400);
         assert!(steps.iter().all(|s| !s.boost));
     }
@@ -375,7 +451,10 @@ mod tests {
 
     #[test]
     fn a_sleep_counts_as_idle_ticks() {
-        let mut load = CpuLoad { util: 1024, busy_run: 9 };
+        let mut load = CpuLoad {
+            util: 1024,
+            busy_run: 9,
+        };
         load.tick(16, true);
         assert_eq!(load.busy_run, 1);
         assert!(load.util < 500, "{}", load.util);
@@ -383,10 +462,16 @@ mod tests {
 
     #[test]
     fn load_stays_in_range() {
-        let mut load = CpuLoad { util: 1024, busy_run: 0 };
+        let mut load = CpuLoad {
+            util: 1024,
+            busy_run: 0,
+        };
         load.tick(0, true);
         assert_eq!(load.util, 1024);
-        let mut load = CpuLoad { util: 1, busy_run: 0 };
+        let mut load = CpuLoad {
+            util: 1,
+            busy_run: 0,
+        };
         load.tick(0, false);
         assert_eq!(load.util, 0);
         load.tick(u64::MAX, false);
@@ -407,7 +492,12 @@ mod tests {
     fn steps(khz: &[u32]) -> Vec<Step> {
         khz.iter()
             .enumerate()
-            .map(|(i, &khz)| Step { index: i as u8, khz, millivolts: 600, boost: false })
+            .map(|(i, &khz)| Step {
+                index: i as u8,
+                khz,
+                millivolts: 600,
+                boost: false,
+            })
             .collect()
     }
 
@@ -433,7 +523,11 @@ mod tests {
         assert_eq!(z.poll(85_000, 9), 0, "below both trips: nothing");
         assert_eq!(z.poll(91_000, 9), 1, "past 90 C, rising: one step");
         assert_eq!(z.poll(92_000, 9), 2, "still rising: one more step");
-        assert_eq!(z.poll(96_000, 9), 3, "past 95 C: the second trip joins, one step");
+        assert_eq!(
+            z.poll(96_000, 9),
+            3,
+            "past 95 C: the second trip joins, one step"
+        );
         assert_eq!(z.poll(97_000, 9), 4);
     }
 
@@ -443,8 +537,16 @@ mod tests {
         for t in [91_000, 92_000, 96_000, 97_000] {
             z.poll(t, 9);
         }
-        assert_eq!(z.poll(94_000, 9), 3, "falling but still throttled: one step down");
-        assert_eq!(z.poll(89_000, 9), 2, "within the hysteresis of 90 C: still throttled, one step down");
+        assert_eq!(
+            z.poll(94_000, 9),
+            3,
+            "falling but still throttled: one step down"
+        );
+        assert_eq!(
+            z.poll(89_000, 9),
+            2,
+            "within the hysteresis of 90 C: still throttled, one step down"
+        );
         assert_eq!(z.poll(89_000, 9), 2, "stable within the hysteresis: held");
         assert_eq!(z.poll(87_000, 9), 0, "below 88 C: released to no cooling");
     }
@@ -456,7 +558,11 @@ mod tests {
         assert_eq!(z.poll(91_000, 9), 1);
         assert_eq!(z.poll(91_000, 9), 1, "stable at the trip: no change");
         assert_eq!(z.poll(96_000, 9), 2);
-        assert_eq!(z.poll(96_000, 9), 2, "stable past the second trip: no change");
+        assert_eq!(
+            z.poll(96_000, 9),
+            2,
+            "stable past the second trip: no change"
+        );
     }
 
     #[test]
@@ -474,7 +580,11 @@ mod tests {
         let mut silver = StepWise::new(&ZONES[0]);
         let mut gold = StepWise::new(&ZONES[6]);
         assert_eq!(silver.poll(96_000, 9), 1);
-        assert_eq!(gold.poll(80_000, 9), 0, "the other zone's heat does not touch this one");
+        assert_eq!(
+            gold.poll(80_000, 9),
+            0,
+            "the other zone's heat does not touch this one"
+        );
         assert_eq!(silver.poll(97_000, 9), 2);
         assert_eq!(gold.poll(80_000, 9), 0);
         assert_eq!(cap_for(silver.poll(80_000, 9), 10), 9);
@@ -495,10 +605,22 @@ mod tests {
         assert_eq!(DomainCooling::new(6).zones().count(), 2);
         let hot = |t: i32| move |zone: usize| Some(if zone == 0 { t } else { 60_000 });
         assert_eq!(silver.poll(hot(85_000), 9), 0);
-        assert_eq!(silver.poll(hot(91_000), 9), 1, "one hot zone raises the shared device");
-        assert_eq!(silver.poll(hot(92_000), 9), 2, "from the device's state, one more step");
+        assert_eq!(
+            silver.poll(hot(91_000), 9),
+            1,
+            "one hot zone raises the shared device"
+        );
+        assert_eq!(
+            silver.poll(hot(92_000), 9),
+            2,
+            "from the device's state, one more step"
+        );
         // The cool zones see the device at 2, not at their own 0: dropping or stable, below their trips, no target.
-        assert_eq!(silver.poll(hot(87_000), 9), 0, "the hot zone falls below 88 C: released");
+        assert_eq!(
+            silver.poll(hot(87_000), 9),
+            0,
+            "the hot zone falls below 88 C: released"
+        );
         assert_eq!(silver.state(), 0);
     }
 }

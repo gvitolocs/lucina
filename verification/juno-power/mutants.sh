@@ -7,6 +7,7 @@ verus=${VERUS:-verus}
 work=$(mktemp -d "${TMPDIR:-/tmp}/juno-power-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
 fail=0
+weak=0
 # try_in <shipped file> <from> <to>; try <from> <to> is level.rs.
 try() { try_in kernel/lucina-power/src/level.rs "$@"; }
 refused=0 total=0
@@ -28,10 +29,21 @@ try_in() {
     if "$verus" "$work/verification/juno-power/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED: $from -> $to"; fail=1
     else
-        refused=$((refused + 1))
-        echo "refused: $from -> $to ($(grep -c "^error" "$work/out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused: $from -> $to ($(grep -c "^error" "$work/out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $from -> $to ($(grep -c "^error" "$work/out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
+# The unchanged files must verify, or every "refused" below would mean nothing.
+if "$verus" verification/juno-power/rules.rs > "$work/baseline" 2>&1; then
+    echo "baseline: verifies"
+else
+    cat "$work/baseline"; echo "mutants: the unchanged files do not verify"; exit 1
+fi
 # The 9-bit size bit.
 try 'if size_clk & 4 != 0 { 511 } else { 63 }' 'if size_clk & 2 != 0 { 511 } else { 63 }'
 # Never above the PWM's top value.
@@ -74,4 +86,6 @@ try_in kernel/lucina-power/src/wake_rules.rs "pub open spec fn may_wait_spec(arm
     armed && quiet >= QUIET_POLLS" "pub open spec fn may_wait_spec(armed: bool, quiet: u32) -> bool {
     quiet >= QUIET_POLLS"
 echo "$refused of $total refused"
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit $fail

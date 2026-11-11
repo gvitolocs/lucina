@@ -82,6 +82,106 @@ pub fn classify(f: &Facts) -> Outcome {
     }
 }
 
+/// What the log must show for a unit that exited 0 to have proved something. A run that passed on its exit code alone is not evidence.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct OutputCheck {
+    /// Why the log does not show a real pass.
+    pub problem: Option<String>,
+    /// Mutants refused without a verification run (a compile or other error): weak evidence, reported per unit.
+    pub weak: Option<u64>,
+}
+
+/// `models`: Stateright's tests ran (`test result: ok. N passed`, N > 0 in total, no FAILED). `tla`: at least one `ok  <model> (` line and
+/// no FAIL line. `deep`: states were counted. `full`: Verus verified something. `mutants`: the unmutated files verified first
+/// (`baseline: verifies` exactly once, before the first `refused`/`NOT REFUSED` line) and the closing `mutants: N refused by
+/// verification, W refused without a verification run` line is there. Other kinds have their own checks in `classify`.
+pub fn check_output(kind: &str, log: &str) -> OutputCheck {
+    let problem = |s: &str| OutputCheck {
+        problem: Some(s.to_string()),
+        weak: None,
+    };
+    match kind {
+        "models" => {
+            let mut passed = 0u64;
+            for l in log.lines() {
+                if l.contains("test result: FAILED") {
+                    return problem("a test result says FAILED");
+                }
+                if let Some(rest) = l.split("test result: ok. ").nth(1) {
+                    passed += rest
+                        .split_whitespace()
+                        .next()
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .unwrap_or(0);
+                }
+            }
+            if passed == 0 {
+                return problem("exit 0, but no test reported passing: nothing ran");
+            }
+            OutputCheck::default()
+        }
+        "tla" => {
+            if log
+                .lines()
+                .any(|l| l.starts_with("FAIL") || l.starts_with("BAD"))
+            {
+                return problem("a model line says FAIL");
+            }
+            if !log
+                .lines()
+                .any(|l| l.starts_with("ok ") && l.contains(" ("))
+            {
+                return problem("exit 0, but no model reported ok: nothing was checked");
+            }
+            OutputCheck::default()
+        }
+        "deep" => {
+            if !log.contains("distinct states") {
+                return problem("exit 0, but no state count in the log: nothing was checked");
+            }
+            OutputCheck::default()
+        }
+        "full" => match parse_results(log) {
+            (Some(v), Some(0)) if v > 0 => OutputCheck::default(),
+            _ => problem("exit 0, but Verus verified nothing in this run"),
+        },
+        "mutants" => {
+            let mut baseline = 0;
+            let mut first_refusal_before_baseline = false;
+            for l in log.lines() {
+                let t = l.trim_start();
+                if t == "baseline: verifies" {
+                    baseline += 1;
+                } else if (t.starts_with("refused") || t.starts_with("NOT REFUSED"))
+                    && baseline == 0
+                {
+                    first_refusal_before_baseline = true;
+                }
+            }
+            if baseline != 1 || first_refusal_before_baseline {
+                return problem(&format!(
+                    "the unmutated files were not shown to verify first (`baseline: verifies` seen {baseline} times, mutants judged before it: {first_refusal_before_baseline})"
+                ));
+            }
+            let summary = log.lines().rev().find(|l| l.starts_with("mutants: "));
+            let weak = summary.and_then(|l| {
+                let (_, rest) = l.split_once("refused by verification, ")?;
+                rest.split_whitespace().next()?.parse::<u64>().ok()
+            });
+            if weak.is_none() {
+                return problem(
+                    "no closing `mutants: N refused by verification, W refused without a verification run` line",
+                );
+            }
+            OutputCheck {
+                problem: None,
+                weak,
+            }
+        }
+        _ => OutputCheck::default(),
+    }
+}
+
 /// `verification results:: 12 verified, 0 errors` -> (12, 0).
 pub fn parse_results(log: &str) -> (Option<u64>, Option<u64>) {
     let mut out = (None, None);
@@ -206,6 +306,86 @@ mod tests {
         assert_ne!(
             Outcome::Timeout.exit_code(),
             Outcome::ProofFailed.exit_code()
+        );
+    }
+
+    #[test]
+    fn a_mutants_log_must_show_the_baseline_first() {
+        let good = "baseline: verifies\nrefused: m1\nrefused (NO VERIFICATION RUN: compile or other error): m2\nmutants: 1 refused by verification, 1 refused without a verification run\n";
+        let c = check_output("mutants", good);
+        assert_eq!(
+            c,
+            OutputCheck {
+                problem: None,
+                weak: Some(1)
+            }
+        );
+        // No baseline, or two, or a mutant judged before it, or no closing line: not evidence.
+        for bad in [
+            "refused: m1\nmutants: 1 refused by verification, 0 refused without a verification run\n",
+            "baseline: verifies\nbaseline: verifies\nrefused: m\nmutants: 1 refused by verification, 0 refused without a verification run\n",
+            "refused: m\nbaseline: verifies\nmutants: 1 refused by verification, 0 refused without a verification run\n",
+            "baseline: verifies\nrefused: m1\n",
+        ] {
+            assert!(check_output("mutants", bad).problem.is_some(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_pass_on_exit_code_alone_is_not_evidence_for_models_tla_deep_and_full() {
+        assert!(
+            check_output("models", "test result: ok. 8 passed; 0 failed\n")
+                .problem
+                .is_none()
+        );
+        assert!(
+            check_output("models", "test result: ok. 0 passed; 0 failed\n")
+                .problem
+                .is_some()
+        );
+        assert!(
+            check_output(
+                "models",
+                "test result: ok. 8 passed\ntest result: FAILED. 1 failed\n"
+            )
+            .problem
+            .is_some()
+        );
+        assert!(check_output("models", "").problem.is_some());
+        assert!(
+            check_output("tla", "ok    A (tla-mc: pass, 5 distinct states found)\n")
+                .problem
+                .is_none()
+        );
+        assert!(
+            check_output(
+                "tla",
+                "ok    A (tla-mc: pass, 5 distinct states found)\nFAIL  B (x)\n"
+            )
+            .problem
+            .is_some()
+        );
+        assert!(check_output("tla", "nothing\n").problem.is_some());
+        assert!(
+            check_output("deep", "53613540 distinct states found\n")
+                .problem
+                .is_none()
+        );
+        assert!(check_output("deep", "done\n").problem.is_some());
+        assert!(
+            check_output("full", "verification results:: 5 verified, 0 errors\n")
+                .problem
+                .is_none()
+        );
+        assert!(
+            check_output("full", "verification results:: 0 verified, 0 errors\n")
+                .problem
+                .is_some()
+        );
+        assert!(check_output("full", "").problem.is_some());
+        assert!(
+            check_output("verus", "").problem.is_none(),
+            "other kinds are judged by classify"
         );
     }
 

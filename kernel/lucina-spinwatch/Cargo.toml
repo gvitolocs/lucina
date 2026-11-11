@@ -1,0 +1,10 @@
+[package]
+name = "lucina-spinwatch"
+version = "0.1.0"
+description = "The rules of the spin-lock wait watchdog (patch 1214): when a waiter marks, reports or crashes, and which CPUs can hold the lock it waits for. no_std, unsafe-free, tested on the host, proved by Verus"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

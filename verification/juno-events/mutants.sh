@@ -22,8 +22,11 @@ if ! "$verus" "$work/base.rs" > "$work/base.out" 2>&1; then
     cat "$work/base.out"
     exit 1
 fi
+echo "baseline: verifies"
 
 fail=0
+refused=0
+weak=0
 try() {
     local from=$1 to=$2
     local text; text=$(<"$rules")
@@ -41,7 +44,13 @@ try() {
         cat "$work/verus.out"
         fail=1
     else
-        echo "refused: $from -> $to ($(grep -c "^error" "$work/verus.out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/verus.out" && ! grep -q 'error\[E' "$work/verus.out"; then
+            refused=$((refused + 1))
+            echo "refused: $from -> $to ($(grep -c "^error" "$work/verus.out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $from -> $to ($(grep -c "^error" "$work/verus.out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
 # The queue and its losses: a full queue drops the oldest, and a reader behind is told exactly how many it lost.
@@ -71,4 +80,6 @@ try "tokens = if gained >= room { burst } else { tokens + gained as u32 };" "tok
 try "    present_seq > since_present &&" "    present_seq >= since_present &&"
 try "(now as u16 >= l as u16 + 2" "(now as u16 >= l as u16 + 1"
 [ "$fail" = 0 ] && echo "all refused"
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit "$fail"

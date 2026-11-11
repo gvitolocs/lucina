@@ -18,7 +18,13 @@ fn cmd(addr: u32, data: u32, wait: bool) -> TcsCmd {
 }
 
 fn setup() -> (SimRsc, RscConfig) {
-    (SimRsc::galaxy_book_go(), RscConfig { bus: None, ..RscConfig::GALAXY_BOOK_GO_DRV2 })
+    (
+        SimRsc::galaxy_book_go(),
+        RscConfig {
+            bus: None,
+            ..RscConfig::GALAXY_BOOK_GO_DRV2
+        },
+    )
 }
 
 #[test]
@@ -33,7 +39,10 @@ fn probe_reads_the_version_and_arms_the_active_tcses() {
 
 #[test]
 fn probe_refuses_layout_3_and_bad_geometry() {
-    let cfg = RscConfig { bus: None, ..RscConfig::GALAXY_BOOK_GO_DRV2 };
+    let cfg = RscConfig {
+        bus: None,
+        ..RscConfig::GALAXY_BOOK_GO_DRV2
+    };
     for id in [0x0003_0000, 0x0003_0700, 0x00ff_0000] {
         let sim = SimRsc::new(id, 2, 8, 3, 0xd00, 0x10000);
         let e = Rsc::probe(&sim, &cfg).err().unwrap();
@@ -606,4 +615,134 @@ fn drivers_without_a_bus_do_not_see_each_other() {
         Err(RscError::Timeout { tcs: 0 })
     );
     assert_eq!(two.in_use(), 0);
+}
+
+/// The model behind a lock of its own, so that a [`Window`] (which must be `Send`) can hold it and the test still reads it.
+#[derive(Clone)]
+struct SharedSim(std::sync::Arc<std::sync::Mutex<SimRsc>>);
+
+impl RegIo for SharedSim {
+    fn read32(&self, off: u32) -> u32 {
+        self.0.lock().unwrap().read32(off)
+    }
+
+    fn write32(&self, off: u32, value: u32) {
+        self.0.lock().unwrap().write32(off, value)
+    }
+}
+
+/// Real sleeps, counted, for the threads of the `Drv` tests.
+#[derive(Default)]
+struct ThreadDelay(std::sync::atomic::AtomicU32);
+
+impl lucina_qcom_soc::io::Delay for ThreadDelay {
+    fn sleep_ms(&self, ms: u32) {
+        self.0.fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(u64::from(ms)));
+    }
+}
+
+/// `rpmh_rsc_probe` once for the whole kernel: the first caller's probe makes the one `Rsc`, a later caller's probe is not run, and
+/// before any probe there is nothing to send through.
+#[test]
+fn the_one_drv_is_probed_once() {
+    use lucina_modem_rpmh::rsc::{Drv, Window};
+    let drv = Drv::new();
+    let d = ThreadDelay::default();
+    assert!(drv.with(&d, |rsc| rsc.version()).is_none());
+    let sim = SharedSim(std::sync::Arc::new(std::sync::Mutex::new(
+        SimRsc::galaxy_book_go(),
+    )));
+    let cfg = RscConfig {
+        bus: None,
+        ..RscConfig::GALAXY_BOOK_GO_DRV2
+    };
+    let first = sim.clone();
+    drv.open(&d, || Rsc::probe(Window(Box::new(first)), &cfg))
+        .unwrap();
+    let again: Result<(), RscError> = drv.open(&d, || panic!("a second probe of the one DRV"));
+    again.unwrap();
+    assert_eq!(drv.with(&d, |rsc| rsc.version()), Some((2, 7)));
+    drv.with(&d, |rsc| rsc.send_cmd(&cmd(A, 7, true), &d, 10))
+        .unwrap()
+        .unwrap();
+    let sim = sim.0.lock().unwrap();
+    sim.assert_clean();
+    assert_eq!(sim.executed().len(), 1);
+}
+
+/// A failed probe leaves it unopened, and the next caller probes.
+#[test]
+fn a_failed_probe_leaves_the_drv_to_the_next_caller() {
+    use lucina_modem_rpmh::rsc::{Drv, Window};
+    let drv = Drv::new();
+    let d = ThreadDelay::default();
+    let failed: Result<(), RscError> = drv.open(&d, || Err(RscError::BadConfig("no window")));
+    assert_eq!(failed, Err(RscError::BadConfig("no window")));
+    assert!(drv.with(&d, |_| ()).is_none());
+    let sim = SharedSim(std::sync::Arc::new(std::sync::Mutex::new(
+        SimRsc::galaxy_book_go(),
+    )));
+    let cfg = RscConfig {
+        bus: None,
+        ..RscConfig::GALAXY_BOOK_GO_DRV2
+    };
+    drv.open(&d, || Rsc::probe(Window(Box::new(sim)), &cfg))
+        .unwrap();
+    assert!(drv.with(&d, |_| ()).is_some());
+}
+
+/// One transaction at a time: a driver that comes while another holds the lock sleeps (it does not spin) until the first lets go,
+/// and the transactions of both run whole and in turn on the one DRV.
+#[test]
+fn transactions_of_two_drivers_wait_for_each_other() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use lucina_modem_rpmh::rsc::{Drv, Window};
+    static DRV: Drv = Drv::new();
+    static INSIDE: AtomicBool = AtomicBool::new(false);
+    let sim = SharedSim(std::sync::Arc::new(std::sync::Mutex::new(
+        SimRsc::galaxy_book_go(),
+    )));
+    let cfg = RscConfig {
+        bus: None,
+        ..RscConfig::GALAXY_BOOK_GO_DRV2
+    };
+    let first = sim.clone();
+    DRV.open(&ThreadDelay::default(), || {
+        Rsc::probe(Window(Box::new(first)), &cfg)
+    })
+    .unwrap();
+    let threads: Vec<_> = [A, B]
+        .into_iter()
+        .map(|addr| {
+            std::thread::spawn(move || {
+                let d = ThreadDelay::default();
+                for n in 0..20 {
+                    DRV.with(&d, |rsc| {
+                        assert!(
+                            !INSIDE.swap(true, Ordering::SeqCst),
+                            "two transactions at once"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        let sent = rsc.send_cmd(&cmd(addr, n, true), &d, 10);
+                        INSIDE.store(false, Ordering::SeqCst);
+                        sent
+                    })
+                    .unwrap()
+                    .unwrap();
+                }
+                d.0.load(Ordering::Relaxed)
+            })
+        })
+        .collect();
+    let slept: u32 = threads.into_iter().map(|t| t.join().unwrap()).sum();
+    assert!(slept > 0, "the second driver waited by sleeping");
+    let sim = sim.0.lock().unwrap();
+    sim.assert_clean();
+    assert_eq!(sim.executed().len(), 40);
+    assert!(
+        sim.executed().iter().all(|e| e.tcs == 0),
+        "each request found TCS 0 free again"
+    );
 }

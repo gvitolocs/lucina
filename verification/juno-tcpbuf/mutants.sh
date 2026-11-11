@@ -7,6 +7,8 @@ verus=${VERUS:-/home/user/tools/verus/verus-x86-linux/verus}
 work=$(mktemp -d "${TMPDIR:-/tmp}/juno-tcpbuf-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
 fail=0
+refused=0
+weak=0
 try() {
     local file=$1 from=$2 to=$3
     # Shown on one line: a planted bug may span lines.
@@ -25,9 +27,21 @@ try() {
     if "$verus" "$work/verification/juno-tcpbuf/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED in $file: $shown"; fail=1
     else
-        echo "refused in $file: $shown ($(grep -c "^error" "$work/out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused in $file: $shown ($(grep -c "^error" "$work/out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error) in $file: $shown ($(grep -c "^error" "$work/out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
+# The unchanged files must verify, or every "refused" below would mean nothing.
+if "$verus" verification/juno-tcpbuf/rules.rs > "$work/baseline" 2>&1; then
+    echo "baseline: verifies"
+else
+    cat "$work/baseline"; echo "mutants: the unchanged files do not verify"; exit 1
+fi
 lib=third_party/smoltcp/src/storage/paged_math.rs
 rules=verification/juno-tcpbuf/rules.rs
 # A piece runs one element into the next page.
@@ -49,4 +63,6 @@ try "$lib" '        (whole + 1, rest)' '        (whole, rest)'
 # capped ignores the cap (syslog's buffer as large as the caller asks).
 try "$lib" '    if len < cap { len } else { cap }' '    len'
 [ "$fail" = 0 ] && echo "all mutants refused" || echo "SOME MUTANTS SURVIVED"
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit $fail

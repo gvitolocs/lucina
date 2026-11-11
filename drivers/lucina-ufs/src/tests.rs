@@ -870,14 +870,13 @@ fn five_retries_then_failure() {
         h.read(0, 0, 1, &[seg(0, 4096)]),
         Err(Error::Ocs(upiu::OCS_ABORTED))
     );
-    let reads = m
-        .0
-        .borrow()
-        .n
-        .scsi
-        .iter()
-        .filter(|c| **c == (0, scsi::READ_10))
-        .count();
+    let reads =
+        m.0.borrow()
+            .n
+            .scsi
+            .iter()
+            .filter(|c| **c == (0, scsi::READ_10))
+            .count();
     assert_eq!(reads, 6, "one try plus SD_MAX_RETRIES retries");
 }
 
@@ -888,14 +887,13 @@ fn task_aborted_is_retried() {
     let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
     m.0.borrow_mut().task_aborted = 2;
     h.read(0, 0, 1, &[seg(0, 4096)]).unwrap();
-    let reads = m
-        .0
-        .borrow()
-        .n
-        .scsi
-        .iter()
-        .filter(|c| **c == (0, scsi::READ_10))
-        .count();
+    let reads =
+        m.0.borrow()
+            .n
+            .scsi
+            .iter()
+            .filter(|c| **c == (0, scsi::READ_10))
+            .count();
     assert_eq!(reads, 3);
 }
 
@@ -906,14 +904,13 @@ fn flush_is_retried() {
     let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
     m.0.borrow_mut().task_aborted = 2;
     h.flush(0).unwrap();
-    let syncs = m
-        .0
-        .borrow()
-        .n
-        .scsi
-        .iter()
-        .filter(|c| **c == (0, scsi::SYNCHRONIZE_CACHE_10))
-        .count();
+    let syncs =
+        m.0.borrow()
+            .n
+            .scsi
+            .iter()
+            .filter(|c| **c == (0, scsi::SYNCHRONIZE_CACHE_10))
+            .count();
     assert_eq!(syncs, 3);
 }
 
@@ -945,7 +942,10 @@ fn uic_errors_in_the_poll_path_are_logged_and_only_pa_init_is_fatal() {
     ));
     assert_eq!(h.read(0, 1, 1, &[seg(0, 4096)]), Err(Error::Dead));
     let log = m.0.borrow().notes.join("\n");
-    assert!(log.contains("UIC error: PA 0x0 DL 0x2000 N 0x0 T 0x0 DME 0x0"), "{log}");
+    assert!(
+        log.contains("UIC error: PA 0x0 DL 0x2000 N 0x0 T 0x0 DME 0x0"),
+        "{log}"
+    );
 
     // A network-layer error: logged and cleared, not fatal by itself.
     let m = Model::cold(laptop_lus());
@@ -957,7 +957,10 @@ fn uic_errors_in_the_poll_path_are_logged_and_only_pa_init_is_fatal() {
     ));
     let s = m.0.borrow();
     let log = s.notes.join("\n");
-    assert!(log.contains("UIC error: PA 0x0 DL 0x0 N 0x80000000 T 0x0 DME 0x0"), "{log}");
+    assert!(
+        log.contains("UIC error: PA 0x0 DL 0x0 N 0x80000000 T 0x0 DME 0x0"),
+        "{log}"
+    );
     assert_eq!(s.is & regs::IS_UE, 0, "IS.UE cleared");
     assert_eq!(s.uec, [0; 5], "the UEC registers cleared on read");
 }
@@ -980,14 +983,13 @@ fn queries_are_retried_three_times() {
     let m = Model::cold(laptop_lus());
     m.0.borrow_mut().query_fail = 2;
     let h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
-    let device_descs = m
-        .0
-        .borrow()
-        .n
-        .queries
-        .iter()
-        .filter(|q| **q == (upiu::QUERY_OP_READ_DESC, desc::IDN_DEVICE, 0))
-        .count();
+    let device_descs =
+        m.0.borrow()
+            .n
+            .queries
+            .iter()
+            .filter(|q| **q == (upiu::QUERY_OP_READ_DESC, desc::IDN_DEVICE, 0))
+            .count();
     assert_eq!(device_descs, 3);
     assert!(h.unit(0).is_some());
 }
@@ -1035,7 +1037,9 @@ fn utrilacr_is_read_and_never_written() {
     let s = m.0.borrow();
     assert_eq!(s.n.utrilacr_writes, 0, "UTRIACR never written");
     assert!(
-        s.notes.iter().any(|n| n == "probe: AHIT 0x0 UTRIACR 0x1f05"),
+        s.notes
+            .iter()
+            .any(|n| n == "probe: AHIT 0x0 UTRIACR 0x1f05"),
         "{:?}",
         s.notes
     );
@@ -1049,15 +1053,14 @@ fn no_write_ever_reaches_a_lun_but_0() {
     h.write(0, 5, 2, &[seg(0, 8192)]).unwrap();
     h.flush(0).unwrap();
     h.read(4, 0, 1, &[seg(0, 4096)]).unwrap();
-    let writes: Vec<u8> = m
-        .0
-        .borrow()
-        .n
-        .scsi
-        .iter()
-        .filter(|(_, op)| *op == scsi::WRITE_10 || *op == scsi::WRITE_16)
-        .map(|(lun, _)| *lun)
-        .collect();
+    let writes: Vec<u8> =
+        m.0.borrow()
+            .n
+            .scsi
+            .iter()
+            .filter(|(_, op)| *op == scsi::WRITE_10 || *op == scsi::WRITE_16)
+            .map(|(lun, _)| *lun)
+            .collect();
     assert_eq!(writes, [0], "every WRITE went to LUN 0");
 }
 
@@ -1149,6 +1152,163 @@ fn a_slow_request_sleeps_on_the_interrupt() {
     m.0.borrow_mut().bell_lag = 400;
     m.0.borrow_mut().irq = true;
     h.read(0, 4, 1, &[seg(0x10000, 4096)]).unwrap();
-    assert!(m.0.borrow().irq_waits > 0, "the host never waited for the interrupt");
+    assert!(
+        m.0.borrow().irq_waits > 0,
+        "the host never waited for the interrupt"
+    );
     assert_eq!(m.mem_read(DATA_DADDR + 0x10000, 4096), pattern);
+}
+
+fn miss_lines(m: &Model) -> usize {
+    m.0.borrow()
+        .notes
+        .iter()
+        .filter(|n| n.starts_with("missed completion interrupt: tag "))
+        .count()
+}
+
+/// A slow request whose interrupt comes: every sleep is capped at 20 ms, and nothing is counted as missed.
+#[test]
+fn a_request_with_its_interrupt_is_not_a_miss() {
+    let m = Model::cold(laptop_lus());
+    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    m.0.borrow_mut().bell_lag = 400;
+    m.0.borrow_mut().irq = true;
+    h.read(0, 4, 1, &[seg(0x10000, 4096)]).unwrap();
+    let s = m.0.borrow();
+    assert!(s.irq_waits > 0);
+    assert!(s.irq_wait_max_us <= crate::irq_wait::SLEEP_CAP_US);
+    assert_eq!((s.missed, h.missed_irq(), h.late_ms_max()), (0, 0, 0));
+    drop(s);
+    assert_eq!(miss_lines(&m), 0);
+}
+
+/// The completion interrupt is lost: the request is found done after one capped sleep instead of at the 30 s timeout,
+/// completes with its data, and is counted and logged once.
+#[test]
+fn a_lost_interrupt_is_found_after_one_capped_sleep() {
+    let m = Model::cold(laptop_lus());
+    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    let pattern: Vec<u8> = (0..4096).map(|i| (i * 13 % 251) as u8).collect();
+    m.mem_write(DATA_DADDR, &pattern);
+    h.write(0, 4, 1, &[seg(0, 4096)]).unwrap();
+    {
+        let mut s = m.0.borrow_mut();
+        // Done 66 looks after the bell: just after the 64 quick looks, during the first sleep.
+        s.bell_lag = 66;
+        s.irq = true;
+        s.irq_lost = true;
+    }
+    h.read(0, 4, 1, &[seg(0x10000, 4096)]).unwrap();
+    assert_eq!(m.mem_read(DATA_DADDR + 0x10000, 4096), pattern);
+    let s = m.0.borrow();
+    assert!(s.irq_wait_max_us <= crate::irq_wait::SLEEP_CAP_US);
+    assert!(
+        s.irq_waits == 1,
+        "{} sleeps for one lost interrupt",
+        s.irq_waits
+    );
+    assert_eq!(s.missed, 1);
+    let line = s
+        .notes
+        .iter()
+        .find(|n| n.starts_with("missed completion interrupt: "))
+        .unwrap()
+        .clone();
+    drop(s);
+    assert_eq!(h.missed_irq(), 1);
+    assert!(
+        h.late_ms_max() >= 20 && h.late_ms_max() <= 21,
+        "{}",
+        h.late_ms_max()
+    );
+    assert_eq!(
+        line,
+        alloc::format!(
+            "missed completion interrupt: tag 0, {} ms late, IS=0x1",
+            h.late_ms_max()
+        )
+    );
+    assert_eq!(miss_lines(&m), 1);
+}
+
+/// A request that never finishes still times out at 30 s, as before the sleeps were capped; no miss is counted.
+#[test]
+fn a_hung_request_with_a_lost_interrupt_times_out_at_30_s() {
+    let m = Model::cold(laptop_lus());
+    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    {
+        let mut s = m.0.borrow_mut();
+        s.irq = true;
+        s.irq_lost = true;
+        s.hang_next = true;
+    }
+    assert_eq!(
+        h.read(0, 0, 1, &[seg(0, 4096)]),
+        Err(Error::Timeout("a transfer request"))
+    );
+    assert_eq!(h.read(0, 1, 1, &[seg(0, 4096)]), Err(Error::Dead));
+    let s = m.0.borrow();
+    // 30 s in sleeps of at most 20 ms each, and not one more than the timeout needs.
+    assert!(
+        s.irq_waits >= 1500 && s.irq_waits <= 1502,
+        "{}",
+        s.irq_waits
+    );
+    assert!(s.irq_wait_max_us <= crate::irq_wait::SLEEP_CAP_US);
+    assert_eq!((s.missed, h.missed_irq()), (0, 0));
+}
+
+/// Many lost interrupts: each is counted, the log gets 10 lines a second, then one "N more" line.
+#[test]
+fn lost_interrupts_are_all_counted_and_the_log_is_rate_limited() {
+    let m = Model::cold(laptop_lus());
+    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    {
+        let mut s = m.0.borrow_mut();
+        s.bell_lag = 66;
+        s.irq = true;
+        s.irq_lost = true;
+    }
+    // One 20 ms sleep each: 15 requests are within the first second.
+    for i in 0..15 {
+        h.read(0, i, 1, &[seg(0, 4096)]).unwrap();
+    }
+    assert_eq!(h.missed_irq(), 15);
+    assert_eq!(miss_lines(&m), 10);
+    // Past the first second: the next window says how many were not logged.
+    for i in 0..60 {
+        h.read(0, i % 16, 1, &[seg(0, 4096)]).unwrap();
+    }
+    assert_eq!(h.missed_irq(), 75);
+    assert_eq!(m.0.borrow().missed, 75);
+    let more: Vec<_> =
+        m.0.borrow()
+            .notes
+            .iter()
+            .filter(|n| {
+                n.starts_with("missed completion interrupt: ") && n.ends_with(" more not logged")
+            })
+            .cloned()
+            .collect();
+    assert!(!more.is_empty());
+    // Each window logged its 10 lines; the misses of a full window past those are said in the next window's "N more"
+    // line, and those of the window still open are only counted.
+    let said: u64 = more
+        .iter()
+        .map(|n| n.split(' ').nth(3).unwrap().parse::<u64>().unwrap())
+        .sum();
+    assert!(miss_lines(&m) as u64 + said <= 75);
+    assert_eq!(miss_lines(&m), 10 * (more.len() + 1));
+}
+
+/// Without an interrupt (QEMU's PCI controller), the host polls as before: no sleeps, no misses.
+#[test]
+fn a_polled_request_has_no_misses() {
+    let m = Model::cold(laptop_lus());
+    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    m.0.borrow_mut().bell_lag = 400;
+    h.read(0, 4, 1, &[seg(0x10000, 4096)]).unwrap();
+    let s = m.0.borrow();
+    assert_eq!((s.irq_waits, s.missed, h.missed_irq()), (0, 0, 0));
 }

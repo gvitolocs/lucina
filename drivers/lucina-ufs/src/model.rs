@@ -14,7 +14,7 @@ use core::{
 };
 
 use crate::{
-    host::{Clock, DmaArea, Regs},
+    host::{Clock, DmaArea, IrqWait, Regs},
     regs,
     upiu::{self, UPIU_HEADER_AND_TSF},
 };
@@ -111,6 +111,13 @@ pub struct State {
     /// The kernel has the controller's interrupt: [`Clock::wait_interrupt`] sleeps (here: counts and lets time pass).
     pub irq: bool,
     pub irq_waits: u32,
+    /// With [`Self::irq`]: the controller's interrupt never reaches the thread (a lost completion interrupt). Every
+    /// [`Clock::wait_interrupt`] sleeps its whole timeout and ends with none; the controller still finishes requests.
+    pub irq_lost: bool,
+    /// The longest sleep the host asked [`Clock::wait_interrupt`] for.
+    pub irq_wait_max_us: u64,
+    /// [`Clock::missed_interrupt`] calls.
+    pub missed: u32,
     pending_bell: Option<(u32, u32)>,
     /// The slot comes back at once and the descriptor is never touched: a list base not taken.
     pub base_ignored: bool,
@@ -182,6 +189,9 @@ impl Model {
             bell_lag: 0,
             irq: false,
             irq_waits: 0,
+            irq_lost: false,
+            irq_wait_max_us: 0,
+            missed: 0,
             pending_bell: None,
             base_ignored: false,
             bells: 0,
@@ -269,15 +279,23 @@ impl Clock for ModelClock {
     fn delay_us(&self, us: u64) {
         self.0.set(self.0.get() + us);
     }
-    fn wait_interrupt(&self, timeout_us: u64) -> bool {
+    fn wait_interrupt(&self, timeout_us: u64) -> IrqWait {
         let mut st = self.1.0.borrow_mut();
         if !st.irq {
-            return false;
+            return IrqWait::Unavailable;
         }
         st.irq_waits += 1;
         assert!(timeout_us >= 1);
+        st.irq_wait_max_us = st.irq_wait_max_us.max(timeout_us);
+        if st.irq_lost {
+            self.0.set(self.0.get() + timeout_us);
+            return IrqWait::Expired;
+        }
         self.0.set(self.0.get() + 1);
-        true
+        IrqWait::Interrupted
+    }
+    fn missed_interrupt(&self, _late_us: u64) {
+        self.1.0.borrow_mut().missed += 1;
     }
     fn note(&self, line: fmt::Arguments<'_>) {
         self.1.0.borrow_mut().notes.push(format!("{line}"));

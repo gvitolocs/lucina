@@ -10,6 +10,9 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 # for a one-crate change, 10 s warm). The root is swept to a size limit below (tools/ci/lucina-ci/src/sweep.rs).
 cache_root=${LUCINA_CHECK_CACHE:-$HOME/.cache/lucina-check-target}
 wt_id=wt-$(printf '%s' "$root" | sha1sum | cut -c1-10)
+if [ -n "${CARGO_TARGET_DIR:-}" ] && [ "${CARGO_TARGET_DIR#"$cache_root"/}" = "$CARGO_TARGET_DIR" ] && [ "${LUCINA_CHECK_ALLOW_TARGET:-}" != 1 ]; then
+    echo "check-fast: warning: CARGO_TARGET_DIR=$CARGO_TARGET_DIR (inherited) is outside $cache_root; a target shared with other worktrees can hold another commit's artifacts. lucina-ci also refuses a binary whose sources differ from this tree (set LUCINA_CHECK_ALLOW_TARGET=1 to silence this)." >&2
+fi
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$cache_root/$wt_id}
 mkdir -p "$CARGO_TARGET_DIR"
 touch "$CARGO_TARGET_DIR/.last-used"
@@ -24,9 +27,25 @@ cargo build --quiet --release --locked --manifest-path "$root/tools/ci/lucina-ci
 # Run from a private copy of the launcher, so a rebuild of release/lucina-ci under a running check cannot pull it out from under its own
 # sub-steps ("Failed to find executable ... (deleted)", seen 2026-11-11).
 bin=$(mktemp "${TMPDIR:-/tmp}/lucina-ci.XXXXXX")
-trap 'rm -f "$bin"' EXIT
+log=$(mktemp "${TMPDIR:-/tmp}/check-fast-log.XXXXXX")
+trap 'rm -f "$bin" "$log"' EXIT
 cp "$CARGO_TARGET_DIR/release/lucina-ci" "$bin"
 chmod 700 "$bin"
 # A size cap on the whole cache: over the limit the least recently used worktree targets go whole (never this one, never one with a build running).
 "$bin" sweep-target --dir "$cache_root" --keep "$CARGO_TARGET_DIR" --limit-gib "${LUCINA_CHECK_TARGET_LIMIT_GIB:-30}" || true
-"$bin" check-fast "$@"
+# One place in the build queue (docs/ci/BQ.md): a short job, so it never waits behind a long build.
+bqbin=$(command -v bq || true)
+[ -x "$HOME/.local/bin/bq" ] && bqbin=$HOME/.local/bin/bq
+runner=()
+[ -z "$bqbin" ] || runner=("$bqbin" run --class short --who "$(basename "$root")" --)
+# A run that ends without its summary line (killed, cut off mid-step, a tool that exited early) is a failure even when the exit code
+# was 0: the output streams through tee, and the last word is the summary line. Stdout only; stderr stays on stderr.
+rc=0
+"${runner[@]}" "$bin" check-fast "$@" | tee "$log" || rc=${PIPESTATUS[0]}
+if [ "$rc" -ne 0 ]; then
+    exit "$rc"
+fi
+if ! tail -n 1 "$log" | grep -Eq '^check-fast: ([0-9]+s, [0-9]+ failed, [0-9]+ skipped|nothing changed against .+)$'; then
+    echo "check-fast: the run ended without its summary line (killed or cut off): refusing, it did not finish" >&2
+    exit 1
+fi

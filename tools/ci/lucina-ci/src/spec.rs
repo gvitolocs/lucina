@@ -2,6 +2,7 @@
 //!
 //!   lucina-ci spec --check [--base REF] [--allow "<why>"] [--merge-gate]
 //!   lucina-ci spec --list [--json]
+//!   lucina-ci spec --write-counts   regenerate tools/ci/statement-counts.tsv (the count ratchet)
 //!
 //! The comparison is against the BASE COMMIT's tree (`git show <base>:<path>`, base = merge base of REF and HEAD; REF defaults to
 //! `origin/main`, else `main`), never against a lock file the branch could edit itself. A "statement" is a fingerprinted piece of
@@ -44,6 +45,12 @@ use std::process::Command;
 
 pub const MERGE_ENV: &str = "LAGENT_ALLOW_SPEC_CHANGE";
 pub const LOCAL_ENV: &str = "LUCINA_SPEC_CHANGE_ALLOW";
+/// Ratchet against an extractor that quietly stops seeing statements: per unit, the number of frozen statements and of statement and
+/// proof tokens, committed. `spec --check` refuses a decrease of either against the base commit's file like a removed statement.
+pub const COUNTS_FILE: &str = "docs/ci/statement-counts.tsv";
+/// The statement keys per unit at the last `--write-counts`: a key that was there and is gone from the extracted set is refused like a
+/// removed statement, even when the counts stay equal because the extractor started counting something else.
+pub const KEYS_FILE: &str = "docs/ci/statement-keys.tsv";
 const MUTATIONS_SH: &str = "scripts/verify-mutations.sh";
 const MODELS_DIR: &str = "specs/lucina-models/src";
 const FORMAL_DIR: &str = "userspace/formal";
@@ -103,14 +110,14 @@ impl Stmt {
 // ------------------------------------------------------------------------------------------------------------------ lexer
 
 #[derive(Clone, Debug)]
-struct Tok {
-    s: String,
-    line: usize,
-    ident: bool,
+pub(crate) struct Tok {
+    pub(crate) s: String,
+    pub(crate) line: usize,
+    pub(crate) ident: bool,
     /// On a `//@` line.
-    tag: bool,
+    pub(crate) tag: bool,
     /// On a `//@` line or a `//@ret` line.
-    carry: bool,
+    pub(crate) carry: bool,
 }
 
 const OPS: &[&str] = &[
@@ -120,7 +127,7 @@ const OPS: &[&str] = &[
 
 /// What Verus reads of a shipped file (scripts/verify-shipped.sh): `//@omit` lines gone, `-> T //@ret` as `-> (ret: T)`,
 /// `//@ x` as `x`. Returns the text and, per line, "is a proof line" and "carries proof".
-fn shipped_transform(src: &str) -> (String, Vec<bool>, Vec<bool>) {
+pub(crate) fn shipped_transform(src: &str) -> (String, Vec<bool>, Vec<bool>) {
     let mut out = String::new();
     let mut tag = Vec::new();
     let mut carry = Vec::new();
@@ -338,7 +345,7 @@ fn lex(src: &str, tag: &[bool], carry: &[bool]) -> Vec<Tok> {
     out
 }
 
-fn is_kw(t: &Tok) -> bool {
+pub(crate) fn is_kw(t: &Tok) -> bool {
     t.ident
         && matches!(
             t.s.as_str(),
@@ -347,11 +354,11 @@ fn is_kw(t: &Tok) -> bool {
 }
 
 /// A clause keyword that belongs to the verified text (a `verus!` block, or a `//@` line).
-fn counts(t: &Tok, verus: bool) -> bool {
+pub(crate) fn counts(t: &Tok, verus: bool) -> bool {
     is_kw(t) && (verus || t.tag)
 }
 
-fn match_brace(t: &[Tok], open: usize) -> usize {
+pub(crate) fn match_brace(t: &[Tok], open: usize) -> usize {
     let mut d = 0i32;
     let mut k = open;
     while k < t.len() {
@@ -375,7 +382,7 @@ fn tight(s: &str) -> bool {
 }
 
 /// Index just past the attribute starting at `i` (`#[..]` or `#![..]`), or None if `i` does not start one.
-fn attr_end(t: &[Tok], i: usize) -> Option<usize> {
+pub(crate) fn attr_end(t: &[Tok], i: usize) -> Option<usize> {
     if t.get(i)?.s != "#" {
         return None;
     }
@@ -406,7 +413,7 @@ fn attr_end(t: &[Tok], i: usize) -> Option<usize> {
 
 /// The formatting-free text of tokens: comments gone, one space between tokens except around `,;(){}[]`, trailing commas
 /// dropped, attributes that cannot change what is proved dropped.
-fn norm_tokens(toks: &[Tok]) -> String {
+pub(crate) fn norm_tokens(toks: &[Tok]) -> String {
     let mut v: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < toks.len() {
@@ -454,13 +461,27 @@ fn join_tight(v: &[&str]) -> String {
 struct Found {
     /// name, kind, text
     stmts: Vec<(String, &'static str, String)>,
+    /// Token ranges of the extracted statements (for `roles`, src/roles.rs).
+    spans: Vec<Span>,
     header_kw: usize,
     body_kw: usize,
     /// Lines (0-based) of clause keywords outside any recognised function.
     stray: Vec<usize>,
 }
 
-fn struct_literal(t: &[Tok], k: usize, clause: bool) -> bool {
+/// Where an extracted statement sits in the token stream. `lo..hi` is the statement text (a fn header, a `spec fn` with its body,
+/// an item); `body` is the inclusive range of the `{ .. }` of an exec or proof fn, which is not part of the statement.
+#[derive(Clone, Debug)]
+pub(crate) struct Span {
+    pub(crate) lo: usize,
+    pub(crate) hi: usize,
+    pub(crate) body: Option<(usize, usize)>,
+    pub(crate) kind: &'static str,
+    /// End of the header (index of the `{` or `;`), for the keyword cross-check.
+    pub(crate) header_end: usize,
+}
+
+pub(crate) fn struct_literal(t: &[Tok], k: usize, clause: bool) -> bool {
     if !clause || k == 0 {
         return false;
     }
@@ -476,10 +497,73 @@ fn struct_literal(t: &[Tok], k: usize, clause: bool) -> bool {
 
 fn item_start(t: &[Tok], i: usize, lo: usize) -> usize {
     let mut j = i;
-    while j > lo && !matches!(t[j - 1].s.as_str(), ";" | "{" | "}") {
+    while j > lo {
+        // An attribute is one unit: a `{` or `;` inside `#[cfg_attr(.., verus_spec(..))]` does not end the item before it.
+        if t[j - 1].s == "]"
+            && let Some(s) = attr_group_start(t, j - 1, lo)
+        {
+            j = s;
+            continue;
+        }
+        if matches!(t[j - 1].s.as_str(), ";" | "{" | "}") {
+            break;
+        }
         j -= 1;
     }
     j
+}
+
+/// The `#` of the attribute whose closing `]` is at `close`, or None if that `]` closes something else.
+fn attr_group_start(t: &[Tok], close: usize, lo: usize) -> Option<usize> {
+    let mut d = 0i32;
+    let mut k = close;
+    loop {
+        match t[k].s.as_str() {
+            "]" => d += 1,
+            "[" => {
+                d -= 1;
+                if d == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        if k == lo {
+            return None;
+        }
+        k -= 1;
+    }
+    if k > lo && t[k - 1].s == "#" {
+        Some(k - 1)
+    } else if k > lo + 1 && t[k - 1].s == "!" && t[k - 2].s == "#" {
+        Some(k - 2)
+    } else {
+        None
+    }
+}
+
+/// Is `name` one of the identifiers by which an attribute-style proof (`verus_spec`, `verus_verify`) marks an item?
+pub(crate) fn is_verus_attr_word(name: &str) -> bool {
+    matches!(name, "verus_spec" | "verus_verify")
+}
+
+/// Do the attributes in `t[j..i]` carry `verus_spec(..)` / `verus_verify` (also inside `cfg_attr(verus_keep_ghost, ..)`)?
+fn has_verus_attr(t: &[Tok], j: usize, i: usize) -> bool {
+    let mut p = j;
+    while p < i {
+        if let Some(e) = attr_end(t, p) {
+            if t[p..e.min(i)]
+                .iter()
+                .any(|x| x.ident && is_verus_attr_word(&x.s))
+            {
+                return true;
+            }
+            p = e;
+        } else {
+            p += 1;
+        }
+    }
+    false
 }
 
 fn parse_fn(t: &[Tok], i: usize, lo: usize, hi: usize, verus: bool, f: &mut Found) -> usize {
@@ -550,7 +634,8 @@ fn parse_fn(t: &[Tok], i: usize, lo: usize, hi: usize, verus: bool, f: &mut Foun
     }
     let is_spec = t[j..i].iter().any(|x| x.ident && x.s == "spec");
     let is_proof = t[j..i].iter().any(|x| x.ident && x.s == "proof");
-    let extract = verus || t[i].tag || t[j..end.min(hi)].iter().any(|x| x.carry);
+    let extract =
+        verus || t[i].tag || t[j..end.min(hi)].iter().any(|x| x.carry) || has_verus_attr(t, j, i);
     if extract {
         let stop = if is_spec && has_body {
             body_close + 1
@@ -566,6 +651,13 @@ fn parse_fn(t: &[Tok], i: usize, lo: usize, hi: usize, verus: bool, f: &mut Foun
         };
         f.stmts
             .push((t[i + 1].s.clone(), kind, norm_tokens(&t[j..stop.min(hi)])));
+        f.spans.push(Span {
+            lo: j,
+            hi: stop.min(hi),
+            body: (has_body && !is_spec).then_some((end, body_close)),
+            kind,
+            header_end: end.min(hi),
+        });
     }
     if has_body { body_close + 1 } else { end + 1 }
 }
@@ -646,6 +738,13 @@ fn parse_item(t: &[Tok], i: usize, lo: usize, hi: usize, f: &mut Found) -> Optio
     }
     f.stmts
         .push((t[i + 1].s.clone(), "item", norm_tokens(&t[j..=end])));
+    f.spans.push(Span {
+        lo: j,
+        hi: end + 1,
+        body: None,
+        kind: "item",
+        header_end: end + 1,
+    });
     Some(end + 1)
 }
 
@@ -677,6 +776,11 @@ fn scan(t: &[Tok], lo: usize, hi: usize, verus: bool, shipped_on: bool, f: &mut 
             }
             let wanted = if verus || tk.tag {
                 matches!(tk.s.as_str(), "struct" | "enum" | "type" | "const")
+            } else if matches!(tk.s.as_str(), "struct" | "enum" | "type" | "const")
+                && has_verus_attr(t, item_start(t, i, lo), i)
+            {
+                // Attribute-style proofs: `#[cfg_attr(verus_keep_ghost, verus_verify)] pub struct ..`.
+                true
             } else {
                 tk.s == "const" && i > 0 && (t[i - 1].s == "pub" || t[i - 1].s == ")")
             };
@@ -698,9 +802,25 @@ pub struct FileScan {
 }
 
 pub fn scan_file(path: &str, src: &str) -> FileScan {
+    scan_full(path, src).file
+}
+
+/// A scanned file with the token stream and the places of its statements (used by `roles`).
+pub(crate) struct Scanned {
+    pub(crate) file: FileScan,
+    pub(crate) toks: Vec<Tok>,
+    /// Per token: inside a `verus! { }` block.
+    pub(crate) in_verus: Vec<bool>,
+    pub(crate) spans: Vec<Span>,
+}
+
+pub(crate) fn scan_full(path: &str, src: &str) -> Scanned {
     let (text, tag, carry) = shipped_transform(src);
-    let shipped_on = carry.iter().any(|&b| b);
+    // Attribute-style proofs (`#[cfg_attr(verus_keep_ghost, verus_spec(..))]`) are scanned like shipped files: the fn headers, the
+    // items and the `pub const`s are statements.
     let t = lex(&text, &tag, &carry);
+    let attr_file = t.iter().any(|x| x.ident && is_verus_attr_word(&x.s));
+    let shipped_on = carry.iter().any(|&b| b) || attr_file;
     let mut f = Found::default();
     scan(&t, 0, t.len(), false, shipped_on, &mut f);
     // Independent count of every clause keyword the verifier reads.
@@ -751,17 +871,22 @@ pub fn scan_file(path: &str, src: &str) -> FileScan {
         };
         stmts.push(Stmt::new(key, kind, text));
     }
-    FileScan {
-        stmts,
-        header_kw: f.header_kw,
-        body_kw: f.body_kw,
-        stray,
+    Scanned {
+        file: FileScan {
+            stmts,
+            header_kw: f.header_kw,
+            body_kw: f.body_kw,
+            stray,
+        },
+        toks: t,
+        in_verus,
+        spans: f.spans,
     }
 }
 
 // ------------------------------------------------------------------------------------------------------------------ models
 
-fn tla_strip(s: &str) -> String {
+pub(crate) fn tla_strip(s: &str) -> String {
     let c: Vec<char> = s.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -790,7 +915,7 @@ fn tla_strip(s: &str) -> String {
     out
 }
 
-fn words(s: &str) -> String {
+pub(crate) fn words(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -1213,7 +1338,7 @@ pub struct ModelStats {
     pub sr_fallback_files: BTreeSet<String>,
 }
 
-fn model_stmts(tree: &dyn Tree) -> (Vec<Stmt>, ModelStats) {
+pub(crate) fn model_stmts(tree: &dyn Tree) -> (Vec<Stmt>, ModelStats) {
     let mut out = Vec::new();
     let mut stats = ModelStats::default();
     let files = tree.files_under(FORMAL_DIR);
@@ -1970,7 +2095,7 @@ fn entry(out: &mut String, tag: &str, base: &Stmt, new: Option<&Stmt>) {
 pub struct AmendCtx {
     pub log: Vec<amend::Entry>,
     pub append_err: Option<String>,
-    /// `LUCINA_SPEC_AMEND_REQUIRED=1`: a legacy allow (no `amend:<id>`) is refused.
+    /// A legacy allow (no `amend:<id>`) is refused. On unless `LUCINA_SPEC_AMEND_REQUIRED=0` is set explicitly (`amend::required`).
     pub required: bool,
 }
 
@@ -2050,7 +2175,7 @@ pub fn render_with(d: &Diff, allow: &Allow, summary: &str, ctx: &AmendCtx) -> (S
     if ids.is_empty() {
         if ctx.required {
             out.push_str(&format!(
-                "REFUSED: the allow reason names no amendment and {} is set.\n\
+                "REFUSED: the allow reason names no amendment ({} is not set to 0, so amendments are required).\n\
 A spec change needs an accepted line in docs/ci/spec-amendments.tsv (a reviewer of another model family, evidence) and the allow reason must say amend:<id>.\n\
 See docs/ci/SPEC-AMENDMENTS.md; `lucina-ci spec amend --template` prints a line to fill.\n",
                 amend::REQUIRED_ENV
@@ -2058,7 +2183,7 @@ See docs/ci/SPEC-AMENDMENTS.md; `lucina-ci spec amend --template` prints a line 
             return (out, 1);
         }
         out.push_str(&format!(
-            "!!!! {} !!!! no amendment is named; this passes only while {} is unset.\n",
+            "!!!! {} !!!! no amendment is named; this passes only because {}=0 is set.\n",
             amend::LEGACY_MARK,
             amend::REQUIRED_ENV
         ));
@@ -2130,6 +2255,146 @@ fn val(args: &[String], k: &str) -> Option<String> {
         .cloned()
 }
 
+/// `unit<TAB>statement_count<TAB>token_count` for every tracked unit (token_count = statement plus proof tokens; 0 for model units).
+pub fn counts_tsv(fps: &[crate::roles::UnitFp]) -> String {
+    let mut s = String::from(
+        "# Generated: lucina-ci spec --write-counts. Per proof unit: frozen statements and statement+proof tokens (docs/ci/PROOF-ROLES.md).\n# `spec --check` refuses a decrease of either number against the base commit unless an amendment or the merge allow covers it.\n# unit<TAB>statement_count<TAB>token_count\n",
+    );
+    let mut rows: Vec<&crate::roles::UnitFp> = fps.iter().filter(|u| u.fp.is_some()).collect();
+    rows.sort_by(|a, b| a.unit.cmp(&b.unit));
+    for u in rows {
+        s.push_str(&format!(
+            "{}\t{}\t{}\n",
+            u.unit,
+            u.stmt_count,
+            u.counts[1] + u.counts[2]
+        ));
+    }
+    s
+}
+
+pub fn parse_counts(text: &str) -> BTreeMap<String, (usize, usize)> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            Some((
+                f.first()?.to_string(),
+                (f.get(1)?.parse().ok()?, f.get(2)?.parse().ok()?),
+            ))
+        })
+        .collect()
+}
+
+/// Units whose count dropped against the base file, as removed `count::<unit>` statements (so the usual allow or amendment covers them).
+pub fn count_decreases(
+    base: &BTreeMap<String, (usize, usize)>,
+    work: &BTreeMap<String, (usize, usize)>,
+) -> Vec<Stmt> {
+    let mut v = Vec::new();
+    for (u, (bs, bt)) in base {
+        let (ws, wt) = work.get(u).copied().unwrap_or((0, 0));
+        if ws < *bs || wt < *bt {
+            v.push(Stmt::new(
+                format!("counts::{u}"),
+                "count",
+                format!("statement_count {bs} -> {ws}, token_count {bt} -> {wt}"),
+            ));
+        }
+    }
+    v
+}
+
+/// `unit<TAB>key` for every frozen statement of every tracked unit.
+pub fn keys_tsv(fps: &[crate::roles::UnitFp]) -> String {
+    let mut s = String::from(
+        "# Generated: lucina-ci spec --write-counts. The statement keys of every proof unit at the last regeneration (docs/ci/PROOF-ROLES.md).\n# `spec --check` refuses a key that is in this file at the base commit and is no longer extracted, unless an amendment or the merge allow covers it.\n# unit<TAB>key\n",
+    );
+    let mut rows: Vec<&crate::roles::UnitFp> = fps.iter().filter(|u| u.fp.is_some()).collect();
+    rows.sort_by(|a, b| a.unit.cmp(&b.unit));
+    for u in rows {
+        for k in &u.stmt_keys {
+            s.push_str(&format!("{}\t{k}\n", u.unit));
+        }
+    }
+    s
+}
+
+pub fn parse_keys(text: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let mut m: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for l in text
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+    {
+        if let Some((u, k)) = l.split_once('\t') {
+            m.entry(u.to_string()).or_default().insert(k.to_string());
+        }
+    }
+    m
+}
+
+/// Keys in the base file that the work set no longer has (a unit that vanished loses all of its keys).
+pub fn key_losses(
+    base: &BTreeMap<String, BTreeSet<String>>,
+    work: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<Stmt> {
+    let empty = BTreeSet::new();
+    let mut v = Vec::new();
+    for (u, keys) in base {
+        let now = work.get(u).unwrap_or(&empty);
+        for k in keys.difference(now) {
+            v.push(Stmt::new(
+                format!("keys::{u}::{k}"),
+                "key",
+                format!("statement key `{k}` of `{u}` is no longer extracted"),
+            ));
+        }
+    }
+    v
+}
+
+/// Everything the committed ratchet files and the computed numbers say is lost. `base_*` are the files at the base commit, `file_*`
+/// the branch's own copies, `comp_*` what the extractor computes now:
+///  - the branch lowered the ratchet (its file has a lower count, a missing unit or a missing key against the base copy);
+///  - the extractor no longer reaches the base's numbers or keys;
+///  - the extractor no longer reaches what the branch's own copy records (a statement vanished).
+///
+/// A committed file that is merely out of date (lower than the computed numbers, a subset of the computed keys) is fine.
+#[allow(clippy::too_many_arguments)]
+pub fn ratchet_losses(
+    base_c: &BTreeMap<String, (usize, usize)>,
+    base_k: &BTreeMap<String, BTreeSet<String>>,
+    file_c: &BTreeMap<String, (usize, usize)>,
+    file_k: &BTreeMap<String, BTreeSet<String>>,
+    comp_c: &BTreeMap<String, (usize, usize)>,
+    comp_k: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<Stmt> {
+    let mut all: Vec<Stmt> = Vec::new();
+    all.extend(count_decreases(base_c, comp_c));
+    all.extend(key_losses(base_k, comp_k));
+    // the branch's own copy against the base copy
+    for s in count_decreases(base_c, file_c) {
+        all.push(Stmt::new(
+            format!("lowered-{}", s.key),
+            "count",
+            format!("the committed {COUNTS_FILE} lowers the ratchet: {}", s.text),
+        ));
+    }
+    for s in key_losses(base_k, file_k) {
+        all.push(Stmt::new(
+            format!("lowered-{}", s.key),
+            "key",
+            format!("the committed {KEYS_FILE} lowers the ratchet: {}", s.text),
+        ));
+    }
+    // the branch's own copy against the computed numbers
+    all.extend(count_decreases(file_c, comp_c));
+    all.extend(key_losses(file_k, comp_k));
+    let mut seen = BTreeSet::new();
+    all.retain(|s| seen.insert(s.key.clone()));
+    all
+}
+
 pub fn cmd(args: &[String]) -> Result<i32, String> {
     let has = |k: &str| args.iter().any(|a| a == k);
     if args.first().map(String::as_str) == Some("amend") {
@@ -2139,6 +2404,19 @@ pub fn cmd(args: &[String]) -> Result<i32, String> {
         .ok_or("not inside a git repository")?;
     let root = PathBuf::from(top);
     let units = inventory::load(&root)?;
+    if has("--write-counts") {
+        let (fps, errs) = crate::roles::fingerprints(&FsTree(root.clone()), &units);
+        if !errs.is_empty() {
+            for e in &errs {
+                eprintln!("spec: cannot classify: {e}");
+            }
+            return Ok(2);
+        }
+        fs::write(root.join(COUNTS_FILE), counts_tsv(&fps)).map_err(|e| e.to_string())?;
+        fs::write(root.join(KEYS_FILE), keys_tsv(&fps)).map_err(|e| e.to_string())?;
+        eprintln!("spec: wrote {COUNTS_FILE} and {KEYS_FILE}");
+        return Ok(0);
+    }
     let work = collect(&FsTree(root.clone()), &units);
     if has("--list") {
         for s in &work.stmts {
@@ -2165,7 +2443,7 @@ pub fn cmd(args: &[String]) -> Result<i32, String> {
     }
     if !has("--check") {
         return Err(
-            "usage: spec --check [--base REF] [--allow WHY] [--merge-gate] | spec --list [--json] | spec amend --list|--template"
+            "usage: spec --check [--base REF] [--allow WHY] [--merge-gate] | spec --list [--json] | spec --write-counts | spec amend --list|--template"
                 .into(),
         );
     }
@@ -2210,7 +2488,32 @@ pub fn cmd(args: &[String]) -> Result<i32, String> {
         None => units.clone(),
     };
     let b = collect(&gt, &base_units);
-    let d = diff(&b.stmts, &work.stmts);
+    let mut d = diff(&b.stmts, &work.stmts);
+    // The count ratchet: computed counts now against the file committed at the base.
+    let (fps, cerrs) = crate::roles::fingerprints(&FsTree(root.clone()), &units);
+    if !cerrs.is_empty() {
+        for e in &cerrs {
+            eprintln!("spec: cannot classify: {e}");
+        }
+        return Ok(2);
+    }
+    let computed = counts_tsv(&fps);
+    // Ratchet against the files committed at the base (written by the previous extractor): a lower count, a missing unit or a vanished
+    // key is refused like a removed statement. A file that is merely out of date (higher numbers) is fine.
+    let base_counts = gt.read(COUNTS_FILE);
+    let base_keys = gt.read(KEYS_FILE);
+    if base_counts.is_some() || base_keys.is_some() {
+        let file_counts = fs::read_to_string(root.join(COUNTS_FILE)).unwrap_or_default();
+        let file_keys = fs::read_to_string(root.join(KEYS_FILE)).unwrap_or_default();
+        d.removed.extend(ratchet_losses(
+            &parse_counts(&base_counts.unwrap_or_default()),
+            &parse_keys(&base_keys.unwrap_or_default()),
+            &parse_counts(&file_counts),
+            &parse_keys(&file_keys),
+            &parse_counts(&computed),
+            &parse_keys(&keys_tsv(&fps)),
+        ));
+    }
     let allow = Allow::read(
         &|k| std::env::var(k).ok(),
         val(args, "--allow"),
@@ -2223,7 +2526,11 @@ pub fn cmd(args: &[String]) -> Result<i32, String> {
     let ctx = AmendCtx {
         log: amend::parse_log(&work_log),
         append_err: amend::append_only(&base_log, &work_log).err(),
-        required: std::env::var(amend::REQUIRED_ENV).is_ok_and(|v| v.trim() == "1"),
+        required: amend::required_at(
+            std::env::var(amend::REQUIRED_ENV).ok().as_deref(),
+            has("--merge-gate"),
+            &std::env::var(MERGE_ENV).unwrap_or_default(),
+        ),
     };
     let (text, code) = render_with(&d, &allow, &summary, &ctx);
     print!("{text}");
@@ -3039,6 +3346,98 @@ mod tests {
             "{t}"
         );
         assert!(!t.contains("SPEC CHANGE ALLOWED"));
+    }
+
+    #[test]
+    fn amendments_are_required_by_default_and_only_an_explicit_zero_turns_that_off() {
+        for env in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("true"),
+            Some("off"),
+            Some("00"),
+        ] {
+            assert!(
+                amend::required(env),
+                "{env:?} must keep amendments required"
+            );
+        }
+        assert!(!amend::required(Some("0")));
+        assert!(!amend::required(Some(" 0\n")));
+        let (d, _) = some_diff();
+        let key = d.changed[0].0.key.clone();
+        // the default (switch unset): a plain allow is refused
+        let (t, code) = render_with(
+            &d,
+            &allow_reason("just because"),
+            "s",
+            &ctx(&[], amend::required(None)),
+        );
+        assert_eq!(code, 1, "{t}");
+        assert!(
+            t.contains("REFUSED") && t.contains("SPEC-AMENDMENTS.md"),
+            "{t}"
+        );
+        assert!(!t.contains("SPEC CHANGE ALLOWED"));
+        // LUCINA_SPEC_AMEND_REQUIRED=0: accepted with the LEGACY warning
+        let (t, code) = render_with(
+            &d,
+            &allow_reason("just because"),
+            "s",
+            &ctx(&[], amend::required(Some("0"))),
+        );
+        assert_eq!(code, 0, "{t}");
+        assert!(t.contains(amend::LEGACY_MARK), "{t}");
+        // an allow that names an amendment is always checked in full, with the switch at either value
+        for env in [None, Some("0")] {
+            let (t, code) = render_with(
+                &d,
+                &allow_reason("amend:ZZ x"),
+                "s",
+                &ctx(&[], amend::required(env)),
+            );
+            assert_eq!(code, 1, "{env:?}: {t}");
+            assert!(t.contains("no such line"), "{t}");
+            let line = amend_line("A1", &key, "accepted", "gpt-6.1-sol", "gpt");
+            let (t, code) = render_with(
+                &d,
+                &allow_reason("amend:A1 tightened"),
+                "s",
+                &ctx(&[line.as_str()], amend::required(env)),
+            );
+            assert_eq!(code, 0, "{env:?}: {t}");
+            assert!(!t.contains(amend::LEGACY_MARK));
+            let same = amend_line("A1", &key, "accepted", "claude-opus-5-5", "claude");
+            let (_, code) = render_with(
+                &d,
+                &allow_reason("amend:A1 tightened"),
+                "s",
+                &ctx(&[same.as_str()], amend::required(env)),
+            );
+            assert_eq!(code, 1, "{env:?}: same family");
+        }
+    }
+
+    #[test]
+    fn at_the_merge_gate_a_zero_switch_needs_the_legacy_amend_token() {
+        // outside the gate: =0 alone
+        assert!(!amend::required_at(Some("0"), false, ""));
+        // at the gate: =0 alone keeps amendments required
+        assert!(amend::required_at(Some("0"), true, ""));
+        assert!(amend::required_at(Some("0"), true, "just because"));
+        assert!(amend::required_at(Some("0"), true, "legacy-amend:"));
+        assert!(amend::required_at(Some("0"), true, "xlegacy-amend:why"));
+        // with the token it is honoured
+        assert!(!amend::required_at(
+            Some("0"),
+            true,
+            "legacy-amend:emergency fix"
+        ));
+        assert!(!amend::required_at(Some("0"), true, "x; legacy-amend:why"));
+        // the token alone without =0 changes nothing
+        assert!(amend::required_at(None, true, "legacy-amend:why"));
+        assert!(amend::required_at(None, false, "legacy-amend:why"));
     }
 
     #[test]

@@ -38,6 +38,7 @@ use std::{
     time::Duration,
 };
 
+use lucina_remote::dataclean;
 use lucina_remote::stream::{Header, Part, add_kernel_args, arm64_image, drop_kernel_arg, hex};
 use sha2::{Digest, Sha256};
 
@@ -61,6 +62,7 @@ const SYS_KEXEC_FILE_LOAD: libc::c_long = 320; // x86-64: only so that the host 
 const LINUX_REBOOT_MAGIC1: libc::c_ulong = 0xfee1_dead;
 const LINUX_REBOOT_MAGIC2: libc::c_ulong = 0x2812_1969;
 const LINUX_REBOOT_CMD_KEXEC: libc::c_ulong = 0x4558_4543;
+const LINUX_REBOOT_CMD_RESTART: libc::c_ulong = 0x0123_4567;
 
 /// Whether a reload is allowed on a kernel that has run `uptime_s` seconds.
 ///
@@ -361,6 +363,15 @@ fn jump_in_background() -> Result<(), String> {
                 }
             }
             std::thread::sleep(DELAY_BEFORE_JUMP);
+            // /data has no journal: without its clean mark the next boot spends a full e2fsck on it. Best effort, capped at
+            // 5 s, from `/` so that the sender's own working directory does not hold /data open.
+            // SAFETY: `chdir` reads a NUL-terminated string that lives through the call.
+            unsafe { libc::chdir(c"/".as_ptr()) };
+            let outcome = dataclean::clean_before_restart();
+            if let Ok(mut kmsg) = fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+                let _ = kmsg
+                    .write_all(format!("<4>lucina-reload: {}\n", outcome.describe()).as_bytes());
+            }
             // SAFETY: The arguments are integers; on success this does not return.
             unsafe {
                 libc::syscall(
@@ -370,8 +381,29 @@ fn jump_in_background() -> Result<(), String> {
                     LINUX_REBOOT_CMD_KEXEC,
                     0 as libc::c_ulong,
                 );
-                libc::_exit(1)
             }
+            // The kexec failed. /data is marked clean and out of use, so a plain restart through the firmware is orderly; running on
+            // would leave writes going to the root's /data mount point.
+            let failed = io::Error::last_os_error();
+            if let Ok(mut kmsg) = fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+                let _ = kmsg.write_all(
+                    format!("<4>lucina-reload: kexec failed ({failed}), restarting through the firmware\n").as_bytes(),
+                );
+            }
+            // SAFETY: The arguments are integers; on success this does not return.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_reboot,
+                    LINUX_REBOOT_MAGIC1,
+                    LINUX_REBOOT_MAGIC2,
+                    LINUX_REBOOT_CMD_RESTART,
+                    0 as libc::c_ulong,
+                );
+            }
+            // Not even that: /data goes back to a normal read-write mount, not clean.
+            let _ = dataclean::reopen_after_failed_restart();
+            // SAFETY: Ends this child without running destructors.
+            unsafe { libc::_exit(1) }
         }
         _ => Ok(()),
     }

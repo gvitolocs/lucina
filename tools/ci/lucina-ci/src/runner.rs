@@ -472,6 +472,21 @@ pub fn inner(args: &[String]) -> i32 {
         verified: m.verified,
         errors: m.errors,
     });
+    if outcome == Outcome::Verified {
+        let c = verdict::check_output(&spec.kind, &text);
+        if let Some(w) = c.weak {
+            m.detail = format!("{} weak refusals (no verification run)", w);
+        }
+        if let Some(p) = c.problem {
+            // A mutants log without its baseline is a script that cannot be trusted (infra); the others passed on the exit code alone.
+            outcome = if spec.kind == "mutants" {
+                Outcome::Infra
+            } else {
+                Outcome::Vacuous
+            };
+            m.detail = p;
+        }
+    }
     if outcome != Outcome::Verified && m.detail.starts_with("disk nearly full") {
         outcome = Outcome::Infra;
     }

@@ -372,6 +372,38 @@ fn set_notice(line: Option<&str>) {
     let _ = fs::write(NOTICE, lines.join("\n") + "\n");
 }
 
+/// Before a planned restart: `lucina-data clean --cap 5`, so that the next boot does not run e2fsck on /data (it has no journal).
+/// Best effort; waits 6 s at most, and says what happened.
+fn mark_data_clean() -> String {
+    if !std::path::Path::new("/run/lucina/data-ready").exists() {
+        return "no /data on this boot".to_string();
+    }
+    let mut child = match Command::new("/sbin/lucina-data")
+        .args(["clean", "--cap", "5"])
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return format!("/data not marked clean (lucina-data: {e}), next boot checks");
+        }
+    };
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(s)) if s.success() => return "/data marked clean".to_string(),
+            Ok(Some(s)) => {
+                return format!("/data not marked clean (lucina-data {s}), next boot checks");
+            }
+            Ok(None) if started.elapsed() > Duration::from_secs(6) => {
+                let _ = child.kill();
+                return "/data not marked clean (lucina-data took too long); the next boot checks it".to_string();
+            }
+            Ok(None) => sleep(Duration::from_millis(50)),
+            Err(e) => return format!("/data not marked clean ({e}), next boot checks"),
+        }
+    }
+}
+
 /// Writes the USB state to the log and asks for a restart, with the reason in the saved log. `LINUX_REBOOT_CMD_RESTART2` is
 /// Linux's restart with a text.
 fn reboot_for_dead_network(for_s: u64, log: &mut Log) -> ! {
@@ -385,16 +417,17 @@ fn reboot_for_dead_network(for_s: u64, log: &mut Log) -> ! {
     }
     let reason = format!("lucina-watchd: the network was up and has been dead for {for_s} s");
     log.say(&reason);
+    log.say(&mark_data_clean());
     let text = CString::new(reason).expect("no NUL in it");
     const MAGIC1: libc::c_long = 0xfee1_dead;
     const MAGIC2: libc::c_long = 0x2812_1969;
     const RESTART2: libc::c_long = 0xa1b2_c3d4;
     // SAFETY: the kernel reads a NUL-terminated string that lives through the call.
     unsafe { libc::syscall(libc::SYS_reboot, MAGIC1, MAGIC2, RESTART2, text.as_ptr()) };
-    log.say(&format!(
-        "the restart failed: {}",
-        std::io::Error::last_os_error()
-    ));
+    let failed = std::io::Error::last_os_error();
+    log.say(&format!("the restart failed: {failed}"));
+    // /data was marked clean and is out of use: back to a normal read-write mount that is not clean (best effort).
+    let _ = Command::new("/sbin/lucina-data").arg("reopen").status();
     // Stop petting, and the kernel ends it.
     loop {
         sleep(Duration::from_secs(60));

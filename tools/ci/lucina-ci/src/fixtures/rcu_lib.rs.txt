@@ -1,0 +1,99 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! RCU grace-period bookkeeping for Juno's kernel, tested on the host and proved by Verus in this very file
+//! (`verification/juno-rcu/rules.rs`, D-011). `docs/research/juno-rcu.md`.
+//!
+//! The original is Asterinas's `ostd/src/sync/rcu/monitor.rs` (MPL-2.0): items retired while a grace period runs wait for
+//! the next one; a grace period ends when every CPU has passed a quiescent point since it started; when it ends, the items
+//! waiting for it are handed back to be freed and the waiting ones start the next grace period. The behaviour is kept
+//! exactly, with the callbacks as items of any type and the CPU set as a 64-bit mask. The kernel calls [`Monitor::quiescent`]
+//! under the monitor's lock on task switch, on going idle and on returning to user mode, and frees what it returns
+//! outside the lock.
+//!
+//! What Verus proves, for any sequence of calls (`ensures` of each function):
+//! * Safety: every item [`Monitor::quiescent`] returns was retired no later than the start of the grace period that
+//!   returns it, and every CPU in `all` passed a quiescent point after that start.
+//! * No loss: everything retired is, in order, what was returned, then the running grace period's items, then the
+//!   waiting ones; each item is returned once.
+//! * Progress: once a grace period runs, each CPU in `all` passing adds to it, and when all have passed it ends and
+//!   returns its items (`round_ends`); the waiting items then start the next one, so an item comes back within two.
+//!
+//! `all` is not stored: the kernel passes its fixed mask of CPUs every time. A grace period ends when every CPU in the
+//! mask given at that moment has passed, which is what Asterinas's `is_full` checks too, so the safety holds for that mask
+//! even if it changed.
+//!
+//! The ghost history (calls so far, retire times, each CPU's last quiescent point) exists only under Verus; the kernel
+//! build has the five plain fields.
+//!
+//! The items are kept in a [`Queue`], not one growing `Vec` (patch 1059). In the kernel no allocation may be larger than
+//! a page: a larger one needs physically contiguous memory, which a fragmented heap may not have, and an infallible one
+//! that fails panics. Asterinas's `VecDeque` of callbacks doubled while a grace period could not end and reached 2 MiB
+//! before 1050 fixed the grace periods; a burst of unmaps between two quiescent points can still queue many thousands.
+//! A [`Queue`] holds full chunks of [`CHUNK`] items in a linked list and fills one more, so its largest allocation is
+//! `CHUNK` items (2 KiB for the kernel's boxed callbacks), however many wait. Verus proves it keeps every item, in order.
+#![no_std]
+#![allow(unexpected_cfgs)]
+
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+
+/// Items per chunk of a [`Queue`]: its largest allocation is this many items.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+pub const CHUNK: usize = 128;
+
+/// A full chunk of [`CHUNK`] items, and the chunks filled before it.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+struct Chunk<T> {
+    items: Vec<T>,
+    older: Option<Box<Chunk<T>>>,
+}
+
+/// A first-in first-out list of items in chunks: the full ones newest first, linked, and one being filled. Nothing in it
+/// allocates more than [`CHUNK`] items at once. Taking from it gives the newest chunk first (see [`Queue::take_last`]).
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+pub struct Queue<T> {
+    /// The newest full chunk, which links to the older ones.
+    }
+}
+
+/// Dropped chunk by chunk: the default drop would recurse once per chunk, deep enough to overflow a kernel stack.
+#[cfg(not(verus_keep_ghost))]
+impl<T> Drop for Queue<T> {
+    fn drop(&mut self) {
+        let mut top = self.full.take();
+        while let Some(mut chunk) = top {
+            top = chunk.older.take();
+        }
+    }
+}
+
+#[cfg(not(verus_keep_ghost))]
+impl<T> Default for Queue<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// How much RCU work one quiescent state may do (patch 1112): at most `chunks` chunks of ready callbacks, and no new chunk
+/// once `micros` have passed, the first always. Linux's `rcu_do_batch` bounds its batch the same two ways (`blimit` and a
+/// time limit). The kernel loops: take a chunk ([`Monitor::take_ready`]), run it outside the lock, ask [`another_chunk`].
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        out
+    }
+}
+
+#[cfg(not(verus_keep_ghost))]
+impl<T> Default for Monitor<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests;

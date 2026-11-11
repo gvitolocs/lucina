@@ -6,6 +6,8 @@ verus=${VERUS:-/home/user/tools/verus/verus-x86-linux/verus}
 work=$(mktemp -d "${TMPDIR:-/tmp}/juno-ring-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
 fail=0
+refused=0
+weak=0
 try() {
     local from=$1 to=$2
     # Shown on one line: a planted bug may span lines.
@@ -24,9 +26,21 @@ try() {
     if "$verus" "$work/verification/juno-ring/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED: $shown"; fail=1
     else
-        echo "refused: $shown ($(grep -c "^error" "$work/out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused: $shown ($(grep -c "^error" "$work/out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $shown ($(grep -c "^error" "$work/out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
+# The unchanged files must verify, or every "refused" below would mean nothing.
+if "$verus" verification/juno-ring/rules.rs > "$work/baseline" 2>&1; then
+    echo "baseline: verifies"
+else
+    cat "$work/baseline"; echo "mutants: the unchanged files do not verify"; exit 1
+fi
 # The offset is within a page.
 try 'pos % PAGE)' 'pos % (PAGE - 1))'
 # The page is the slot of the position in the ring, not how many times it wrapped.
@@ -48,4 +62,6 @@ try 'let end = if head == tail &&' 'let end = if head != tail &&'
 try 'tail.wrapping_sub(start) > cap {' 'tail.wrapping_sub(start) > cap + PAGE {'
 # Every page the read took is reported, not one fewer.
 try 'let mut count = end.wrapping_sub(start) / PAGE;' 'let mut count = end.wrapping_sub(start) / PAGE / 2;'
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit $fail

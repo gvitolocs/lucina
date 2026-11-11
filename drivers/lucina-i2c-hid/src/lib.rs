@@ -62,7 +62,10 @@ pub enum Error<E> {
     BufferTooSmall,
     /// GET_REPORT answered with another report ID than the one asked for (`i2c_hid_get_report`, "device returned
     /// incorrect report").
-    WrongReport { asked: u8, got: u8 },
+    WrongReport {
+        asked: u8,
+        got: u8,
+    },
 }
 
 impl<E: fmt::Display> fmt::Display for Error<E> {
@@ -79,7 +82,10 @@ impl<E: fmt::Display> fmt::Display for Error<E> {
             }
             Error::BufferTooSmall => f.write_str("buffer too small"),
             Error::WrongReport { asked, got } => {
-                write!(f, "asked for report {asked}, the device answered with report {got}")
+                write!(
+                    f,
+                    "asked for report {asked}, the device answered with report {got}"
+                )
             }
         }
     }
@@ -754,7 +760,12 @@ fn walk_items(desc: &[u8], mut f: impl FnMut(&InputItem)) -> Option<()> {
                         f(&InputItem {
                             kind,
                             report_id: g.report_id,
-                            logical: logical_at[..level].iter().rev().copied().find(|&l| l != 0).unwrap_or(0),
+                            logical: logical_at[..level]
+                                .iter()
+                                .rev()
+                                .copied()
+                                .find(|&l| l != 0)
+                                .unwrap_or(0),
                             physical_min: g.physical_min,
                             physical_max: g.physical_max,
                             unit_exponent: g.unit_exponent,
@@ -801,9 +812,21 @@ fn walk_items(desc: &[u8], mut f: impl FnMut(&InputItem)) -> Option<()> {
                 0x0 => g.usage_page = unsigned,
                 0x1 => g.logical_min = signed,
                 // Linux's hid_parser_global: a maximum is unsigned unless its minimum is negative.
-                0x2 => g.logical_max = if g.logical_min < 0 { signed } else { unsigned as i32 },
+                0x2 => {
+                    g.logical_max = if g.logical_min < 0 {
+                        signed
+                    } else {
+                        unsigned as i32
+                    }
+                }
                 0x3 => g.physical_min = signed,
-                0x4 => g.physical_max = if g.physical_min < 0 { signed } else { unsigned as i32 },
+                0x4 => {
+                    g.physical_max = if g.physical_min < 0 {
+                        signed
+                    } else {
+                        unsigned as i32
+                    }
+                }
                 // Linux's hid_parser_global: a unit exponent of 0..15 is a 4-bit two's complement number (HID 1.11
                 // 6.2.2.7 is often read that way), anything else is taken as it is.
                 0x5 => {
@@ -864,9 +887,8 @@ impl KeyboardFormat {
                 return;
             }
             match item.usage(0) >> 16 {
-                0x07
-                    if keyboard_id.is_none_or(|id| id == item.report_id)
-                        && fmt.nfields < MAX_FIELDS =>
+                0x07 if keyboard_id.is_none_or(|id| id == item.report_id)
+                    && fmt.nfields < MAX_FIELDS =>
                 {
                     keyboard_id = Some(item.report_id);
                     fmt.fields[fmt.nfields] = Field {
@@ -879,12 +901,15 @@ impl KeyboardFormat {
                     };
                     fmt.nfields += 1;
                 }
-                0x01 if item.usage(0) & 0xffff == 0xc6 && item.variable && item.size == 1 && fmt.radio.is_none() => {
+                0x01 if item.usage(0) & 0xffff == 0xc6
+                    && item.variable
+                    && item.size == 1
+                    && fmt.radio.is_none() =>
+                {
                     fmt.radio = Some((item.report_id, item.bit_offset));
                 }
-                0x0c
-                    if consumer_id.is_none_or(|id| id == item.report_id)
-                        && fmt.nconsumer_fields < MAX_FIELDS =>
+                0x0c if consumer_id.is_none_or(|id| id == item.report_id)
+                    && fmt.nconsumer_fields < MAX_FIELDS =>
                 {
                     consumer_id = Some(item.report_id);
                     fmt.consumer_fields[fmt.nconsumer_fields] = ConsumerField {
@@ -1210,7 +1235,11 @@ impl Keyboard {
         let is = value != 0;
         if is != self.radio_pressed {
             self.radio_pressed = is;
-            out(KeyEvent { usage: 0xc6, code: KEY_RFKILL, pressed: is });
+            out(KeyEvent {
+                usage: 0xc6,
+                code: KEY_RFKILL,
+                pressed: is,
+            });
         }
         true
     }
@@ -1318,7 +1347,10 @@ impl Keyboard {
             for u in 0..1024u32 {
                 let (w, b) = ((u / 32) as usize, 1 << (u % 32));
                 let (was, is) = (self.consumer_pressed[w] & b != 0, now[w] & b != 0);
-                if was != is && is == pass && let Some(code) = consumer_key(u as u16) {
+                if was != is
+                    && is == pass
+                    && let Some(code) = consumer_key(u as u16)
+                {
                     out(KeyEvent {
                         usage: u as u8,
                         code,
@@ -1415,21 +1447,24 @@ pub fn consumer_keys() -> impl Iterator<Item = u16> {
 
 /// The codes of [`consumer_key`], in usage order.
 const CONSUMER_KEYS: [u16; 23] = [
-    225, 224, 431, 592, 593, 244, 163, 165, 166, 164, 113, 115, 114, 171, 155, 140, 144, 150, 217, 172,
-    158, 159, 173,
+    225, 224, 431, 592, 593, 244, 163, 165, 166, 164, 113, 115, 114, 171, 155, 140, 144, 150, 217,
+    172, 158, 159, 173,
 ];
 
 pub mod fnrow;
+pub mod gesture_out;
 pub mod setup;
 pub use setup::{SETUP_RETRY_MS, SETUP_TRIES, setup_retry_ms};
-pub mod wait;
 pub mod ptp;
 pub mod samsung_ec;
 pub mod touchpad;
 pub mod tp_accel;
-pub mod tp_tap;
 pub mod tp_buttons;
 pub mod tp_rules;
+pub mod tp_tap;
+pub mod wait;
 
+#[cfg(test)]
+mod replay_tests;
 #[cfg(test)]
 mod tests;

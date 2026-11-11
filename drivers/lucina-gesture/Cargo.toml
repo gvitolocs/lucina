@@ -1,0 +1,10 @@
+[package]
+name = "lucina-gesture"
+version = "0.1.0"
+description = "The touchpad gesture record /dev/lucina-gesture carries and the driver's queue of them: 32 little-endian bytes, libinput units and Q16 fixed points, a swipe, a pinch or a hold with its begin, updates and end. no_std, unsafe-free, allocation-free, no dependencies; the kernel copies it into its tree and the shell and the window-manager rules depend on it"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]

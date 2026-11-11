@@ -22,8 +22,10 @@ if ! "$verus" "$work/base.rs" > "$work/base.out" 2>&1; then
     cat "$work/base.out"
     exit 1
 fi
+echo "baseline: verifies"
 
 fail=0
+weak=0
 killed=0
 try() {
     local from=$1 to=$2
@@ -40,8 +42,13 @@ try() {
         echo "NOT REFUSED: $from -> $to"
         fail=1
     else
-        echo "refused: $from -> $to"
-        killed=$((killed + 1))
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/verus.out" && ! grep -q 'error\[E' "$work/verus.out"; then
+            echo "refused: $from -> $to"
+            killed=$((killed + 1))
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $from -> $to"
+            weak=$((weak+1))
+        fi
     fi
 }
 # The column stack: a card that fits lies wholly above the cursor, the next one starts after the gap.
@@ -83,5 +90,7 @@ try "    width - gone as u32" "    gone as u32"
 try "    let gone = (width as u64) * (t as u64) / 65536;" "    let gone = (width as u64) * (t as u64) / 65536 + 1;"
 tried=$(grep -c "^try " "$0")
 echo "refused $killed of $tried"
-[ "$killed" -eq "$tried" ] || fail=1
+[ "$((killed + weak))" -eq "$tried" ] || fail=1
+echo "mutants: $killed refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit "$fail"

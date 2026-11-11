@@ -37,13 +37,19 @@ pub enum Wait {
     ensures
         r == wait_spec(line_irq, line_moved, test_on, deadline_us, now_us),
 ))]
-pub fn wait_plan(line_irq: bool, line_moved: bool, test_on: bool, deadline_us: Option<u64>, now_us: u64) -> Wait {
+pub fn wait_plan(
+    line_irq: bool,
+    line_moved: bool,
+    test_on: bool,
+    deadline_us: Option<u64>,
+    now_us: u64,
+) -> Wait {
     if !line_irq || !line_moved || test_on {
         Wait::Tick
     } else {
         match deadline_us {
             None => Wait::Line,
-            Some(d) => Wait::LineFor(if d > now_us { d - now_us } else { 0 }),
+            Some(d) => Wait::LineFor(d.saturating_sub(now_us)),
         }
     }
 }
@@ -100,9 +106,18 @@ mod tests {
     #[test]
     fn waits_for_the_line_until_the_next_timer() {
         assert_eq!(wait_plan(true, true, false, None, 100), Wait::Line);
-        assert_eq!(wait_plan(true, true, false, Some(250), 100), Wait::LineFor(150));
-        assert_eq!(wait_plan(true, true, false, Some(100), 100), Wait::LineFor(0));
-        assert_eq!(wait_plan(true, true, false, Some(40), 100), Wait::LineFor(0));
+        assert_eq!(
+            wait_plan(true, true, false, Some(250), 100),
+            Wait::LineFor(150)
+        );
+        assert_eq!(
+            wait_plan(true, true, false, Some(100), 100),
+            Wait::LineFor(0)
+        );
+        assert_eq!(
+            wait_plan(true, true, false, Some(40), 100),
+            Wait::LineFor(0)
+        );
     }
 
     #[test]

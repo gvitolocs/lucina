@@ -32,8 +32,19 @@ licence, and nothing here relicenses it:
 - Code derived from Asterinas is under the Mozilla Public License 2.0, as Asterinas is.
 - third_party/ holds other projects, each under the licence in its own folder or files.
 - Code ported from Linux and other GPL projects stays under the GPL with its notices. Today that is files in
-  drivers/lucina-adreno, drivers/lucina-venus, drivers/lucina-qrtr, drivers/lucina-qmi, fortuna/sim and office/engine (AGPL).
+  drivers/lucina-adreno, drivers/lucina-venus, drivers/lucina-qrtr, drivers/lucina-qmi, kernel/lucina-cpubw (GPL-2.0-only),
+  kernel/lucina-errseq (GPL-2.0-only, from lib/errseq.c of Linux), drivers/lucina-apple-aic (GPL-2.0-or-later, from irq-apple-aic.c
+  of Asahi Linux), drivers/lucina-apple-uart (GPL-2.0-only, from samsung_tty.c of Linux),
+  drivers/lucina-apple-aic-glue (GPL-2.0-only, from irq-apple-aic.c and arm_arch_timer.c of Linux), drivers/lucina-apple-boot
+  (GPL-2.0-only, from arm64 smp_spin_table.c and the simple-framebuffer binding of Linux; follows m1n1 behaviour, nothing copied), fortuna/sim and office/engine (AGPL).
   A program built from such a file is itself bound by that licence.
+- Crates under the Mozilla Public License 2.0, as the Asterinas code they extend or the code they were written beside:
+  drivers/lucina-audio-ledger, drivers/lucina-audio-wake, drivers/lucina-charge, kernel/lucina-cpufreq, kernel/lucina-crash,
+  drivers/lucina-gesture, drivers/lucina-i2c-hid, kernel/lucina-idle, kernel/lucina-irqgate, kernel/lucina-kexec, kernel/lucina-ksyms,
+  kernel/lucina-ksyms-build, services/lucina-nav, kernel/lucina-power, kernel/lucina-rcu, kernel/lucina-ring, apps/lucina-shell,
+  kernel/lucina-sleep, kernel/lucina-spmi, kernel/lucina-standby, kernel/lucina-structmap, kernel/lucina-taskcpu and
+  drivers/lucina-wifi-wake.
+- drivers/lucina-qcom-services is under the BSD 3-Clause licence.
 - apps/lucina-app-desk links lucinadesk-core (gvitolocs/lucinadesk-core), which is under the AGPL-3.0-only. The desk app as built is
   bound by the AGPL.
 - Fonts and other assets are under the licence files next to them.

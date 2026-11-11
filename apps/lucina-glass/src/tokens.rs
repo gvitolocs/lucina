@@ -50,6 +50,12 @@ pub mod color {
     pub const MATERIAL: Color = Color::hexa(0x1c1c1e, 168);
     /// The bottom sheet and other dark glass (the tab bar's `#1C1C1EB8`).
     pub const SMOKE: Color = Color::hexa(0x1c1c1e, 184);
+    /// Bars that follow the page behind them (browser tab strip, toolbar, address pill, dock; widgets/adaptive.rs): the dark
+    /// glass is the tint over a dark page, the light glass over a light one, and `INK_ON_LIGHT` is the ink on the latter.
+    pub const GLASS_BAR_TINT: Color = Color::hexa(0x1c1c1e, 150);
+    pub const GLASS_TINT_LIGHT: Color = Color::hexa(0xf2f2f7, 176);
+    pub const GLASS_RIM_LIGHT: Color = Color::hexa(0x000000, 46);
+    pub const INK_ON_LIGHT: Color = Color::hex(0x1c1c1e);
     /// Shadows under floating cards (`scrim`).
     pub const SHADOW: Color = Color::hexa(0x000000, 110);
 }

@@ -637,8 +637,21 @@ fn run_headless<A: App>(
 ) -> std::io::Result<()> {
     let mut pipe = [-1; 2];
     // SAFETY: pipe2 fills the two-element array.
+    #[cfg(not(target_os = "macos"))]
     if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
         return Err(std::io::Error::last_os_error());
+    }
+    // macOS has no pipe2: pipe, then the same two flags on both ends.
+    #[cfg(target_os = "macos")]
+    // SAFETY: pipe fills the two-element array; fcntl takes the descriptors it just made.
+    unsafe {
+        if libc::pipe(pipe.as_mut_ptr()) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        for fd in pipe {
+            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
     }
     let [wake_r, wake_w] = pipe;
     SIGNAL_FD.store(wake_w, Ordering::SeqCst);
@@ -750,8 +763,21 @@ fn run_inner<A: App>(name: &str, build: impl FnOnce(Sender<A::Msg>) -> A) -> std
 
     let mut pipe = [-1; 2];
     // SAFETY: pipe2 fills the two-element array.
+    #[cfg(not(target_os = "macos"))]
     if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
         return Err(std::io::Error::last_os_error());
+    }
+    // macOS has no pipe2: pipe, then the same two flags on both ends.
+    #[cfg(target_os = "macos")]
+    // SAFETY: pipe fills the two-element array; fcntl takes the descriptors it just made.
+    unsafe {
+        if libc::pipe(pipe.as_mut_ptr()) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        for fd in pipe {
+            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
     }
     let [wake_r, wake_w] = pipe;
     SIGNAL_FD.store(wake_w, Ordering::SeqCst);

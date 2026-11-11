@@ -1,0 +1,13 @@
+[package]
+name = "lucina-apple-boot"
+version = "0.1.0"
+description = "What the Mac M4 board needs from its boot loader's device tree, as pure logic: the simple-framebuffer node m1n1 fills in (formats, geometry, apple,simple-framebuffer first) and the spin-table CPU release (method per cpu node, the release sequence over a trait); no_std, unsafe-free, host-tested"
+# Spelled out rather than taken from the workspace, like the other kernel-side crates: the kernel build copies such a crate into
+# the Asterinas tree (kernel/inject.txt), whose workspace has no such keys.
+# Derived behaviour from Linux's arch/arm64/kernel/smp_spin_table.c (GPL-2.0-only) and the simple-framebuffer devicetree
+# binding (GPL-2.0, i.e. version 2 only), so GPL-2.0-only; see README.md.
+license = "GPL-2.0-only"
+edition = "2024"
+publish = false
+
+[dependencies]

@@ -1,0 +1,16 @@
+[package]
+name = "lucina-apple-aic"
+version = "0.1.0"
+description = "Apple Interrupt Controller (AIC v1/v2/v3, MacBook Air M4 = t8132-aic3) logic: geometry, hwirq packing, fwspec translation, IRQ/FIQ dispatch, masking and IPIs over register traits; no_std, unsafe-free, host-tested"
+# Derived behaviour from Asahi Linux's drivers/irqchip/irq-apple-aic.c (GPL-2.0-or-later); see README.md.
+license = "GPL-2.0-or-later"
+# Spelled out rather than taken from the workspace, like the other kernel-side crates: the kernel build copies such a crate into
+# the Asterinas tree (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]
+
+[features]
+# The software AIC (`sim`), for host tests of crates built on this one (lucina-apple-aic-glue); uses std.
+sim = []

@@ -21,8 +21,10 @@ if ! "$verus" "$work/base.rs" > "$work/base.out" 2>&1; then
     cat "$work/base.out"
     exit 1
 fi
+echo "baseline: verifies"
 
 fail=0
+weak=0
 killed=0
 try() {
     local from=$1 to=$2
@@ -39,8 +41,13 @@ try() {
         echo "NOT REFUSED: $from -> $to"
         fail=1
     else
-        killed=$((killed + 1))
-        echo "refused: $from -> $to"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/verus.out" && ! grep -q 'error\[E' "$work/verus.out"; then
+            killed=$((killed + 1))
+            echo "refused: $from -> $to"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error): $from -> $to"
+            weak=$((weak+1))
+        fi
     fi
 }
 
@@ -76,4 +83,6 @@ try '((opcode == 8 || opcode == 9 || opcode == 10) && len <= 125)
 try '    opcode == 1 || opcode == 2 ||' '    opcode == 0 || opcode == 1 || opcode == 2 ||'
 
 echo "mutants refused: $killed"
+echo "mutants: $killed refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit "$fail"

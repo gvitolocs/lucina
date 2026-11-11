@@ -10,9 +10,11 @@
 
 pub mod appset;
 pub mod conn;
+pub mod dataclean;
 pub mod disk;
 pub mod disk_rules;
 pub mod esp;
+pub mod fsck;
 pub mod gptw;
 pub mod image;
 pub mod install;
@@ -21,5 +23,6 @@ pub mod log;
 pub mod netinst;
 pub mod netinst_rules;
 pub mod process;
+pub mod repair;
 pub mod seed;
 pub mod stream;

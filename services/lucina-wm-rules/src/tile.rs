@@ -4,7 +4,7 @@
 
 use crate::tile_rules;
 
-/// A rectangle in whole pixels: `x`,`y` is the top-left corner, `w`,`h` the size. Coordinates and sizes up to 8192 cannot overflow.
+/// A rectangle in whole pixels: `x`,`y` is the top-left corner, `w`,`h` the size. Coordinates and sizes up to `tile_rules::LIMIT` (2^28, far beyond any real display) cannot overflow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
     pub x: i32,
@@ -89,66 +89,48 @@ pub fn edge_zone(work: Rect, px: i32, py: i32, edge: i32) -> Zone {
     }
 }
 
-/// The work area shrunk by `padding` on every side (never negative in size).
-fn inset(work: Rect, padding: i32) -> Rect {
+/// `v` kept in `-LIMIT..=LIMIT`, the range `tile_rules` covers. Inputs beyond it are clamped (2^28 is far beyond any real
+/// display), so no arithmetic below can overflow.
+fn bounded(v: i32) -> i64 {
+    (v as i64).clamp(-tile_rules::LIMIT, tile_rules::LIMIT)
+}
+
+/// A padding in `0..=LIMIT`: a negative padding behaves as 0 at this boundary.
+fn bounded_padding(p: i32) -> i64 {
+    (p.max(0) as i64).min(tile_rules::LIMIT)
+}
+
+/// A `tile_rules` rectangle `(x, y, w, h)` as a `Rect`. The conversion with `as` cannot lose bits: the prover shows every value fits
+/// `i32` for inputs bounded by `bounded` / `bounded_padding`.
+fn rect((x, y, w, h): (i64, i64, i64, i64)) -> Rect {
     Rect {
-        x: work.x + padding,
-        y: work.y + padding,
-        w: (work.w - 2 * padding).max(0),
-        h: (work.h - 2 * padding).max(0),
+        x: x as i32,
+        y: y as i32,
+        w: w as i32,
+        h: h as i32,
     }
 }
 
 /// The rectangle of a tile zone: `None` gives the work area unchanged, `Top` the work area inset by `padding`, halves and quarters have
 /// `padding` to the work-area edge and between each other (KWin quick-tile padding, 4). The left/top half is the floor half, the right/bottom
-/// half takes the odd pixel.
+/// half takes the odd pixel. A negative `padding` behaves as 0 and work-area values beyond ±`tile_rules::LIMIT` are clamped (not for `None`).
 pub fn zone_rect(work: Rect, zone: Zone, padding: i32) -> Rect {
-    let inner = inset(work, padding);
-    let lw = ((inner.w - padding).max(0)) / 2;
-    let rw = (inner.w - padding - lw).max(0);
-    let th = ((inner.h - padding).max(0)) / 2;
-    let bh = (inner.h - padding - th).max(0);
-    let rx = inner.x + lw + padding;
-    let by = inner.y + th + padding;
+    let (x, y, w, h) = (
+        bounded(work.x),
+        bounded(work.y),
+        bounded(work.w),
+        bounded(work.h),
+    );
+    let p = bounded_padding(padding);
     match zone {
         Zone::None => work,
-        Zone::Top => inner,
-        Zone::Left => Rect {
-            x: inner.x,
-            y: inner.y,
-            w: lw,
-            h: inner.h,
-        },
-        Zone::Right => Rect {
-            x: rx,
-            y: inner.y,
-            w: rw,
-            h: inner.h,
-        },
-        Zone::TopLeft => Rect {
-            x: inner.x,
-            y: inner.y,
-            w: lw,
-            h: th,
-        },
-        Zone::TopRight => Rect {
-            x: rx,
-            y: inner.y,
-            w: rw,
-            h: th,
-        },
-        Zone::BottomLeft => Rect {
-            x: inner.x,
-            y: by,
-            w: lw,
-            h: bh,
-        },
-        Zone::BottomRight => Rect {
-            x: rx,
-            y: by,
-            w: rw,
-            h: bh,
-        },
+        Zone::Top => rect(tile_rules::inset(x, y, w, h, p)),
+        Zone::Left => rect(tile_rules::split_geom(x, y, w, h, p, 500).0),
+        Zone::Right => rect(tile_rules::split_geom(x, y, w, h, p, 500).1),
+        Zone::TopLeft => rect(tile_rules::quarter(x, y, w, h, p, false, false)),
+        Zone::TopRight => rect(tile_rules::quarter(x, y, w, h, p, true, false)),
+        Zone::BottomLeft => rect(tile_rules::quarter(x, y, w, h, p, false, true)),
+        Zone::BottomRight => rect(tile_rules::quarter(x, y, w, h, p, true, true)),
     }
 }
 
@@ -156,29 +138,25 @@ pub fn zone_rect(work: Rect, zone: Zone, padding: i32) -> Rect {
 /// edges and exactly `padding` between the two; the usable width `w - 3 * padding` is shared by ratio, and each side keeps at least one pixel
 /// whenever there are two to give. Both rectangles lie inside `work` and never intersect.
 pub fn split_h(work: Rect, ratio_permille: i32, padding: i32) -> (Rect, Rect) {
-    let inner = inset(work, padding);
-    let (lw, rw) = tile_rules::split_widths(work.w as i64, padding as i64, ratio_permille as i64);
-    let (lw, rw) = (lw as i32, rw as i32);
-    (
-        Rect {
-            x: inner.x,
-            y: inner.y,
-            w: lw,
-            h: inner.h,
-        },
-        Rect {
-            x: inner.x + lw + padding,
-            y: inner.y,
-            w: rw,
-            h: inner.h,
-        },
-    )
+    let (l, r) = tile_rules::split_geom(
+        bounded(work.x),
+        bounded(work.y),
+        bounded(work.w),
+        bounded(work.h),
+        bounded_padding(padding),
+        ratio_permille as i64,
+    );
+    (rect(l), rect(r))
 }
 
-/// Clamp a divider ratio (per-mille of the work width) so that neither side is narrower than `min_w` pixels. When the work area is too
-/// narrow for two such sides the divider goes to the middle (500).
-pub fn clamp_ratio(work: Rect, ratio_permille: i32, min_w: i32) -> i32 {
-    tile_rules::clamp_ratio(work.w as i64, min_w as i64, ratio_permille as i64) as i32
+/// Clamp a divider ratio (per-mille of the width `split_h` shares) so that neither side is narrower than `min_w` pixels. The ratio applies to
+/// the room `work.w - 3 * padding` that `split_h` hands out, not to the full work width. When that room is too narrow for two such sides the
+/// divider goes to the middle (500).
+pub fn clamp_ratio(work: Rect, padding: i32, ratio_permille: i32, min_w: i32) -> i32 {
+    // tile_rules covers widths, paddings and minima up to LIMIT with padding >= 0, so bound the inputs first.
+    let padding = bounded_padding(padding);
+    let avail = (bounded(work.w) - 3 * padding).clamp(0, tile_rules::LIMIT);
+    tile_rules::clamp_ratio(avail, bounded(min_w), ratio_permille as i64) as i32
 }
 
 /// Snap a dragged divider to 500 when it is within `snap` per-mille of it (magnetic centre, macOS/GNOME-like); otherwise unchanged.
@@ -396,7 +374,7 @@ mod tests {
                     continue;
                 }
                 for ratio in 0..=1000 {
-                    let c = clamp_ratio(work, ratio, min_w);
+                    let c = clamp_ratio(work, 0, ratio, min_w);
                     let left = (w as i64 * c as i64 / 1000) as i32;
                     assert!(
                         left >= min_w && w - left >= min_w,
@@ -413,12 +391,161 @@ mod tests {
                     w: 500,
                     h: 10
                 },
+                0,
                 100,
                 300
             ),
             500
         );
-        assert_eq!(clamp_ratio(WORK, 500, 100), 500);
+        assert_eq!(clamp_ratio(WORK, 0, 500, 100), 500);
+    }
+
+    #[test]
+    fn clamp_keeps_min_width_of_the_split_sides() {
+        for w in [600, 1000, 1920] {
+            let work = Rect {
+                x: 0,
+                y: 0,
+                w,
+                h: 100,
+            };
+            for padding in [0, 4, 12] {
+                let min_w = 200;
+                assert!(2 * min_w <= w - 3 * padding);
+                for ratio in 0..=1000 {
+                    let r = clamp_ratio(work, padding, ratio, min_w);
+                    let (l, rr) = split_h(work, r, padding);
+                    assert!(
+                        l.w >= min_w && rr.w >= min_w,
+                        "w {w} padding {padding} ratio {ratio} -> {r}: {} and {}",
+                        l.w,
+                        rr.w
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_geom_matches_the_documented_layout() {
+        let (l, r) = tile_rules::split_geom(11, 5, 200, 300, 4, 500);
+        assert_eq!(l, (15, 9, 94, 292));
+        assert_eq!(r, (113, 9, 94, 292));
+    }
+
+    #[test]
+    fn split_geom_clamps_height_and_has_no_negative_size() {
+        let (l, r) = tile_rules::split_geom(0, 0, 5, 5, 4, 500);
+        assert_eq!((l.3, r.3), (0, 0));
+        assert_eq!((l.2, r.2), (0, 0));
+    }
+
+    #[test]
+    fn inset_values() {
+        assert_eq!(tile_rules::inset(0, 32, 1920, 1048, 4), (4, 36, 1912, 1040));
+        assert_eq!(tile_rules::inset(3, 3, 5, 5, 4), (7, 7, 0, 0));
+        assert_eq!(tile_rules::inset(1, 2, 10, 20, 0), (1, 2, 10, 20));
+    }
+
+    #[test]
+    fn second_4k_screen_to_the_right_is_not_cut() {
+        let work = Rect {
+            x: 11520,
+            y: 0,
+            w: 3840,
+            h: 2160,
+        };
+        let left = zone_rect(work, Zone::Left, 4);
+        assert_eq!(left.x, 11524);
+    }
+
+    #[test]
+    fn negative_padding_behaves_as_zero() {
+        for p in [-1, -4, i32::MIN] {
+            for zone in [
+                Zone::Top,
+                Zone::Left,
+                Zone::Right,
+                Zone::TopLeft,
+                Zone::TopRight,
+                Zone::BottomLeft,
+                Zone::BottomRight,
+            ] {
+                assert_eq!(zone_rect(WORK, zone, p), zone_rect(WORK, zone, 0));
+            }
+            assert_eq!(split_h(WORK, 400, p), split_h(WORK, 400, 0));
+            assert_eq!(
+                clamp_ratio(WORK, p, 100, 300),
+                clamp_ratio(WORK, 0, 100, 300)
+            );
+        }
+    }
+
+    #[test]
+    fn huge_inputs_do_not_panic_and_fit_i32() {
+        let extremes = [i32::MIN, -1, 0, 1, i32::MAX];
+        for x in extremes {
+            for w in extremes {
+                let work = Rect { x, y: x, w, h: w };
+                for p in extremes {
+                    for zone in [
+                        Zone::Top,
+                        Zone::Left,
+                        Zone::Right,
+                        Zone::TopLeft,
+                        Zone::TopRight,
+                        Zone::BottomLeft,
+                        Zone::BottomRight,
+                    ] {
+                        let r = zone_rect(work, zone, p);
+                        assert!(i64::from(r.x) + i64::from(r.w) <= i64::from(i32::MAX));
+                        assert!(r.w >= 0 && r.h >= 0);
+                    }
+                    for ratio in extremes {
+                        let (l, r) = split_h(work, ratio, p);
+                        assert!(l.w >= 0 && r.w >= 0 && l.h >= 0);
+                        let _ = clamp_ratio(work, p, ratio, w);
+                    }
+                }
+            }
+        }
+        // beyond the limit behaves as the limit
+        let big = Rect {
+            x: 0,
+            y: 0,
+            w: i32::MAX,
+            h: i32::MAX,
+        };
+        let lim = tile_rules::LIMIT as i32;
+        let at = Rect {
+            x: 0,
+            y: 0,
+            w: lim,
+            h: lim,
+        };
+        assert_eq!(split_h(big, 500, 4), split_h(at, 500, 4));
+    }
+
+    #[test]
+    fn the_four_quarters_never_intersect_and_lie_inside_the_work_area() {
+        let zones = [
+            Zone::TopLeft,
+            Zone::TopRight,
+            Zone::BottomLeft,
+            Zone::BottomRight,
+        ];
+        for padding in 0..=12 {
+            for (w, h) in [(100, 90), (101, 91), (640, 480), (1921, 1049)] {
+                let work = Rect { x: 7, y: 3, w, h };
+                for i in 0..4 {
+                    let a = zone_rect(work, zones[i], padding);
+                    assert!(work.contains(&a), "padding {padding} {w}x{h}");
+                    for z in zones.iter().skip(i + 1) {
+                        assert!(!a.intersects(&zone_rect(work, *z, padding)));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

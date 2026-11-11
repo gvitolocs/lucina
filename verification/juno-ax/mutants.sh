@@ -6,7 +6,7 @@ verus=${VERUS:-/home/user/tools/verus/verus-x86-linux/verus}
 file=services/lucina-ax/src/rules.rs
 work=$(mktemp -d "${TMPDIR:-/tmp}/juno-ax-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
-fail=0
+fail=0 refused=0 weak=0
 try() {
     local from=$1 to=$2
     local text; text=$(<"$file")
@@ -19,13 +19,22 @@ try() {
     printf 'use vstd::prelude::*;\nverus! {\n%s\n}\nfn main() {}\n' "$body" > "$work/rules.rs"
     if "$verus" "$work/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED: $from -> $to"; fail=1
-    elif grep -qE 'verification results:: [0-9]+ verified, [1-9][0-9]* errors' "$work/out"; then
+    elif { grep -qE 'verification results:: [0-9]+ verified, [1-9][0-9]* errors' "$work/out" || grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out"; } && ! grep -q 'error\[E' "$work/out"; then
+        refused=$((refused + 1))
         echo "refused: $from -> $to"
     else
         # Refused before any proof ran (it does not compile): that shows nothing about the proof.
-        echo "DID NOT COMPILE: $from -> $to"; sed -n 1,6p "$work/out"; fail=1
+        echo "refused (NO VERIFICATION RUN: compile or other error): $from -> $to"; sed -n 1,6p "$work/out"; weak=$((weak+1)); fail=1
     fi
 }
+# The unchanged files must verify, or every "refused" below would mean nothing.
+base_body=$(sed -E -e '/\/\/@omit$/d' -e 's/-> (.*[^ ]) \/\/@ret$/-> (ret: \1)/' -e 's/^( *)\/\/@ ?/\1\/*proof*\/ /' "$file")
+printf 'use vstd::prelude::*;\nverus! {\n%s\n}\nfn main() {}\n' "$base_body" > "$work/base.rs"
+if "$verus" "$work/base.rs" > "$work/baseline" 2>&1; then
+    echo "baseline: verifies"
+else
+    cat "$work/baseline"; echo "mutants: the unchanged files do not verify"; exit 1
+fi
 # Secret values: a password's text, a private area's values or drawn text, a dropped child, or a missing secret mark leak.
 try 'value: !secret,' 'value: true,'
 try 'value: !secret,' 'value: !scope.private,'
@@ -65,4 +74,6 @@ try $'            *pending = None;\n            Some(p.act)' $'            Some(
 try $'    !(owner_only && injected)\n}' $'    !owner_only\n}'
 try $'    !(owner_only && injected)\n}' $'    !injected\n}'
 [ "$fail" = 0 ] && echo "mutants: every planted bug was refused" || echo "mutants: FAILED"
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit $fail

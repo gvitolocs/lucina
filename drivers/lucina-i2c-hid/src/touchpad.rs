@@ -10,9 +10,9 @@
 //! (`tp_pin_fingers`, `tp_unpin_finger`), the finger count and its debounce (`tp_gesture_update_finger_state`), the
 //! gesture states NONE / UNKNOWN / POINTER_MOTION / SCROLL_START / SCROLL and the scroll-or-pinch decision
 //! (`tp_gesture_detect_motion_gestures`, `tp_gesture_is_pinch`), scroll constraints, `evdev_post_scroll` /
-//! `evdev_stop_scroll`, natural scrolling. Pinches and swipes are told apart from scrolling as libinput does, and then
-//! send nothing (no reader takes them yet). Not ported: hold gestures (they only notify clients; a touch stops kinetic
-//! scrolling instead, as libinput's hold begin does for GTK), the pressure, size, edge, typing and trackpoint palm
+//! `evdev_stop_scroll`, natural scrolling, and the hold, swipe and pinch gestures (HOLD, HOLD_AND_MOTION, SWIPE_START,
+//! SWIPE, PINCH_START, PINCH: libinput's `gesture_notify_*` become [`Output::Gesture`]; a touch also stops kinetic scrolling).
+//! Not ported: the pressure, size, edge, typing and trackpoint palm
 //! detectors and thumb detection (this pad has no pressure or size; the firmware's confidence bit marks palms and
 //! thumbs), edge scrolling, 3-finger drag, jump detection and hysteresis (quirks for other models). The clickpad's
 //! click becomes left, middle or right by where the fingers are, libinput's default click method for it (software
@@ -20,9 +20,10 @@
 
 use crate::ptp::{Frame, MAX_SLOTS, MT_TOOL_PALM};
 use crate::tp_accel::TouchpadAccel;
+use crate::tp_buttons::{ButtonPhase, ButtonTouch, ClickButton, SoftButtons};
+pub use crate::tp_rules::GestureKind;
 pub use crate::tp_rules::GestureState;
 use crate::tp_rules::{GestureEvent, finger_update, gesture_step};
-use crate::tp_buttons::{ButtonPhase, ButtonTouch, ClickButton, SoftButtons};
 use crate::tp_tap::{Tap, TapButton, TapConfig, TapEvent, TapTouch, TouchPhase};
 
 /// `TOUCHPAD_HISTORY_LENGTH`.
@@ -33,6 +34,11 @@ const DEFAULT_MOUSE_DPI: f64 = 1000.0;
 const GESTURE_SWITCH_TIMEOUT_US: u64 = 100_000;
 const GESTURE_SWIPE_TIMEOUT_US: u64 = 150_000;
 const GESTURE_PINCH_TIMEOUT_US: u64 = 300_000;
+/// `QUICK_GESTURE_HOLD_TIMEOUT`, `DEFAULT_GESTURE_HOLD_TIMEOUT`.
+const GESTURE_QUICK_HOLD_TIMEOUT_US: u64 = 40_000;
+const GESTURE_HOLD_TIMEOUT_US: u64 = 180_000;
+/// `HOLD_AND_MOTION_THRESHOLD` (mm).
+const HOLD_AND_MOTION_THRESHOLD_MM: f64 = 0.5;
 /// `PINCH_DISAMBIGUATION_MOVE_THRESHOLD` (mm).
 const PINCH_DISAMBIGUATION_MOVE_MM: f64 = 1.5;
 /// `tp_unpin_finger`: 1.5 mm movement unpins.
@@ -89,16 +95,54 @@ pub enum Button {
     Middle,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GesturePhase {
+    Begin,
+    Update,
+    End,
+}
+
+/// One libinput gesture event (`gesture_notify_*`), at the frame's time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gesture {
+    pub kind: GestureKind,
+    pub phase: GesturePhase,
+    pub fingers: u8,
+    /// End only: libinput's `cancelled`.
+    pub cancelled: bool,
+    /// libinput's `unaccel` delta (`tp_filter_motion_unaccelerated`: the raw delta in the x axis' units through the
+    /// touchpad's constant filter, which is 0.9 * 0.2968 of the 1000-dpi normalized delta): swipe = average touch delta,
+    /// pinch = centre delta. 0 on begin and end.
+    pub dx: f64,
+    pub dy: f64,
+    /// Pinch: libinput's scale (1.0 at begin; at end the last one). Others 1.0 (libinput sends 0 there).
+    pub scale: f64,
+    /// Pinch: libinput's angle delta in degrees since the previous event. Others 0.
+    pub angle: f64,
+}
+
 /// What the pad did, as the pointer device sends it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Output {
     /// REL_X, REL_Y in pointer pixels (libinput's accelerated, normalized units).
-    Motion { dx: i32, dy: i32 },
+    Motion {
+        dx: i32,
+        dy: i32,
+    },
     /// REL_HWHEEL_HI_RES, REL_WHEEL_HI_RES (v120): `dx` positive = right, `dy` positive = up (the wheel's sense).
-    Scroll { dx: i32, dy: i32 },
+    Scroll {
+        dx: i32,
+        dy: i32,
+    },
     /// The scroll ended (libinput's zero axis event, `evdev_stop_scroll`), and whether kinetic scrolling follows.
-    ScrollStop { kinetic: bool },
-    Button { button: Button, pressed: bool },
+    ScrollStop {
+        kinetic: bool,
+    },
+    Button {
+        button: Button,
+        pressed: bool,
+    },
+    Gesture(Gesture),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -153,7 +197,6 @@ impl Touch {
         matches!(self.state, TouchState::Begin | TouchState::Update)
     }
 }
-
 
 /// `tp->scroll` and the scrolling half of `device->scroll`.
 #[derive(Clone, Copy, Debug, Default)]
@@ -314,6 +357,13 @@ pub struct Touchpad {
     switch_deadline: Option<u64>,
     initial_time: u64,
     gesture_touches: [usize; 2],
+    /// `tp->gesture.hold_timer`.
+    hold_deadline: Option<u64>,
+    /// `tp->gesture.initial_distance`, `.angle`, `.center`, `.prev_scale`.
+    pinch_distance: f64,
+    pinch_angle: f64,
+    pinch_center: (f64, f64),
+    pinch_scale: f64,
     scroll: Scroll,
     kinetic: Kinetic,
     /// What did not make a whole pixel or v120 unit yet.
@@ -326,7 +376,14 @@ pub struct Touchpad {
 impl Touchpad {
     /// A pad with `num_slots` slots, axes from 0 to `x_max`, `y_max` with `res_x`, `res_y` units per mm
     /// (`hidinput_calc_abs_res`).
-    pub fn new(x_max: i32, y_max: i32, res_x: i32, res_y: i32, num_slots: usize, config: Config) -> Touchpad {
+    pub fn new(
+        x_max: i32,
+        y_max: i32,
+        res_x: i32,
+        res_y: i32,
+        num_slots: usize,
+        config: Config,
+    ) -> Touchpad {
         let res = (f64::from(res_x.max(1)), f64::from(res_y.max(1)));
         // `device->dpi = absinfo_x->resolution * 25.4` (evdev-mt-touchpad.c tp_init), then `int dpi = device->dpi`.
         let dpi = (res.0 * 25.4) as i32;
@@ -347,6 +404,11 @@ impl Touchpad {
             switch_deadline: None,
             initial_time: 0,
             gesture_touches: [0, 0],
+            hold_deadline: None,
+            pinch_distance: 0.0,
+            pinch_angle: 0.0,
+            pinch_center: (0.0, 0.0),
+            pinch_scale: 1.0,
             scroll: Scroll::default(),
             kinetic: Kinetic::default(),
             motion_rest: (0.0, 0.0),
@@ -377,10 +439,16 @@ impl Touchpad {
             .kinetic
             .running()
             .then_some(self.kinetic.last_tick + KINETIC_TICK_US);
-        [self.tap.deadline(), self.buttons.deadline(), self.switch_deadline, kinetic]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.tap.deadline(),
+            self.buttons.deadline(),
+            self.switch_deadline,
+            self.hold_deadline,
+            kinetic,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Timers due at `now` (libinput's timer handlers, GTK's frame clock for the deceleration).
@@ -405,6 +473,10 @@ impl Touchpad {
     fn timers(&mut self, now: u64, out: &mut dyn FnMut(Output)) {
         if self.tap.deadline().is_some_and(|d| now >= d) {
             self.tap.timeout(now, &mut |e| out(tap_output(e)));
+            // tp_gesture_tap_timeout (hold is enabled on this pad).
+            if self.tap.take_gesture_timeout() && !self.is_quick_hold() {
+                self.hold_event(now, out);
+            }
         }
         if self.buttons.deadline().is_some_and(|d| now >= d) {
             self.buttons.timeout(now);
@@ -416,6 +488,13 @@ impl Touchpad {
                 self.gesture_event(GestureEvent::FingerSwitchTimeout, now, out);
                 self.finger_count = self.finger_count_pending;
                 self.finger_count_pending = 0;
+            }
+        }
+        if self.hold_deadline.is_some_and(|d| now >= d) {
+            self.hold_deadline = None;
+            // tp_gesture_hold_timeout.
+            if !self.tap.dragging_or_double_tapping() && !self.tap.dragging() {
+                self.hold_event(now, out);
             }
         }
     }
@@ -439,7 +518,10 @@ impl Touchpad {
     /// make them dirty. Returns the physical button's change.
     fn read_frame(&mut self, frame: &Frame) -> Option<bool> {
         self.queued_motion = false;
-        for (t, s) in self.touches[..self.num_slots].iter_mut().zip(frame.slots.iter()) {
+        for (t, s) in self.touches[..self.num_slots]
+            .iter_mut()
+            .zip(frame.slots.iter())
+        {
             let was = t.down() && t.tracking_id >= 0;
             if s.active() && (!was || s.tracking_id != t.tracking_id) {
                 // A slot that went straight to another contact: the old one's finger is gone, the new one counts once.
@@ -487,7 +569,12 @@ impl Touchpad {
     }
 
     /// `tp_process_state`.
-    fn process_state(&mut self, time: u64, button_change: Option<bool>, out: &mut dyn FnMut(Output)) {
+    fn process_state(
+        &mut self,
+        time: u64,
+        button_change: Option<bool>,
+        out: &mut dyn FnMut(Output),
+    ) {
         let want_motion_reset = self.nfingers_down != self.old_nfingers_down;
         let mut restart_filter = false;
         let res = self.res;
@@ -525,7 +612,12 @@ impl Touchpad {
             self.accel.restart(time);
         }
         // tp_button_handle_state: the dirty touches through the software-button state machine.
-        let mut bt = [ButtonTouch { slot: 0, phase: ButtonPhase::Begin, x: 0, y: 0 }; MAX_SLOTS];
+        let mut bt = [ButtonTouch {
+            slot: 0,
+            phase: ButtonPhase::Begin,
+            x: 0,
+            y: 0,
+        }; MAX_SLOTS];
         let mut nb = 0;
         for (i, t) in self.touches[..self.num_slots].iter().enumerate() {
             let phase = match (t.dirty, t.state) {
@@ -534,7 +626,12 @@ impl Touchpad {
                 (true, TouchState::End) => ButtonPhase::End,
                 _ => continue,
             };
-            bt[nb] = ButtonTouch { slot: i as u8, phase, x: t.point.0, y: t.point.1 };
+            bt[nb] = ButtonTouch {
+                slot: i as u8,
+                phase,
+                x: t.point.0,
+                y: t.point.1,
+            };
             nb += 1;
         }
         self.buttons.handle_frame(time, &bt[..nb]);
@@ -561,7 +658,10 @@ impl Touchpad {
             self.finger_count,
             self.finger_count_pending,
             self.debounce_finger_changes(),
-            matches!(self.state, GestureState::Unknown | GestureState::PointerMotion),
+            matches!(
+                self.state,
+                GestureState::Unknown | GestureState::PointerMotion
+            ),
         );
         if u.end {
             self.gesture_end(time, false, out);
@@ -578,7 +678,14 @@ impl Touchpad {
 
     /// `tp_gesture_debounce_finger_changes`.
     fn debounce_finger_changes(&self) -> bool {
-        matches!(self.state, GestureState::Scroll | GestureState::Pinch | GestureState::Swipe)
+        matches!(
+            self.state,
+            GestureState::Hold
+                | GestureState::HoldAndMotion
+                | GestureState::Scroll
+                | GestureState::Pinch
+                | GestureState::Swipe
+        )
     }
 
     /// `tp_post_events`.
@@ -612,9 +719,13 @@ impl Touchpad {
             };
             n += 1;
         }
-        let mut ignore_motion =
-            self.tap
-                .handle_frame(time, &touches[..n], button_change, self.nfingers_down, &mut |e| out(tap_output(e)));
+        let mut ignore_motion = self.tap.handle_frame(
+            time,
+            &touches[..n],
+            button_change,
+            self.nfingers_down,
+            &mut |e| out(tap_output(e)),
+        );
         // tp_post_button_events on a clickpad: tp_post_softbutton_buttons picks the button by area.
         if let Some(pressed) = button_change {
             ignore_motion |= self.buttons.click(time, pressed, &mut |b, p| {
@@ -683,8 +794,18 @@ impl Touchpad {
         if self.state == GestureState::Unknown && !ignore_motion {
             self.detect_motion_gestures(time, out);
         }
+        if self.state == GestureState::Hold && !ignore_motion {
+            self.detect_motion_gestures(time, out);
+        }
         if self.state == GestureState::PointerMotion && self.queued_motion {
             self.post_pointer_motion(time, out);
+        }
+        if self.state == GestureState::HoldAndMotion {
+            // tp_gesture_handle_state_hold_and_pointer_motion: the pointer moves as in POINTER_MOTION.
+            if self.queued_motion {
+                self.post_pointer_motion(time, out);
+            }
+            self.detect_motion_gestures(time, out);
         }
         if self.state == GestureState::Scroll {
             self.handle_state_scroll(time, out);
@@ -692,12 +813,17 @@ impl Touchpad {
         if self.state == GestureState::ScrollStart {
             self.handle_state_scroll_start(time, out);
         }
-        // Swipes and pinches: recognised, nothing sent (libinput's _START states move on at their first motion).
+        if self.state == GestureState::Swipe {
+            self.handle_state_swipe(time, out);
+        }
         if self.state == GestureState::SwipeStart {
-            self.state = GestureState::Swipe;
+            self.handle_state_swipe_start(time, out);
+        }
+        if self.state == GestureState::Pinch {
+            self.handle_state_pinch(time, false, out);
         }
         if self.state == GestureState::PinchStart {
-            self.state = GestureState::Pinch;
+            self.handle_state_pinch(time, true, out);
         }
     }
 
@@ -778,6 +904,14 @@ impl Touchpad {
             if !self.has_pending_pointer_motion() {
                 return;
             }
+            let is_hold_and_motion = first_mm < HOLD_AND_MOTION_THRESHOLD_MM;
+            if self.state == GestureState::Hold && is_hold_and_motion {
+                self.gesture_event(GestureEvent::HoldAndMotionStart, time, out);
+                return;
+            }
+            if self.state == GestureState::HoldAndMotion && is_hold_and_motion {
+                return;
+            }
             self.gesture_event(GestureEvent::PointerMotionStart, time, out);
             return;
         }
@@ -793,7 +927,10 @@ impl Touchpad {
         if first_mm < 1.0 && second_mm < 1.0 {
             return;
         }
-        if distance.0 < 40.0 && distance.1 < 7.0 && time > self.initial_time + GESTURE_SWIPE_TIMEOUT_US {
+        if distance.0 < 40.0
+            && distance.1 < 7.0
+            && time > self.initial_time + GESTURE_SWIPE_TIMEOUT_US
+        {
             let e = if self.finger_count == 2 {
                 GestureEvent::ScrollStart
             } else {
@@ -1125,26 +1262,230 @@ impl Touchpad {
         self.gesture_event(e, time, out);
     }
 
+    /// `tp_gesture_cancel`, which libinput calls on suspend: whatever gesture is open ends, cancelled, so the kernel can
+    /// close it on a driver reset or a suspend.
+    pub fn cancel_gestures(&mut self, time: u64, out: &mut dyn FnMut(Output)) {
+        self.gesture_end(time, true, out);
+    }
+
     /// `tp_gesture_cancel_motion_gestures`.
     fn cancel_motion_gestures(&mut self, time: u64, out: &mut dyn FnMut(Output)) {
         if matches!(
             self.state,
-            GestureState::PointerMotion | GestureState::Scroll | GestureState::Pinch | GestureState::Swipe
+            GestureState::HoldAndMotion
+                | GestureState::PointerMotion
+                | GestureState::Scroll
+                | GestureState::Pinch
+                | GestureState::Swipe
         ) {
             self.gesture_end(time, true, out);
         }
     }
 
-    /// `tp_gesture_handle_event`: [`gesture_step`] decides; the scroll's stop and buildup happen here.
+    /// `tp_gesture_handle_event`: [`gesture_step`] decides; the notifications, the scroll's stop and buildup, the pinch
+    /// initialisation and the hold timer happen here.
     fn gesture_event(&mut self, event: GestureEvent, time: u64, out: &mut dyn FnMut(Output)) {
         let step = gesture_step(self.state, event);
-        if step.buildup {
+        if step.buildup || step.hold_buildup {
             self.set_scroll_buildup();
+        }
+        if step.init_pinch {
+            self.init_pinch();
         }
         if step.stop_scroll {
             self.stop_scroll(time, out);
         }
+        if let Some((kind, cancelled)) = step.end {
+            let scale = if kind == GestureKind::Pinch {
+                self.pinch_scale
+            } else {
+                1.0
+            };
+            self.notify_gesture(
+                kind,
+                GesturePhase::End,
+                cancelled,
+                (0.0, 0.0),
+                scale,
+                0.0,
+                out,
+            );
+        }
+        if let Some(kind) = step.begin {
+            self.notify_gesture(kind, GesturePhase::Begin, false, (0.0, 0.0), 1.0, 0.0, out);
+        }
+        if step.cancel_timer {
+            self.hold_deadline = None;
+        }
+        // tp_gesture_handle_event_on_state_none: a finger sets the hold timer.
+        if self.state == GestureState::None && step.next == GestureState::Unknown {
+            self.set_hold_timer(time);
+        }
         self.state = step.next;
+    }
+
+    /// `gesture_notify_swipe`, `_pinch`, `_hold` and their ends, with the current finger count.
+    #[allow(clippy::too_many_arguments)]
+    fn notify_gesture(
+        &self,
+        kind: GestureKind,
+        phase: GesturePhase,
+        cancelled: bool,
+        delta: (f64, f64),
+        scale: f64,
+        angle: f64,
+        out: &mut dyn FnMut(Output),
+    ) {
+        out(Output::Gesture(Gesture {
+            kind,
+            phase,
+            fingers: self.finger_count as u8,
+            cancelled,
+            dx: delta.0,
+            dy: delta.1,
+            scale,
+            angle,
+        }));
+    }
+
+    /// `tp_gesture_is_quick_hold`: one or two fingers hold "quickly", so that a hold stops kinetic scrolling at once.
+    fn is_quick_hold(&self) -> bool {
+        self.finger_count == 1 || self.finger_count == 2
+    }
+
+    /// `tp_gesture_use_hold_timer`.
+    fn use_hold_timer(&self) -> bool {
+        // Tap off, a quick hold, more fingers than a tap takes, or a tap machine already holding or dead: the timer.
+        !self.config.tap.enabled
+            || self.is_quick_hold()
+            || self.finger_count > 3
+            || self.tap.holding()
+            || self.tap.dead()
+        // Otherwise the hold is synced with the tap machine's timeout (`tp_gesture_tap_timeout`).
+    }
+
+    /// `tp_gesture_set_hold_timer` (`hold_enabled` is true: this pad is not semi-mt and has more than one slot).
+    fn set_hold_timer(&mut self, time: u64) {
+        if self.use_hold_timer() {
+            let timeout = if self.is_quick_hold() {
+                GESTURE_QUICK_HOLD_TIMEOUT_US
+            } else {
+                GESTURE_HOLD_TIMEOUT_US
+            };
+            self.hold_deadline = Some(time + timeout);
+        }
+    }
+
+    /// `GESTURE_EVENT_HOLD_TIMEOUT` / `GESTURE_EVENT_TAP_TIMEOUT`. In POINTER_MOTION it only takes with one finger that has
+    /// moved less than `HOLD_AND_MOTION_THRESHOLD` since it went down (`tp_gesture_handle_event_on_state_pointer_motion`).
+    fn hold_event(&mut self, time: u64, out: &mut dyn FnMut(Output)) {
+        if self.state == GestureState::PointerMotion {
+            if self.finger_count != 1 {
+                return;
+            }
+            let (x, y) = self.mm_moved(self.gesture_touches[0]);
+            if sqrt(x * x + y * y) >= HOLD_AND_MOTION_THRESHOLD_MM {
+                return;
+            }
+        }
+        self.gesture_event(GestureEvent::HoldTimeout, time, out);
+    }
+
+    /// `tp_gesture_get_pinch_info`: the distance (normalized), the angle in degrees and the centre (device units) of the
+    /// two tracked touches.
+    fn pinch_info(&self) -> (f64, f64, (f64, f64)) {
+        let [first, second] = self.gesture_touches;
+        let (a, b) = (self.touches[first].point, self.touches[second].point);
+        let d = (
+            f64::from(a.0 - b.0) * (DEFAULT_MOUSE_DPI / 25.4) / self.res.0,
+            f64::from(a.1 - b.1) * (DEFAULT_MOUSE_DPI / 25.4) / self.res.1,
+        );
+        let angle = atan2(d.1, d.0) * 180.0 / core::f64::consts::PI;
+        let center = (f64::from(a.0 + b.0) / 2.0, f64::from(a.1 + b.1) / 2.0);
+        (sqrt(d.0 * d.0 + d.1 * d.1), angle, center)
+    }
+
+    /// `tp_gesture_init_pinch`.
+    fn init_pinch(&mut self) {
+        let (distance, angle, center) = self.pinch_info();
+        self.pinch_distance = distance;
+        self.pinch_angle = angle;
+        self.pinch_center = center;
+        self.pinch_scale = 1.0;
+    }
+
+    /// `tp_filter_motion` (called for its effect on the pointer acceleration, as libinput does) and
+    /// `tp_filter_motion_unaccelerated`, for a non-zero `raw` delta.
+    fn gesture_deltas(&mut self, raw: (f64, f64), time: u64) -> (f64, f64) {
+        if raw == (0.0, 0.0) {
+            return (0.0, 0.0);
+        }
+        let (x, y) = self.to_xaxis(raw);
+        let _ = self.accel.filter(x, y, time);
+        self.accel.constant(x, y)
+    }
+
+    /// `tp_gesture_handle_state_swipe_start`.
+    fn handle_state_swipe_start(&mut self, time: u64, out: &mut dyn FnMut(Output)) {
+        let raw = self.touches_delta(true);
+        let _ = self.gesture_deltas(raw, time);
+        if raw != (0.0, 0.0) {
+            self.gesture_event(GestureEvent::SwipeBegin, time, out);
+        }
+    }
+
+    /// `tp_gesture_handle_state_swipe`.
+    fn handle_state_swipe(&mut self, time: u64, out: &mut dyn FnMut(Output)) {
+        let raw = self.touches_delta(true);
+        if raw != (0.0, 0.0) {
+            let unaccel = self.gesture_deltas(raw, time);
+            self.notify_gesture(
+                GestureKind::Swipe,
+                GesturePhase::Update,
+                false,
+                unaccel,
+                1.0,
+                0.0,
+                out,
+            );
+        }
+    }
+
+    /// `tp_gesture_handle_state_pinch_start` (`start`) and `tp_gesture_handle_state_pinch`.
+    fn handle_state_pinch(&mut self, time: u64, start: bool, out: &mut dyn FnMut(Output)) {
+        let (distance, angle, center) = self.pinch_info();
+        let scale = distance / self.pinch_distance;
+        let mut angle_delta = angle - self.pinch_angle;
+        self.pinch_angle = angle;
+        if angle_delta > 180.0 {
+            angle_delta -= 360.0;
+        } else if angle_delta < -180.0 {
+            angle_delta += 360.0;
+        }
+        let fdelta = (
+            center.0 - self.pinch_center.0,
+            center.1 - self.pinch_center.1,
+        );
+        self.pinch_center = center;
+        let unaccel = self.gesture_deltas(fdelta, time);
+        if fdelta == (0.0, 0.0) && scale == self.pinch_scale && angle_delta == 0.0 {
+            return;
+        }
+        if start {
+            // The begin carries scale 1.0 and no delta; the state is PINCH from here.
+            self.gesture_event(GestureEvent::PinchBegin, time, out);
+        } else {
+            self.notify_gesture(
+                GestureKind::Pinch,
+                GesturePhase::Update,
+                false,
+                unaccel,
+                scale,
+                angle_delta,
+                out,
+            );
+        }
+        self.pinch_scale = scale;
     }
 }
 
@@ -1276,7 +1617,11 @@ fn atan2(y: f64, x: f64) -> f64 {
         return 0.0;
     }
     let (ax, ay) = (x.abs(), y.abs());
-    let a = if ay <= ax { atan01(ay / ax) } else { pi / 2.0 - atan01(ax / ay) };
+    let a = if ay <= ax {
+        atan01(ay / ax)
+    } else {
+        pi / 2.0 - atan01(ax / ay)
+    };
     let a = if x < 0.0 { pi - a } else { a };
     if y < 0.0 { -a } else { a }
 }

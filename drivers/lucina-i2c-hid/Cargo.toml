@@ -8,3 +8,5 @@ edition = "2024"
 publish = false
 
 [dependencies]
+# The kernel copies both crates into kernel/libs/ side by side, so this relative path works there too.
+lucina-gesture = { path = "../../drivers/lucina-gesture" }

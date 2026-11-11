@@ -6,6 +6,7 @@ verus=${VERUS:-/home/user/tools/verus/verus-x86-linux/verus}
 work=$(mktemp -d "${TMPDIR:-/tmp}/juno-charge-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
 fail=0
+weak=0
 refused=0
 files="rules.rs adc.rs pdic_rules.rs sleep_drain.rs supply_state.rs"
 fresh() {
@@ -18,7 +19,7 @@ fresh
 if ! "$verus" "$work/verification/juno-charge/rules.rs" > "$work/out" 2>&1; then
     echo "BASE DOES NOT VERIFY: the mutants would prove nothing"; tail -5 "$work/out"; exit 1
 fi
-echo "base verifies"
+echo "baseline: verifies"
 # mutate <file> <from> <to>
 mutate() {
     local file=$1 from=$2 to=$3
@@ -34,8 +35,13 @@ mutate() {
     if "$verus" "$work/verification/juno-charge/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED ($file): $from -> $to"; fail=1
     else
-        refused=$((refused + 1))
-        echo "refused ($file): $from -> $to ($(grep -c "^error" "$work/out") errors)"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused ($file): $from -> $to ($(grep -c "^error" "$work/out") errors)"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error) ($file): $from -> $to ($(grep -c "^error" "$work/out") errors)"
+            weak=$((weak+1))
+        fi
     fi
 }
 try() { mutate rules.rs "$1" "$2"; }
@@ -192,7 +198,13 @@ both() {
     if "$verus" "$work/verification/juno-charge/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED (both): $2"; fail=1
     else
-        refused=$((refused + 1)); echo "refused (both): $2"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused (both): $2"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error) (both): $2"
+            weak=$((weak+1))
+        fi
     fi
 }
 # Patch 1197: the adapter's state.
@@ -216,7 +228,13 @@ sbth() {
     if "$verus" "$work/verification/juno-charge/rules.rs" > "$work/out" 2>&1; then
         echo "NOT REFUSED (both): $2"; fail=1
     else
-        refused=$((refused + 1)); echo "refused (both): $2"
+        if grep -qE 'verification results|simplifies to|not satisfied|assertion failed|possible arithmetic|may not terminate|cannot show|recommendation not met' "$work/out" && ! grep -q 'error\[E' "$work/out"; then
+            refused=$((refused + 1))
+            echo "refused (both): $2"
+        else
+            echo "refused (NO VERIFICATION RUN: compile or other error) (both): $2"
+            weak=$((weak+1))
+        fi
     fi
 }
 sbth "        Pd::Unsettled => match prev {
@@ -247,4 +265,6 @@ both "    let mean = (start_mv as u64 + end_mv as u64) / 2;" "    let mean = sta
     "(((start_mv as int) + (end_mv as int)) / 2)" "(start_mv as int)"
 echo "$refused refused"
 [ "$fail" = 0 ] && echo "all refused"
+echo "mutants: $refused refused by verification, $weak refused without a verification run"
+if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
 exit "$fail"

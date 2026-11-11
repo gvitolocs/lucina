@@ -10,15 +10,18 @@
 //!   lucina-ci merge-check ...                  the lagent merge gate: did GitHub verify this commit?
 //!   lucina-ci spec --check [--base REF] [--allow WHY] [--merge-gate] | --list [--json]   freeze proof specifications against the base commit (src/spec.rs)
 //!   lucina-ci spec amend --list | --template   the amendment log a spec change needs (src/amend.rs, docs/ci/SPEC-AMENDMENTS.md)
+//!   lucina-ci roles --check [--base REF] [--merge-gate] | --list [--json|--summary] | --template KIND | --seed   who wrote the code, who proved it, who judged it (src/roles.rs, docs/ci/PROOF-ROLES.md)
 //!   lucina-ci green-commit|sync-plan|sync-gate the automatic public sync and the install gate (docs/ci/PUBLIC-SYNC.md)
 
 mod amend;
 mod coverage;
 mod fast;
 mod inventory;
+mod roles;
 mod runner;
 mod snapshot;
 mod spec;
+mod srcid;
 mod sweep;
 mod sync;
 mod trust;
@@ -112,6 +115,30 @@ fn cmd_inventory(a: &Args) -> Result<i32, String> {
         );
         return Ok(1);
     }
+    let lic = coverage::check_licences(&root)?;
+    if !lic.is_empty() {
+        for (c, ids) in &lic {
+            eprintln!(
+                "crates/{c} carries {ids} and the snapshot includes it, but LICENSE does not name crates/{c}"
+            );
+        }
+        eprintln!(
+            "add each to the list of code that keeps its own licence in LICENSE (the public copy ships that file)"
+        );
+        return Ok(1);
+    }
+    let unguarded = coverage::unguarded_mutant_scripts(&root, &units);
+    if !unguarded.is_empty() {
+        for u in &unguarded {
+            eprintln!(
+                "{u}: its mutants.sh does not print `baseline: verifies` and the closing `refused by verification` line"
+            );
+        }
+        eprintln!(
+            "the verdict needs both (docs/ci/PROOF-WORKFLOW.md): without the baseline a mutant may be 'refused' by a file that never verified"
+        );
+        return Ok(1);
+    }
     // The public snapshot must hold every file a proof reads (the private tree only: the public one has no crates/ folder).
     let gaps = coverage::check(&root, &units)?;
     if !gaps.is_empty() {
@@ -185,8 +212,8 @@ fn cmd_trust(a: &Args) -> Result<i32, String> {
     let units = inventory::load(&root)?;
     let scanned = trust::compute(&root, &units);
     let actual = trust::counts(&scanned);
-    let report = trust::render_report(&scanned);
     let read = |p: &str| fs::read_to_string(root.join(p)).ok();
+    let report = trust::render_report_gaps(&scanned, &read(trust::GAPS).unwrap_or_default());
     let baseline = match read(trust::BASELINE) {
         Some(t) => Some(trust::parse_baseline(&t)?),
         None => None,
@@ -258,6 +285,9 @@ fn cmd_trust(a: &Args) -> Result<i32, String> {
                 trust::BASELINE
             ));
         }
+        if let Some(base) = a.val("--base") {
+            bad.extend(trust_silent_drops(&root, &base, &scanned, &actual)?);
+        }
         if read(trust::REPORT).as_deref() != Some(report.as_str()) {
             bad.push(format!(
                 "{} is not current: run lucina-ci trust --write and commit the result",
@@ -284,6 +314,58 @@ fn cmd_trust(a: &Args) -> Result<i32, String> {
         print!("{report}");
     }
     Ok(0)
+}
+
+/// `trust --check --base REF`: counts that fell against the base commit's baseline while the source lines holding those sites are
+/// all still there (`trust::silent_drops`). Reads the base files with `git show`.
+fn trust_silent_drops(
+    root: &Path,
+    base: &str,
+    scanned: &[trust::UnitTrust],
+    actual: &trust::Counts,
+) -> Result<Vec<String>, String> {
+    let show = |rev: &str, p: &str| -> Option<String> {
+        let o = Command::new("git")
+            .args(["show", &format!("{rev}:{p}")])
+            .current_dir(root)
+            .output()
+            .ok()?;
+        o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    let Some(text) = show(base, trust::BASELINE) else {
+        return Ok(vec![]);
+    };
+    let base_counts = trust::parse_baseline(&text)?;
+    let mut units: BTreeMap<String, Vec<trust::FileDelta>> = BTreeMap::new();
+    for u in scanned.iter().filter(|u| !u.is_flags()) {
+        let read_base = |f: &str| show(base, f);
+        let mut paths: BTreeSet<String> = trust::included_files(&read_base, &u.target)
+            .into_iter()
+            .collect();
+        paths.extend(u.files.iter().map(|f| f.path.clone()));
+        units.insert(
+            u.unit.clone(),
+            paths
+                .into_iter()
+                .map(|p| trust::FileDelta {
+                    base: show(base, &p),
+                    work: fs::read_to_string(root.join(&p)).ok(),
+                    path: p,
+                })
+                .collect(),
+        );
+    }
+    let mut errors = trust::silent_drops(&base_counts, actual, &units);
+    // The hand-kept gaps file may not go missing (the report would then print "open trust gaps: 0").
+    if show(base, trust::GAPS).is_some() && !root.join(trust::GAPS).exists() {
+        errors.push(format!(
+            "trust: {} exists at the base commit and is missing now; the report would lose its open trust gaps",
+            trust::GAPS
+        ));
+    }
+    Ok(errors)
 }
 
 fn cmd_plan(a: &Args) -> Result<i32, String> {
@@ -914,6 +996,29 @@ fn cmd_sweep_target(a: &Args) -> Result<i32, String> {
     sweep::run(&dir, limit, to, keep.as_deref(), a.has("--dry-run"))
 }
 
+/// `output-check --kind K < unit.log`: what a unit's log must show for its pass to count (verdict::check_output); exit 1 with the reason.
+fn cmd_output_check(a: &Args) -> Result<i32, String> {
+    use std::io::Read;
+    let mut log = String::new();
+    std::io::stdin()
+        .read_to_string(&mut log)
+        .map_err(|e| format!("stdin: {e}"))?;
+    let c = verdict::check_output(&a.need("--kind")?, &log);
+    if let Some(w) = c.weak {
+        println!("weak refusals: {w}");
+    }
+    match c.problem {
+        Some(p) => {
+            println!("not evidence: {p}");
+            Ok(1)
+        }
+        None => {
+            println!("ok");
+            Ok(0)
+        }
+    }
+}
+
 /// `infra-check`: a failed job's log on stdin; exit 0 when the runner's network failed, not a test (sync::is_infra_failure).
 fn cmd_infra_check() -> Result<i32, String> {
     use std::io::Read;
@@ -1158,11 +1263,13 @@ fn main() -> ExitCode {
         "sync-plan" => cmd_sync_plan(&a),
         "sync-gate" => cmd_sync_gate(&a),
         "infra-check" => cmd_infra_check(),
+        "output-check" => cmd_output_check(&a),
         "sweep-target" => cmd_sweep_target(&a),
         "alert-plan" => cmd_alert_plan(&a),
         "portable-workspace" => cmd_portable_workspace(&a),
         "snapshot" => cmd_snapshot(&a),
         "spec" => spec::cmd(&a.0),
+        "roles" => roles::cmd(&a.0),
         "check-fast" => cmd_check_fast(&a),
         "perf" => cmd_perf(&a),
         "__alloc" => cmd_alloc(&a),
@@ -1241,11 +1348,89 @@ fn tool_exists(t: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// The steps this binary can run, in order. `check-fast` prints them first, and refuses to run when a required one is not here.
+const FAST_STEPS: &[&str] = &[
+    "diffgate",
+    "build",
+    "shellcheck",
+    "actionlint",
+    "secrets",
+    "inventory",
+    "spec",
+    "roles",
+    "trust",
+    "proofs",
+];
+/// Steps that must be registered in the binary, and that are refusals (not skips) when they run out of time at the merge gate.
+const FAST_STEPS_REQUIRED: &[&str] = &["inventory", "spec", "roles", "trust"];
+
+/// The required steps that `registered` lacks: a `check-fast` built from a tree that predates a step must not pass for the full gate.
+fn missing_required_steps(registered: &[&str]) -> Vec<&'static str> {
+    FAST_STEPS_REQUIRED
+        .iter()
+        .copied()
+        .filter(|r| !registered.contains(r))
+        .collect()
+}
+
+/// Prints a line when `check-fast` ends any way other than through its summary line (a panic, an early `?`), so a log never just stops.
+struct FastEnd {
+    started: std::time::Instant,
+    done: bool,
+}
+
+impl Drop for FastEnd {
+    fn drop(&mut self) {
+        if !self.done {
+            println!(
+                "check-fast: aborted after {:.0}s, no summary: the run did not finish",
+                self.started.elapsed().as_secs_f64()
+            );
+        }
+    }
+}
+
 /// `check-fast [--base REF] [--proofs] [--all-proofs] [--mutants] [--no-build]`
 fn cmd_check_fast(a: &Args) -> Result<i32, String> {
     let root = repo_root()?;
     std::env::set_current_dir(&root).map_err(|e| e.to_string())?;
     let started = std::time::Instant::now();
+    let mut end = FastEnd {
+        started,
+        done: false,
+    };
+    let tree = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let built = env!("LUCINA_CI_SRC_ID");
+    println!(
+        "lucina-ci src {built} (tree {tree}) checks: {}",
+        FAST_STEPS.join(" ")
+    );
+    let tree_id = srcid::compute(&root.join("tools/ci/lucina-ci"));
+    if let Some(m) = srcid::mismatch(built, tree_id.as_deref()) {
+        end.done = true;
+        eprintln!("check-fast: {m}");
+        println!("check-fast: refused, binary and tree sources differ");
+        return Ok(1);
+    }
+    let missing = missing_required_steps(FAST_STEPS);
+    if !missing.is_empty() {
+        end.done = true;
+        eprintln!(
+            "check-fast: this lucina-ci ({tree}) has no step {}: refusing to run an older gate than the tree needs",
+            missing.join(", ")
+        );
+        println!(
+            "check-fast: refused, missing step(s) {}",
+            missing.join(", ")
+        );
+        return Ok(1);
+    }
     let base_ref = a.val("--base").unwrap_or_else(|| "main".into());
     let base = merge_base(&root, &base_ref, "HEAD")
         .ok_or_else(|| format!("no merge base with {base_ref}"))?;
@@ -1271,6 +1456,7 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
         .cloned()
         .collect();
     if changed.is_empty() {
+        end.done = true;
         println!("check-fast: nothing changed against {base_ref}");
         return Ok(0);
     }
@@ -1302,14 +1488,17 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
                 tc: &runner::Toolchain,
                 failed: &mut Vec<String>|
      -> Result<(), String> {
-        let t = if merge_gate { t.min(180) } else { t };
+        // `spec`, `roles`, `trust` and `inventory` are refusals when they run out of time at the merge gate, never skips.
+        let strict = FAST_STEPS_REQUIRED.contains(&name);
+        let t = if merge_gate && !strict { t.min(180) } else { t };
         if !fast_step(name, cmd, kind, t, &b, tc, &out)?.0 {
             let json = fs::read_to_string(
                 Path::new(&out).join(format!("fast__{}.json", name.replace('/', "__"))),
             )
             .unwrap_or_default();
-            let late =
-                merge_gate && runner::report_field(&json, "outcome").as_deref() == Some("timeout");
+            let late = merge_gate
+                && !strict
+                && runner::report_field(&json, "outcome").as_deref() == Some("timeout");
             failed.push(if late {
                 format!(
                     "~{name}: past its {t} s limit at merge; run scripts/check-fast in the worktree"
@@ -1430,18 +1619,38 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
             &none,
             &mut failed,
         )?;
+        // The model that writes the code must not prove it or judge the proof (src/roles.rs): compared with the base commit's tree.
+        step(
+            "roles",
+            &format!(
+                "{exe} roles --check --base {base}{}",
+                if merge_gate { " --merge-gate" } else { "" }
+            ),
+            "script",
+            300,
+            &none,
+            &mut failed,
+        )?;
     } else {
         skipped.push("proof inventory: this worktree predates it".into());
+        if merge_gate {
+            failed.push("inventory, spec, roles: skipped at the merge gate because tools/ci/proof-inventory.tsv is missing".into());
+        }
     }
     if root.join(trust::BASELINE).exists() {
         step(
             "trust",
-            &format!("{exe} trust --check"),
+            &format!("{exe} trust --check --base {base}"),
             "script",
             60,
             &none,
             &mut failed,
         )?;
+    } else if merge_gate {
+        failed.push(format!(
+            "trust: skipped at the merge gate because {} is missing",
+            trust::BASELINE
+        ));
     }
     let units = inventory::load(&root).unwrap_or_default();
     let list: Vec<String> = changed.iter().cloned().collect();
@@ -1523,6 +1732,7 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
     for s in &skipped {
         println!("skipped  {s}");
     }
+    end.done = true;
     println!(
         "check-fast: {:.0}s, {} failed, {} skipped",
         started.elapsed().as_secs_f64(),
@@ -1596,6 +1806,50 @@ fn cmd_perf(a: &Args) -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_source_id_hashes_paths_and_bytes_and_a_mismatch_is_refused() {
+        let f = |p: &str, b: &str| (p.to_string(), b.as_bytes().to_vec());
+        let a = srcid::hash_files(&[f("src/a.rs", "x"), f("Cargo.toml", "t")]);
+        // order of the input does not matter, content and path do
+        assert_eq!(
+            a,
+            srcid::hash_files(&[f("Cargo.toml", "t"), f("src/a.rs", "x")])
+        );
+        assert_ne!(
+            a,
+            srcid::hash_files(&[f("src/a.rs", "y"), f("Cargo.toml", "t")])
+        );
+        assert_ne!(
+            a,
+            srcid::hash_files(&[f("src/b.rs", "x"), f("Cargo.toml", "t")])
+        );
+        assert_ne!(
+            srcid::hash_files(&[f("a", "bc")]),
+            srcid::hash_files(&[f("ab", "c")])
+        );
+        assert_eq!(a.len(), 16);
+        assert!(srcid::mismatch(&a, Some(&a)).is_none());
+        let m = srcid::mismatch(&a, Some("0000000000000000")).unwrap();
+        assert!(m.contains(&a) && m.contains("0000000000000000"), "{m}");
+        assert!(srcid::mismatch(&a, None).is_some());
+        // the binary under test was built from the sources next to it
+        let here = srcid::compute(Path::new(env!("CARGO_MANIFEST_DIR")));
+        assert_eq!(here.as_deref(), Some(env!("LUCINA_CI_SRC_ID")));
+    }
+
+    #[test]
+    fn check_fast_refuses_a_binary_without_a_required_step() {
+        assert!(missing_required_steps(FAST_STEPS).is_empty());
+        for gone in FAST_STEPS_REQUIRED {
+            let reg: Vec<&str> = FAST_STEPS.iter().copied().filter(|s| s != gone).collect();
+            assert_eq!(missing_required_steps(&reg), vec![*gone]);
+        }
+        assert_eq!(
+            missing_required_steps(&["diffgate"]),
+            vec!["inventory", "spec", "roles", "trust"]
+        );
+    }
+
     use super::*;
 
     fn unit(name: &str, group: &str, inputs: &[&str]) -> Unit {

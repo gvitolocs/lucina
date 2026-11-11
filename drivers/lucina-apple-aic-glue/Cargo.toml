@@ -1,0 +1,18 @@
+[package]
+name = "lucina-apple-aic-glue"
+version = "0.1.0"
+description = "The kernel side of the Apple Interrupt Controller (MacBook Air M4): device-tree windows and affinities, the hwirq-to-line table, dispatch to the kernel's lines, map/unmap/eoi and per-CPU start over lucina-apple-aic; no_std, unsafe-free, host-tested"
+# Derived behaviour from Asahi Linux's drivers/irqchip/irq-apple-aic.c and drivers/clocksource/arm_arch_timer.c
+# (GPL-2.0-or-later and GPL-2.0-only), so the whole is GPL-2.0-only; see README.md.
+license = "GPL-2.0-only"
+# Spelled out rather than taken from the workspace, like the other kernel-side crates: the kernel build copies such a crate into
+# the Asterinas tree (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+
+[dependencies]
+# Injected next to this crate (ostd/libs/), so the relative path holds in both trees.
+lucina-apple-aic = { path = "../../drivers/lucina-apple-aic" }
+
+[dev-dependencies]
+lucina-apple-aic = { path = "../../drivers/lucina-apple-aic", features = ["sim"] }
