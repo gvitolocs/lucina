@@ -129,3 +129,14 @@ From GitHub run 42868326535 on gvitolocs/lucina commit f8ec1214b (2026-11-10): 1
 | `verus/juno-vsync/rules` | juno-gpu-media | verified | 0.8 | 243 |
 | `verus/juno-wifi-wake/rules` | juno-net-security | verified | 1 | 275 |
 | `verus/vostd-port/frame_linked_list` | kernel-memory | verified | 2 | 295 |
+
+## Deep tier
+
+From GitHub run 43011772527 on gvitolocs/lucina (2026-11-11), one runner per unit, cap 12 GiB. Both checkers reached the pinned count, `expect-states: 53613540`.
+
+| Unit | Checker | Seconds | Peak GiB | Distinct states |
+| --- | --- | ---: | ---: | ---: |
+| `deep/tla-mc/idle-wake` | tla-mc (Rust) | 200 | 2.90 | 53,613,540 |
+| `deep/tlc/idle-wake` | TLC (Java, 10 GiB heap) | 612 | 5.91 | 53,613,540 |
+
+The heaviest proof uses less than half the cap, so nothing needs splitting yet.
