@@ -1,6 +1,8 @@
 //! LucinaOS proof CI: see docs/ci/VERUS.md.
 //!
 //!   lucina-ci inventory --check | --write      the list of proof units and the proof matrix page
+//!   lucina-ci trust [--write|--check] [--json]  the trust audit: what each Verus/shipped unit assumes (docs/ci/TRUST-REPORT.md, ratchet
+//!                                              in tools/ci/trust-baseline.tsv; --accept-baseline "<reason>" lets --write raise a count)
 //!   lucina-ci plan ...                         which groups a commit needs (GitHub matrix)
 //!   lucina-ci run --group G --phase P ...      run a group's units, each under its own memory cap
 //!   lucina-ci selftest ...                     prove the cap, timeouts and verdicts work on this machine
@@ -14,6 +16,7 @@ mod inventory;
 mod runner;
 mod snapshot;
 mod sync;
+mod trust;
 mod verdict;
 
 use inventory::Unit;
@@ -171,6 +174,106 @@ fn merge_base(root: &Path, a: &str, b: &str) -> Option<String> {
 
 /// `--event --ref --before --sha --output --plan`. Pull requests and main get everything; another branch gets what its changes
 /// reach, and any doubt about the base means everything.
+/// `trust [--write|--check] [--json] [--accept-baseline "<reason>"]`: the trust audit (src/trust.rs).
+fn cmd_trust(a: &Args) -> Result<i32, String> {
+    let root = repo_root()?;
+    let units = inventory::load(&root)?;
+    let scanned = trust::compute(&root, &units);
+    let actual = trust::counts(&scanned);
+    let report = trust::render_report(&scanned);
+    let read = |p: &str| fs::read_to_string(root.join(p)).ok();
+    let baseline = match read(trust::BASELINE) {
+        Some(t) => Some(trust::parse_baseline(&t)?),
+        None => None,
+    };
+    let (allow, problems) = trust::parse_allow(&read(trust::ALLOW).unwrap_or_default());
+    let outcome = trust::ratchet(&actual, &allow, &problems);
+    let json = a.has("--json");
+    let say = |s: &str| {
+        if json {
+            eprintln!("{s}");
+        } else {
+            println!("{s}");
+        }
+    };
+    for w in &outcome.warnings {
+        eprintln!("warning: {w}");
+    }
+    if a.has("--write") {
+        // Every nonzero count needs an allow entry; without one, a reason must be given on the command line.
+        if !outcome.errors.is_empty() {
+            match a.val("--accept-baseline") {
+                Some(r) if !r.trim().is_empty() => {
+                    println!("allow check waived on purpose: {r}");
+                    for e in &outcome.errors {
+                        println!("  {e}");
+                    }
+                }
+                _ => {
+                    for e in &outcome.errors {
+                        eprintln!("{e}");
+                    }
+                    eprintln!(
+                        "trust --write refuses a count no allow entry covers: fix it, add a reasoned line to {}, or pass --accept-baseline \"<reason>\"",
+                        trust::ALLOW
+                    );
+                    return Ok(1);
+                }
+            }
+        }
+        fs::create_dir_all(root.join("docs/ci")).map_err(|e| e.to_string())?;
+        fs::write(root.join(trust::REPORT), &report).map_err(|e| e.to_string())?;
+        fs::write(root.join(trust::BASELINE), trust::baseline_tsv(&actual))
+            .map_err(|e| e.to_string())?;
+        let t = |c| scanned.iter().map(|u| u.count(c)).sum::<usize>();
+        say(&format!(
+            "{} units: {} assumption, {} escape, {} unsafe written",
+            scanned.len(),
+            t(trust::Class::Assumption),
+            t(trust::Class::Escape),
+            t(trust::Class::Unsafe)
+        ));
+        if json {
+            print!("{}", trust::render_json(&scanned, Some(&outcome)));
+        }
+        return Ok(0);
+    }
+    if a.has("--check") {
+        let mut bad = outcome.errors.clone();
+        if baseline.is_none() {
+            bad.push(format!(
+                "{} is missing: run lucina-ci trust --write",
+                trust::BASELINE
+            ));
+        }
+        if read(trust::REPORT).as_deref() != Some(report.as_str()) {
+            bad.push(format!(
+                "{} is not current: run lucina-ci trust --write and commit the result",
+                trust::REPORT
+            ));
+        }
+        for e in &bad {
+            eprintln!("{e}");
+        }
+        if json {
+            let o = trust::Outcome {
+                errors: bad.clone(),
+                warnings: outcome.warnings.clone(),
+            };
+            print!("{}", trust::render_json(&scanned, Some(&o)));
+        } else if bad.is_empty() {
+            println!("trust: {} units, ratchet holds", scanned.len());
+        }
+        return Ok(if bad.is_empty() { 0 } else { 1 });
+    }
+    if json {
+        print!("{}", trust::render_json(&scanned, Some(&outcome)));
+    } else {
+        print!("{report}");
+    }
+    Ok(0)
+}
+
 fn cmd_plan(a: &Args) -> Result<i32, String> {
     let root = repo_root()?;
     let units = inventory::load(&root)?;
@@ -1014,7 +1117,7 @@ fn cmd_snapshot(a: &Args) -> Result<i32, String> {
 fn main() -> ExitCode {
     let mut all: Vec<String> = std::env::args().skip(1).collect();
     if all.is_empty() {
-        eprintln!("usage: lucina-ci inventory|plan|run|selftest|gate|merge-check ...");
+        eprintln!("usage: lucina-ci inventory|trust|plan|run|selftest|gate|merge-check ...");
         return ExitCode::from(2);
     }
     let cmd = all.remove(0);
@@ -1024,6 +1127,7 @@ fn main() -> ExitCode {
     let a = Args(all);
     let r = match cmd.as_str() {
         "inventory" => cmd_inventory(&a),
+        "trust" => cmd_trust(&a),
         "plan" => cmd_plan(&a),
         "run" => cmd_run(&a),
         "selftest" => cmd_selftest(&a),
@@ -1275,6 +1379,16 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
         )?;
     } else {
         skipped.push("proof inventory: this worktree predates it".into());
+    }
+    if root.join(trust::BASELINE).exists() {
+        step(
+            "trust",
+            &format!("{exe} trust --check"),
+            "script",
+            60,
+            &none,
+            &mut failed,
+        )?;
     }
     let units = inventory::load(&root).unwrap_or_default();
     let list: Vec<String> = changed.iter().cloned().collect();
