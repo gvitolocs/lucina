@@ -605,6 +605,28 @@ fn remote_open_without_our_ack_times_out_with_close() {
     assert_eq!(rig.modem.take(), vec![Msg::Close(lcid)]);
 }
 
+#[test]
+fn a_remote_open_after_a_long_start_gets_its_five_seconds_from_now() {
+    // A caller that polls before it ticks (the audio and Wi-Fi threads) first tells the clock the time. Without that the OPEN read at
+    // boot counted its five seconds from 0, and the first tick at 13 s failed it and sent a CLOSE for a channel that was opening fine.
+    let mut rig = Rig::new(1024, 1024);
+    rig.ap.set_time(13_000);
+    rig.settle();
+    rig.modem.take();
+    rig.modem_says(vec![m_open(7, "IPCRTR")]);
+    rig.modem.take();
+    assert_eq!(rig.ap.next_deadline(), Some(18_000));
+    assert!(rig.ap.tick(13_000).is_empty());
+    assert!(rig.ap.tick(17_999).is_empty());
+    assert!(matches!(
+        &rig.ap.tick(18_000)[..],
+        [Event::OpenFailed { .. }]
+    ));
+    // The clock never goes back.
+    rig.ap.set_time(1);
+    assert!(rig.ap.tick(18_001).is_empty());
+}
+
 // ---- sending ----------------------------------------------------------------------------------------------------
 
 #[test]

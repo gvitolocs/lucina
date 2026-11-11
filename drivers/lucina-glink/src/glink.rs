@@ -533,6 +533,13 @@ impl<T: Shared + Doorbell> Glink<T> {
         self.events.drain(..).collect()
     }
 
+    /// Tells the clock the time and does nothing else. The deadlines that [`Glink::poll`] sets (the five seconds a remote OPEN
+    /// gets) count from this clock, which starts at 0 and moves only here and in [`Glink::tick`]. A caller that polls before it
+    /// ticks calls this first, or the first OPEN it reads at boot gets a deadline in the past and fails at once.
+    pub fn set_time(&mut self, now_ms: u64) {
+        self.now = self.now.max(now_ms);
+    }
+
     /// Advances the clock to `now_ms` (any monotonic millisecond count), expires what has timed out and flushes.
     pub fn tick(&mut self, now_ms: u64) -> Vec<Event> {
         self.now = self.now.max(now_ms);
