@@ -9,14 +9,17 @@
 //!   lucina-ci gate --plan F --reports D        every planned unit verified on this commit?
 //!   lucina-ci merge-check ...                  the lagent merge gate: did GitHub verify this commit?
 //!   lucina-ci spec --check [--base REF] [--allow WHY] [--merge-gate] | --list [--json]   freeze proof specifications against the base commit (src/spec.rs)
+//!   lucina-ci spec amend --list | --template   the amendment log a spec change needs (src/amend.rs, docs/ci/SPEC-AMENDMENTS.md)
 //!   lucina-ci green-commit|sync-plan|sync-gate the automatic public sync and the install gate (docs/ci/PUBLIC-SYNC.md)
 
+mod amend;
 mod coverage;
 mod fast;
 mod inventory;
 mod runner;
 mod snapshot;
 mod spec;
+mod sweep;
 mod sync;
 mod trust;
 mod verdict;
@@ -189,7 +192,11 @@ fn cmd_trust(a: &Args) -> Result<i32, String> {
         None => None,
     };
     let (allow, problems) = trust::parse_allow(&read(trust::ALLOW).unwrap_or_default());
-    let outcome = trust::ratchet(&actual, &allow, &problems);
+    let max_rlimit: std::collections::BTreeMap<String, u64> = scanned
+        .iter()
+        .filter_map(|u| u.rlimit_max().map(|v| (u.unit.clone(), v)))
+        .collect();
+    let outcome = trust::ratchet_values(&actual, &max_rlimit, &allow, &problems);
     let json = a.has("--json");
     let say = |s: &str| {
         if json {
@@ -229,11 +236,14 @@ fn cmd_trust(a: &Args) -> Result<i32, String> {
             .map_err(|e| e.to_string())?;
         let t = |c| scanned.iter().map(|u| u.count(c)).sum::<usize>();
         say(&format!(
-            "{} units: {} assumption, {} escape, {} unsafe written",
+            "{} units: {} assumption, {} escape, {} unsafe, {} loosen, {} rlimit, {} flag written",
             scanned.len(),
             t(trust::Class::Assumption),
             t(trust::Class::Escape),
-            t(trust::Class::Unsafe)
+            t(trust::Class::Unsafe),
+            t(trust::Class::Loosen),
+            t(trust::Class::Rlimit),
+            t(trust::Class::Flag)
         ));
         if json {
             print!("{}", trust::render_json(&scanned, Some(&outcome)));
@@ -895,6 +905,15 @@ fn cmd_alert_plan(a: &Args) -> Result<i32, String> {
     Ok(0)
 }
 
+/// `sweep-target --dir ROOT --limit-gib N [--to-gib M] [--keep TARGET] [--dry-run]`: keeps the fast-check cache under N GiB (sweep.rs).
+fn cmd_sweep_target(a: &Args) -> Result<i32, String> {
+    let dir = PathBuf::from(a.need("--dir")?);
+    let limit = a.num("--limit-gib", 30)?;
+    let to = a.num("--to-gib", limit * 4 / 5)?;
+    let keep = a.val("--keep").map(PathBuf::from);
+    sweep::run(&dir, limit, to, keep.as_deref(), a.has("--dry-run"))
+}
+
 /// `infra-check`: a failed job's log on stdin; exit 0 when the runner's network failed, not a test (sync::is_infra_failure).
 fn cmd_infra_check() -> Result<i32, String> {
     use std::io::Read;
@@ -1139,6 +1158,7 @@ fn main() -> ExitCode {
         "sync-plan" => cmd_sync_plan(&a),
         "sync-gate" => cmd_sync_gate(&a),
         "infra-check" => cmd_infra_check(),
+        "sweep-target" => cmd_sweep_target(&a),
         "alert-plan" => cmd_alert_plan(&a),
         "portable-workspace" => cmd_portable_workspace(&a),
         "snapshot" => cmd_snapshot(&a),

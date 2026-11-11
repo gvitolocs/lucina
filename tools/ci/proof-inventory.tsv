@@ -15,6 +15,7 @@ mutants/juno-audio-wake	juno-audio-voice	mutants	verification/juno-audio-wake/mu
 mutants/juno-ax	juno-input-apps	mutants	verification/juno-ax/mutants.sh	services/lucina-ax/,verification/juno-ax/
 mutants/juno-camera	juno-gpu-media	mutants	verification/juno-camera/mutants.sh	drivers/lucina-uvc/,verification/juno-camera/
 mutants/juno-charge	juno-power	mutants	verification/juno-charge/mutants.sh	drivers/lucina-charge/,verification/juno-charge/,verification/juno-charge/rules.rs
+mutants/juno-cpubw	juno-power	mutants	verification/juno-cpubw/mutants.sh	kernel/lucina-cpubw/,verification/juno-cpubw/,verification/juno-cpubw/rules.rs
 mutants/juno-cpufreq	juno-power	mutants	verification/juno-cpufreq/mutants.sh	kernel/lucina-cpufreq/,verification/juno-cpufreq/,verification/juno-cpufreq/rules.rs
 mutants/juno-crash-layout	boot-storage	mutants	verification/juno-crash-layout/mutants.sh	kernel/lucina-crash/,verification/juno-crash-layout/
 mutants/juno-disk	boot-storage	mutants	verification/juno-disk/mutants.sh	boot/gbgo/boot.toml,boot/remote/authorized_keys,drivers/lucina-ufs/,kernel/lucina-boot/,kernel/lucina-fdt/,services/lucina-remote/,verification/fdt/header.rs,verification/juno-disk/,verification/juno-disk/rules.rs
@@ -57,6 +58,7 @@ mutants/juno-venus	juno-gpu-media	mutants	verification/juno-venus/mutants.sh	dri
 mutants/juno-vsync	juno-gpu-media	mutants	verification/juno-vsync/mutants.sh	drivers/lucina-adreno/,verification/juno-vsync/,verification/juno-vsync/rules.rs
 mutants/juno-wdt	boot-storage	mutants	verification/juno-wdt/mutants.sh	kernel/lucina-wdt/,verification/juno-wdt/
 mutants/juno-wifi-wake	juno-net-security	mutants	verification/juno-wifi-wake/mutants.sh	drivers/lucina-wifi-wake/,verification/juno-wifi-wake/,verification/juno-wifi-wake/rules.rs
+mutants/juno-wm-rules	juno-input-apps	mutants	verification/juno-wm-rules/mutants.sh	services/lucina-wm-rules/,verification/juno-wm-rules/
 mutants/lucinanet-mse	juno-gpu-media	mutants	verification/lucinanet-mse/mutants.sh	drivers/lucina-video/,verification/lucinanet-mse/
 mutants/net-installer	boot-storage	mutants	verification/net-installer/mutants.sh	boot/gbgo/boot.toml,kernel/lucina-boot/,kernel/lucina-fdt/,services/lucina-release/,verification/fdt/header.rs,verification/net-installer/,verification/net-installer/rules.rs
 mutants/phone-glass	juno-gpu-media	mutants	verification/phone-glass/mutants.sh	apps/lucina-glass/,verification/phone-glass/
@@ -89,6 +91,9 @@ shipped/lucina-venus/rules	juno-gpu-media	shipped	drivers/lucina-venus/src/rules
 shipped/lucina-video/mse_rules	juno-gpu-media	shipped	drivers/lucina-video/src/mse_rules.rs	drivers/lucina-video/
 shipped/lucina-voice-stream/rules	juno-audio-voice	shipped	drivers/lucina-voice-stream/src/rules.rs	drivers/lucina-voice-stream/
 shipped/lucina-wdt/rules	boot-storage	shipped	kernel/lucina-wdt/src/rules.rs	kernel/lucina-wdt/
+shipped/lucina-wm-rules/mru_rules	juno-input-apps	shipped	services/lucina-wm-rules/src/mru_rules.rs	services/lucina-wm-rules/
+shipped/lucina-wm-rules/snap_rules	juno-input-apps	shipped	services/lucina-wm-rules/src/snap_rules.rs	services/lucina-wm-rules/
+shipped/lucina-wm-rules/tile_rules	juno-input-apps	shipped	services/lucina-wm-rules/src/tile_rules.rs	services/lucina-wm-rules/
 tla/juno	tla	tla	specs/juno/run.sh	specs/juno/
 verus/aarch64-pt/descriptor	kernel-memory	verus	verification/aarch64-pt/descriptor.rs	verification/aarch64-pt/,verification/aarch64-pt/descriptor.rs
 verus/aarch64-pt/walk	kernel-memory	verus	verification/aarch64-pt/walk.rs	verification/aarch64-pt/,verification/aarch64-pt/walk.rs
@@ -99,6 +104,7 @@ verus/fdt/header	boot-storage	verus	verification/fdt/header.rs	verification/fdt/
 verus/juno-audio-ledger/rules	juno-audio-voice	verus	verification/juno-audio-ledger/rules.rs	drivers/lucina-audio-ledger/,verification/juno-audio-ledger/,verification/juno-audio-ledger/rules.rs
 verus/juno-audio-wake/rules	juno-audio-voice	verus	verification/juno-audio-wake/rules.rs	drivers/lucina-audio-wake/,verification/juno-audio-wake/,verification/juno-audio-wake/rules.rs
 verus/juno-charge/rules	juno-power	verus	verification/juno-charge/rules.rs	drivers/lucina-charge/,verification/juno-charge/,verification/juno-charge/rules.rs
+verus/juno-cpubw/rules	juno-power	verus	verification/juno-cpubw/rules.rs	kernel/lucina-cpubw/,verification/juno-cpubw/,verification/juno-cpubw/rules.rs
 verus/juno-cpufreq/rules	juno-power	verus	verification/juno-cpufreq/rules.rs	kernel/lucina-cpufreq/,verification/juno-cpufreq/,verification/juno-cpufreq/rules.rs
 verus/juno-disk/rules	boot-storage	verus	verification/juno-disk/rules.rs	boot/gbgo/boot.toml,boot/remote/authorized_keys,drivers/lucina-ufs/,kernel/lucina-boot/,kernel/lucina-fdt/,services/lucina-remote/,verification/fdt/header.rs,verification/juno-disk/,verification/juno-disk/rules.rs
 verus/juno-ec/rules	juno-power	verus	verification/juno-ec/rules.rs	drivers/lucina-i2c-hid/,verification/juno-ec/,verification/juno-ec/rules.rs

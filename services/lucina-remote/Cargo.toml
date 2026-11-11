@@ -15,10 +15,17 @@ sha2 = "0.10"
 # BOOT.CFG as the loader reads it, and the GPT, for lucina-install-disk.
 lucina-boot = { path = "../../kernel/lucina-boot", default-features = false }
 lucina-ufs = { path = "../../drivers/lucina-ufs" }
+# The net installer's signed manifests and the rules it checks them with (docs/design/lucina-net-installer.md).
+lucina-release = { path = "../../services/lucina-release" }
 # The seed file's rules, proved with the kernel's (verification/juno-random).
 lucina-random = { path = "../../kernel/lucina-random" }
 zeroize = "1"
 log = "0.4"
+
+[features]
+# Adds the QEMU proof's board (`qemu-virt-test`) to the net installer's compiled write set. Off by default and never on in a
+# release build: only scripts/qemu-net-install.sh builds with it, so that no real board is ever allowed by it.
+qemu-test-board = []
 
 [[bin]]
 name = "lucina-sshd"

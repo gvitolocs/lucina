@@ -122,14 +122,7 @@ fn settled_generation() -> Option<u32> {
 }
 
 fn note_settled(generation: u32) {
-    if fs::write(SETTLED, format!("{generation}\n")).is_ok() {
-        if let Ok(f) = fs::File::open(SETTLED) {
-            let _ = f.sync_all();
-        }
-        if let Ok(dir) = fs::File::open("/data/lucina") {
-            let _ = dir.sync_all();
-        }
-    }
+    let _ = write_whole(SETTLED, &format!("{generation}\n"));
 }
 
 fn mark_good(generation: u32) -> Result<(), String> {
@@ -268,17 +261,27 @@ fn read_settle() -> Option<Settle> {
 }
 
 /// Written whole or not at all: a new file, synced, renamed over the old, and the folder synced.
-fn write_settle(s: &Settle) -> Result<(), String> {
+/// A cut in the middle leaves `<path>.new` behind; the next call truncates it, and readers never look at it.
+fn write_whole(path: &str, text: &str) -> Result<(), String> {
     use std::io::Write;
-    let tmp = format!("{SETTLE}.new");
+    let tmp = format!("{path}.new");
     let mut f = fs::File::create(&tmp).map_err(|e| format!("{tmp}: {e}"))?;
-    writeln!(f, "{} {} {}", s.generation, s.boots, s.bad).map_err(|e| format!("{tmp}: {e}"))?;
+    f.write_all(text.as_bytes())
+        .map_err(|e| format!("{tmp}: {e}"))?;
     f.sync_all().map_err(|e| format!("{tmp}: {e}"))?;
-    fs::rename(&tmp, SETTLE).map_err(|e| format!("{SETTLE}: {e}"))?;
-    if let Ok(dir) = fs::File::open("/data/lucina") {
+    fs::rename(&tmp, path).map_err(|e| format!("{path}: {e}"))?;
+    if let Some(dir) = path
+        .rsplit_once('/')
+        .and_then(|(parent, _)| fs::File::open(parent).ok())
+    {
         let _ = dir.sync_all();
     }
     Ok(())
+}
+
+/// The settle count, written whole or not at all.
+fn write_settle(s: &Settle) -> Result<(), String> {
+    write_whole(SETTLE, &format!("{} {} {}\n", s.generation, s.boots, s.bad))
 }
 
 /// Whether the boot before this one ended in a crash record or vanished, from `lucina-crash`'s first line.
@@ -333,13 +336,7 @@ fn settle_check() -> Result<(), String> {
             "Lucina Juno went back to generation {now}: generation {current} crashed or reset {bad} times after it was marked good"
         );
         kmsg(&line);
-        let _ = fs::write(WENT_BACK, &line);
-        if let Ok(f) = fs::File::open(WENT_BACK) {
-            let _ = f.sync_all();
-        }
-        if let Ok(dir) = fs::File::open("/data/lucina") {
-            let _ = dir.sync_all();
-        }
+        let _ = write_whole(WENT_BACK, &line);
         sync_all();
         let _ = Command::new("reboot").arg("-f").status();
     }
@@ -449,5 +446,64 @@ fn main() -> ExitCode {
             kmsg(&e);
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_whole;
+    use std::{fs, path::Path};
+
+    /// `f` runs in a fresh temp directory, removed afterwards.
+    fn with_dir(name: &str, f: impl FnOnce(&str)) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "lucina-trial-test-{}-{name}-{now:?}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        f(dir.to_str().unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_whole_creates_the_file_with_exact_contents() {
+        with_dir("creates", |dir| {
+            let path = format!("{dir}/trial-settle");
+            write_whole(&path, "3 1 0\n").unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "3 1 0\n");
+        });
+    }
+
+    #[test]
+    fn write_whole_replaces_an_existing_file() {
+        with_dir("replaces", |dir| {
+            let path = format!("{dir}/trial-settle");
+            fs::write(&path, "a much older and longer content").unwrap();
+            write_whole(&path, "3 1 0\n").unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "3 1 0\n");
+        });
+    }
+
+    #[test]
+    fn write_whole_leaves_no_new_file_behind() {
+        with_dir("no-new-file", |dir| {
+            let path = format!("{dir}/trial-settle");
+            write_whole(&path, "3 1 0\n").unwrap();
+            assert!(!Path::new(&format!("{path}.new")).exists());
+        });
+    }
+
+    #[test]
+    fn a_leftover_new_file_does_not_break_the_next_write() {
+        with_dir("leftover", |dir| {
+            let path = format!("{dir}/trial-settle");
+            fs::write(format!("{path}.new"), "half a line from a cut boot").unwrap();
+            write_whole(&path, "3 1 0\n").unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "3 1 0\n");
+            assert!(!Path::new(&format!("{path}.new")).exists());
+        });
     }
 }

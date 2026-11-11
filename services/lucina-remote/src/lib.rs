@@ -18,6 +18,8 @@ pub mod image;
 pub mod install;
 pub mod keys;
 pub mod log;
+pub mod netinst;
+pub mod netinst_rules;
 pub mod process;
 pub mod seed;
 pub mod stream;

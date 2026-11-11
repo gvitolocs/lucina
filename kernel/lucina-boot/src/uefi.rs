@@ -576,6 +576,74 @@ pub fn memory_ranges(
     Ok(merged)
 }
 
+/// Most (base, size) pairs in `/chosen` `lucina,firmware-ranges`.
+pub const MAX_FIRMWARE_RANGES: usize = 512;
+/// Bytes of one pair: base and size, 64-bit big-endian each.
+pub const FIRMWARE_RANGE_BYTES: usize = 16;
+
+/// A keep-out list for the kernel (`lucina.fwranges=keep`): the firmware's controllers may still use memory its boot
+/// services held after ExitBootServices. Those are the BootServicesCode and BootServicesData descriptors, as
+/// (base, size) pairs of 64-bit big-endian values for `/chosen` `lucina,firmware-ranges`. Descriptors that touch
+/// the previous pair (UEFI maps come sorted by address) are merged into it. Ranges are rounded outward to whole
+/// pages (start down, end up: a partial page at an edge is included) and empty ones are left out.
+/// Writes at most `out.len() / 16` pairs; returns the bytes written and how many pairs did not fit.
+pub fn firmware_ranges(descs: impl Iterator<Item = MemDesc>, out: &mut [u8]) -> (usize, usize) {
+    let cap = out.len() / FIRMWARE_RANGE_BYTES;
+    let mut n = 0usize;
+    let mut dropped = 0usize;
+    let mut last_end = 0u64;
+    // Whether the last pair written ends at `last_end` (a dropped pair does not).
+    let mut open = false;
+    // Whether the last pair was dropped and ends at `last_end`: a touching one belongs to the same dropped pair.
+    let mut lost = false;
+    for d in descs {
+        if !matches!(
+            d.typ,
+            mem_type::BOOT_SERVICES_CODE | mem_type::BOOT_SERVICES_DATA
+        ) {
+            continue;
+        }
+        let Some(r) = d.range() else { continue };
+        let start = r.start & !(PAGE - 1);
+        let end = r.end.saturating_add(PAGE - 1) & !(PAGE - 1);
+        if start >= end {
+            continue;
+        }
+        if open && start == last_end {
+            // Touches the previous pair: grow it.
+            let at = (n - 1) * FIRMWARE_RANGE_BYTES;
+            let size = end - read_u64_be(&out[at..at + 8]);
+            out[at + 8..at + 16].copy_from_slice(&size.to_be_bytes());
+            last_end = end;
+            continue;
+        }
+        if lost && start == last_end {
+            last_end = end;
+            continue;
+        }
+        if n < cap {
+            let at = n * FIRMWARE_RANGE_BYTES;
+            out[at..at + 8].copy_from_slice(&start.to_be_bytes());
+            out[at + 8..at + 16].copy_from_slice(&(end - start).to_be_bytes());
+            n += 1;
+            open = true;
+            lost = false;
+        } else {
+            dropped += 1;
+            open = false;
+            lost = true;
+        }
+        last_end = end;
+    }
+    (n * FIRMWARE_RANGE_BYTES, dropped)
+}
+
+fn read_u64_be(b: &[u8]) -> u64 {
+    let mut v = [0u8; 8];
+    v.copy_from_slice(b);
+    u64::from_be_bytes(v)
+}
+
 /// The physical window a kernel built for `dram_base` occupies: from its load address, whole 2 MiB blocks
 /// covering `image_size`.
 pub fn kernel_window(img: &Image, dram_base: u64) -> Option<Range> {
@@ -708,6 +776,8 @@ pub struct TreeValues {
     pstore_reg_len: usize,
     rng: Option<RngSeed>,
     rng_note: Option<&'static [u8]>,
+    fw_ranges: [u8; MAX_FIRMWARE_RANGES * FIRMWARE_RANGE_BYTES],
+    fw_ranges_len: usize,
 }
 
 /// How much the loader asks the firmware for: Linux's `EFI_RANDOM_SEED_SIZE`.
@@ -878,6 +948,8 @@ impl TreeValues {
             pstore_reg_len: 0,
             rng: None,
             rng_note: None,
+            fw_ranges: [0; MAX_FIRMWARE_RANGES * FIRMWARE_RANGE_BYTES],
+            fw_ranges_len: 0,
         };
 
         // Memory nodes: by device_type, as the kernel finds them (patch 0012).
@@ -960,6 +1032,14 @@ impl TreeValues {
         self.rng_note = Some(note);
     }
 
+    /// Takes the boot-services ranges of `descs` for `/chosen` `lucina,firmware-ranges`; returns how many pairs did
+    /// not fit in [`MAX_FIRMWARE_RANGES`].
+    pub fn set_firmware_ranges(&mut self, descs: impl Iterator<Item = MemDesc>) -> usize {
+        let (len, dropped) = firmware_ranges(descs, &mut self.fw_ranges);
+        self.fw_ranges_len = len;
+        dropped
+    }
+
     /// Overwrites this copy of the seed, once the tree is written.
     pub fn wipe_rng_seed(&mut self) {
         if let Some(seed) = &mut self.rng {
@@ -1027,7 +1107,7 @@ pub const RESERVED_MEMORY_EDITS: [Edit<'static>; 3] = [
 ];
 
 /// Every edit, in a fixed array; returns it and how many are used. At most 2 (memory) + 3 (stale memory nodes) +
-/// 1 (bootargs) + 2 (initrd) + 2 (`/chosen` cells) + 6 (framebuffer) + 3 (random seed) + 3 (saved log), below [`lucina_fdt::MAX_EDITS`].
+/// 1 (bootargs) + 2 (initrd) + 2 (`/chosen` cells) + 6 (framebuffer) + 3 (random seed) + 1 (firmware ranges) + 3 (saved log), below [`lucina_fdt::MAX_EDITS`].
 pub fn edits<'a>(v: &'a TreeValues) -> ([Edit<'a>; lucina_fdt::MAX_EDITS], usize) {
     let mut e = [Edit::Remove {
         node: "/",
@@ -1126,6 +1206,11 @@ pub fn edits<'a>(v: &'a TreeValues) -> ([Edit<'a>; lucina_fdt::MAX_EDITS], usize
             value: note,
         });
     }
+    add(Edit::Set {
+        node: "/chosen",
+        name: "lucina,firmware-ranges",
+        value: &v.fw_ranges[..v.fw_ranges_len],
+    });
     if v.pstore_path_len != 0 {
         let node = as_str(&v.pstore_path[..v.pstore_path_len]);
         add(Edit::Set {
@@ -1731,5 +1816,125 @@ mod tests {
         );
         let mut small = [0u8; 8];
         assert_eq!(merge_cmdline("console=tty0", "maxcpus=1", &mut small), None);
+    }
+
+    fn fw(descs: &[MemDesc], cap: usize) -> (Vec<(u64, u64)>, usize) {
+        let mut out = vec![0u8; cap * FIRMWARE_RANGE_BYTES];
+        let (len, dropped) = firmware_ranges(descs.iter().copied(), &mut out);
+        let pairs = out[..len]
+            .chunks(16)
+            .map(|c| (read_u64_be(&c[..8]), read_u64_be(&c[8..])))
+            .collect();
+        (pairs, dropped)
+    }
+
+    #[test]
+    fn firmware_ranges_pick_only_boot_services() {
+        use mem_type::*;
+        let map = [
+            d(CONVENTIONAL, 0x4000_0000, 16),
+            d(BOOT_SERVICES_CODE, 0x5000_0000, 4),
+            d(LOADER_DATA, 0x6000_0000, 4),
+            d(RUNTIME_SERVICES_DATA, 0x7000_0000, 4),
+            d(BOOT_SERVICES_DATA, 0x8000_0000, 2),
+            d(ACPI_RECLAIM, 0x9000_0000, 2),
+        ];
+        let (p, dropped) = fw(&map, 8);
+        assert_eq!(dropped, 0);
+        assert_eq!(p, vec![(0x5000_0000, 0x4000), (0x8000_0000, 0x2000)]);
+        assert!(p.iter().all(|&(b, s)| b % PAGE == 0 && s % PAGE == 0));
+    }
+
+    #[test]
+    fn firmware_ranges_merge_touching_only() {
+        use mem_type::*;
+        let map = [
+            d(BOOT_SERVICES_CODE, 0x5000_0000, 4),
+            d(BOOT_SERVICES_DATA, 0x5000_4000, 2),
+            d(BOOT_SERVICES_DATA, 0x5000_7000, 1),
+        ];
+        let (p, _) = fw(&map, 8);
+        assert_eq!(p, vec![(0x5000_0000, 0x6000), (0x5000_7000, 0x1000)]);
+    }
+
+    #[test]
+    fn firmware_ranges_round_outward_and_skip_empty() {
+        use mem_type::*;
+        let map = [
+            d(BOOT_SERVICES_DATA, 0x5000_0800, 3),
+            d(BOOT_SERVICES_DATA, 0x6000_0000, 0),
+        ];
+        let (p, _) = fw(&map, 8);
+        // 0x5000_0800..0x5000_3800 is covered whole: 0x5000_0000..0x5000_4000.
+        assert_eq!(p, vec![(0x5000_0000, 0x4000)]);
+    }
+
+    #[test]
+    fn firmware_ranges_respect_the_cap() {
+        use mem_type::*;
+        let map: Vec<MemDesc> = (0..5)
+            .map(|i| d(BOOT_SERVICES_DATA, 0x5000_0000 + i * 0x2000, 1))
+            .collect();
+        let (p, dropped) = fw(&map, 3);
+        assert_eq!(p.len(), 3);
+        assert_eq!(dropped, 2);
+        assert_eq!(p[2], (0x5000_4000, 0x1000));
+        // A descriptor touching a dropped pair does not grow the last kept one.
+        let map = [
+            d(BOOT_SERVICES_DATA, 0x5000_0000, 1),
+            d(BOOT_SERVICES_DATA, 0x6000_0000, 1),
+            d(BOOT_SERVICES_DATA, 0x6000_1000, 1),
+        ];
+        let (p, dropped) = fw(&map, 1);
+        assert_eq!(p, vec![(0x5000_0000, 0x1000)]);
+        assert_eq!(dropped, 1);
+    }
+
+    #[test]
+    fn firmware_ranges_empty_map_is_an_empty_property() {
+        let (p, dropped) = fw(&[], 4);
+        assert!(p.is_empty());
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn firmware_ranges_property_is_always_in_chosen() {
+        use mem_type::*;
+        let src = Tree::parse(VIRT).unwrap().to_bytes().unwrap();
+        let fdt = Fdt::new(&src).unwrap();
+        let ram = [Range {
+            start: 0x4000_0000,
+            end: 0x8000_0000,
+        }];
+        let prop = |v: &TreeValues| {
+            let (e, n) = edits(v);
+            assert!(n <= lucina_fdt::MAX_EDITS);
+            let mut out = vec![0u8; src.len() + 64 * 1024];
+            let len = patch(&fdt, &e[..n], &mut out).unwrap();
+            let new = Fdt::new(&out[..len]).unwrap();
+            new.node("/chosen")
+                .unwrap()
+                .unwrap()
+                .property("lucina,firmware-ranges")
+                .unwrap()
+                .expect("property present")
+                .value
+                .to_vec()
+        };
+        // No map taken: present, length 0.
+        let mut v = TreeValues::new(&fdt, &ram, None, "x", None).unwrap();
+        assert!(prop(&v).is_empty());
+        let map = [d(BOOT_SERVICES_DATA, 0x5000_0000, 2)];
+        assert_eq!(v.set_firmware_ranges(map.iter().copied()), 0);
+        assert_eq!(
+            prop(&v),
+            [0, 0, 0, 0, 0x50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0]
+        );
+        // The most pairs the property can hold.
+        let many: Vec<MemDesc> = (0..MAX_FIRMWARE_RANGES as u64 + 3)
+            .map(|i| d(BOOT_SERVICES_DATA, 0x1_0000_0000 + i * 0x2000, 1))
+            .collect();
+        assert_eq!(v.set_firmware_ranges(many.iter().copied()), 3);
+        assert_eq!(prop(&v).len(), MAX_FIRMWARE_RANGES * FIRMWARE_RANGE_BYTES);
     }
 }

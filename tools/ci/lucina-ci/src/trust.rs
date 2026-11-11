@@ -2,8 +2,24 @@
 //! shipped unit it finds the verified source files (the target and every file it pulls in by `#[path]`), scans them for the
 //! markers that make a green proof weaker than it sounds (`assume`, `external_body`, `unsafe`, ...), counts verified against
 //! trusted lines, and lists the functions of a shipped file that carry no `//@ requires`/`ensures` at all. The counts are a
-//! ratchet: `trust --check` refuses a unit with a nonzero assumption, escape or `unsafe` count that `tools/ci/trust-allow.tsv`
-//! does not cover (max_count at least the count, with a reason). The committed `docs/ci/TRUST-REPORT.md` is generated.
+//! ratchet: `trust --check` refuses a unit with a nonzero assumption, escape, `unsafe`, loosening-attribute, rlimit or verifier-flag
+//! count that `tools/ci/trust-allow.tsv` does not cover (max_count at least the count, with a reason; an rlimit also needs a
+//! `max_value` that no value exceeds). The committed `docs/ci/TRUST-REPORT.md` is generated.
+//!
+//! Attribute table (stage 3b; names checked against the pinned Verus binary, see `docs/ci/TRUST-FLAGS.md`). `verifier::X`,
+//! `verifier(X)` and the arguments of `verus_verify(..)`:
+//!
+//! | Attribute | Class | Why |
+//! | --- | --- | --- |
+//! | `external_body`, `external`, `exec_allows_no_decreases_clause` | escape | counted above, unchanged |
+//! | `external_type_specification`, `external_trait_specification`, `external_trait_extension`, `verus_verify(external)` | escape | declarations the verifier takes from outside |
+//! | `external_fn_specification`, `uninterp` | assumption | counted above, unchanged |
+//! | `trusted`, `assume_*` | assumption | the item is taken as true |
+//! | `nonlinear`, `bit_vector`, `integer_ring` | solver | a different, less transparent decision procedure |
+//! | `rlimit(N)`, `--rlimit N` | rlimit | more solver time per function; value recorded, ratcheted |
+//! | `loop_isolation(false)`, any `verifier::` name not in this table | loosen | loops see the whole context; unknown means a human decides |
+//! | `no_auto_trigger` | info | trigger control, changes completeness not soundness |
+//! | `verify`, `spinoff_prover`, `loop_isolation(true)`, `opaque*`, `reveal*`, `inline`, `when_used_as_spec`, `accept_recursive_types`, `reject_recursive_types*`, `memoize`, `truncate`, `ext_equal*`, `auto_ext_equal`, `type_invariant`, `atomic`, `broadcast_forall`, `prophetic`, `reveal_group` | harmless | opt in, performance or sound proof structure |
 
 use crate::coverage;
 use crate::inventory::Unit;
@@ -14,24 +30,72 @@ pub const REPORT: &str = "docs/ci/TRUST-REPORT.md";
 pub const BASELINE: &str = "tools/ci/trust-baseline.tsv";
 pub const ALLOW: &str = "tools/ci/trust-allow.tsv";
 
-/// How much a marker weakens a proof. The first three are ratcheted.
+/// How much a marker weakens a proof. All but `Solver` and `Info` are ratcheted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Class {
     Assumption,
     Escape,
     Unsafe,
+    /// An attribute that loosens checking and is in no other class.
+    Loosen,
+    /// `#[verifier::rlimit(N)]` or `--rlimit N`; the value is recorded.
+    Rlimit,
+    /// A Verus command-line flag that loosens checking (unit `flags/<script>`).
+    Flag,
     Solver,
     Info,
 }
 
-pub const ALL_CLASSES: [Class; 5] = [
+pub const ALL_CLASSES: [Class; 8] = [
     Class::Assumption,
     Class::Escape,
     Class::Unsafe,
+    Class::Loosen,
+    Class::Rlimit,
+    Class::Flag,
     Class::Solver,
     Class::Info,
 ];
-pub const RATCHET_CLASSES: [Class; 3] = [Class::Assumption, Class::Escape, Class::Unsafe];
+pub const RATCHET_CLASSES: [Class; 6] = [
+    Class::Assumption,
+    Class::Escape,
+    Class::Unsafe,
+    Class::Loosen,
+    Class::Rlimit,
+    Class::Flag,
+];
+
+/// Verus default rlimit is 10; a value of ten times that or more is listed for a human, in thousandths.
+pub const RLIMIT_TEN_TIMES_MILLI: u64 = 100_000;
+
+/// An rlimit value in thousandths (`50` is 50000, `2.5` is 2500, `infinity` is `u64::MAX`).
+pub fn parse_value(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s == "infinity" {
+        return Some(u64::MAX);
+    }
+    let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+    if int.is_empty() || !int.bytes().all(|b| b.is_ascii_digit()) || frac.len() > 3 {
+        return None;
+    }
+    if !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let f: u64 = format!("{frac:0<3}").parse().ok()?;
+    int.parse::<u64>().ok()?.checked_mul(1000)?.checked_add(f)
+}
+
+pub fn fmt_value(v: u64) -> String {
+    if v == u64::MAX {
+        "infinity".into()
+    } else if v.is_multiple_of(1000) {
+        (v / 1000).to_string()
+    } else {
+        format!("{}.{:03}", v / 1000, v % 1000)
+            .trim_end_matches('0')
+            .to_string()
+    }
+}
 
 impl Class {
     pub fn name(self) -> &'static str {
@@ -39,6 +103,9 @@ impl Class {
             Class::Assumption => "assumption",
             Class::Escape => "escape",
             Class::Unsafe => "unsafe",
+            Class::Loosen => "loosen",
+            Class::Rlimit => "rlimit",
+            Class::Flag => "flag",
             Class::Solver => "solver",
             Class::Info => "info",
         }
@@ -54,6 +121,8 @@ pub struct Marker {
     pub class: Class,
     pub file: String,
     pub line: usize,
+    /// An rlimit's value in thousandths (`u64::MAX` for infinity or a value that is not a literal).
+    pub value: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -247,11 +316,13 @@ fn fn_names(s: &str) -> Vec<String> {
         .collect()
 }
 
-fn markers_in(s: &str, ws: &str) -> Vec<(&'static str, Class)> {
-    let mut v: Vec<(&'static str, Class)> = Vec::new();
-    let mut add = |n: usize, k: &'static str, c: Class| {
+type Hit = (&'static str, Class, Option<u64>);
+
+fn markers_in(s: &str, ws: &str) -> Vec<Hit> {
+    let v: std::cell::RefCell<Vec<Hit>> = std::cell::RefCell::new(Vec::new());
+    let add = |n: usize, k: &'static str, c: Class| {
         for _ in 0..n {
-            v.push((k, c));
+            v.borrow_mut().push((k, c, None));
         }
     };
     add(calls(s, "assume"), "assume", Class::Assumption);
@@ -305,10 +376,16 @@ fn markers_in(s: &str, ws: &str) -> Vec<(&'static str, Class)> {
         Class::Escape,
     );
     add(
-        count_sub(ws, "verifier::rlimit(") + count_sub(ws, "verifier(rlimit("),
-        "rlimit",
-        Class::Info,
+        count_sub(ws, "by(integer_ring)"),
+        "by(integer_ring)",
+        Class::Solver,
     );
+    // Other `verifier::` attributes (the table at the top of this file), rlimit included.
+    for a in attrs_in(ws) {
+        if let Some(h) = classify_attr(&a) {
+            v.borrow_mut().push(h);
+        }
+    }
     if !s.trim_start().starts_with("use ") {
         add(word_at(s, "transmute").len(), "transmute", Class::Unsafe);
     }
@@ -324,9 +401,183 @@ fn markers_in(s: &str, ws: &str) -> Vec<(&'static str, Class)> {
         .join(" ")
         .contains("broadcast axiom");
     if named || spelled {
-        v.push(("axiom", Class::Assumption));
+        v.borrow_mut().push(("axiom", Class::Assumption, None));
     }
-    v
+    v.into_inner()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Via {
+    /// `verifier::name`
+    Path,
+    /// `verifier(name, ..)`
+    Paren,
+    /// `verus_verify(name, ..)`
+    VerusVerify,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Attr {
+    name: String,
+    /// What is inside the parentheses after the name, if there are any.
+    args: Option<String>,
+    via: Via,
+}
+
+/// The text inside the parenthesis that opens at byte `open` of `s`, and the index after the closing one.
+fn balanced(s: &str, open: usize) -> Option<(&str, usize)> {
+    let mut depth = 0usize;
+    for (i, b) in s.bytes().enumerate().skip(open) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&s[open + 1..i], i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut from) = (0usize, 0usize);
+    for (i, b) in s.bytes().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                out.push(&s[from..i]);
+                from = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[from..]);
+    out.into_iter().filter(|x| !x.is_empty()).collect()
+}
+
+/// `name` and its parenthesised arguments at the start of `s`.
+fn name_and_args(s: &str) -> Option<(String, Option<String>)> {
+    let name: String = s.chars().take_while(|&c| is_ident(c)).collect();
+    if name.is_empty() {
+        return None;
+    }
+    let args = if s[name.len()..].starts_with('(') {
+        balanced(s, name.len()).map(|(a, _)| a.to_string())
+    } else {
+        None
+    };
+    Some((name, args))
+}
+
+/// Every `verifier::name`, `verifier(name, ..)` and `verus_verify(name, ..)` attribute on a whitespace-free line.
+fn attrs_in(ws: &str) -> Vec<Attr> {
+    let mut out = Vec::new();
+    let b = ws.as_bytes();
+    let mut from = 0;
+    while let Some(p) = ws[from..].find("verifier::") {
+        let i = from + p;
+        from = i + 10;
+        if i > 0 && is_ident(b[i - 1] as char) {
+            continue;
+        }
+        if let Some((name, args)) = name_and_args(&ws[i + 10..]) {
+            out.push(Attr {
+                name,
+                args,
+                via: Via::Path,
+            });
+        }
+    }
+    for (key, via) in [
+        ("verifier(", Via::Paren),
+        ("verus_verify(", Via::VerusVerify),
+    ] {
+        let mut from = 0;
+        while let Some(p) = ws[from..].find(key) {
+            let i = from + p;
+            from = i + key.len();
+            if i > 0 && is_ident(b[i - 1] as char) {
+                continue;
+            }
+            let Some((inner, _)) = balanced(ws, i + key.len() - 1) else {
+                continue;
+            };
+            for item in split_top(inner) {
+                if let Some((name, args)) = name_and_args(item) {
+                    out.push(Attr { name, args, via });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The attribute table. `None` for harmless attributes and for those that the plain-text rules above already count
+/// (`external_body`, `external`, `external_fn_specification`, `uninterp`, `exec_allows_no_decreases_clause`).
+fn classify_attr(a: &Attr) -> Option<Hit> {
+    let n = a.name.as_str();
+    let value = || Some(a.args.as_deref().and_then(parse_value).unwrap_or(u64::MAX));
+    if a.via == Via::VerusVerify {
+        return match n {
+            "external" => Some(("verus_verify(external)", Class::Escape, None)),
+            "rlimit" => Some(("rlimit", Class::Rlimit, value())),
+            _ => None,
+        };
+    }
+    match n {
+        "external_body"
+        | "external"
+        | "external_fn_specification"
+        | "uninterp"
+        | "exec_allows_no_decreases_clause" => None,
+        "external_type_specification" => {
+            Some(("verifier::external_type_specification", Class::Escape, None))
+        }
+        "external_trait_specification" => Some((
+            "verifier::external_trait_specification",
+            Class::Escape,
+            None,
+        )),
+        "external_trait_extension" => {
+            Some(("verifier::external_trait_extension", Class::Escape, None))
+        }
+        "trusted" => Some(("verifier::trusted", Class::Assumption, None)),
+        _ if n.starts_with("assume_") => Some(("verifier::assume_*", Class::Assumption, None)),
+        "nonlinear" => Some(("verifier::nonlinear", Class::Solver, None)),
+        "bit_vector" => Some(("verifier::bit_vector", Class::Solver, None)),
+        "integer_ring" => Some(("verifier::integer_ring", Class::Solver, None)),
+        "rlimit" => Some(("rlimit", Class::Rlimit, value())),
+        "no_auto_trigger" => Some(("verifier::no_auto_trigger", Class::Info, None)),
+        "loop_isolation" => match a.args.as_deref() {
+            Some("true") => None,
+            Some("false") => Some(("verifier::loop_isolation(false)", Class::Loosen, None)),
+            _ => Some(("verifier::loop_isolation(?)", Class::Loosen, None)),
+        },
+        "verify"
+        | "spinoff_prover"
+        | "inline"
+        | "when_used_as_spec"
+        | "accept_recursive_types"
+        | "reject_recursive_types"
+        | "reject_recursive_types_in_ground_variants"
+        | "memoize"
+        | "truncate"
+        | "ext_equal"
+        | "ext_equal_deep"
+        | "auto_ext_equal"
+        | "type_invariant"
+        | "atomic"
+        | "broadcast_forall"
+        | "prophetic"
+        | "reveal_group" => None,
+        _ if n.starts_with("opaque") || n.starts_with("reveal") => None,
+        _ => Some(("verifier::<unknown>", Class::Loosen, None)),
+    }
 }
 
 /// Per line: the source with the `//@` marker removed, the lexed (comment- and string-free) text, and whether it was a proof line.
@@ -546,12 +797,13 @@ pub fn scan_text(path: &str, text: &str) -> FileScan {
         let ws: String = l.split_whitespace().collect();
         // Test code is not what the proof is about: a test calling a function named `admit` is not an `admit()`.
         if !in_test[n] {
-            for (kind, class) in markers_in(l, &ws) {
+            for (kind, class, value) in markers_in(l, &ws) {
                 scan.markers.push(Marker {
                     kind,
                     class,
                     file: path.to_string(),
                     line,
+                    value,
                 });
             }
         }
@@ -593,6 +845,111 @@ fn carries_spec(raw: &[&str], cleaned: &[String], proof: &[bool], n: usize) -> b
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Verifier flags in the scripts and the runner that invoke Verus.
+
+/// Files outside `scripts/verify*.sh` and `verification/*/mutants.sh` that run Verus or pass it arguments.
+pub const FLAG_FILES: [&str; 5] = [
+    "scripts/verus-one.sh",
+    "tools/ci/lucina-ci/src/runner.rs",
+    ".github/workflows/verus.yml",
+    "tools/ci/install-verus.sh",
+    "tools/ci/proof-inventory.tsv",
+];
+pub const FLAG_UNIT_PREFIX: &str = "flags/";
+
+/// What a Verus command-line flag does to checking. `None` for a token that is not a Verus flag we know.
+fn flag_effect(tok: &str, next: Option<&str>) -> Option<Hit> {
+    let hit = |k: &'static str, c: Class| Some((k, c, None));
+    match tok {
+        "--no-verify" => hit("--no-verify", Class::Flag),
+        "--no-lifetime" => hit("--no-lifetime", Class::Flag),
+        "--no-trait-conflicts" => hit("--no-trait-conflicts", Class::Flag),
+        "--no-erasure-check" => hit("--no-erasure-check", Class::Flag),
+        "--no-auto-recommends-check" => hit("--no-auto-recommends-check", Class::Flag),
+        "--no-vstd" => hit("--no-vstd", Class::Flag),
+        "--smt-option" => hit("--smt-option", Class::Flag),
+        "--verify-root" | "--verify-module" | "--verify-only-module" | "--verify-function" => {
+            hit("--verify-<scope>", Class::Flag)
+        }
+        t if t.starts_with("--disable-") => hit("--disable-*", Class::Flag),
+        "--rlimit" => Some((
+            "--rlimit",
+            Class::Rlimit,
+            Some(next.and_then(parse_value).unwrap_or(u64::MAX)),
+        )),
+        "-V" => match next.unwrap_or("") {
+            "ignore-unexpected-smt" => hit("-V ignore-unexpected-smt", Class::Flag),
+            "no-solver-version-check" => hit("-V no-solver-version-check", Class::Flag),
+            "allow-inline-air" => hit("-V allow-inline-air", Class::Flag),
+            "cvc5" | "cvc5-smtlib" => hit("-V cvc5", Class::Flag),
+            "no-bv-simplify" => hit("-V no-bv-simplify", Class::Flag),
+            _ => hit("-V (other)", Class::Info),
+        },
+        "--no-cheating" => hit("--no-cheating (tightens)", Class::Info),
+        "--cfg" => hit("--cfg", Class::Info),
+        "--features" => hit("--features", Class::Info),
+        "--expand-errors" => hit("--expand-errors", Class::Info),
+        "--triggers" | "--triggers-mode" => hit("--triggers", Class::Info),
+        "--multiple-errors" => hit("--multiple-errors", Class::Info),
+        "--num-threads" => hit("--num-threads", Class::Info),
+        "--compile" => hit("--compile", Class::Info),
+        _ => None,
+    }
+}
+
+/// The Verus flags in a script, workflow or Rust source. Only logical lines (continuations joined) that mention `verus` are
+/// read; `#` and `//` comment lines are skipped. A flag on a line that does not mention Verus, such as an argument array
+/// spread over several lines, is not seen (stated in `docs/ci/TRUST-FLAGS.md`). With `record_only` (mutant scripts, which run
+/// Verus on planted-bug copies) every hit is class info: recorded, not ratcheted.
+pub fn scan_flags(path: &str, text: &str, record_only: bool) -> FileScan {
+    let mut scan = FileScan {
+        path: path.to_string(),
+        ..FileScan::default()
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let start = i;
+        let mut logical = lines[i].to_string();
+        while logical.trim_end().ends_with('\\') && i + 1 < lines.len() {
+            logical = logical.trim_end().trim_end_matches('\\').to_string();
+            i += 1;
+            logical.push(' ');
+            logical.push_str(lines[i]);
+        }
+        i += 1;
+        let t = logical.trim_start();
+        if !t.is_empty() {
+            scan.code_lines += usize::from(!t.starts_with('#') && !t.starts_with("//"));
+        }
+        if t.starts_with('#') || t.starts_with("//") || !t.to_ascii_lowercase().contains("verus") {
+            continue;
+        }
+        let toks: Vec<&str> = t
+            .split(|c: char| c.is_whitespace() || "\"'(),;[]{}".contains(c))
+            .filter(|x| !x.is_empty())
+            .collect();
+        for (k, tok) in toks.iter().enumerate() {
+            let (name, inline) = match tok.split_once('=') {
+                Some((a, b)) if a.starts_with('-') => (a, Some(b)),
+                _ => (*tok, None),
+            };
+            let next = inline.or_else(|| toks.get(k + 1).copied());
+            if let Some((kind, class, value)) = flag_effect(name, next) {
+                scan.markers.push(Marker {
+                    kind,
+                    class: if record_only { Class::Info } else { class },
+                    file: path.to_string(),
+                    line: start + 1,
+                    value,
+                });
+            }
+        }
+    }
+    scan
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Units.
 
 #[derive(Debug, Clone)]
@@ -610,6 +967,18 @@ impl UnitTrust {
             .flat_map(|f| &f.markers)
             .filter(|m| m.class == class)
             .count()
+    }
+    /// The largest rlimit value (thousandths) of the unit, if it has any.
+    pub fn rlimit_max(&self) -> Option<u64> {
+        self.files
+            .iter()
+            .flat_map(|f| &f.markers)
+            .filter(|m| m.class == Class::Rlimit)
+            .map(|m| m.value.unwrap_or(u64::MAX))
+            .max()
+    }
+    pub fn is_flags(&self) -> bool {
+        self.kind == "flags"
     }
     pub fn verified_lines(&self) -> usize {
         self.files.iter().map(|f| f.verified_lines).sum()
@@ -711,8 +1080,50 @@ pub fn compute(root: &Path, units: &[Unit]) -> Vec<UnitTrust> {
             files,
         });
     }
+    out.extend(flag_units(root));
     out.sort_by(|a, b| a.unit.cmp(&b.unit));
     out
+}
+
+/// The files that invoke Verus, as `(path, record_only)`, sorted.
+fn flag_paths(root: &Path) -> Vec<(String, bool)> {
+    let mut v: Vec<(String, bool)> = FLAG_FILES.iter().map(|f| (f.to_string(), false)).collect();
+    if let Ok(rd) = std::fs::read_dir(root.join("scripts")) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if n.starts_with("verify") && n.ends_with(".sh") {
+                v.push((format!("scripts/{n}"), false));
+            }
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(root.join("verification")) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            let rel = format!("verification/{n}/mutants.sh");
+            if root.join(&rel).is_file() {
+                v.push((rel, true));
+            }
+        }
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// One unit `flags/<path>` per file that invokes Verus (kind `flags`), with its flags as markers.
+fn flag_units(root: &Path) -> Vec<UnitTrust> {
+    flag_paths(root)
+        .into_iter()
+        .filter_map(|(p, record)| {
+            let text = std::fs::read_to_string(root.join(&p)).ok()?;
+            Some(UnitTrust {
+                unit: format!("{FLAG_UNIT_PREFIX}{p}"),
+                kind: "flags".into(),
+                target: p.clone(),
+                files: vec![scan_flags(&p, &text, record)],
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -771,6 +1182,8 @@ pub struct Allow {
     pub class: String,
     pub max: usize,
     pub reason: String,
+    /// The optional fifth column, for class `rlimit`: no value may exceed it (thousandths).
+    pub max_value: Option<u64>,
 }
 
 /// Valid entries and the problems found. An entry without a reason is a problem and permits nothing.
@@ -790,18 +1203,33 @@ pub fn parse_allow(text: &str) -> (Vec<Allow>, Vec<String>) {
             continue;
         }
         let Some(class) = Class::parse(f[1]).filter(|c| RATCHET_CLASSES.contains(c)) else {
-            bad.push(format!("{at}: class must be assumption, escape or unsafe"));
+            bad.push(format!(
+                "{at}: class must be assumption, escape, unsafe, loosen, rlimit or flag"
+            ));
             continue;
         };
         let Ok(max) = f[2].parse::<usize>() else {
             bad.push(format!("{at}: max_count is not a number"));
             continue;
         };
+        let mut max_value = None;
+        if let Some(v) = f.get(4).map(|v| v.trim()).filter(|v| !v.is_empty()) {
+            match parse_value(v) {
+                Some(x) => max_value = Some(x),
+                None => {
+                    bad.push(format!(
+                        "{at}: max_value must be a number (for example 50 or 2.5) or infinity"
+                    ));
+                    continue;
+                }
+            }
+        }
         ok.push(Allow {
             unit: f[0].to_string(),
             class: class.name().to_string(),
             max,
             reason: f[3].trim().to_string(),
+            max_value,
         });
     }
     (ok, bad)
@@ -816,7 +1244,20 @@ pub struct Outcome {
 /// Every nonzero count of assumption, escape or unsafe needs an allow entry (`max_count` at least the count, a reason): the
 /// baseline alone no longer suffices. An allow above the actual count is stale (warning only). `allow_problems` are the parse
 /// errors of the allow file, and an entry without a reason permits nothing.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn ratchet(actual: &Counts, allow: &[Allow], allow_problems: &[String]) -> Outcome {
+    ratchet_values(actual, &BTreeMap::new(), allow, allow_problems)
+}
+
+/// `ratchet`, and for class `rlimit` also the values: `max_rlimit` is the largest rlimit of each unit (thousandths). A unit with an
+/// rlimit needs an allow entry with a `max_value`, and no value may exceed the largest `max_value` of its entries. Raising an
+/// existing rlimit therefore needs the allow line to change, with a reason.
+pub fn ratchet_values(
+    actual: &Counts,
+    max_rlimit: &BTreeMap<String, u64>,
+    allow: &[Allow],
+    allow_problems: &[String],
+) -> Outcome {
     let mut o = Outcome::default();
     o.errors.extend(allow_problems.iter().cloned());
     for ((unit, class), &n) in actual {
@@ -836,6 +1277,27 @@ pub fn ratchet(actual: &Counts, allow: &[Allow], allow_problems: &[String]) -> O
                 "{unit}: {n} {class} but the allow entry covers {m}; remove them, or raise it with a reason in {ALLOW}"
             )),
             Some(_) => {}
+        }
+        if class.as_str() == Class::Rlimit.name()
+            && let Some(&top) = max_rlimit.get(unit)
+        {
+            let cap = allow
+                .iter()
+                .filter(|a| &a.unit == unit && &a.class == class)
+                .filter_map(|a| a.max_value)
+                .max();
+            match cap {
+                None => o.errors.push(format!(
+                    "{unit}: {n} rlimit but no allow entry has a max_value (fifth column) for it; write the largest value ({}) with a reason in {ALLOW}",
+                    fmt_value(top)
+                )),
+                Some(c) if top > c => o.errors.push(format!(
+                    "{unit}: rlimit {} but the allow entry covers {}; lower it, or raise max_value with a reason in {ALLOW}",
+                    fmt_value(top),
+                    fmt_value(c)
+                )),
+                Some(_) => {}
+            }
         }
     }
     for a in allow {
@@ -880,15 +1342,26 @@ fn ranked_items(units: &[UnitTrust]) -> Vec<Item> {
                 .insert(unit.to_string());
         };
     for u in units {
+        if u.is_flags() {
+            continue;
+        }
         for mk in u.files.iter().flat_map(|f| &f.markers) {
             let (rank, cat) = match mk.class {
                 Class::Assumption => (0, "assumption"),
                 Class::Escape => (1, "escape"),
                 Class::Unsafe => (2, "unsafe"),
+                Class::Loosen => (5, "loosen"),
+                Class::Rlimit => (6, "rlimit"),
                 Class::Solver => (4, "solver"),
-                Class::Info => continue,
+                Class::Flag | Class::Info => continue,
             };
-            put(rank, cat, mk.kind.to_string(), &mk.file, mk.line, &u.unit);
+            let what = match mk.value {
+                Some(v) if mk.class == Class::Rlimit => {
+                    format!("{} {}", mk.kind, fmt_value(v))
+                }
+                _ => mk.kind.to_string(),
+            };
+            put(rank, cat, what, &mk.file, mk.line, &u.unit);
         }
         for (file, line, name) in u.unspecified() {
             put(3, "unproved fn", format!("fn {name}"), &file, line, &u.unit);
@@ -900,19 +1373,20 @@ fn ranked_items(units: &[UnitTrust]) -> Vec<Item> {
 pub fn render_report(units: &[UnitTrust]) -> String {
     let mut units: Vec<&UnitTrust> = units.iter().collect();
     units.sort_by(|a, b| a.unit.cmp(&b.unit));
-    let owned: Vec<UnitTrust> = units.iter().map(|u| (*u).clone()).collect();
+    let all: Vec<UnitTrust> = units.iter().map(|u| (*u).clone()).collect();
+    let owned: Vec<UnitTrust> = all.iter().filter(|u| !u.is_flags()).cloned().collect();
+    let flag_units: Vec<&UnitTrust> = all.iter().filter(|u| u.is_flags()).collect();
     let items = ranked_items(&owned);
     let mut s = String::new();
     s.push_str("# Trust report\n\nGenerated by lucina-ci trust --write. Do not edit.\n\n");
     s.push_str("What each Verus and shipped proof unit assumes instead of proving (gap B of `docs/ci/PROOF-WORKFLOW.md`). It scans the\n");
     s.push_str("target file of each unit and every file it pulls in by `#[path]`. Markers in comments and string literals do not count; `//@` lines do. Verified lines are the lines inside `verus! { }` blocks and `#[verus_spec(..)]` attributes, plus `//@` lines.\n");
-    s.push_str("Every nonzero assumption, escape or unsafe count of a unit needs a line with a reason in `tools/ci/trust-allow.tsv`;\n");
+    s.push_str("Every nonzero assumption, escape, unsafe, loosen, rlimit or flag count of a unit needs a line with a reason in `tools/ci/trust-allow.tsv` (an rlimit also a `max_value`);\n");
     s.push_str("`lucina-ci trust --check` refuses one that has none. `tools/ci/trust-baseline.tsv` records today's counts.\n\n");
 
-    let total = |c: Class| owned.iter().map(|u| u.count(c)).sum::<usize>();
+    let total = |c: Class| all.iter().map(|u| u.count(c)).sum::<usize>();
     let distinct = |c: Class| {
-        owned
-            .iter()
+        all.iter()
             .flat_map(|u| u.files.iter().flat_map(|f| &f.markers))
             .filter(|m| m.class == c)
             .map(|m| (m.file.clone(), m.line, m.kind))
@@ -943,14 +1417,16 @@ pub fn render_report(units: &[UnitTrust]) -> String {
     }
     s.push_str("\nClasses: assumption = taken as true (`assume`, `admit`, axioms, `assume_specification`, `external_fn_specification`, `uninterp`, `proof_from_false`); ");
     s.push_str("escape = code the verifier does not check (`external_body`, `external`, `cfg(not(verus))`, `exec_allows_no_decreases_clause`); ");
-    s.push_str("unsafe = `unsafe`, `transmute`; solver = `by(nonlinear_arith)`, `by(bit_vector)`; info = `rlimit`.\n\n");
+    s.push_str("unsafe = `unsafe`, `transmute`; loosen = a `verifier::` attribute that loosens checking and fits no other class (`loop_isolation(false)`, an attribute the table in `trust.rs` does not know); rlimit = `#[verifier::rlimit(N)]` and `--rlimit N`, value recorded; flag = a Verus command-line flag that loosens checking (unit `flags/<script>`); solver = `by(nonlinear_arith)`, `by(bit_vector)`, `by(integer_ring)`, `verifier::nonlinear`, `verifier::bit_vector`, `verifier::integer_ring`; info = recorded, not ratcheted (`no_auto_trigger`, neutral flags, flags in mutant scripts). The attribute table and the flag table are in `docs/ci/TRUST-FLAGS.md`.\n\n");
 
     s.push_str("## Per unit\n\n");
-    s.push_str("| Unit | Kind | Files | Verified / code lines | Assumption | Escape | Unsafe | Solver | Info | Unspecified fns |\n");
-    s.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    s.push_str("| Unit | Kind | Files | Verified / code lines | Assumption | Escape | Unsafe | Loosen | Rlimit | Solver | Info | Unspecified fns |\n");
+    s.push_str(
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+    );
     for u in &owned {
         s.push_str(&format!(
-            "| `{}` | {} | {} | {} / {} | {} | {} | {} | {} | {} | {} |\n",
+            "| `{}` | {} | {} | {} / {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             u.unit,
             u.kind,
             u.files.len(),
@@ -959,6 +1435,8 @@ pub fn render_report(units: &[UnitTrust]) -> String {
             u.count(Class::Assumption),
             u.count(Class::Escape),
             u.count(Class::Unsafe),
+            u.count(Class::Loosen),
+            u.count(Class::Rlimit),
             u.count(Class::Solver),
             u.count(Class::Info),
             u.unspecified().len()
@@ -966,7 +1444,7 @@ pub fn render_report(units: &[UnitTrust]) -> String {
     }
 
     s.push_str("\n## The items most worth a human's look\n\n");
-    s.push_str("Ranked: assumption, escape, unsafe, unproved function, solver. The first ten of each are listed; `lucina-ci trust --json` has all.\n\n");
+    s.push_str("Ranked: assumption, escape, unsafe, unproved function, solver, loosening attribute, rlimit. The first ten of each are listed; `lucina-ci trust --json` has all.\n\n");
     for (cat, title) in [
         ("assumption", "Assumptions"),
         ("escape", "Escapes"),
@@ -976,6 +1454,11 @@ pub fn render_report(units: &[UnitTrust]) -> String {
             "Unproved functions (shipped files, no `//@ requires`/`ensures`)",
         ),
         ("solver", "Solver tactics"),
+        ("loosen", "Loosening attributes"),
+        (
+            "rlimit",
+            "Raised rlimits (value in Verus's units; the default is 10)",
+        ),
     ] {
         let list: Vec<&Item> = items.iter().filter(|i| i.category == cat).collect();
         s.push_str(&format!("### {title} ({})\n\n", list.len()));
@@ -1000,6 +1483,80 @@ pub fn render_report(units: &[UnitTrust]) -> String {
         }
         s.push('\n');
     }
+
+    let mut big_set: BTreeSet<(String, usize, String)> = BTreeSet::new();
+    for m in all
+        .iter()
+        .flat_map(|u| u.files.iter().flat_map(|f| &f.markers))
+    {
+        if m.class == Class::Rlimit && m.value.unwrap_or(u64::MAX) >= RLIMIT_TEN_TIMES_MILLI {
+            let v = fmt_value(m.value.unwrap_or(u64::MAX));
+            big_set.insert((m.file.clone(), m.line, format!("{} {v}", m.kind)));
+        }
+    }
+    let big: Vec<(String, usize, String)> = big_set.into_iter().collect();
+    s.push_str(&format!(
+        "### Needs ten times the default rlimit or more (value >= {}) ({})\n\n",
+        fmt_value(RLIMIT_TEN_TIMES_MILLI),
+        big.len()
+    ));
+    if big.is_empty() {
+        s.push_str("None.\n\n");
+    }
+    for (file, line, what) in &big {
+        s.push_str(&format!("- `{file}:{line}` {what}\n"));
+    }
+    if !big.is_empty() {
+        s.push('\n');
+    }
+
+    s.push_str("## Verifier flags\n\n");
+    s.push_str("Command-line flags in the files that invoke Verus (`flags/<path>` units; hits are read from logical lines that mention `verus`). ");
+    s.push_str("A loosening flag is class `flag` and `--rlimit N` is class `rlimit`, both ratcheted per file through `tools/ci/trust-allow.tsv`; neutral flags and every flag in a mutant script (`verification/*/mutants.sh`, which runs Verus on planted-bug copies) are recorded as info.\n\n");
+    s.push_str(
+        "| File | Loosening flags | Rlimit | Recorded only |\n| --- | ---: | ---: | ---: |\n",
+    );
+    let (mutant_units, other_units): (Vec<&UnitTrust>, Vec<&UnitTrust>) = flag_units
+        .iter()
+        .partition(|u| u.target.starts_with("verification/") && u.target.ends_with("/mutants.sh"));
+    for u in other_units.iter().chain(
+        mutant_units
+            .iter()
+            .filter(|u| u.files.iter().any(|f| !f.markers.is_empty())),
+    ) {
+        s.push_str(&format!(
+            "| `{}` | {} | {} | {} |\n",
+            u.target,
+            u.count(Class::Flag),
+            u.count(Class::Rlimit),
+            u.count(Class::Info)
+        ));
+    }
+    s.push_str(&format!(
+        "\n{} mutant scripts (`verification/*/mutants.sh`) are scanned too and listed above only when they pass a flag.\n\n",
+        mutant_units.len()
+    ));
+    let mut any = false;
+    for u in &flag_units {
+        for m in u.files.iter().flat_map(|f| &f.markers) {
+            any = true;
+            let v = m
+                .value
+                .map(|v| format!(" {}", fmt_value(v)))
+                .unwrap_or_default();
+            s.push_str(&format!(
+                "- `{}:{}` `{}{v}` ({})\n",
+                m.file,
+                m.line,
+                m.kind,
+                m.class.name()
+            ));
+        }
+    }
+    if !any {
+        s.push_str("No flag is used today.\n");
+    }
+    s.push('\n');
 
     s.push_str("## Comments that say \"not proved\"\n\nRead by a human, not by Verus.\n\n");
     let mut np: BTreeMap<(String, usize), String> = BTreeMap::new();
@@ -1065,8 +1622,12 @@ pub fn render_json(units: &[UnitTrust], outcome: Option<&Outcome>) -> String {
             .iter()
             .flat_map(|f| &f.markers)
             .map(|m| {
+                let value = m
+                    .value
+                    .map(|v| format!(",\"value\":{}", json_str(&fmt_value(v))))
+                    .unwrap_or_default();
                 format!(
-                    "{{\"kind\":{},\"class\":\"{}\",\"file\":{},\"line\":{}}}",
+                    "{{\"kind\":{},\"class\":\"{}\",\"file\":{},\"line\":{}{value}}}",
                     json_str(m.kind),
                     m.class.name(),
                     json_str(&m.file),
@@ -1186,7 +1747,7 @@ broadcast axiom fn ax() {}
                 ("by(nonlinear_arith)", "solver"),
                 ("by(bit_vector)", "solver"),
                 ("cfg(not(verus))", "escape"),
-                ("rlimit", "info"),
+                ("rlimit", "rlimit"),
                 ("transmute", "unsafe"),
                 ("axiom", "assumption"),
             ]
@@ -1457,5 +2018,285 @@ fn f() { let m = \"mod s;\"; }
         assert!(one.contains("Generated by lucina-ci trust --write. Do not edit."));
         assert!(one.contains("`t.rs:2` external_body"));
         assert!(one.contains("`t.rs:1` fn g"));
+    }
+
+    // --- stage 3b: loosening attributes, rlimit values, verifier flags -----------------------------------------------
+
+    fn class_of(src: &str) -> Vec<(&'static str, &'static str)> {
+        scan_text("f.rs", src)
+            .markers
+            .iter()
+            .map(|m| (m.kind, m.class.name()))
+            .collect()
+    }
+
+    #[test]
+    fn each_new_attribute_class_is_detected() {
+        let src = "\
+#![verifier::loop_isolation(false)]
+#[verifier::external_type_specification] struct A;
+#[verifier::external_trait_specification] trait B {}
+#[verifier::external_trait_extension(CE via CS)] trait C {}
+#[verifier::trusted] fn d() {}
+#[verifier::assume_termination] fn e() {}
+#[verifier::nonlinear] proof fn f() {}
+#[verifier::bit_vector] proof fn g() {}
+#[verifier(integer_ring)] proof fn h() {}
+#[verifier::no_auto_trigger] spec fn i() {}
+#[verifier::some_future_thing] fn j() {}
+#[verus_verify(external)] fn k() {}
+assert(x) by(integer_ring);
+";
+        assert_eq!(
+            class_of(src),
+            [
+                ("verifier::loop_isolation(false)", "loosen"),
+                ("verifier::external_type_specification", "escape"),
+                ("verifier::external_trait_specification", "escape"),
+                ("verifier::external_trait_extension", "escape"),
+                ("verifier::trusted", "assumption"),
+                ("verifier::assume_*", "assumption"),
+                ("verifier::nonlinear", "solver"),
+                ("verifier::bit_vector", "solver"),
+                ("verifier::integer_ring", "solver"),
+                ("verifier::no_auto_trigger", "info"),
+                ("verifier::<unknown>", "loosen"),
+                ("verus_verify(external)", "escape"),
+                ("by(integer_ring)", "solver"),
+            ]
+        );
+    }
+
+    #[test]
+    fn harmless_attributes_are_not_flagged() {
+        let src = "\
+#[verifier::verify] fn a() {}
+#[verifier::spinoff_prover] proof fn b() {}
+#![verifier::loop_isolation(true)]
+#[verifier::opaque] spec fn c() -> bool;
+#[verifier::opaque_outside_module] spec fn d() -> bool;
+#[verifier::inline] spec fn e() -> bool { true }
+#[verifier::when_used_as_spec(f)] fn g() {}
+#[verifier::accept_recursive_types(T)] struct H<T>(T);
+#[verifier::reject_recursive_types(T)] struct I<T>(T);
+#[verifier::memoize] spec fn j() -> int { 1 }
+#[verifier::reveal_group] broadcast group k {}
+#[verus_verify(dual_spec)] fn l() {}
+#[verifier(spinoff_prover, opaque)] proof fn m() {}
+#![allow(dead_code)]
+#[allow(unused)] fn n() {}
+";
+        assert_eq!(class_of(src), []);
+    }
+
+    #[test]
+    fn attribute_forms_are_all_read() {
+        // Several attributes in one `verifier(..)`, a nested argument list, and a cfg_attr wrapper.
+        let src = "\
+#[verifier(spinoff_prover, rlimit(40), loop_isolation(false))] proof fn a() {}
+#[cfg_attr(verus_keep_ghost, verifier::nonlinear)] proof fn b() {}
+#[verus_verify(rlimit(120))] fn c() {}
+";
+        assert_eq!(
+            class_of(src),
+            [
+                ("rlimit", "rlimit"),
+                ("verifier::loop_isolation(false)", "loosen"),
+                ("verifier::nonlinear", "solver"),
+                ("rlimit", "rlimit"),
+            ]
+        );
+    }
+
+    #[test]
+    fn rlimit_values_are_recorded() {
+        let src = "\
+#[verifier::rlimit(50)] proof fn a() {}
+#[verifier(rlimit(2.5))] proof fn b() {}
+#[verifier::rlimit(infinity)] proof fn c() {}
+#[verifier::rlimit(N)] proof fn d() {}
+";
+        let v: Vec<Option<u64>> = scan_text("f.rs", src)
+            .markers
+            .iter()
+            .map(|m| m.value)
+            .collect();
+        // A value that is not a literal counts as the worst case.
+        assert_eq!(
+            v,
+            [Some(50_000), Some(2_500), Some(u64::MAX), Some(u64::MAX)]
+        );
+        assert_eq!(parse_value("0.5"), Some(500));
+        assert_eq!(parse_value("1.2345"), None);
+        assert_eq!(parse_value("x"), None);
+        assert_eq!(fmt_value(2_500), "2.5");
+        assert_eq!(fmt_value(50_000), "50");
+        assert_eq!(fmt_value(u64::MAX), "infinity");
+        assert_eq!(parse_value(&fmt_value(1_250)), Some(1_250));
+    }
+
+    fn rl(unit: &str, n: usize) -> Counts {
+        c(&[(unit, "rlimit", n)])
+    }
+
+    #[test]
+    fn a_higher_rlimit_value_is_refused_unless_the_allow_says_so() {
+        let (allow, bad) = parse_allow("u\trlimit\t1\tthe walk lemma needs it\t100\n");
+        assert!(bad.is_empty());
+        assert_eq!(allow[0].max_value, Some(100_000));
+        let at = |top: u64| {
+            let m = BTreeMap::from([("u".to_string(), top)]);
+            ratchet_values(&rl("u", 1), &m, &allow, &bad)
+        };
+        assert!(at(100_000).errors.is_empty());
+        let o = at(150_000);
+        assert_eq!(o.errors.len(), 1);
+        assert!(o.errors[0].contains("rlimit 150") && o.errors[0].contains("covers 100"));
+        // Infinity is above every number.
+        assert_eq!(at(u64::MAX).errors.len(), 1);
+        // Raising the allow (with a reason) lets it through.
+        let (allow2, _) = parse_allow("u\trlimit\t1\traised for the new lemma\t200\n");
+        let m = BTreeMap::from([("u".to_string(), 150_000)]);
+        assert!(
+            ratchet_values(&rl("u", 1), &m, &allow2, &[])
+                .errors
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_rlimit_allow_without_a_max_value_is_refused_and_a_new_rlimit_has_no_allow() {
+        let (allow, bad) = parse_allow("u\trlimit\t1\told style line\n");
+        assert!(bad.is_empty() && allow[0].max_value.is_none());
+        let m = BTreeMap::from([("u".to_string(), 20_000)]);
+        let o = ratchet_values(&rl("u", 1), &m, &allow, &bad);
+        assert_eq!(o.errors.len(), 1);
+        assert!(o.errors[0].contains("max_value"));
+        // A second rlimit raises the count above the allow.
+        let (allow, _) = parse_allow("u\trlimit\t1\tone\t20\n");
+        let o = ratchet_values(&rl("u", 2), &m, &allow, &[]);
+        assert!(o.errors[0].contains("covers 1"));
+        // No allow at all.
+        assert!(ratchet_values(&rl("u", 1), &m, &[], &[]).errors[0].contains("no allow entry"));
+    }
+
+    #[test]
+    fn the_allow_file_gains_a_fifth_column_and_old_lines_still_parse() {
+        let old = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../trust-allow.tsv"),
+        )
+        .unwrap_or_default();
+        let (ok, bad) = parse_allow(&old);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert!(ok.iter().all(|a| a.max_value.is_none()));
+        let (ok, bad) = parse_allow("u\tflag\t1\tr\nu\tloosen\t2\tr\t\n");
+        assert!(bad.is_empty());
+        assert_eq!(ok.len(), 2);
+        let (_, bad) = parse_allow("u\trlimit\t1\tr\tabc\n");
+        assert_eq!(bad.len(), 1);
+        let (_, bad) = parse_allow("u\tinfo\t1\tr\n");
+        assert_eq!(bad.len(), 1);
+        // The new classes need an allow line like the old ones.
+        for cl in ["loosen", "flag"] {
+            let o = ratchet(&c(&[("u", cl, 1)]), &[], &[]);
+            assert_eq!(o.errors.len(), 1, "{cl}");
+        }
+    }
+
+    #[test]
+    fn verifier_flags_are_found_and_the_harmless_ones_only_recorded() {
+        let sh = "\
+#!/usr/bin/env bash
+# verus --no-verify in a comment
+\"$verus\" \"$file\"
+\"$verus\" --no-auto-recommends-check --rlimit 50 \"$file\"
+\"$verus\" \\
+    -V no-solver-version-check \\
+    --smt-option smt.random_seed=7 \"$f\"
+verus --cfg foo --expand-errors --rlimit=2.5 x.rs
+echo --no-verify without the tool
+";
+        let s = scan_flags("scripts/verify-x.sh", sh, false);
+        let got: Vec<(&str, &str, usize, Option<u64>)> = s
+            .markers
+            .iter()
+            .map(|m| (m.kind, m.class.name(), m.line, m.value))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("--no-auto-recommends-check", "flag", 4, None),
+                ("--rlimit", "rlimit", 4, Some(50_000)),
+                ("-V no-solver-version-check", "flag", 5, None),
+                ("--smt-option", "flag", 5, None),
+                ("--cfg", "info", 8, None),
+                ("--expand-errors", "info", 8, None),
+                ("--rlimit", "rlimit", 8, Some(2_500)),
+            ]
+        );
+        // A mutant script only records.
+        let m = scan_flags("verification/x/mutants.sh", sh, true);
+        assert!(m.markers.iter().all(|k| k.class == Class::Info));
+        assert_eq!(m.markers.len(), got.len());
+        // No flag, no marker.
+        assert!(
+            scan_flags("a.sh", "\"$verus\" \"$f\"\n", false)
+                .markers
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_flag_unit_is_ratcheted_per_script() {
+        let s = scan_flags(
+            "scripts/verify.sh",
+            "\"$verus\" --no-verify \"$f\"\n",
+            false,
+        );
+        let u = UnitTrust {
+            unit: "flags/scripts/verify.sh".into(),
+            kind: "flags".into(),
+            target: "scripts/verify.sh".into(),
+            files: vec![s],
+        };
+        let actual = counts(std::slice::from_ref(&u));
+        assert_eq!(
+            actual.get(&("flags/scripts/verify.sh".into(), "flag".into())),
+            Some(&1)
+        );
+        assert_eq!(ratchet(&actual, &[], &[]).errors.len(), 1);
+        let (allow, bad) =
+            parse_allow("flags/scripts/verify.sh\tflag\t1\tcompile-only smoke run\n");
+        assert!(ratchet(&actual, &allow, &bad).errors.is_empty());
+    }
+
+    #[test]
+    fn the_report_lists_big_rlimits_and_flags_and_stays_deterministic() {
+        let a = unit_trust(
+            "verus/a",
+            "verus",
+            "verus! {\n#[verifier::rlimit(150)]\nproof fn f() {}\n#[verifier::rlimit(20)]\nproof fn g() {}\n#![verifier::loop_isolation(false)]\n}\n",
+        );
+        let f = UnitTrust {
+            unit: "flags/scripts/verify.sh".into(),
+            kind: "flags".into(),
+            target: "scripts/verify.sh".into(),
+            files: vec![scan_flags(
+                "scripts/verify.sh",
+                "\"$verus\" --rlimit 200 --no-lifetime x\n",
+                false,
+            )],
+        };
+        let one = render_report(&[a.clone(), f.clone()]);
+        let two = render_report(&[f, a]);
+        assert_eq!(one, two);
+        assert!(one.contains("Needs ten times the default rlimit or more (value >= 100) (2)"));
+        assert!(one.contains("- `t.rs:2` rlimit 150"));
+        assert!(one.contains("- `scripts/verify.sh:1` --rlimit 200"));
+        assert!(one.contains("## Verifier flags"));
+        assert!(one.contains("- `scripts/verify.sh:1` `--no-lifetime` (flag)"));
+        assert!(one.contains("Loosening attributes (1)"));
+        // The flags unit is not a proof unit.
+        assert!(one.contains("1 units, "));
     }
 }

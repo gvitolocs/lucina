@@ -12,10 +12,11 @@ use core::fmt;
 
 use crate::{
     Error,
+    cache::CacheReport,
     desc::{self, DeviceDesc, GeometryDesc, UnitDesc},
     policy::{UnitRole, WritePolicy},
     regs::{self, Capabilities},
-    scsi::{self, Capacity, Inquiry},
+    scsi::{self, Capacity, Inquiry, ModeSense},
     upiu::{self, DataDir, Query, UPIU_AREA, UPIU_HEADER_AND_TSF, UTRD_SIZE, Utrd},
 };
 
@@ -71,6 +72,10 @@ pub const PRDT_MAX: usize = (BOUNCE_OFFSET - UCD_OFFSET - PRDT_OFFSET) / upiu::P
 /// A buffer of the driver's own for small transfers (INQUIRY, READ CAPACITY) and single blocks.
 pub const BOUNCE_OFFSET: usize = 0x2000;
 pub const BOUNCE_SIZE: usize = AREA_SIZE - BOUNCE_OFFSET;
+
+/// Allocation length of a MODE SENSE (10) for one page: header, a long block descriptor and the 20-byte Caching page
+/// fit many times over; a multiple of 4, as a PRDT entry must be.
+const MODE_SENSE_ALLOC: usize = 0x100;
 
 /// The task tag; one request at a time, always in slot 0.
 const TAG: u8 = 0;
@@ -1001,6 +1006,35 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
         Inquiry::parse(&self.read_bounce(36))
     }
 
+    /// MODE SENSE (10) of the Caching page of `lun` (`pc`: [`scsi::MODE_PC_CURRENT`] or
+    /// [`scsi::MODE_PC_CHANGEABLE`]). Read only, and through the same path as [`Self::scsi`], so the command
+    /// allowlist applies. A device answers with no more than it has, so unlike a READ a short transfer is fine here:
+    /// only the bytes the residual count says arrived are parsed.
+    pub fn mode_sense_caching(&mut self, lun: u8, pc: u8) -> Result<ModeSense, Error> {
+        let seg = self.bounce(MODE_SENSE_ALLOC);
+        let cdb = scsi::mode_sense_10(scsi::MODE_PAGE_CACHING, pc, MODE_SENSE_ALLOC as u16);
+        let residual = self.command(lun, &cdb, DataDir::FromDevice, &[seg], true)?;
+        let moved = MODE_SENSE_ALLOC.saturating_sub(residual as usize);
+        ModeSense::parse(&self.read_bounce(moved))
+    }
+
+    /// The write cache report of `lun` for the boot log (see [`crate::cache`]), `None` if there is no such unit. Read
+    /// only; a failed MODE SENSE is in the report, never an error.
+    pub fn cache_report(&mut self, lun: u8) -> Option<CacheReport> {
+        let unit = self.unit(lun)?.desc;
+        let current = self.mode_sense_caching(lun, scsi::MODE_PC_CURRENT);
+        let changeable = current
+            .is_ok()
+            .then(|| self.mode_sense_caching(lun, scsi::MODE_PC_CHANGEABLE));
+        Some(CacheReport {
+            lun,
+            current,
+            changeable,
+            unit,
+            device: self.device,
+        })
+    }
+
     /// Reads the GPT of `lun` (header and up to 16 blocks of entries) through the bounce buffer.
     /// Returns `None` for a unit without one.
     pub fn read_gpt(
@@ -1085,6 +1119,19 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
         dir: DataDir,
         data: &[DataSegment],
     ) -> Result<(), Error> {
+        self.command(lun, cdb, dir, data, false).map(|_| ())
+    }
+
+    /// [`Self::scsi`], which fails a short transfer unless `short_ok`; with `short_ok` it returns the residual count
+    /// (bytes not moved; 0 when the device set the overflow flag, whose count means nothing).
+    fn command(
+        &mut self,
+        lun: u8,
+        cdb: &[u8],
+        dir: DataDir,
+        data: &[DataSegment],
+        short_ok: bool,
+    ) -> Result<u32, Error> {
         let role = match self.unit(lun) {
             Some(u) => u.role,
             // During the scan the unit is not in the list yet: read-only commands only.
@@ -1128,13 +1175,13 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
         }
         // Linux sets the residual from the response (ufshcd_transfer_rsp_status) and sd fails a short transfer:
         // a non-zero residual with the overflow flag clear means fewer bytes moved than asked.
-        if dir != DataDir::None
-            && rsp.residual != 0
-            && rsp.flags & upiu::RSP_FLAG_OVERFLOW == 0
-        {
-            return Err(Error::BadData("residual transfer count"));
+        if dir != DataDir::None && rsp.residual != 0 && rsp.flags & upiu::RSP_FLAG_OVERFLOW == 0 {
+            if !short_ok {
+                return Err(Error::BadData("residual transfer count"));
+            }
+            return Ok(rsp.residual);
         }
-        Ok(())
+        Ok(0)
     }
 
     /// Reads `blocks` blocks at `lba` of `lun` into `data`.
@@ -1339,7 +1386,8 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
             if is & regs::IS_FATAL != 0 || ue_fatal {
                 // Described before the slot is cleared: afterwards the registers show nothing.
                 self.note_request(&Error::Fatal(is));
-                self.regs.write32(regs::IS, is & (regs::IS_FATAL | regs::IS_UE));
+                self.regs
+                    .write32(regs::IS, is & (regs::IS_FATAL | regs::IS_UE));
                 self.abort();
                 // Linux's error handler resets the host on these bits; this driver cannot reset (no PHY/GCC/RPMh
                 // reset), so the host is dead: Linux's "reset failed" outcome.
@@ -1466,7 +1514,9 @@ fn retryable(result: &Result<(), Error>) -> bool {
                 || *status == upiu::SCSI_TASK_ABORTED
                 || sense.is_some_and(|s| s.key == scsi::SENSE_UNIT_ATTENTION)
         }
-        Err(Error::Ocs(upiu::OCS_ABORTED)) | Err(Error::Ocs(upiu::OCS_INVALID_COMMAND_STATUS)) => true,
+        Err(Error::Ocs(upiu::OCS_ABORTED)) | Err(Error::Ocs(upiu::OCS_INVALID_COMMAND_STATUS)) => {
+            true
+        }
         _ => false,
     }
 }

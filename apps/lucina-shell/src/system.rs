@@ -121,9 +121,14 @@ pub fn uptime_s() -> u64 {
 }
 
 pub fn status(zone: &Zone, network: &Network) -> Status {
+    status_with(zone, network, battery())
+}
+
+/// [`status`] with a battery reading the caller already has (the shell reads it once a minute, not on every status pass).
+pub fn status_with(zone: &Zone, network: &Network, battery: Option<Battery>) -> Status {
     Status {
         clock: clock_text(zone, clock(libc::CLOCK_REALTIME)),
-        battery: battery(),
+        battery,
         network: network.summary(),
         online: network.primary().is_some(),
         camera: lucina_app::camera_mark::read().map(|(_, program)| program),

@@ -311,9 +311,7 @@ pub fn crash_rows(report: Option<&str>) -> Rows {
 
 /// Runs `lucina-crash`. Slow compared with a frame, so only when the section is opened.
 pub fn read_crash_report() -> Option<String> {
-    let out = std::process::Command::new("/sbin/lucina-crash")
-        .output()
-        .ok()?;
+    let out = crate::spawn::output(&mut std::process::Command::new("/sbin/lucina-crash")).ok()?;
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 

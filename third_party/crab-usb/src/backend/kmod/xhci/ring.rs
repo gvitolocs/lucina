@@ -265,6 +265,86 @@ impl Ring {
         self.write_trb(index, command::Allowed::Noop(noop).into());
         true
     }
+
+    /// The ring positions of a TD, `first` to `last`, as the controller walks them (the Link TRB skipped, Linux
+    /// `next_trb`). Empty if either is not on this ring or `last` is not reached within one lap.
+    pub(crate) fn td_addrs(&self, first: BusAddr, last: BusAddr) -> Vec<BusAddr> {
+        let mut addrs = Vec::new();
+        let (Some(_), Some(_)) = (self.index_of(first), self.index_of(last)) else {
+            return addrs;
+        };
+        let mut addr = first;
+        for _ in 0..self.len() {
+            addrs.push(addr);
+            if addr == last {
+                return addrs;
+            }
+            let Some(next) = self.next_trb_addr(addr) else {
+                break;
+            };
+            addr = next;
+        }
+        Vec::new()
+    }
+
+    /// Whether `addr` is one of the TRBs of the TD `first..=last` (Linux `trb_in_td`).
+    pub(crate) fn td_contains(&self, first: BusAddr, last: BusAddr, addr: BusAddr) -> bool {
+        self.td_addrs(first, last).contains(&addr)
+    }
+
+    /// Turns every TRB of the TD `first..=last` into a Transfer No Op that keeps only its cycle bit, as Linux's
+    /// `td_to_noop` with `trb_to_noop` (`xhci-ring.c:129-143`): the other fields and the chain bit are cleared, and
+    /// the cycle word is written last. The controller then steps over the TD without a transfer or an event.
+    pub(crate) fn td_to_noop(&mut self, first: BusAddr, last: BusAddr) {
+        for addr in self.td_addrs(first, last) {
+            let Some(index) = self.index_of(addr) else {
+                continue;
+            };
+            let mut noop = transfer::Noop::default();
+            if self.read_word(index, 3) & 1 != 0 {
+                noop.set_cycle_bit();
+            } else {
+                noop.clear_cycle_bit();
+            }
+            self.write_trb(index, transfer::Allowed::Noop(noop).into());
+        }
+    }
+
+    /// The dequeue pointer and cycle state just past the TD whose last TRB is `last`, when the controller stopped
+    /// with its dequeue pointer at `hw_dequeue` (cycle state `hw_cycle`) inside that TD: Linux
+    /// `xhci_move_dequeue_past_td`, which walks the ring from the hardware dequeue pointer, toggling the cycle
+    /// state at each Link TRB it passes. `None` if either address is not on this ring.
+    pub(crate) fn past_td(
+        &self,
+        hw_dequeue: BusAddr,
+        hw_cycle: bool,
+        last: BusAddr,
+    ) -> Option<(BusAddr, bool)> {
+        let mut index = self.index_of(hw_dequeue)?;
+        let last = self.index_of(last)?;
+        let mut cycle = hw_cycle;
+        if self.link && index >= self.len() - 1 {
+            // Stopped on the Link TRB itself: the controller follows it first.
+            index = 0;
+            cycle = !cycle;
+        }
+        for _ in 0..=self.len() {
+            let at_last = index == last;
+            let next = index + 1;
+            if self.link && next >= self.len() - 1 {
+                index = 0;
+                cycle = !cycle;
+            } else if next >= self.len() {
+                index = 0;
+            } else {
+                index = next;
+            }
+            if at_last {
+                return Some((self.trb_bus_addr(index), cycle));
+            }
+        }
+        None
+    }
 }
 
 pub struct SendRing<R> {
@@ -331,6 +411,41 @@ impl<R> SendRing<R> {
         self.finished.get_finished(addr)
     }
 
+    /// The completion stored at `addr`, left where it is.
+    pub fn peek_finished(&self, addr: BusAddr) -> Option<R>
+    where
+        R: Copy,
+    {
+        self.finished.peek_finished(addr)
+    }
+
+    /// Takes the completion stored at `addr` only if `take` accepts it.
+    pub fn take_finished_if(&self, addr: BusAddr, take: impl FnOnce(&R) -> bool) -> Option<R> {
+        self.finished.take_finished_if(addr, take)
+    }
+
+    pub(crate) fn td_contains(&self, first: BusAddr, last: BusAddr, addr: BusAddr) -> bool {
+        self.ring.td_contains(first, last, addr)
+    }
+
+    pub(crate) fn td_to_noop(&mut self, first: BusAddr, last: BusAddr) {
+        self.ring.td_to_noop(first, last);
+    }
+
+    pub(crate) fn past_td(
+        &self,
+        hw_dequeue: BusAddr,
+        hw_cycle: bool,
+        last: BusAddr,
+    ) -> Option<(BusAddr, bool)> {
+        self.ring.past_td(hw_dequeue, hw_cycle, last)
+    }
+
+    pub(crate) fn read_trb_word(&self, addr: BusAddr, word: usize) -> Option<u32> {
+        let index = self.ring.index_of(addr)?;
+        Some(self.ring.read_word(index, word))
+    }
+
     pub fn register_cx(&self, addr: BusAddr, cx: &mut core::task::Context<'_>) {
         self.finished.register_cx(addr, cx);
     }
@@ -357,5 +472,125 @@ impl<R> SendRing<R> {
 
     pub fn enqueue_pointer(&self) -> (BusAddr, bool) {
         (self.ring.trb_bus_addr(self.ring.i), self.ring.cycle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::kmod::xhci::endpoint::tests::test_kernel;
+
+    /// A transfer ring of 8 positions: 7 TRBs and the Link TRB, producer cycle state 1.
+    fn ring8() -> Ring {
+        Ring::new_with_len(8, true, DmaDirection::Bidirectional, &test_kernel()).unwrap()
+    }
+
+    fn chained_normal() -> transfer::Allowed {
+        transfer::Allowed::Normal(
+            *transfer::Normal::new()
+                .set_data_buffer_pointer(0x1234_5000)
+                .set_trb_transfer_length(64)
+                .set_chain_bit()
+                .set_interrupt_on_completion(),
+        )
+    }
+
+    fn addr(ring: &Ring, index: usize) -> BusAddr {
+        ring.trb_bus_addr(index)
+    }
+
+    #[test]
+    fn the_dequeue_pointer_moves_to_the_trb_after_the_tds_last() {
+        let ring = ring8();
+        // Stopped on the TD's second TRB (2), TD is 1..=3: the new dequeue is TRB 4, same cycle state.
+        assert_eq!(
+            ring.past_td(addr(&ring, 2), true, addr(&ring, 3)),
+            Some((addr(&ring, 4), true))
+        );
+        // Stopped on the first TRB of a one-TRB TD.
+        assert_eq!(
+            ring.past_td(addr(&ring, 1), false, addr(&ring, 1)),
+            Some((addr(&ring, 2), false))
+        );
+    }
+
+    #[test]
+    fn the_dequeue_pointer_wraps_over_the_link_trb_and_toggles_the_cycle_state() {
+        let ring = ring8();
+        // The last TRB is the one before the Link TRB (6): the next is TRB 0 of the next lap.
+        assert_eq!(
+            ring.past_td(addr(&ring, 5), true, addr(&ring, 6)),
+            Some((addr(&ring, 0), false))
+        );
+        // A TD across the Link TRB (5, 6, 0, 1), stopped before the wrap: the cycle state toggles once, passing it.
+        assert_eq!(
+            ring.past_td(addr(&ring, 6), true, addr(&ring, 1)),
+            Some((addr(&ring, 2), false))
+        );
+        // Stopped after the wrap, inside the same TD, the hardware cycle state is already the new lap's.
+        assert_eq!(
+            ring.past_td(addr(&ring, 0), false, addr(&ring, 1)),
+            Some((addr(&ring, 2), false))
+        );
+        // Stopped on the Link TRB itself: the controller follows it first.
+        assert_eq!(
+            ring.past_td(addr(&ring, 7), true, addr(&ring, 1)),
+            Some((addr(&ring, 2), false))
+        );
+    }
+
+    #[test]
+    fn a_dequeue_pointer_off_the_ring_has_no_new_position() {
+        let ring = ring8();
+        let off = BusAddr::from(ring.bus_addr().raw() + 8 * TRB_SIZE as u64);
+        assert_eq!(ring.past_td(off, true, addr(&ring, 1)), None);
+        assert_eq!(ring.past_td(addr(&ring, 1), true, off), None);
+    }
+
+    #[test]
+    fn a_td_spans_the_trbs_from_first_to_last_skipping_the_link_trb() {
+        let ring = ring8();
+        let td = ring.td_addrs(addr(&ring, 5), addr(&ring, 1));
+        assert_eq!(
+            td,
+            [5, 6, 0, 1].map(|index| addr(&ring, index)).to_vec()
+        );
+        assert!(ring.td_contains(addr(&ring, 5), addr(&ring, 1), addr(&ring, 0)));
+        assert!(!ring.td_contains(addr(&ring, 5), addr(&ring, 1), addr(&ring, 2)));
+        assert!(!ring.td_contains(addr(&ring, 5), addr(&ring, 1), addr(&ring, 7)));
+    }
+
+    #[test]
+    fn a_td_turned_into_no_ops_keeps_its_cycle_bits_and_loses_its_chain_and_fields() {
+        let mut ring = ring8();
+        // Four TRBs of other TDs, then the TD's three, all on the first lap: cycle bit 1.
+        for _ in 0..4 {
+            ring.enque_transfer(chained_normal());
+        }
+        let first = ring.enque_transfer(chained_normal());
+        ring.enque_transfer(chained_normal());
+        let last = ring.enque_transfer(chained_normal());
+        // The next lap starts after the Link TRB: cycle bit 0.
+        let second_lap = ring.enque_transfer(chained_normal());
+
+        ring.td_to_noop(first, last);
+        ring.td_to_noop(second_lap, second_lap);
+
+        let noop_type = (transfer::Noop::default().into_raw()[3] >> 10) & 0x3f;
+        assert_eq!(noop_type, 8);
+        for (index, cycle) in [(4, 1), (5, 1), (6, 1), (0, 0)] {
+            let word3 = ring.read_word(index, 3);
+            assert_eq!(word3 & 1, cycle, "cycle bit of TRB {index}");
+            assert_eq!((word3 >> 10) & 0x3f, 8, "TRB {index} is a Transfer No Op");
+            assert_eq!(word3 & (1 << 4), 0, "chain bit of TRB {index}");
+            assert_eq!(word3 & (1 << 5), 0, "IOC of TRB {index}");
+            for word in 0..3 {
+                assert_eq!(ring.read_word(index, word), 0, "word {word} of TRB {index}");
+            }
+        }
+        // The TRBs of other TDs are untouched.
+        let other = ring.read_word(3, 3);
+        assert_eq!((other >> 10) & 0x3f, 1, "a Normal TRB");
+        assert_ne!(other & (1 << 4), 0);
     }
 }

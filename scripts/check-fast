@@ -4,10 +4,29 @@
 # Verus runs on GitHub; --proofs runs the affected proofs here.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-# One shared Cargo target for every worktree, so the loop adds no new large target directories on buildhost.
-export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$HOME/.cache/lucina-check-target}
+# One Cargo target PER WORKTREE, all under one cache root. Cargo gives a workspace member the same artifact hash in every worktree, so a
+# target shared by worktrees on different commits let one overwrite the others' rlibs and test binaries: a check could test code that
+# was not in its worktree (seen twice on 2026-11-11). The first check in a new worktree compiles its dependencies (measured about 40 s
+# for a one-crate change, 10 s warm). The root is swept to a size limit below (tools/ci/lucina-ci/src/sweep.rs).
+cache_root=${LUCINA_CHECK_CACHE:-$HOME/.cache/lucina-check-target}
+wt_id=wt-$(printf '%s' "$root" | sha1sum | cut -c1-10)
+export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$cache_root/$wt_id}
+mkdir -p "$CARGO_TARGET_DIR"
+touch "$CARGO_TARGET_DIR/.last-used"
+# No incremental compilation: the caches rarely get reused and were nearly half the old shared target's size (40 of 89 GiB on 2026-11-11,
+# when buildhost's disk ran short). A caller that sets CARGO_INCREMENTAL keeps its value.
+export CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0}
 export LUCINA_CI_CPU_QUOTA=${LUCINA_CI_CPU_QUOTA:-400%}
 free=$(df --output=avail -BG "$HOME" | tail -1 | tr -dc 0-9)
-[ "$free" -ge 20 ] || { echo "check-fast: only ${free} GiB free; refusing to build" >&2; exit 2; }
+floor=${LUCINA_CHECK_FREE_FLOOR_GIB:-20}
+[ "$free" -ge "$floor" ] || { echo "check-fast: only ${free} GiB free on $HOME's disk, the floor is ${floor} GiB: refusing to build rather than fill it. Free space first (stale worktrees: wt prune; the cache $cache_root)." >&2; exit 2; }
 cargo build --quiet --release --locked --manifest-path "$root/tools/ci/lucina-ci/Cargo.toml"
-exec "$CARGO_TARGET_DIR/release/lucina-ci" check-fast "$@"
+# Run from a private copy of the launcher, so a rebuild of release/lucina-ci under a running check cannot pull it out from under its own
+# sub-steps ("Failed to find executable ... (deleted)", seen 2026-11-11).
+bin=$(mktemp "${TMPDIR:-/tmp}/lucina-ci.XXXXXX")
+trap 'rm -f "$bin"' EXIT
+cp "$CARGO_TARGET_DIR/release/lucina-ci" "$bin"
+chmod 700 "$bin"
+# A size cap on the whole cache: over the limit the least recently used worktree targets go whole (never this one, never one with a build running).
+"$bin" sweep-target --dir "$cache_root" --keep "$CARGO_TARGET_DIR" --limit-gib "${LUCINA_CHECK_TARGET_LIMIT_GIB:-30}" || true
+"$bin" check-fast "$@"

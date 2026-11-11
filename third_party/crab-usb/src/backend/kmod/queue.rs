@@ -127,6 +127,19 @@ impl<C> Finished<C> {
         self.waiter(addr).get_finished()
     }
 
+    /// The completion stored at `addr`, if any, left where it is.
+    pub fn peek_finished(&self, addr: BusAddr) -> Option<C>
+    where
+        C: Copy,
+    {
+        self.waiter(addr).peek_finished()
+    }
+
+    /// Takes the completion stored at `addr` only if `take` accepts it; returns what was taken.
+    pub fn take_finished_if(&self, addr: BusAddr, take: impl FnOnce(&C) -> bool) -> Option<C> {
+        self.waiter(addr).take_finished_if(take)
+    }
+
     /// Takes a completion stored at `addr`, if any, and `None` for an address that is not on the queue or whose
     /// waiter is taken by someone else (unlike `get_finished`, never panics).
     pub fn try_get_finished(&self, addr: BusAddr) -> Option<C> {
@@ -254,6 +267,42 @@ impl<C> FinishedData<C> {
         }
         self.state.store(SLOT_READY, Ordering::Release);
         self.waker.wake();
+    }
+
+    /// Runs `f` on the stored completion, if one is ready; the slot is empty afterwards if `f` took it.
+    fn with_ready<R>(&self, f: impl FnOnce(&mut Option<C>) -> R) -> Option<R> {
+        self.state
+            .compare_exchange(
+                SLOT_READY,
+                SLOT_READING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        // SAFETY: SLOT_READING is held by this thread only, as in `get_finished`.
+        let slot = unsafe { &mut *self.data.get() };
+        let result = f(slot);
+        let state = if slot.is_some() { SLOT_READY } else { SLOT_EMPTY };
+        self.state.store(state, Ordering::Release);
+        Some(result)
+    }
+
+    fn take_finished_if(&self, take: impl FnOnce(&C) -> bool) -> Option<C> {
+        self.with_ready(|slot| {
+            if slot.as_ref().is_some_and(take) {
+                slot.take()
+            } else {
+                None
+            }
+        })
+        .flatten()
+    }
+
+    fn peek_finished(&self) -> Option<C>
+    where
+        C: Copy,
+    {
+        self.with_ready(|slot| *slot).flatten()
     }
 
     pub fn get_finished(&self) -> Option<C> {

@@ -36,6 +36,10 @@ pub struct Lu {
     pub data: Vec<u8>,
     /// Report UNIT ATTENTION to the next command, as after a reset.
     pub unit_attention: bool,
+    /// The Caching mode page's WCE and RCD; `None`: MODE SENSE is an invalid opcode.
+    pub caching: Option<(bool, bool)>,
+    /// MODE SENSE answers carry an 8-byte block descriptor.
+    pub mode_block_descriptor: bool,
 }
 
 impl Lu {
@@ -55,6 +59,8 @@ impl Lu {
             log2_bs,
             data,
             unit_attention: false,
+            caching: Some((true, false)),
+            mode_block_descriptor: true,
         }
     }
     fn bs(&self) -> usize {
@@ -317,8 +323,13 @@ impl Regs for ModelRegs {
             regs::HCE => s.hce,
             regs::UTRIACR => s.utrilacr,
             regs::UECPA | regs::UECDL | regs::UECN | regs::UECT | regs::UECDME => {
-                const UEC: [usize; 5] =
-                    [regs::UECPA, regs::UECDL, regs::UECN, regs::UECT, regs::UECDME];
+                const UEC: [usize; 5] = [
+                    regs::UECPA,
+                    regs::UECDL,
+                    regs::UECN,
+                    regs::UECT,
+                    regs::UECDME,
+                ];
                 // The UEC registers clear when read.
                 core::mem::take(&mut s.uec[UEC.iter().position(|r| *r == offset).unwrap()])
             }
@@ -737,6 +748,45 @@ fn scsi(s: &mut State, req: &[u8], dd: u32, segs: &[(u64, usize)], out: &mut [u8
                 }
                 let d = lu.data[range].to_vec();
                 reply(s, &d);
+            }
+            0
+        }
+        crate::scsi::MODE_SENSE_10 => {
+            let Some((wce, rcd)) = lu.caching else {
+                return check_condition(out, 0x5, 0x20, 0);
+            };
+            if dd != 2 {
+                return upiu::OCS_INVALID_CMD_TABLE_ATTR;
+            }
+            let (pc, page) = (cdb[2] >> 6, cdb[2] & 0x3f);
+            if page != crate::scsi::MODE_PAGE_CACHING && page != 0x3f {
+                return check_condition(out, 0x5, 0x24, 0); // INVALID FIELD IN CDB
+            }
+            let mut d = vec![0u8; 8];
+            d[3] = 0x10; // DPOFUA
+            if lu.mode_block_descriptor {
+                d[7] = 8;
+                let mut bd = [0u8; 8];
+                bd[0..4].copy_from_slice(&(lu.blocks().min(u32::MAX as u64) as u32).to_be_bytes());
+                bd[5..8].copy_from_slice(&(bs as u32).to_be_bytes()[1..4]);
+                d.extend_from_slice(&bd);
+            }
+            let mut page08 = [0u8; 20];
+            page08[0] = crate::scsi::MODE_PAGE_CACHING;
+            page08[1] = 18;
+            page08[2] = match pc {
+                1 => 0x04,
+                _ => (wce as u8) << 2 | rcd as u8,
+            };
+            d.extend_from_slice(&page08);
+            let mdl = (d.len() - 2) as u16;
+            d[0..2].copy_from_slice(&mdl.to_be_bytes());
+            let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
+            let n = d.len().min(alloc).min(expected);
+            reply(s, &d[..n]);
+            // A device moves no more than it has: the rest is an underflow residual.
+            if n < expected {
+                s.residual = Some(((expected - n) as u32, false));
             }
             0
         }

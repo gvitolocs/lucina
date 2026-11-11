@@ -106,13 +106,15 @@ impl Device {
     }
 
     fn create_ep(&self, dci: Dci) -> Result<XhciEndpoint> {
-        XhciEndpoint::new(
+        let mut ep = XhciEndpoint::new(
             self.id,
             dci,
             &self.kernel,
             self.bell.clone(),
             self.cmd.clone(),
-        )
+        )?;
+        ep.set_out_context(self.ctx.out_context());
+        Ok(ep)
     }
 
     fn create_registered_ep(&self, dci: Dci) -> Result<XhciEndpoint> {

@@ -35,6 +35,7 @@
 //! and those in bodies that are not part of a statement (`unextracted`), must account for all of them. A keyword outside any
 //! function (a function this scan did not recognise) is a miss: exit 2.
 
+use crate::amend;
 use crate::inventory::{self, Unit};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -1965,8 +1966,35 @@ fn entry(out: &mut String, tag: &str, base: &Stmt, new: Option<&Stmt>) {
     }
 }
 
-/// The report and the exit code (0 pass, 1 refused).
+/// What the amendment protocol (src/amend.rs) knows: the tree's log, whether it is append-only against the base, and the switch.
+pub struct AmendCtx {
+    pub log: Vec<amend::Entry>,
+    pub append_err: Option<String>,
+    /// `LUCINA_SPEC_AMEND_REQUIRED=1`: a legacy allow (no `amend:<id>`) is refused.
+    pub required: bool,
+}
+
+/// The report and the exit code with no amendment log: a legacy allow passes (tests of the freeze itself).
+#[cfg(test)]
 pub fn render(d: &Diff, allow: &Allow, summary: &str) -> (String, i32) {
+    let ctx = AmendCtx {
+        log: Vec::new(),
+        append_err: None,
+        required: false,
+    };
+    render_with(d, allow, summary, &ctx)
+}
+
+/// The report and the exit code (0 pass, 1 refused).
+pub fn render_with(d: &Diff, allow: &Allow, summary: &str, ctx: &AmendCtx) -> (String, i32) {
+    if let Some(e) = &ctx.append_err {
+        return (
+            format!(
+                "================ SPEC AMENDMENT LOG ================\nREFUSED: {e}\nThe log may only be appended to (docs/ci/SPEC-AMENDMENTS.md).\n"
+            ),
+            1,
+        );
+    }
     let spec_changed: Vec<&(Stmt, Stmt)> =
         d.changed.iter().filter(|(b, _)| !b.is_mutant()).collect();
     let spec_removed: Vec<&Stmt> = d.removed.iter().filter(|b| !b.is_mutant()).collect();
@@ -2009,15 +2037,57 @@ pub fn render(d: &Diff, allow: &Allow, summary: &str) -> (String, i32) {
     out.push('\n');
     out.push_str(&allow.describe());
     out.push('\n');
-    match allow.effective() {
-        Some((reason, src)) => {
+    let Some((reason, src)) = allow.effective() else {
+        out.push_str(
+            "Merge needs: lagent merge --allow spec-change=\"<why>\" (reviewer must read the statements above)\n",
+        );
+        out.push_str(
+            "Protocol: append an accepted line to docs/ci/spec-amendments.tsv first (lucina-ci spec amend --template; docs/ci/SPEC-AMENDMENTS.md), then use <why> = \"amend:<id> ...\".\n",
+        );
+        return (out, 1);
+    };
+    let ids = amend::named_ids(reason);
+    if ids.is_empty() {
+        if ctx.required {
+            out.push_str(&format!(
+                "REFUSED: the allow reason names no amendment and {} is set.\n\
+A spec change needs an accepted line in docs/ci/spec-amendments.tsv (a reviewer of another model family, evidence) and the allow reason must say amend:<id>.\n\
+See docs/ci/SPEC-AMENDMENTS.md; `lucina-ci spec amend --template` prints a line to fill.\n",
+                amend::REQUIRED_ENV
+            ));
+            return (out, 1);
+        }
+        out.push_str(&format!(
+            "!!!! {} !!!! no amendment is named; this passes only while {} is unset.\n",
+            amend::LEGACY_MARK,
+            amend::REQUIRED_ENV
+        ));
+        out.push_str(&format!("SPEC CHANGE ALLOWED: {reason}  [{src}]\n"));
+        return (out, 0);
+    }
+    let mut keys: Vec<(String, bool)> = Vec::new();
+    for (b, _) in &d.changed {
+        keys.push((b.key.clone(), b.is_mutant()));
+    }
+    for b in &d.removed {
+        keys.push((b.key.clone(), b.is_mutant()));
+    }
+    match amend::authorize(&keys, &ids, &ctx.log) {
+        Ok(used) => {
+            for u in &used {
+                out.push_str(&format!(
+                    "AMENDMENT amend:{}  evidence: {}  reviewer: {}\n",
+                    u.id, u.evidence_kind, u.reviewer_model
+                ));
+            }
             out.push_str(&format!("SPEC CHANGE ALLOWED: {reason}  [{src}]\n"));
             (out, 0)
         }
-        None => {
-            out.push_str(
-                "Merge needs: lagent merge --allow spec-change=\"<why>\" (reviewer must read the statements above)\n",
-            );
+        Err(problems) => {
+            out.push_str("REFUSED: the amendment protocol is not met:\n");
+            for p in problems {
+                out.push_str(&format!("  - {p}\n"));
+            }
             (out, 1)
         }
     }
@@ -2062,6 +2132,9 @@ fn val(args: &[String], k: &str) -> Option<String> {
 
 pub fn cmd(args: &[String]) -> Result<i32, String> {
     let has = |k: &str| args.iter().any(|a| a == k);
+    if args.first().map(String::as_str) == Some("amend") {
+        return amend_cmd(&args[1..]);
+    }
     let top = git_out(Path::new("."), &["rev-parse", "--show-toplevel"])
         .ok_or("not inside a git repository")?;
     let root = PathBuf::from(top);
@@ -2092,7 +2165,7 @@ pub fn cmd(args: &[String]) -> Result<i32, String> {
     }
     if !has("--check") {
         return Err(
-            "usage: spec --check [--base REF] [--allow WHY] [--merge-gate] | spec --list [--json]"
+            "usage: spec --check [--base REF] [--allow WHY] [--merge-gate] | spec --list [--json] | spec amend --list|--template"
                 .into(),
         );
     }
@@ -2145,9 +2218,51 @@ pub fn cmd(args: &[String]) -> Result<i32, String> {
     );
     let short = &base[..base.len().min(10)];
     let summary = format!("against {short}: {}", work.summary());
-    let (text, code) = render(&d, &allow, &summary);
+    let work_log = fs::read_to_string(root.join(amend::LOG)).unwrap_or_default();
+    let base_log = gt.read(amend::LOG).unwrap_or_default();
+    let ctx = AmendCtx {
+        log: amend::parse_log(&work_log),
+        append_err: amend::append_only(&base_log, &work_log).err(),
+        required: std::env::var(amend::REQUIRED_ENV).is_ok_and(|v| v.trim() == "1"),
+    };
+    let (text, code) = render_with(&d, &allow, &summary, &ctx);
     print!("{text}");
     Ok(code)
+}
+
+/// `spec amend --list | --template`.
+fn amend_cmd(args: &[String]) -> Result<i32, String> {
+    if args.iter().any(|a| a == "--template") {
+        print!("{}", amend::template());
+        return Ok(0);
+    }
+    if args.iter().any(|a| a == "--list") {
+        let top = git_out(Path::new("."), &["rev-parse", "--show-toplevel"])
+            .ok_or("not inside a git repository")?;
+        let text = fs::read_to_string(Path::new(&top).join(amend::LOG)).unwrap_or_default();
+        let entries = amend::parse_log(&text);
+        println!("id\tdate\tkind\tverdict\tauthor\treviewer\tevidence\tkeys");
+        for e in &entries {
+            match &e.res {
+                Ok(a) => println!(
+                    "{}\t{}\t{}\t{}\t{}\t{} ({})\t{}\t{}",
+                    a.id,
+                    a.date,
+                    a.kind,
+                    a.verdict,
+                    a.author_model,
+                    a.reviewer_model,
+                    a.reviewer_family,
+                    a.evidence_kind,
+                    a.keys.join(",")
+                ),
+                Err(m) => println!("{}\tMALFORMED (line {}): {m}", e.id, e.line),
+            }
+        }
+        eprintln!("spec amend: {} line(s) in {}", entries.len(), amend::LOG);
+        return Ok(0);
+    }
+    Err("usage: spec amend --list | spec amend --template".into())
 }
 
 // -------------------------------------------------------------------------------------------------------------------- tests
@@ -2838,5 +2953,106 @@ mod tests {
         };
         let (t, _) = render(&d, &Allow::default(), "s");
         assert!(t.contains("[truncated]"));
+    }
+
+    // ---- amendment protocol (src/amend.rs) ----
+
+    fn ctx(lines: &[&str], required: bool) -> AmendCtx {
+        AmendCtx {
+            log: amend::parse_log(&lines.join("\n")),
+            append_err: None,
+            required,
+        }
+    }
+    fn amend_line(id: &str, keys: &str, verdict: &str, rev: &str, fam: &str) -> String {
+        format!(
+            "{id}\t2026-11-11\twt\tchange\t{keys}\tfailing-proof\tx.out\tclaude-sonnet-5-5\t{rev}\t{fam}\t{verdict}\twhy"
+        )
+    }
+    fn allow_reason(r: &str) -> Allow {
+        let r = r.to_string();
+        Allow::read(&move |k| (k == MERGE_ENV).then(|| r.clone()), None, true)
+    }
+
+    #[test]
+    fn amendment_allows_and_prints_the_banner() {
+        let (d, _) = some_diff();
+        let key = d.changed[0].0.key.clone();
+        let line = amend_line("A1", &key, "accepted", "gpt-6.1-sol", "gpt");
+        let c = ctx(&[line.as_str()], true);
+        let (t, code) = render_with(&d, &allow_reason("amend:A1 tightened"), "s", &c);
+        assert_eq!(code, 0, "{t}");
+        assert!(t.contains("AMENDMENT amend:A1  evidence: failing-proof  reviewer: gpt-6.1-sol"));
+        assert!(t.contains("SPEC CHANGE ALLOWED"));
+        assert!(!t.contains(amend::LEGACY_MARK));
+    }
+
+    #[test]
+    fn amendment_missing_key_same_family_or_rejected_is_refused() {
+        let (d, _) = some_diff();
+        let key = d.changed[0].0.key.clone();
+        let cases = [
+            amend_line("A1", "other::key", "accepted", "gpt-6.1-sol", "gpt"),
+            amend_line("A1", &key, "accepted", "claude-opus-5-5", "claude"),
+            amend_line("A1", &key, "rejected", "gpt-6.1-sol", "gpt"),
+            amend_line("A1", &key, "escalated", "gpt-6.1-sol", "gpt"),
+        ];
+        for l in &cases {
+            let c = ctx(&[l.as_str()], false);
+            let (t, code) = render_with(&d, &allow_reason("amend:A1 x"), "s", &c);
+            assert_eq!(code, 1, "{t}");
+            assert!(t.contains("the amendment protocol is not met"), "{t}");
+        }
+        // naming an amendment that is not in the log is refused even while legacy allows pass
+        let (t, code) = render_with(&d, &allow_reason("amend:ZZ x"), "s", &ctx(&[], false));
+        assert_eq!(code, 1, "{t}");
+    }
+
+    #[test]
+    fn non_append_only_log_is_refused_even_without_changes() {
+        let same = Diff {
+            changed: vec![],
+            removed: vec![],
+            added: 0,
+            same: 3,
+        };
+        let c = AmendCtx {
+            log: vec![],
+            append_err: Some(amend::append_only("a\nb\n", "a\n").unwrap_err()),
+            required: false,
+        };
+        let (t, code) = render_with(&same, &Allow::default(), "s", &c);
+        assert_eq!(code, 1);
+        assert!(t.contains("append-only") || t.contains("removed"), "{t}");
+    }
+
+    #[test]
+    fn legacy_allow_warns_unless_the_switch_is_set() {
+        let (d, _) = some_diff();
+        let (t, code) = render_with(&d, &allow_reason("just because"), "s", &ctx(&[], false));
+        assert_eq!(code, 0);
+        assert!(t.contains(amend::LEGACY_MARK));
+        let (t, code) = render_with(&d, &allow_reason("just because"), "s", &ctx(&[], true));
+        assert_eq!(code, 1);
+        assert!(
+            t.contains(amend::REQUIRED_ENV) && t.contains("SPEC-AMENDMENTS.md"),
+            "{t}"
+        );
+        assert!(!t.contains("SPEC CHANGE ALLOWED"));
+    }
+
+    #[test]
+    fn mutant_amendment_covers_only_mutant_lines() {
+        let (_, m) = some_diff();
+        assert!(m.removed.iter().any(|s| s.is_mutant()));
+        let l = "M1\t2026-11-11\twt\tmutant\t*mutants*\tfailing-test\tx.out\tclaude-x\tgpt-x\tgpt\taccepted\twhy";
+        let (t, code) = render_with(&m, &allow_reason("amend:M1 pruned"), "s", &ctx(&[l], true));
+        assert_eq!(code, 0, "{t}");
+        let (d, _) = some_diff();
+        let (t, code) = render_with(&d, &allow_reason("amend:M1 pruned"), "s", &ctx(&[l], true));
+        assert_eq!(
+            code, 1,
+            "a spec change is not covered by a mutant amendment: {t}"
+        );
     }
 }

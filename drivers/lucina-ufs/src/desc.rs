@@ -60,11 +60,22 @@ pub struct DeviceDesc {
     pub product_name: u8,
     /// Offset of the unit descriptors in the configuration descriptor (unused here, recorded for the report).
     pub ud0_base_offset: u8,
+    /// dExtendedUFSFeaturesSupport (0x4f), `None` when the descriptor is too short to hold it (UFS 2.1 devices
+    /// have a 0x40-byte descriptor). Read for the log only.
+    pub ext_features: Option<u32>,
+    /// bWriteBoosterBufferPreserveUserSpaceEn (0x53), if present.
+    pub wb_preserve_user_space: Option<u8>,
+    /// bWriteBoosterBufferType (0x54): 0 LU dedicated, 1 shared; if present.
+    pub wb_buffer_type: Option<u8>,
 }
+
+/// dExtendedUFSFeaturesSupport bit: WriteBooster (Linux `UFS_DEV_WRITE_BOOSTER_SUP`).
+pub const EXT_FEATURE_WRITE_BOOSTER: u32 = 1 << 8;
 
 impl DeviceDesc {
     pub fn parse(d: &[u8]) -> Result<Self, Error> {
         let d = check(d, IDN_DEVICE, 0x1b, "device descriptor")?;
+        let byte = |at: usize| d.get(at).copied();
         Ok(Self {
             num_lu: d[0x06],
             num_wlu: d[0x07],
@@ -74,7 +85,18 @@ impl DeviceDesc {
             product_name: d[0x15],
             manufacturer_id: be16(d, 0x18),
             ud0_base_offset: d[0x1a],
+            ext_features: d
+                .get(0x4f..0x53)
+                .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]])),
+            wb_preserve_user_space: byte(0x53),
+            wb_buffer_type: byte(0x54),
         })
+    }
+
+    /// Whether the device says it supports WriteBooster; `None` when the descriptor has no extended features field.
+    pub fn write_booster_supported(&self) -> Option<bool> {
+        self.ext_features
+            .map(|f| f & EXT_FEATURE_WRITE_BOOSTER != 0)
     }
 }
 

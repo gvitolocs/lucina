@@ -1,4 +1,5 @@
-# unit<TAB>class<TAB>max_count<TAB>reason. lucina-ci trust --check refuses a count above max(baseline, max_count); a non-empty reason is mandatory.
+# unit<TAB>class<TAB>max_count<TAB>reason[<TAB>max_value]. lucina-ci trust --check refuses a count above max(baseline, max_count); a non-empty reason is mandatory.
+# Classes: assumption, escape, unsafe, loosen, rlimit, flag (flag units are flags/<script path>). Class rlimit also needs max_value (the largest rlimit, e.g. 40 or 2.5), see docs/ci/TRUST-FLAGS.md.
 # Each line below explains the escapes the baseline already holds (today's count). Written 2026-11-11 from the code's own comments; see docs/ci/TRUST-FINDINGS.md.
 verus/juno-cpufreq/rules	escape	1	CpuLoad::tick (kernel/lucina-cpufreq/src/rules.rs:63) is external_body: a u32 decay loop with is_multiple_of and div_ceil, host tests only (the file says: Verus skips it)
 verus/juno-idle/rules	escape	1	the teo idle governor module (kernel/lucina-idle/src/teo.rs, about 260 non-test code lines) is skipped whole by one external on lib.rs:31; no comment gives a reason; host tests only

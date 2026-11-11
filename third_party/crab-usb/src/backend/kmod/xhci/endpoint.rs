@@ -30,7 +30,12 @@ use xhci::{
 };
 
 use super::{
-    DirectionExt, SlotId, cmd::CommandRing, reg::SlotBell, ring::SendRing, transfer::TransferId,
+    DirectionExt, SlotId,
+    cmd::CommandRing,
+    context::{EP_STATE_HALTED, EP_STATE_RUNNING, EP_STATE_STOPPED, OutContext},
+    reg::SlotBell,
+    ring::SendRing,
+    transfer::TransferId,
 };
 use crate::{
     BusAddr,
@@ -140,6 +145,18 @@ pub struct Endpoint {
     /// A soft reset in flight: the request it retries, the event that caused it, and Reset Endpoint (TSP) plus
     /// the doorbell.
     soft_reset: Option<SoftReset>,
+    /// The controller's output device context of the slot: where the controller leaves the endpoint state and the
+    /// TR Dequeue Pointer it stopped on (Linux `xhci_get_hw_deq`). Without it, the pointer of a Stopped event is
+    /// used.
+    out_ctx: Option<OutContext>,
+    /// TDs cancelled and not yet taken off the ring, in the order they were cancelled (Linux `cancelled_td_list`).
+    cancelled_tds: Vec<EndpointRequestId>,
+    /// The Stop Endpoint, invalidate and Set TR Dequeue Pointer pass that takes `cancelled_tds` off the ring.
+    cancel_op: Option<CancelOp>,
+    /// TRBs of cancelled TDs turned into No-Ops that the controller may not have stepped over yet, by the id of the
+    /// request they belonged to: they still take room in the ring. Ours; Linux counts them in the ring's free TRBs
+    /// until its dequeue passes them.
+    stale_noops: BTreeMap<EndpointRequestId, usize>,
 }
 
 struct SoftReset {
@@ -148,6 +165,84 @@ struct SoftReset {
     event: TransferEvent,
     future: EndpointResetFuture,
 }
+
+/// One pass over the cancelled TDs, as Linux `xhci_urb_dequeue` queues it and `xhci_handle_cmd_stop_ep`,
+/// `xhci_invalidate_cancelled_tds` and `xhci_handle_cmd_set_deq` carry it out.
+struct CancelOp {
+    /// The cancelled TDs this pass takes off the ring; a TD cancelled meanwhile joins the next pass.
+    batch: Vec<EndpointRequestId>,
+    phase: CancelPhase,
+    /// Stop Endpoint commands sent in this pass.
+    stop_attempts: u8,
+    /// The endpoint was halted and has been reset in this pass.
+    reset_halted: bool,
+    /// Requests with an id from here on were submitted while the pass runs: they are queued behind the stop and
+    /// are no part of it (never cancelled, never stepped over).
+    first_new_id: u64,
+}
+
+enum CancelPhase {
+    /// Stop Endpoint sent.
+    Stopping(EndpointResetFuture),
+    /// The Stop Endpoint found the endpoint halted: Reset Endpoint sent first (`xhci_handle_cmd_stop_ep`).
+    ResettingHalted(EndpointResetFuture),
+    /// Set TR Dequeue Pointer sent, to step the dequeue pointer past `past`, the TD the controller stopped on.
+    SettingDequeue {
+        future: EndpointResetFuture,
+        past: EndpointRequestId,
+    },
+}
+
+/// What an endpoint context state says about a Stop Endpoint that failed (`xhci_handle_cmd_stop_ep`). No context
+/// (`None`) is taken as stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopState {
+    Stopped,
+    Halted,
+    Running,
+    Other,
+}
+
+fn stop_state(state: Option<u8>) -> StopState {
+    match state {
+        None | Some(EP_STATE_STOPPED) => StopState::Stopped,
+        Some(EP_STATE_HALTED) => StopState::Halted,
+        Some(EP_STATE_RUNNING) => StopState::Running,
+        Some(_) => StopState::Other,
+    }
+}
+
+async fn stop_endpoint_command(
+    command_ring: &mut CommandRing,
+    slot_id: u8,
+    endpoint_id: u8,
+) -> Result<(), TransferError> {
+    let stop_endpoint = *command::StopEndpoint::default()
+        .set_endpoint_id(endpoint_id)
+        .set_slot_id(slot_id);
+    command_ring
+        .cmd_request(command::Allowed::StopEndpoint(stop_endpoint))
+        .await?;
+    Ok(())
+}
+
+async fn reset_endpoint_command(
+    command_ring: &mut CommandRing,
+    slot_id: u8,
+    endpoint_id: u8,
+) -> Result<(), TransferError> {
+    let reset_endpoint = *command::ResetEndpoint::default()
+        .set_endpoint_id(endpoint_id)
+        .set_slot_id(slot_id);
+    command_ring
+        .cmd_request(command::Allowed::ResetEndpoint(reset_endpoint))
+        .await?;
+    Ok(())
+}
+
+/// Ours: Linux requeues a Stop Endpoint that raced with the endpoint starting, without a bound; a controller that
+/// keeps answering with a context error while the endpoint runs would never end the pass.
+const MAX_STOP_ATTEMPTS: u8 = 3;
 
 /// Ours, from crab-usb: 16 pages per endpoint ring; Linux starts endpoint rings small and grows them.
 const ENDPOINT_RING_PAGES: usize = 16;
@@ -189,7 +284,20 @@ impl Endpoint {
             soft_retry: false,
             err_count: 0,
             soft_reset: None,
+            out_ctx: None,
+            cancelled_tds: Vec::new(),
+            cancel_op: None,
+            stale_noops: BTreeMap::new(),
         })
+    }
+
+    #[cfg(test)]
+    fn quarantine_len(&self) -> usize {
+        self.cmd.quarantine().len()
+    }
+
+    pub(crate) fn set_out_context(&mut self, out_ctx: OutContext) {
+        self.out_ctx = Some(out_ctx);
     }
 
     pub fn set_soft_retry(&mut self, soft_retry: bool) {
@@ -284,6 +392,353 @@ impl Endpoint {
                 ))
             }
         }
+    }
+
+    /// A pass over the cancelled TDs is queued or running.
+    fn cancel_in_progress(&self) -> bool {
+        self.cancel_op.is_some() || !self.cancelled_tds.is_empty()
+    }
+
+    /// The first and the last TRB of a TD (Linux `td->first_trb`, `td->last_trb`).
+    fn td_span(submitted: &SubmittedTd) -> Option<(BusAddr, BusAddr)> {
+        match &submitted.kind {
+            SubmittedTdKind::Normal { completion_trb } => Some((completion_trb.0, completion_trb.0)),
+            SubmittedTdKind::Control(control_td) => {
+                Some((control_td.setup_trb.0, control_td.status_trb.0))
+            }
+            SubmittedTdKind::Iso { packets } => {
+                Some((packets.first()?.trb.0, packets.last()?.trb.0))
+            }
+        }
+    }
+
+    /// Whether the TD's own completion is in already, so that a cancel would only race with it: Linux gives back an
+    /// URB the controller has finished with its result (`usb_hcd_unlink_urb_from_ep` fails for it), and
+    /// `usb_start_wait_urb` returns the completion of a transfer that finished as the timeout fired. ISO TDs
+    /// report per packet and are cancelled whole.
+    fn has_final_event(&self, submitted: &SubmittedTd) -> bool {
+        let event_of = |trb: TransferId| {
+            self.ring
+                .peek_finished(trb.0)
+                .filter(|event| !event_is_stop(event))
+        };
+        match &submitted.kind {
+            SubmittedTdKind::Normal { completion_trb } => event_of(*completion_trb).is_some(),
+            SubmittedTdKind::Control(control_td) => control_td.trbs().any(|(trb, stage)| {
+                event_of(trb).is_some_and(|event| {
+                    stage == ControlStage::Status
+                        || !matches!(event.completion_code(), Ok(code) if code.to_result().is_ok())
+                })
+            }),
+            SubmittedTdKind::Iso { .. } => false,
+        }
+    }
+
+    /// Where the controller stopped: the TR Dequeue Pointer and Dequeue Cycle State of the endpoint context in the
+    /// output device context (Linux `xhci_get_hw_deq`), else the TRB of a Stopped event, whose cycle bit is the
+    /// cycle state the controller is at.
+    fn hw_dequeue(&self) -> Option<(BusAddr, bool)> {
+        if let Some(out_ctx) = &self.out_ctx {
+            let (pointer, cycle) = out_ctx.endpoint_dequeue(self.dci.as_u8());
+            return Some((BusAddr::from(pointer), cycle));
+        }
+        self.trb_to_request.keys().find_map(|trb| {
+            let event = self.ring.peek_finished(trb.0)?;
+            if !event_is_stop(&event) {
+                return None;
+            }
+            Some((trb.0, self.ring.read_trb_word(trb.0, 3)? & 1 != 0))
+        })
+    }
+
+    /// Drives the pass over the cancelled TDs: starts one when TDs wait and nothing else holds the endpoint (a soft
+    /// reset), and moves a running one along as far as its commands have completed.
+    fn poll_cancel_op(&mut self) {
+        if self.cmd.is_dead() {
+            // Every request is given back as `NoDevice` by `reclaim_request` (`xhci_hc_died`).
+            self.cancel_op = None;
+            self.cancelled_tds.clear();
+            return;
+        }
+        let mut op = match self.cancel_op.take() {
+            Some(op) => op,
+            None => {
+                if self.cancelled_tds.is_empty() || self.soft_reset.is_some() {
+                    return;
+                }
+                CancelOp {
+                    batch: core::mem::take(&mut self.cancelled_tds),
+                    phase: CancelPhase::Stopping(self.stop_command_future()),
+                    stop_attempts: 1,
+                    reset_halted: false,
+                    first_new_id: self.next_request_id,
+                }
+            }
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            let polled = match &mut op.phase {
+                CancelPhase::Stopping(future)
+                | CancelPhase::ResettingHalted(future)
+                | CancelPhase::SettingDequeue { future, .. } => future.as_mut().poll(&mut cx),
+            };
+            let Poll::Ready(result) = polled else {
+                self.cancel_op = Some(op);
+                return;
+            };
+            match self.cancel_step(op, result) {
+                Some(next) => op = next,
+                None => return,
+            }
+        }
+    }
+
+    /// The command of the pass in `op.phase` completed with `result`. Returns the pass with its next command
+    /// queued, or `None` if the pass is over.
+    fn cancel_step(&mut self, op: CancelOp, result: Result<(), TransferError>) -> Option<CancelOp> {
+        let CancelOp {
+            batch,
+            phase,
+            stop_attempts,
+            reset_halted,
+            first_new_id,
+        } = op;
+        match phase {
+            CancelPhase::Stopping(_) => match result {
+                Ok(()) => self.invalidate_cancelled_tds(batch, stop_attempts, reset_halted, first_new_id),
+                Err(TransferError::Timeout | TransferError::NoDevice) => {
+                    self.give_up_cancelled_tds(batch, "the Stop Endpoint command did not complete");
+                    None
+                }
+                Err(error) => {
+                    // `xhci_handle_cmd_stop_ep`, COMP_CONTEXT_STATE_ERROR: the endpoint state says what raced.
+                    let state = self
+                        .out_ctx
+                        .as_ref()
+                        .map(|out_ctx| out_ctx.endpoint_state(self.dci.as_u8()));
+                    match stop_state(state) {
+                        // The endpoint halted before the stop: reset it first, the stop's effect is the same.
+                        StopState::Halted => Some(CancelOp {
+                            batch,
+                            phase: CancelPhase::ResettingHalted(self.reset_halted_future()),
+                            stop_attempts,
+                            reset_halted,
+                            first_new_id,
+                        }),
+                        // The stop was handled before the endpoint was running: stop it again.
+                        StopState::Running if stop_attempts < MAX_STOP_ATTEMPTS => {
+                            Some(CancelOp {
+                                batch,
+                                phase: CancelPhase::Stopping(self.stop_command_future()),
+                                stop_attempts: stop_attempts + 1,
+                                reset_halted,
+                                first_new_id,
+                            })
+                        }
+                        // Already stopped, by an earlier pass or the controller: go on.
+                        StopState::Stopped => {
+                            self.invalidate_cancelled_tds(batch, stop_attempts, reset_halted, first_new_id)
+                        }
+                        StopState::Running | StopState::Other => {
+                            warn!(
+                                "xhci: Stop Endpoint dci={} failed: {error}, endpoint state {state:?}",
+                                self.dci.raw()
+                            );
+                            self.give_up_cancelled_tds(batch, "the endpoint could not be stopped");
+                            None
+                        }
+                    }
+                }
+            },
+            CancelPhase::ResettingHalted(_) => {
+                // Linux ignores the completion code of this Reset Endpoint (`xhci_handle_cmd_reset_ep`).
+                if result.is_ok() {
+                    self.halted.store(false, Ordering::Release);
+                }
+                self.invalidate_cancelled_tds(batch, stop_attempts, true, first_new_id)
+            }
+            CancelPhase::SettingDequeue { past, .. } => {
+                // `xhci_handle_cmd_set_deq`: a failed command is only reported, and the TDs are given back; the
+                // TD the controller stopped on may still be cached by it, so its buffer is kept.
+                let kept = match result {
+                    Ok(()) => None,
+                    Err(error) => {
+                        warn!(
+                            "xhci: Set TR Dequeue Pointer dci={} failed: {error}",
+                            self.dci.raw()
+                        );
+                        Some(past)
+                    }
+                };
+                self.give_back_cancelled_tds(batch, kept);
+                None
+            }
+        }
+    }
+
+    /// Linux `xhci_invalidate_cancelled_tds`, with the endpoint stopped: the TD the controller stopped on is stepped
+    /// over by a Set TR Dequeue Pointer, every other cancelled TD is turned into No-Ops (`td_to_noop`) for the
+    /// controller to skip. Returns the pass with the Set TR Dequeue Pointer queued, or `None` if the TDs are already
+    /// given back.
+    fn invalidate_cancelled_tds(
+        &mut self,
+        batch: Vec<EndpointRequestId>,
+        stop_attempts: u8,
+        reset_halted: bool,
+        first_new_id: u64,
+    ) -> Option<CancelOp> {
+        let hw = self.hw_dequeue();
+        let mut cached = None;
+        for &request_id in &batch {
+            let Some(submitted) = self.inflight.get(&request_id) else {
+                continue;
+            };
+            let Some((first, last)) = Self::td_span(submitted) else {
+                continue;
+            };
+            let holds_hw = hw.is_some_and(|(addr, _)| self.ring.td_contains(first, last, addr));
+            let trb_count = submitted.trb_count;
+            self.ring.td_to_noop(first, last);
+            if holds_hw && cached.is_none() {
+                cached = Some(request_id);
+            } else {
+                self.stale_noops.insert(request_id, trb_count);
+            }
+        }
+        // A TD that stalled the endpoint is not given back by this pass, but the controller must not run it again
+        // after the reset: its dequeue pointer is stepped over it too (Linux `find_halted_td`).
+        if cached.is_none()
+            && reset_halted
+            && let Some((hw_addr, _)) = hw
+        {
+            cached = self.inflight.iter().find_map(|(&request_id, submitted)| {
+                if request_id.0 >= first_new_id {
+                    return None;
+                }
+                let (first, last) = Self::td_span(submitted)?;
+                self.ring
+                    .td_contains(first, last, hw_addr)
+                    .then_some(request_id)
+            });
+        }
+        let Some(past) = cached else {
+            self.give_back_cancelled_tds(batch, None);
+            return None;
+        };
+        let moved = hw.and_then(|(hw_addr, hw_cycle)| {
+            let (_, last) = Self::td_span(self.inflight.get(&past)?)?;
+            self.ring.past_td(hw_addr, hw_cycle, last)
+        });
+        let Some((pointer, cycle)) = moved else {
+            // Linux marks the TDs cleared anyway ("Failed to move past cached td").
+            warn!(
+                "xhci: no dequeue pointer past the TD the endpoint dci={} stopped on",
+                self.dci.raw()
+            );
+            self.give_back_cancelled_tds(batch, Some(past));
+            return None;
+        };
+        Some(CancelOp {
+            batch,
+            phase: CancelPhase::SettingDequeue {
+                future: self.set_dequeue_future(pointer, cycle, false),
+                past,
+            },
+            stop_attempts,
+            reset_halted,
+            first_new_id,
+        })
+    }
+
+    /// Linux `xhci_giveback_invalidated_tds`, at the end of `xhci_handle_cmd_set_deq`: each cancelled TD is dropped,
+    /// freeing its buffer and mapping (`kept` is quarantined instead, or any TD if the controller died),
+    /// `reclaim_request` reports `Cancelled` for it, and the endpoint's remaining TDs are started again with the
+    /// doorbell (`ring_doorbell_for_active_rings`).
+    fn give_back_cancelled_tds(&mut self, batch: Vec<EndpointRequestId>, kept: Option<EndpointRequestId>) {
+        for request_id in batch {
+            let Some(submitted) = self.remove_request(request_id) else {
+                continue;
+            };
+            submitted.waker.wake();
+            if kept == Some(request_id) {
+                self.cmd.quarantine().keep(submitted);
+            } else {
+                self.release_td(submitted);
+            }
+            self.stopped_completions.insert(request_id);
+        }
+        // The Stopped events of the TDs that go on would hide their real completions (a slot holds one event).
+        let live_trbs = self.trb_to_request.keys().copied().collect::<Vec<_>>();
+        for trb in live_trbs {
+            self.ring.take_finished_if(trb.0, event_is_stop);
+        }
+        if !self.inflight.is_empty() && self.cancelled_tds.is_empty() {
+            mb();
+            self.doorbell();
+        }
+    }
+
+    /// The endpoint could not be stopped, so the controller may still run the cancelled TDs: they are given up with
+    /// their buffers kept in the quarantine, and their requests end as cancelled.
+    fn give_up_cancelled_tds(&mut self, batch: Vec<EndpointRequestId>, why: &str) {
+        warn!(
+            "xhci: cancel on dci={}: {why}; {} TDs quarantined",
+            self.dci.raw(),
+            batch.len()
+        );
+        for request_id in batch {
+            let Some(submitted) = self.remove_request(request_id) else {
+                continue;
+            };
+            submitted.waker.wake();
+            self.cmd.quarantine().keep(submitted);
+            self.stopped_completions.insert(request_id);
+        }
+    }
+
+    /// Reset Endpoint without Transfer State Preserve, for an endpoint a Stop Endpoint found halted.
+    fn reset_halted_future(&self) -> EndpointResetFuture {
+        let (slot_id, endpoint_id) = (self.slot_id.as_u8(), self.dci.as_u8());
+        let mut cmd = self.cmd.clone();
+        Box::pin(async move { reset_endpoint_command(&mut cmd, slot_id, endpoint_id).await })
+    }
+
+    /// Set TR Dequeue Pointer to `dequeue_pointer` with Dequeue Cycle State `dequeue_cycle_state`; then the
+    /// doorbell, if `ring_bell`.
+    fn set_dequeue_future(
+        &self,
+        dequeue_pointer: BusAddr,
+        dequeue_cycle_state: bool,
+        ring_bell: bool,
+    ) -> EndpointResetFuture {
+        let slot_id = self.slot_id.as_u8();
+        let endpoint_id = self.dci.as_u8();
+        let mut command_ring = self.cmd.clone();
+        let bell = self.bell.clone();
+        Box::pin(async move {
+            let mut set_dequeue_pointer = command::SetTrDequeuePointer::default();
+            set_dequeue_pointer
+                .set_new_tr_dequeue_pointer(dequeue_pointer.raw())
+                .set_endpoint_id(endpoint_id)
+                .set_slot_id(slot_id);
+            if dequeue_cycle_state {
+                set_dequeue_pointer.set_dequeue_cycle_state();
+            } else {
+                set_dequeue_pointer.clear_dequeue_cycle_state();
+            }
+            command_ring
+                .cmd_request(command::Allowed::SetTrDequeuePointer(set_dequeue_pointer))
+                .await?;
+
+            if ring_bell {
+                let mut doorbell = doorbell::Register::default();
+                doorbell.set_doorbell_target(endpoint_id);
+                // SAFETY: Configure rollback keeps the endpoint unpublished while
+                // the task path restores its dequeue pointer and rings the bell.
+                unsafe { bell.lock_raw() }.ring(doorbell);
+            }
+            Ok(())
+        })
     }
 
     pub fn configure_periodic(
@@ -388,6 +843,9 @@ impl Endpoint {
         if submitted.cancelled {
             return Err(TransferError::Cancelled);
         }
+        // The controller works through the ring in order: a TD that completed is behind every No-Op of an earlier
+        // cancelled one.
+        self.stale_noops.retain(|&cancelled, _| cancelled > request_id);
 
         if matches!(event.completion_code(), Ok(CompletionCode::Success)) {
             self.err_count = 0;
@@ -427,6 +885,7 @@ impl Endpoint {
 
     fn remove_request(&mut self, request_id: EndpointRequestId) -> Option<SubmittedTd> {
         let submitted = self.inflight.remove(&request_id)?;
+        self.cancelled_tds.retain(|&cancelled| cancelled != request_id);
         self.outstanding_trbs = self.outstanding_trbs.saturating_sub(submitted.trb_count);
         match &submitted.kind {
             SubmittedTdKind::Normal { completion_trb } => {
@@ -515,6 +974,9 @@ impl Endpoint {
             let Some(event) = self.ring.get_finished(event_trb.0) else {
                 continue;
             };
+            if event_is_stop(&event) {
+                continue;
+            }
             let remaining = event.trb_transfer_length() as usize;
             if let Some(submitted) = self.inflight.get_mut(&request_id)
                 && let SubmittedTdKind::Control(control_td) = &mut submitted.kind
@@ -566,6 +1028,9 @@ impl Endpoint {
             let Some(event) = self.ring.get_finished(packet_trb.0) else {
                 continue;
             };
+            if event_is_stop(&event) {
+                continue;
+            }
             let actual = match iso_packet_actual_length(requested, event) {
                 Ok(actual) => actual,
                 Err(err) => {
@@ -763,7 +1228,13 @@ impl Endpoint {
 
     fn ensure_ring_capacity(&self, required: usize) -> Result<(), TransferError> {
         let usable = self.ring.usable_capacity().saturating_sub(1);
-        if self.outstanding_trbs.saturating_add(required) > usable {
+        let stale = self.stale_noops.values().sum::<usize>();
+        if self
+            .outstanding_trbs
+            .saturating_add(stale)
+            .saturating_add(required)
+            > usable
+        {
             return Err(TransferError::QueueFull);
         }
         Ok(())
@@ -783,22 +1254,61 @@ impl Endpoint {
         }
     }
 
-    pub(crate) fn stop_future(&self) -> EndpointResetFuture {
-        let slot_id = self.slot_id.as_u8();
-        let endpoint_id = self.dci.as_u8();
+    /// The bare Stop Endpoint command; the cancel pass reads its error against the endpoint state itself.
+    fn stop_command_future(&self) -> EndpointResetFuture {
+        let (slot_id, endpoint_id) = (self.slot_id.as_u8(), self.dci.as_u8());
         let mut command_ring = self.cmd.clone();
+        Box::pin(async move { stop_endpoint_command(&mut command_ring, slot_id, endpoint_id).await })
+    }
+
+    /// Gets the endpoint stopped, for a reconfiguration or a disconnect. As Linux, which sends no Stop Endpoint to
+    /// reconfigure (Configure Endpoint works on a stopped endpoint, `xhci_check_bandwidth`) and takes a Context State
+    /// Error for an endpoint whose context says Stopped as done (`xhci_handle_cmd_stop_ep`): an endpoint the output
+    /// context already shows stopped (a cancel pass leaves it so) gets no command; a halted one is reset first
+    /// (`EP_STATE_HALTED`: Reset Endpoint); a running one that answers with a context error is stopped again.
+    pub(crate) fn stop_future(&self) -> EndpointResetFuture {
+        let (slot_id, endpoint_id) = (self.slot_id.as_u8(), self.dci.as_u8());
+        let mut command_ring = self.cmd.clone();
+        let out_ctx = self.out_ctx.clone();
+        let halted = self.halted.clone();
         Box::pin(async move {
-            let stop_endpoint = *command::StopEndpoint::default()
-                .set_endpoint_id(endpoint_id)
-                .set_slot_id(slot_id);
-            command_ring
-                .cmd_request(command::Allowed::StopEndpoint(stop_endpoint))
-                .await?;
-            Ok(())
+            let state = || {
+                out_ctx
+                    .as_ref()
+                    .map(|out_ctx| out_ctx.endpoint_state(endpoint_id))
+            };
+            let mut attempts = 0;
+            loop {
+                match stop_state(state()) {
+                    StopState::Stopped if state().is_some() => return Ok(()),
+                    StopState::Halted => {
+                        reset_endpoint_command(&mut command_ring, slot_id, endpoint_id).await?;
+                        halted.store(false, Ordering::Release);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                attempts += 1;
+                match stop_endpoint_command(&mut command_ring, slot_id, endpoint_id).await {
+                    Ok(()) => return Ok(()),
+                    Err(error @ (TransferError::Timeout | TransferError::NoDevice)) => {
+                        return Err(error);
+                    }
+                    Err(error) => match stop_state(state()) {
+                        StopState::Stopped | StopState::Halted if state().is_some() => {}
+                        StopState::Running if attempts < MAX_STOP_ATTEMPTS => {}
+                        _ => return Err(error),
+                    },
+                }
+            }
         })
     }
 
     pub(crate) fn retire_all_after_stop(&mut self) {
+        // The dequeue pointer is set to the enqueue pointer next: nothing is left to take off the ring.
+        self.cancelled_tds.clear();
+        self.cancel_op = None;
+        self.stale_noops.clear();
         let request_ids = self.inflight.keys().copied().collect::<Vec<_>>();
         for request_id in request_ids {
             if let Some(submitted) = self.remove_request(request_id) {
@@ -812,32 +1322,7 @@ impl Endpoint {
 
     pub(crate) fn resume_future(&self) -> EndpointResetFuture {
         let (dequeue_pointer, dequeue_cycle_state) = self.ring.enqueue_pointer();
-        let slot_id = self.slot_id.as_u8();
-        let endpoint_id = self.dci.as_u8();
-        let mut command_ring = self.cmd.clone();
-        let bell = self.bell.clone();
-        Box::pin(async move {
-            let mut set_dequeue_pointer = command::SetTrDequeuePointer::default();
-            set_dequeue_pointer
-                .set_new_tr_dequeue_pointer(dequeue_pointer.raw())
-                .set_endpoint_id(endpoint_id)
-                .set_slot_id(slot_id);
-            if dequeue_cycle_state {
-                set_dequeue_pointer.set_dequeue_cycle_state();
-            } else {
-                set_dequeue_pointer.clear_dequeue_cycle_state();
-            }
-            command_ring
-                .cmd_request(command::Allowed::SetTrDequeuePointer(set_dequeue_pointer))
-                .await?;
-
-            let mut doorbell = doorbell::Register::default();
-            doorbell.set_doorbell_target(endpoint_id);
-            // SAFETY: Configure rollback keeps the endpoint unpublished while
-            // the task path restores its dequeue pointer and rings the bell.
-            unsafe { bell.lock_raw() }.ring(doorbell);
-            Ok(())
-        })
+        self.set_dequeue_future(dequeue_pointer, dequeue_cycle_state, true)
     }
 }
 
@@ -860,6 +1345,8 @@ impl EndpointOp for Endpoint {
         if self.cmd.is_dead() {
             return Err(submission.reject(TransferError::NoDevice));
         }
+        // Whoever submits drives a pass that its owner left unpolled (a cancel followed by a drop).
+        self.poll_cancel_op();
         if self.reset_in_progress.load(Ordering::Acquire) {
             return Err(submission.reject(TransferError::QueueFull));
         }
@@ -1021,7 +1508,12 @@ impl EndpointOp for Endpoint {
             },
         );
         mb();
-        self.doorbell();
+        // While the cancelled TDs are taken off the ring the doorbell stays quiet, as Linux's `xhci_ring_ep_doorbell`
+        // for `EP_STOP_CMD_PENDING | SET_DEQ_PENDING`: the end of the pass rings it for the TDs that remain. The new
+        // TD lies behind the enqueue point of the stop, so neither the No-Ops nor the new dequeue pointer reach it.
+        if !self.cancel_in_progress() {
+            self.doorbell();
+        }
 
         Ok(Self::public_request_id(request_id))
     }
@@ -1044,6 +1536,14 @@ impl EndpointOp for Endpoint {
         if let Some(held) = self.poll_soft_reset(id, request_id) {
             return held;
         }
+        self.poll_cancel_op();
+        if self.stopped_completions.remove(&request_id) {
+            return Some(Err(TransferError::Cancelled));
+        }
+        // A cancelled TD is given back by the pass that takes it off the ring, not by an event of its own.
+        if self.inflight.get(&request_id)?.cancelled {
+            return None;
+        }
         let target = match &self.inflight.get(&request_id)?.kind {
             SubmittedTdKind::Normal { completion_trb } => ReclaimTarget::Normal(*completion_trb),
             SubmittedTdKind::Control(control_td) => ReclaimTarget::Control(*control_td),
@@ -1052,6 +1552,11 @@ impl EndpointOp for Endpoint {
         match target {
             ReclaimTarget::Normal(completion_trb) => {
                 let event = self.ring.get_finished(completion_trb.0)?;
+                // Linux `process_bulk_intr_td`: a Stopped event is the endpoint stopping on the TD, which goes on
+                // after the doorbell.
+                if event_is_stop(&event) {
+                    return None;
+                }
                 if self.start_soft_retry(request_id, completion_trb, event) {
                     return self.poll_soft_reset(id, request_id).unwrap_or(None);
                 }
@@ -1076,6 +1581,10 @@ impl EndpointOp for Endpoint {
         let Some(submitted) = self.inflight.get(&request_id) else {
             return;
         };
+        // The pass over the cancelled TDs is driven by polling `reclaim_request`; none of its commands wakes a task.
+        if self.cancel_in_progress() {
+            cx.waker().wake_by_ref();
+        }
         submitted.waker.register(cx.waker());
         match &submitted.kind {
             SubmittedTdKind::Normal { completion_trb } => {
@@ -1096,9 +1605,17 @@ impl EndpointOp for Endpoint {
         let request_id = Self::private_request_id(id);
         let submitted = self
             .inflight
-            .get_mut(&request_id)
+            .get(&request_id)
             .ok_or(TransferError::InvalidEndpoint)?;
-        submitted.cancelled = true;
+        if submitted.cancelled || self.has_final_event(submitted) {
+            return Ok(());
+        }
+        if let Some(submitted) = self.inflight.get_mut(&request_id) {
+            submitted.cancelled = true;
+        }
+        // `xhci_urb_dequeue`: the TD joins the list, and a Stop Endpoint starts the pass unless one is running.
+        self.cancelled_tds.push(request_id);
+        self.poll_cancel_op();
         Ok(())
     }
 
@@ -1176,6 +1693,17 @@ fn completion_code_halts(code: Result<CompletionCode, u8>) -> bool {
             | Ok(CompletionCode::BabbleDetectedError)
             | Ok(CompletionCode::UsbTransactionError)
             | Ok(CompletionCode::SplitTransactionError)
+    )
+}
+
+/// Whether the event is the endpoint stopping on the TD (Linux `COMP_STOPPED`, `COMP_STOPPED_LENGTH_INVALID`,
+/// `COMP_STOPPED_SHORT_PACKET`), not the TD finishing.
+fn event_is_stop(event: &TransferEvent) -> bool {
+    matches!(
+        event.completion_code(),
+        Ok(CompletionCode::Stopped
+            | CompletionCode::StoppedLengthInvalid
+            | CompletionCode::StoppedShortPacket)
     )
 }
 
@@ -1371,6 +1899,7 @@ pub(crate) mod tests {
     use usb_if::err::TransferError;
 
     use super::*;
+    use crate::backend::kmod::xhci::context::ContextData;
     use crate::backend::ty::ep::{EndpointHandle, OwnedRequest};
     use crate::{
         backend::kmod::xhci::{reg::XhciRegisters, transfer::TransferResultHandler},
@@ -1770,6 +2299,472 @@ pub(crate) mod tests {
             Some(Err(TransferError::Cancelled))
         ));
         assert!(endpoint.reclaim_request(request_id).is_none());
+    }
+
+    // The cancel pass (Linux `xhci_urb_dequeue`, `xhci_handle_cmd_stop_ep`, `xhci_invalidate_cancelled_tds`,
+    // `xhci_handle_cmd_set_deq`), with the controller played by the test.
+
+    const CMD_RESET_ENDPOINT: u32 = 14;
+    const CMD_STOP_ENDPOINT: u32 = 15;
+    const CMD_SET_TR_DEQUEUE: u32 = 16;
+    const TRB_TYPE_NOOP: u32 = 8;
+
+    /// The type of the command TRB the endpoint queued as its `index`th command.
+    fn command_type(endpoint: &Endpoint, index: usize) -> u32 {
+        (endpoint.cmd.trb_word(index, 3) >> 10) & 0x3f
+    }
+
+    /// The controller completes the `index`th command of the endpoint's command ring with `code`.
+    fn complete_command(endpoint: &Endpoint, index: usize, code: CompletionCode) {
+        let mut raw = xhci::ring::trb::event::CommandCompletion::default().into_raw();
+        raw[2] = (code as u32) << 24;
+        let event = xhci::ring::trb::event::CommandCompletion::try_from(raw).unwrap();
+        let addr = BusAddr::from(endpoint.cmd.bus_addr().raw() + (index * 16) as u64);
+        endpoint.cmd.finished_handle().set_finished(addr, event);
+    }
+
+    fn td_trb(endpoint: &Endpoint, id: RequestId) -> BusAddr {
+        match endpoint.inflight[&Endpoint::private_request_id(id)].kind {
+            SubmittedTdKind::Normal { completion_trb } => completion_trb.0,
+            _ => panic!("not a normal TD"),
+        }
+    }
+
+    fn ring_index(endpoint: &Endpoint, addr: BusAddr) -> u64 {
+        (addr.raw() - endpoint.ring.bus_addr().raw()) / 16
+    }
+
+    /// Three bulk OUT TDs in flight, TRBs 0, 1 and 2 of the ring.
+    fn three_tds() -> (Box<AlignedMmio>, Endpoint, [RequestId; 3]) {
+        let (mmio, mut endpoint) = test_endpoint();
+        let ids = [
+            endpoint.submit_request(bulk_out(64)).unwrap(),
+            endpoint.submit_request(bulk_out(64)).unwrap(),
+            endpoint.submit_request(bulk_out(64)).unwrap(),
+        ];
+        (mmio, endpoint, ids)
+    }
+
+    fn trb_type(endpoint: &Endpoint, addr: BusAddr) -> u32 {
+        (endpoint.ring.read_trb_word(addr, 3).unwrap() >> 10) & 0x3f
+    }
+
+    #[test]
+    fn a_cancelled_td_off_the_controllers_dequeue_pointer_becomes_no_ops_and_is_given_back() {
+        let (_mmio, mut endpoint, [a, b, c]) = three_tds();
+        let (trb_a, trb_b, trb_c) = (td_trb(&endpoint, a), td_trb(&endpoint, b), td_trb(&endpoint, c));
+        let mappings = ACTIVE_STREAMING_MAPPINGS.with(|count| count.get());
+
+        endpoint.cancel_request(b).unwrap();
+        // Stop Endpoint is queued, the request waits for it.
+        assert_eq!(command_type(&endpoint, 0), CMD_STOP_ENDPOINT);
+        assert!(endpoint.reclaim_request(b).is_none());
+        assert_eq!(endpoint.inflight.len(), 3, "not given back before the stop completes");
+
+        complete_command(&endpoint, 0, CompletionCode::Success);
+        assert!(matches!(
+            endpoint.reclaim_request(b),
+            Some(Err(TransferError::Cancelled))
+        ));
+        assert!(endpoint.reclaim_request(b).is_none(), "reported once");
+        assert_eq!(endpoint.inflight.len(), 2);
+        assert_eq!(
+            ACTIVE_STREAMING_MAPPINGS.with(|count| count.get()),
+            mappings - 1,
+            "the cancelled TD's buffer is unmapped"
+        );
+        assert_eq!(trb_type(&endpoint, trb_b), TRB_TYPE_NOOP);
+        assert_eq!(trb_type(&endpoint, trb_a), 1, "the other TDs are untouched");
+        assert_eq!(trb_type(&endpoint, trb_c), 1);
+        assert!(endpoint.cancel_op.is_none() && endpoint.cancelled_tds.is_empty());
+        assert_eq!(endpoint.cmd.trb_word(1, 3) & 0xfc00, 0, "no Set TR Dequeue Pointer was sent");
+
+        // The No-Op still takes room in the ring until the controller is known to be past it.
+        assert_eq!(endpoint.stale_noops.len(), 1);
+        for (id, trb) in [(a, trb_a), (c, trb_c)] {
+            endpoint
+                .ring
+                .finished_handle()
+                .set_finished(trb, transfer_event(CompletionCode::Success, 0));
+            assert!(endpoint.reclaim_request(id).unwrap().is_ok());
+        }
+        assert!(endpoint.stale_noops.is_empty());
+    }
+
+    #[test]
+    fn the_td_the_controller_stopped_on_is_stepped_over_with_a_set_tr_dequeue_pointer() {
+        let (_mmio, mut endpoint, [a, b, c]) = three_tds();
+        let (trb_a, trb_b, trb_c) = (td_trb(&endpoint, a), td_trb(&endpoint, b), td_trb(&endpoint, c));
+        // The controller stopped on B: a Stopped event for it, and for A, which is not cancelled, none.
+        endpoint
+            .ring
+            .finished_handle()
+            .set_finished(trb_b, transfer_event(CompletionCode::Stopped, 64));
+
+        endpoint.cancel_request(b).unwrap();
+        complete_command(&endpoint, 0, CompletionCode::Success);
+        assert!(endpoint.reclaim_request(b).is_none(), "waits for the Set TR Dequeue Pointer");
+        assert_eq!(command_type(&endpoint, 1), CMD_SET_TR_DEQUEUE);
+        // New dequeue pointer: the TRB after B (TRB 2), cycle state 1 (first lap).
+        let expected = trb_c.raw() | 1;
+        assert_eq!(endpoint.cmd.trb_word(1, 0), expected as u32);
+        assert_eq!(endpoint.cmd.trb_word(1, 1), (expected >> 32) as u32);
+        assert_eq!(ring_index(&endpoint, trb_b), 1);
+        assert_eq!(endpoint.inflight.len(), 3);
+
+        complete_command(&endpoint, 1, CompletionCode::Success);
+        assert!(matches!(
+            endpoint.reclaim_request(b),
+            Some(Err(TransferError::Cancelled))
+        ));
+        assert_eq!(endpoint.inflight.len(), 2);
+        assert!(endpoint.stale_noops.is_empty(), "the dequeue pointer is past B");
+        assert!(endpoint.quarantine_len() == 0);
+        // The TDs that go on complete as before.
+        for (id, trb) in [(a, trb_a), (c, trb_c)] {
+            endpoint
+                .ring
+                .finished_handle()
+                .set_finished(trb, transfer_event(CompletionCode::Success, 0));
+            assert!(endpoint.reclaim_request(id).unwrap().is_ok());
+        }
+    }
+
+    #[test]
+    fn a_failed_set_tr_dequeue_pointer_keeps_the_buffer_of_the_td_the_controller_may_still_hold() {
+        let (_mmio, mut endpoint, [_a, b, _c]) = three_tds();
+        let trb_b = td_trb(&endpoint, b);
+        let mappings = ACTIVE_STREAMING_MAPPINGS.with(|count| count.get());
+        endpoint
+            .ring
+            .finished_handle()
+            .set_finished(trb_b, transfer_event(CompletionCode::Stopped, 64));
+
+        endpoint.cancel_request(b).unwrap();
+        complete_command(&endpoint, 0, CompletionCode::Success);
+        assert!(endpoint.reclaim_request(b).is_none());
+        complete_command(&endpoint, 1, CompletionCode::ContextStateError);
+
+        assert!(matches!(
+            endpoint.reclaim_request(b),
+            Some(Err(TransferError::Cancelled))
+        ));
+        assert_eq!(ACTIVE_STREAMING_MAPPINGS.with(|count| count.get()), mappings, "kept, not unmapped");
+        assert_eq!(endpoint.quarantine_len(), 1);
+    }
+
+    #[test]
+    fn a_stopped_event_on_a_td_that_is_not_cancelled_is_not_its_completion() {
+        let (_mmio, mut endpoint) = test_endpoint();
+        let id = endpoint.submit_request(bulk_out(64)).unwrap();
+        let trb = td_trb(&endpoint, id);
+        for code in [
+            CompletionCode::Stopped,
+            CompletionCode::StoppedLengthInvalid,
+            CompletionCode::StoppedShortPacket,
+        ] {
+            endpoint
+                .ring
+                .finished_handle()
+                .set_finished(trb, transfer_event(code, 64));
+            assert!(endpoint.reclaim_request(id).is_none(), "{code:?}");
+            assert_eq!(endpoint.inflight.len(), 1, "{code:?}");
+        }
+        endpoint
+            .ring
+            .finished_handle()
+            .set_finished(trb, transfer_event(CompletionCode::Success, 0));
+        assert!(endpoint.reclaim_request(id).unwrap().is_ok());
+    }
+
+    #[test]
+    fn the_stopped_events_of_the_tds_that_go_on_are_cleared_so_that_their_completions_arrive() {
+        let (_mmio, mut endpoint, [a, b, _c]) = three_tds();
+        let trb_a = td_trb(&endpoint, a);
+        endpoint
+            .ring
+            .finished_handle()
+            .set_finished(trb_a, transfer_event(CompletionCode::Stopped, 64));
+
+        endpoint.cancel_request(b).unwrap();
+        complete_command(&endpoint, 0, CompletionCode::Success);
+        // A's Stopped event is the hardware dequeue pointer (A is not cancelled): no Set TR Dequeue Pointer.
+        assert!(matches!(
+            endpoint.reclaim_request(b),
+            Some(Err(TransferError::Cancelled))
+        ));
+        // The slot is free for the completion A gets once the doorbell restarts it: a slot holds one event, and
+        // a second set_finished on a full slot would be dropped.
+        assert!(endpoint.ring.peek_finished(trb_a).is_none());
+    }
+
+    #[test]
+    fn a_td_that_completed_before_the_cancel_returns_its_completion() {
+        let (_mmio, mut endpoint) = test_endpoint();
+        let id = endpoint.submit_request(bulk_out(64)).unwrap();
+        let trb = td_trb(&endpoint, id);
+        endpoint
+            .ring
+            .finished_handle()
+            .set_finished(trb, transfer_event(CompletionCode::Success, 0));
+
+        endpoint.cancel_request(id).unwrap();
+
+        assert!(endpoint.cancel_op.is_none(), "no Stop Endpoint for a finished TD");
+        assert!(endpoint.reclaim_request(id).unwrap().is_ok());
+    }
+
+    /// Doorbell array offset 0 is word 1 of the fake registers (the `mmio.0[1]` of `test_endpoint`), so the doorbell
+    /// of slot 1 is that word. A value the controller never writes stands for "not rung".
+    const BELL_IDLE: u32 = 0xdead_0000;
+
+    fn bell_word(mmio: &mut AlignedMmio) -> usize {
+        mmio.0[1] = BELL_IDLE;
+        1
+    }
+
+    /// Whether the doorbell was rung since the last call.
+    fn bell_rung(mmio: &mut AlignedMmio, word: usize) -> bool {
+        core::mem::replace(&mut mmio.0[word], BELL_IDLE) != BELL_IDLE
+    }
+
+    #[test]
+    fn a_td_submitted_while_the_cancelled_tds_are_taken_off_the_ring_waits_for_the_end_of_the_pass() {
+        let (mut mmio, mut endpoint, [_a, b, _c]) = three_tds();
+        let bell = bell_word(&mut mmio);
+        endpoint.cancel_request(b).unwrap();
+
+        // Cancel, then nobody polls the request (the owner dropped it): the submit goes on the ring, quietly.
+        let d = endpoint.submit_request(bulk_out(64)).unwrap();
+        assert!(!bell_rung(&mut mmio, bell), "no doorbell while the stop is pending");
+        assert_eq!(endpoint.inflight.len(), 4);
+
+        // The next submit drives the pass: the stop completed, B is given back, the doorbell restarts the TDs.
+        complete_command(&endpoint, 0, CompletionCode::Success);
+        let e = endpoint.submit_request(bulk_out(64)).unwrap();
+        assert!(bell_rung(&mut mmio, bell), "the end of the pass rings the doorbell");
+        assert_eq!(endpoint.inflight.len(), 4, "B is gone, D and E are in");
+
+        for id in [d, e] {
+            let trb = td_trb(&endpoint, id);
+            assert_eq!(trb_type(&endpoint, trb), 1, "a new TD is never turned into a No-Op");
+            endpoint
+                .ring
+                .finished_handle()
+                .set_finished(trb, transfer_event(CompletionCode::Success, 0));
+            assert!(endpoint.reclaim_request(id).unwrap().is_ok());
+        }
+    }
+
+    #[test]
+    fn a_td_submitted_during_the_pass_is_not_stepped_over_and_the_doorbell_comes_once_the_dequeue_pointer_is_set() {
+        let (mut mmio, mut endpoint, [_a, b, c]) = three_tds();
+        let bell = bell_word(&mut mmio);
+        let (trb_b, trb_c) = (td_trb(&endpoint, b), td_trb(&endpoint, c));
+        endpoint
+            .ring
+            .finished_handle()
+            .set_finished(trb_b, transfer_event(CompletionCode::Stopped, 64));
+        endpoint.cancel_request(b).unwrap();
+        let d = endpoint.submit_request(bulk_out(64)).unwrap();
+        assert!(!bell_rung(&mut mmio, bell));
+
+        complete_command(&endpoint, 0, CompletionCode::Success);
+        assert!(endpoint.reclaim_request(d).is_none());
+        assert_eq!(command_type(&endpoint, 1), CMD_SET_TR_DEQUEUE);
+        assert_eq!(endpoint.cmd.trb_word(1, 0), (trb_c.raw() as u32) | 1, "the pointer is just past B");
+        assert!(!bell_rung(&mut mmio, bell), "not before the Set TR Dequeue Pointer completes");
+
+        complete_command(&endpoint, 1, CompletionCode::Success);
+        assert!(endpoint.reclaim_request(d).is_none());
+        assert!(bell_rung(&mut mmio, bell));
+        assert!(!bell_rung(&mut mmio, bell), "once");
+        assert_eq!(trb_type(&endpoint, td_trb(&endpoint, d)), 1);
+    }
+
+    #[test]
+    fn nothing_is_left_in_the_stopped_completions_once_the_cancelled_requests_are_reclaimed() {
+        let (_mmio, mut endpoint, [a, b, c]) = three_tds();
+        endpoint.cancel_request(a).unwrap();
+        endpoint.cancel_request(c).unwrap();
+        complete_command(&endpoint, 0, CompletionCode::Success);
+        assert!(matches!(endpoint.reclaim_request(a), Some(Err(TransferError::Cancelled))));
+        assert!(endpoint.reclaim_request(c).is_none());
+        complete_command(&endpoint, 1, CompletionCode::Success);
+        assert!(matches!(endpoint.reclaim_request(c), Some(Err(TransferError::Cancelled))));
+        assert!(endpoint.stopped_completions.is_empty());
+        assert!(endpoint.cancel_op.is_none() && endpoint.cancelled_tds.is_empty());
+        assert!(endpoint.inflight.contains_key(&Endpoint::private_request_id(b)));
+    }
+
+    /// An endpoint with its output context, state `state`.
+    fn with_out_context(endpoint: &mut Endpoint, state: u8) -> ContextData {
+        let ctx = ContextData::new(false, &test_kernel()).unwrap();
+        endpoint.set_out_context(ctx.out_context());
+        ctx.controller_writes(endpoint.dci.as_u8(), 0, u32::from(state));
+        ctx
+    }
+
+    #[test]
+    fn an_endpoint_a_cancel_pass_left_stopped_is_reconfigured_without_a_stop_command_and_then_runs_again() {
+        use crate::osal::tests::run;
+        let (mut mmio, mut endpoint, [a, b, c]) = three_tds();
+        let bell = bell_word(&mut mmio);
+        let ctx = with_out_context(&mut endpoint, EP_STATE_RUNNING);
+        let dci = endpoint.dci.as_u8();
+
+        // Every TD cancelled and no one left to ring the doorbell: the pass ends with the endpoint stopped.
+        for id in [a, b, c] {
+            endpoint.cancel_request(id).unwrap();
+        }
+        ctx.controller_writes(dci, 0, u32::from(EP_STATE_STOPPED));
+        // TDs cancelled while a pass runs join the next one: it stops the stopped endpoint again, which the
+        // controller answers with a context error.
+        complete_command(&endpoint, 0, CompletionCode::Success);
+        for id in [a, b, c] {
+            let _ = endpoint.reclaim_request(id);
+        }
+        complete_command(&endpoint, 1, CompletionCode::ContextStateError);
+        for id in [a, b, c] {
+            let _ = endpoint.reclaim_request(id);
+        }
+        assert!(endpoint.inflight.is_empty() && endpoint.stopped_completions.is_empty());
+        assert!(!bell_rung(&mut mmio, bell), "nothing is left to start");
+
+        // `Device::stop_endpoints` before a reconfiguration: no Stop Endpoint for a stopped endpoint.
+        let queued = endpoint.cmd.trb_word(2, 3);
+        let (result, _) = run(endpoint.stop_future(), || {});
+        assert!(result.is_ok());
+        assert_eq!(endpoint.cmd.trb_word(2, 3), queued, "no command was queued");
+        endpoint.retire_all_after_stop();
+
+        // A new stream: the doorbell starts the stopped endpoint, and the TD completes.
+        let d = endpoint.submit_request(bulk_out(64)).unwrap();
+        assert!(bell_rung(&mut mmio, bell));
+        endpoint
+            .ring
+            .finished_handle()
+            .set_finished(td_trb(&endpoint, d), transfer_event(CompletionCode::Success, 0));
+        assert!(endpoint.reclaim_request(d).unwrap().is_ok());
+    }
+
+    #[test]
+    fn a_stop_endpoint_context_error_on_a_stopped_endpoint_is_done() {
+        use crate::osal::tests::run;
+        let (_mmio, mut endpoint) = test_endpoint();
+        let ctx = with_out_context(&mut endpoint, EP_STATE_RUNNING);
+        let dci = endpoint.dci.as_u8();
+        let mut answered = false;
+        let (result, _) = run(endpoint.stop_future(), || {
+            if !core::mem::replace(&mut answered, true) {
+                // The endpoint stopped on its own before the command was executed.
+                ctx.controller_writes(dci, 0, u32::from(EP_STATE_STOPPED));
+                complete_command(&endpoint, 0, CompletionCode::ContextStateError);
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(command_type(&endpoint, 0), CMD_STOP_ENDPOINT);
+    }
+
+    #[test]
+    fn a_stop_endpoint_on_a_halted_endpoint_resets_it_and_clears_the_halt() {
+        use crate::osal::tests::run;
+        let (_mmio, mut endpoint) = test_endpoint();
+        let ctx = with_out_context(&mut endpoint, EP_STATE_HALTED);
+        let dci = endpoint.dci.as_u8();
+        endpoint.halted.store(true, Ordering::Release);
+        let mut answered = false;
+        let (result, _) = run(endpoint.stop_future(), || {
+            if !core::mem::replace(&mut answered, true) {
+                ctx.controller_writes(dci, 0, u32::from(EP_STATE_STOPPED));
+                complete_command(&endpoint, 0, CompletionCode::Success);
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(command_type(&endpoint, 0), CMD_RESET_ENDPOINT);
+        assert!(!endpoint.halted.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_td_cancelled_during_a_pass_joins_the_next_one() {
+        let (_mmio, mut endpoint, [a, b, c]) = three_tds();
+        endpoint.cancel_request(a).unwrap();
+        endpoint.cancel_request(c).unwrap();
+        assert_eq!(endpoint.cancelled_tds, [Endpoint::private_request_id(c)]);
+
+        complete_command(&endpoint, 0, CompletionCode::Success);
+        assert!(matches!(
+            endpoint.reclaim_request(a),
+            Some(Err(TransferError::Cancelled))
+        ));
+        // The first pass is over; C's pass starts with the next poll.
+        assert!(endpoint.reclaim_request(c).is_none());
+        assert_eq!(command_type(&endpoint, 1), CMD_STOP_ENDPOINT);
+        complete_command(&endpoint, 1, CompletionCode::Success);
+        assert!(matches!(
+            endpoint.reclaim_request(c),
+            Some(Err(TransferError::Cancelled))
+        ));
+        assert_eq!(endpoint.inflight.len(), 1);
+        assert!(endpoint.reclaim_request(b).is_none());
+    }
+
+    #[test]
+    fn a_stop_endpoint_that_finds_the_endpoint_halted_resets_it_first() {
+        let (_mmio, mut endpoint, [a, b, _c]) = three_tds();
+        let ctx = ContextData::new(false, &test_kernel()).unwrap();
+        endpoint.set_out_context(ctx.out_context());
+        let dci = endpoint.dci.as_u8();
+        // Halted at A, which stalled and is not cancelled; B is.
+        let trb_a = td_trb(&endpoint, a);
+        ctx.controller_writes(dci, 0, u32::from(EP_STATE_HALTED));
+        ctx.controller_writes(dci, 2, (trb_a.raw() as u32) | 1);
+        ctx.controller_writes(dci, 3, (trb_a.raw() >> 32) as u32);
+        endpoint.halted.store(true, Ordering::Release);
+
+        endpoint.cancel_request(b).unwrap();
+        complete_command(&endpoint, 0, CompletionCode::ContextStateError);
+        assert!(endpoint.reclaim_request(b).is_none());
+        assert_eq!(command_type(&endpoint, 1), CMD_RESET_ENDPOINT);
+        assert_eq!(endpoint.cmd.trb_word(1, 3) & (1 << 9), 0, "no Transfer State Preserve");
+
+        ctx.controller_writes(dci, 0, u32::from(EP_STATE_STOPPED));
+        complete_command(&endpoint, 1, CompletionCode::Success);
+        // The stalled TD A holds the dequeue pointer: stepped over, so that it is not run again.
+        assert!(endpoint.reclaim_request(b).is_none());
+        assert_eq!(command_type(&endpoint, 2), CMD_SET_TR_DEQUEUE);
+        let past_a = endpoint.ring.bus_addr().raw() + 16;
+        assert_eq!(endpoint.cmd.trb_word(2, 0), (past_a as u32) | 1);
+        assert!(!endpoint.halted.load(Ordering::Acquire), "the reset cleared the halt");
+
+        complete_command(&endpoint, 2, CompletionCode::Success);
+        assert!(matches!(
+            endpoint.reclaim_request(b),
+            Some(Err(TransferError::Cancelled))
+        ));
+        assert!(endpoint.inflight.contains_key(&Endpoint::private_request_id(a)), "A is not given back");
+    }
+
+    #[test]
+    fn a_stop_endpoint_that_keeps_racing_the_endpoint_is_given_up_with_the_buffers_kept() {
+        let (_mmio, mut endpoint, [_a, b, _c]) = three_tds();
+        let ctx = ContextData::new(false, &test_kernel()).unwrap();
+        endpoint.set_out_context(ctx.out_context());
+        ctx.controller_writes(endpoint.dci.as_u8(), 0, u32::from(EP_STATE_RUNNING));
+        let mappings = ACTIVE_STREAMING_MAPPINGS.with(|count| count.get());
+
+        endpoint.cancel_request(b).unwrap();
+        for attempt in 0..usize::from(MAX_STOP_ATTEMPTS) {
+            assert!(endpoint.reclaim_request(b).is_none());
+            assert_eq!(command_type(&endpoint, attempt), CMD_STOP_ENDPOINT);
+            complete_command(&endpoint, attempt, CompletionCode::ContextStateError);
+        }
+        assert!(matches!(
+            endpoint.reclaim_request(b),
+            Some(Err(TransferError::Cancelled))
+        ));
+        assert_eq!(ACTIVE_STREAMING_MAPPINGS.with(|count| count.get()), mappings);
+        assert_eq!(endpoint.quarantine_len(), 1);
     }
 
     #[test]

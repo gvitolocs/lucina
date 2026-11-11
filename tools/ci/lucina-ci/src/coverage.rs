@@ -60,9 +60,53 @@ pub fn read_files(root: &Path, target: &str) -> Vec<String> {
     seen
 }
 
+/// Repository paths a mutant script names: every `crates/...` word in it (a `../../` before it is dropped). Shell variables and globs
+/// end a word, so `crates/foo/src/$x.rs` yields `crates/foo/src/`.
+pub fn script_paths(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("crates/") {
+        let tail = &rest[i..];
+        let end = tail
+            .find(|c: char| !(c.is_ascii_alphanumeric() || "_-./".contains(c)))
+            .unwrap_or(tail.len());
+        let word = tail[..end].trim_end_matches('.');
+        // "crates/" alone, or inside a longer word such as "mycrates/", is not a path.
+        let glued = rest[..i]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if word.len() > "crates/".len() && !glued && !out.iter().any(|w| w == word) {
+            out.push(word.to_string());
+        }
+        rest = &tail[end.max(1)..];
+    }
+    out
+}
+
 /// `(unit, file)` for every file a Verus or shipped proof reads that the snapshot rules leave out.
 pub fn gaps(root: &Path, units: &[Unit], rules: &Rules) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    for u in units
+        .iter()
+        .filter(|u| matches!(u.kind.as_str(), "mutants" | "mutations"))
+    {
+        // The script is the unit's target (a path, maybe with variables in front of `bash`).
+        let script = u
+            .target
+            .split_whitespace()
+            .rev()
+            .find(|w| w.ends_with(".sh"))
+            .unwrap_or("");
+        let Ok(text) = std::fs::read_to_string(root.join(script)) else {
+            continue;
+        };
+        for p in script_paths(&text) {
+            if root.join(&p).exists() && !snapshot::included(rules, &p) {
+                out.push((u.name.clone(), p));
+            }
+        }
+    }
     for u in units
         .iter()
         .filter(|u| matches!(u.kind.as_str(), "verus" | "shipped"))
@@ -101,6 +145,20 @@ mod tests {
         let src = "#![feature(x)]\n#[path = \"../../crates/a/src/r.rs\"]\npub mod r;\n  #[path=\"b.rs\"] mod b;\n#[cfg(test)]\nmod t;";
         assert_eq!(path_attributes(src), ["../../crates/a/src/r.rs", "b.rs"]);
         assert!(path_attributes("fn main() {}").is_empty());
+    }
+
+    #[test]
+    fn mutant_scripts_name_their_crate_paths() {
+        let sh = "cp ../../crates/zzz-leftout/src/mru.rs \"$d/m.rs\"\nsed -i s/x/y/ crates/zzz-kept/src/$f.rs # mycrates/nope\nfor t in crates/zzz-kept/tests/*.rs; do :; done\necho crates/";
+        assert_eq!(
+            script_paths(sh),
+            [
+                "crates/zzz-leftout/src/mru.rs",
+                "crates/zzz-kept/src/",
+                "crates/zzz-kept/tests/"
+            ]
+        );
+        assert!(script_paths("echo hi").is_empty());
     }
 
     #[test]
@@ -154,12 +212,39 @@ mod tests {
                 "crates/zzz-leftout/src/rules.rs".to_string()
             )]
         );
+        // A mutant script that names the left-out crate is found too (2026-11-11: juno-wm-rules, reported as a surviving mutant).
+        std::fs::write(
+            t.join("verification/zzz-proof/mutants.sh"),
+            "cp ../../crates/zzz-leftout/src/rules.rs \"$d\"\ncp crates/zzz-kept/src/board.rs \"$d\"\n",
+        )
+        .unwrap();
+        let mut m = unit(
+            "mutants/zzz-proof",
+            "VARS=1 bash verification/zzz-proof/mutants.sh",
+        );
+        m.kind = "mutants".into();
+        let both = [
+            unit("verus/zzz-proof/rules", "verification/zzz-proof/rules.rs"),
+            m,
+        ];
+        let g = gaps(&t, &both, &rules);
+        assert!(
+            g.contains(&(
+                "mutants/zzz-proof".to_string(),
+                "crates/zzz-leftout/src/rules.rs".to_string()
+            )),
+            "{g:?}"
+        );
+        assert!(
+            !g.iter()
+                .any(|(u, f)| u == "mutants/zzz-proof" && f.contains("zzz-kept"))
+        );
         // Named in a group: no gap.
         let rules = snapshot::parse_rules(
             "include verification/\ngroup kernel zzz-kept\ngroup services zzz-leftout\n",
         )
         .unwrap();
-        assert!(gaps(&t, &u, &rules).is_empty());
+        assert!(gaps(&t, &both, &rules).is_empty());
         std::fs::remove_dir_all(&t).ok();
     }
 }

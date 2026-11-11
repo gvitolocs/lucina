@@ -31,6 +31,8 @@ use secretary_calendar::model::{day_start, local_to_utc};
 use secretary_calendar::{Event, Source as CalSource};
 use serde_json::Value;
 
+use crate::home_cache;
+
 /// How often each source is read while the screen is on.
 const CALENDAR_EVERY: Duration = Duration::from_secs(5 * 60);
 const DECISIONS_EVERY: Duration = Duration::from_secs(2 * 60);
@@ -54,6 +56,12 @@ const EVENT_WAIT_MS: u64 = 60_000;
 /// The calendar's own cache of months (apps/lucina-app-calendar/src/account.rs).
 const CALENDAR_CACHE: &str = "calendar-cache.json";
 const DEFAULT_TZ: Tz = chrono_tz::Europe::Copenhagen;
+/// Every request a Home source makes gives up after this long (the account client's default is 15 s, which left a card missing
+/// for that long when the network was half up).
+const HOME_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long, and how often, the feed looks for the cache while /data is not mounted yet.
+const CACHE_WAIT: Duration = Duration::from_secs(10);
+const CACHE_RETRY: Duration = Duration::from_secs(1);
 
 /// One source's latest answer. Each replaces that source's previous answer whole. `None` in a field means "this source has
 /// nothing for that card": the card is left out (never sample text).
@@ -108,7 +116,7 @@ pub enum Ask {
 }
 
 pub struct Feed {
-    rx: Receiver<Update>,
+    rx: Receiver<(Update, bool)>,
     tx: Sender<Ask>,
     wake: OwnedFd,
 }
@@ -116,13 +124,33 @@ pub struct Feed {
 /// Where the sources put their answers: the channel, and one byte on the wake pipe for the shell's `poll`.
 #[derive(Clone)]
 struct Sink {
-    tx: Sender<Update>,
+    tx: Sender<(Update, bool)>,
     wake: Arc<OwnedFd>,
+    cache: Arc<home_cache::Shared>,
 }
 
 impl Sink {
+    /// A live answer: replaces a cached card, is written to the cache when it is a real one, and a `Gone` does not remove a
+    /// cached card in the first minute.
     fn send(&self, u: Update) {
-        if self.tx.send(u).is_err() {
+        if !self.cache.admit_live(&u, Instant::now()) {
+            return;
+        }
+        if lucina_account::client::clock_is_set() {
+            self.cache.persist(Path::new(home_cache::DIR), &u, now_ms());
+        }
+        self.push(u, false);
+    }
+
+    /// The last known answer of a source, read from the cache before the network has said anything.
+    fn send_cached(&self, u: Update) {
+        if self.cache.admit_cached(&u) {
+            self.push(u, true);
+        }
+    }
+
+    fn push(&self, u: Update, cached: bool) {
+        if self.tx.send((u, cached)).is_err() {
             return;
         }
         let byte = 1u8;
@@ -145,11 +173,12 @@ impl Feed {
             use std::os::fd::FromRawFd;
             (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1]))
         };
-        let (utx, urx) = std::sync::mpsc::channel::<Update>();
+        let (utx, urx) = std::sync::mpsc::channel::<(Update, bool)>();
         let (atx, arx) = std::sync::mpsc::channel::<Ask>();
         let sink = Sink {
             tx: utx,
             wake: Arc::new(w),
+            cache: Arc::new(home_cache::Shared::new(Instant::now())),
         };
         let events_sink = sink.clone();
         std::thread::Builder::new()
@@ -174,6 +203,12 @@ impl Feed {
 
     /// Every update that has come, in order; empties the wake pipe.
     pub fn drain(&mut self) -> Vec<Update> {
+        self.drain_marked().into_iter().map(|(u, _)| u).collect()
+    }
+
+    /// [`Self::drain`], each update with whether it is a last known value read from the cache (`true`) rather than a live
+    /// answer. A cached one is real but may be hours old; the first live answer of its source replaces it.
+    pub fn drain_marked(&mut self) -> Vec<(Update, bool)> {
         let mut buf = [0u8; 64];
         // SAFETY: reading into a local buffer from our own non-blocking pipe.
         while unsafe { libc::read(self.wake.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {
@@ -242,23 +277,38 @@ fn coordinate(asks: Receiver<Ask>, sink: Sink) {
     let mut tasks = Slot::new(TASKS_EVERY, start);
     let mut uploads = Slot::new(UPLOADS_EVERY, start);
     let mut awake = true;
+    // The last known values go out before any fetch. /data is mounted about 2.5 s after the kernel: until the cache directory is
+    // there, look again every second for CACHE_WAIT, on this thread's own wake-ups.
+    let mut cache_pending = !load_cache(&sink);
     loop {
+        if cache_pending && (start.elapsed() >= CACHE_WAIT || load_cache(&sink)) {
+            cache_pending = false;
+        }
         let now = Instant::now();
         if awake {
             let s = sink.clone();
-            calendar.run(now, "calendar", move || fetch_calendar(&s, tz));
+            calendar.run(now, "calendar", move || {
+                traced("calendar", || fetch_calendar(&s, tz))
+            });
             let s = sink.clone();
-            decisions.run(now, "decisions", move || fetch_decisions(&s));
+            decisions.run(now, "decisions", move || {
+                traced("decisions", || fetch_decisions(&s))
+            });
             let s = sink.clone();
-            agents.run(now, "agents", move || fetch_agents(&s));
+            agents.run(now, "agents", move || traced("agents", || fetch_agents(&s)));
             let s = sink.clone();
-            tasks.run(now, "tasks", move || fetch_tasks(&s, tz));
+            tasks.run(now, "tasks", move || {
+                traced("tasks", || fetch_tasks(&s, tz))
+            });
             let s = sink.clone();
             uploads.run(now, "uploads", move || {
-                s.send(Update::Uploads(pending_uploads(
-                    &recordings_dir(),
-                    SystemTime::now(),
-                )))
+                traced("uploads", || {
+                    s.send(Update::Uploads(pending_uploads(
+                        &recordings_dir(),
+                        SystemTime::now(),
+                    )));
+                    Outcome::Ok
+                })
             });
         }
         // Asleep: nothing is due, so wait for the shell without a timeout.
@@ -270,8 +320,12 @@ fn coordinate(asks: Receiver<Ask>, sink: Sink) {
         } else {
             None
         };
-        let ask = match next {
-            Some(due) => asks.recv_timeout(due.saturating_duration_since(Instant::now())),
+        let mut wait = next.map(|due| due.saturating_duration_since(Instant::now()));
+        if cache_pending {
+            wait = Some(wait.map_or(CACHE_RETRY, |w| w.min(CACHE_RETRY)));
+        }
+        let ask = match wait {
+            Some(w) => asks.recv_timeout(w),
             None => asks.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
         match ask {
@@ -303,6 +357,55 @@ fn timezone() -> Tz {
         .ok()
         .and_then(|s| secretary_calendar::parse_tz(&s))
         .unwrap_or(DEFAULT_TZ)
+}
+
+/// How a fetch ended, for the per-source trace line.
+enum Outcome {
+    /// It answered and the answer went to the shell.
+    Ok,
+    /// The source is `Gone` without a failed call (nobody signed in, no clock, an answer that says nothing).
+    Gone,
+    /// A call failed; the reason is a few words.
+    Error(String),
+}
+
+/// A failed call in a few words, never the server's text.
+fn reason(e: &ApiError) -> String {
+    match e {
+        ApiError::Unauthorized(_) => "unauthorized".into(),
+        ApiError::RateLimited(s) => format!("rate limited {s}s"),
+        ApiError::Http(status, _, _) => format!("http {status}"),
+        ApiError::Network(m) => {
+            let short: String = m.chars().take(48).collect();
+            format!("network {short}")
+        }
+        ApiError::Protocol(_) => "protocol".into(),
+    }
+}
+
+/// Runs one fetch and logs one line to stderr when it ends: `lucina-shell: home source <name> <ms> ms <ok|gone|error: why>`.
+/// Always on (one line per fetch, every 1 to 5 minutes per source): it is how a slow source gets named.
+fn traced(name: &str, fetch: impl FnOnce() -> Outcome) {
+    let t = Instant::now();
+    let outcome = fetch();
+    let ms = t.elapsed().as_millis();
+    match outcome {
+        Outcome::Ok => eprintln!("lucina-shell: home source {name} {ms} ms ok"),
+        Outcome::Gone => eprintln!("lucina-shell: home source {name} {ms} ms gone"),
+        Outcome::Error(why) => eprintln!("lucina-shell: home source {name} {ms} ms error: {why}"),
+    }
+}
+
+/// Sends every cached value that can be shown, if the cache directory is there; whether it was.
+fn load_cache(sink: &Sink) -> bool {
+    let dir = Path::new(home_cache::DIR);
+    if !dir.is_dir() {
+        return false;
+    }
+    for u in home_cache::load_all(dir, now_ms(), lucina_account::client::clock_is_set()) {
+        sink.send_cached(u);
+    }
+    true
 }
 
 /// A signed-in client, or `Gone` for `source` when nobody is signed in.
@@ -611,14 +714,14 @@ fn encode(s: &str) -> String {
     out
 }
 
-fn fetch_calendar(sink: &Sink, tz: Tz) {
+fn fetch_calendar(sink: &Sink, tz: Tz) -> Outcome {
     // Before the clock is set (Juno starts in 1970) there is no week to show.
     if !lucina_account::client::clock_is_set() {
         sink.send(Update::Gone(Source::Calendar));
-        return;
+        return Outcome::Gone;
     }
     let Some(client) = client_or_gone(sink, Source::Calendar) else {
-        return;
+        return Outcome::Gone;
     };
     let now_ms = Utc::now().timestamp_millis();
     let (first, last) = window(now_ms, tz);
@@ -631,15 +734,20 @@ fn fetch_calendar(sink: &Sink, tz: Tz) {
     let at = |d: NaiveDate| {
         encode(&day_start(tz, d).to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
     };
-    match client.get_json(&format!(
-        "/v1/calendar/events?from={}&to={}",
-        at(first),
-        at(last)
-    )) {
+    match client.get_json_within(
+        &format!("/v1/calendar/events?from={}&to={}", at(first), at(last)),
+        HOME_TIMEOUT,
+    ) {
         Ok(v) => match events_in(&v) {
-            Some(events) => sink.send(calendar_update(&events, Utc::now().timestamp_millis(), tz)),
-            None if !sent => sink.send(Update::Gone(Source::Calendar)),
-            None => {}
+            Some(events) => {
+                sink.send(calendar_update(&events, Utc::now().timestamp_millis(), tz));
+                Outcome::Ok
+            }
+            None if !sent => {
+                sink.send(Update::Gone(Source::Calendar));
+                Outcome::Gone
+            }
+            None => Outcome::Gone,
         },
         Err(e) => {
             failed(&e);
@@ -647,6 +755,7 @@ fn fetch_calendar(sink: &Sink, tz: Tz) {
             if !sent || matches!(e, ApiError::Unauthorized(_)) {
                 sink.send(Update::Gone(Source::Calendar));
             }
+            Outcome::Error(reason(&e))
         }
     }
 }
@@ -673,18 +782,29 @@ pub fn decision_notes(all: &[lucina_account::decisions::Decision]) -> (u32, Vec<
     (pending.len() as u32, notes)
 }
 
-fn fetch_decisions(sink: &Sink) {
+fn fetch_decisions(sink: &Sink) -> Outcome {
     let Some(client) = client_or_gone(sink, Source::Decisions) else {
-        return;
+        return Outcome::Gone;
     };
-    match client.decisions(Some("pending"), 100) {
-        Ok(list) => {
+    // `Client::decisions(Some("pending"), 100)` with the Home timeout instead of the default one.
+    match client.get_json_within("/v1/decisions?limit=100&status=pending", HOME_TIMEOUT) {
+        Ok(v) => {
+            let list: Vec<lucina_account::decisions::Decision> = v["items"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(lucina_account::decisions::Decision::parse)
+                        .collect()
+                })
+                .unwrap_or_default();
             let (pending, notes) = decision_notes(&list);
             sink.send(Update::Decisions { pending, notes });
+            Outcome::Ok
         }
         Err(e) => {
             failed(&e);
             sink.send(Update::Gone(Source::Decisions));
+            Outcome::Error(reason(&e))
         }
     }
 }
@@ -761,25 +881,26 @@ pub fn build_of(board: &PipelineBoard, now: chrono::DateTime<chrono::Utc>) -> Op
     })
 }
 
-fn fetch_agents(sink: &Sink) {
+fn fetch_agents(sink: &Sink) -> Outcome {
     let Some(client) = client_or_gone(sink, Source::Agents) else {
-        return;
+        return Outcome::Gone;
     };
-    let running = match client.get_json("/v1/agents/items") {
+    let running = match client.get_json_within("/v1/agents/items", HOME_TIMEOUT) {
         Ok(v) => agents_running(&v),
         Err(e) => {
             failed(&e);
             sink.send(Update::Gone(Source::Agents));
-            return;
+            return Outcome::Error(reason(&e));
         }
     };
     // The board is its own route; without it the running count still stands and there is no Build card.
     let build = client
-        .get_json("/v1/agents/pipeline/board")
+        .get_json_within("/v1/agents/pipeline/board", HOME_TIMEOUT)
         .ok()
         .and_then(|v| serde_json::from_value::<PipelineBoard>(v).ok())
         .and_then(|b| build_of(&b, chrono::Utc::now()));
     sink.send(Update::Agents { running, build });
+    Outcome::Ok
 }
 
 // ---- Tasks ----
@@ -851,11 +972,14 @@ pub fn task_counts(state: &Value) -> Option<(u32, u32)> {
     Some((today.saturating_sub(overdue), overdue))
 }
 
-fn fetch_tasks(sink: &Sink, tz: Tz) {
+fn fetch_tasks(sink: &Sink, tz: Tz) -> Outcome {
     let Some(client) = client_or_gone(sink, Source::Tasks) else {
-        return;
+        return Outcome::Gone;
     };
-    match client.get_json(&format!("/v1/tasks/state?timezone={}", encode(tz.name()))) {
+    match client.get_json_within(
+        &format!("/v1/tasks/state?timezone={}", encode(tz.name())),
+        HOME_TIMEOUT,
+    ) {
         Ok(v) => match task_counts(&v) {
             Some((due_today, overdue)) => {
                 let (today, overdue_tasks) = task_tops(&v);
@@ -864,13 +988,18 @@ fn fetch_tasks(sink: &Sink, tz: Tz) {
                     overdue,
                     today,
                     overdue_tasks,
-                })
+                });
+                Outcome::Ok
             }
-            None => sink.send(Update::Gone(Source::Tasks)),
+            None => {
+                sink.send(Update::Gone(Source::Tasks));
+                Outcome::Gone
+            }
         },
         Err(e) => {
             failed(&e);
             sink.send(Update::Gone(Source::Tasks));
+            Outcome::Error(reason(&e))
         }
     }
 }

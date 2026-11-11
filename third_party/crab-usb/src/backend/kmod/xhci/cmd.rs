@@ -79,6 +79,15 @@ impl CommandRing {
         inner.ring.bus_addr()
     }
 
+    /// Word `word` of the command TRB queued at ring position `index` (tests read what a command asked for).
+    #[cfg(test)]
+    pub(crate) fn trb_word(&self, index: usize, word: usize) -> u32 {
+        // SAFETY: command-ring access excludes local xHCI event re-entry.
+        let inner = unsafe { self.inner.lock_raw() };
+        let addr = BusAddr::from(inner.ring.bus_addr().raw() + (index * 16) as u64);
+        inner.ring.read_trb_word(addr, word).unwrap()
+    }
+
     pub fn cycle(&self) -> bool {
         // SAFETY: command-ring access excludes local xHCI event re-entry.
         let inner = unsafe { self.inner.lock_raw() };

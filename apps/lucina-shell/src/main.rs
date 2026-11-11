@@ -38,11 +38,13 @@ mod control;
 mod dash;
 mod events;
 mod fnkeys;
+mod home_cache;
 mod home_feed;
 mod net;
 mod power_watch;
 mod pty;
 mod settings;
+mod spawn;
 mod standby;
 mod system;
 mod term;
@@ -1241,16 +1243,19 @@ impl App {
         self.home.note = None;
         self.kb.release_all();
         let t0 = monotonic_us();
-        let started = apps::prepare(m).and_then(|(path, copy)| {
-            let mut run = m.clone();
-            run.exec = path;
-            let dir = apps::app_dir(m, copy);
-            let r = Running::start(a, &run, &dir, &self.zone.rule, self.opts.trace, args, env);
-            if copy {
-                // It runs from its own pages now.
-                let _ = std::fs::remove_file(&run.exec);
-            }
-            r
+        // One lock across the copy to RUN_DIR, closing its write descriptor and the exec (spawn.rs).
+        let started = spawn::locked(|| {
+            apps::prepare(m).and_then(|(path, copy)| {
+                let mut run = m.clone();
+                run.exec = path;
+                let dir = apps::app_dir(m, copy);
+                let r = Running::start(a, &run, &dir, &self.zone.rule, self.opts.trace, args, env);
+                if copy {
+                    // It runs from its own pages now.
+                    let _ = std::fs::remove_file(&run.exec);
+                }
+                r
+            })
         });
         if self.opts.trace {
             self.log(&format!("app prepared in {} us", monotonic_us() - t0));
@@ -1768,10 +1773,9 @@ impl App {
             fb.present(&self.frame, dirty);
         }
         if std::path::Path::new("/run/lucina/data-ready").exists() {
-            match std::process::Command::new("/sbin/lucina-data")
-                .arg("clean")
-                .status()
-            {
+            let mut cmd = std::process::Command::new("/sbin/lucina-data");
+            cmd.arg("clean");
+            match spawn::spawn(&mut cmd).and_then(|mut c| c.wait()) {
                 Ok(s) if s.success() => self.log("/data marked clean"),
                 Ok(s) => self.log(&format!("/data not marked clean: lucina-data {s}")),
                 Err(e) => self.log(&format!("/data not marked clean: {e}")),
@@ -2432,11 +2436,28 @@ impl App {
         // The big apps on the persistent partition, when it has come up.
         self.start_data_apps();
         let mut next_status = Instant::now();
+        // The network line waits for kernel route notifications (Juno's netlink has no multicast groups yet; lever E, juno-power): until then it is read every STATUS_EVERY.
+        let mut next_net = Instant::now();
+        let mut battery_cache = system::battery();
         let mut next_camera = Instant::now();
         // The plug's events from the hub, so the battery indicator follows the cable at once.
         let mut power = power_watch::PowerWatch::start();
         // Input devices by event: the kernel's input.added and input.removed through the hub (patch 1192).
         let mut input_watch = input_watch::InputWatch::start();
+        self.log(&format!(
+            "status sources: network=timer ({} s), adapter={}, battery={}",
+            STATUS_EVERY.as_secs(),
+            if power.is_some() {
+                "event (power.*)"
+            } else {
+                "timer (5 s, no power watch)"
+            },
+            if power.is_some() {
+                "timer (with the clock minute)"
+            } else {
+                "timer (5 s, no power watch)"
+            },
+        ));
         self.handle_input(next_status, input_watch.as_mut());
         loop {
             // The level of a function key goes after its moment: the loop's deadline wakes it for that (below).
@@ -2459,7 +2480,7 @@ impl App {
             let mut deadline = if self.asleep {
                 now + ASLEEP_RECHECK
             } else {
-                let d = next_clock.min(next_status).min(next_camera);
+                let d = next_clock.min(next_status).min(next_net).min(next_camera);
                 // With the kernel's input events, no timer after the first seconds: a new device comes as an event.
                 match self.inputs.next_rescan(now) {
                     Some(r) => d.min(r),
@@ -2621,19 +2642,26 @@ impl App {
                 }
             }
             let stale = std::mem::take(&mut self.status_stale);
-            if !self.asleep && (stale || now >= next_clock || now >= next_status) {
+            // The network line is read on its own timer; the adapter and the battery percentage only when a plug event, the clock's
+            // minute or a wake says so (every 5 s when there is no power watch).
+            let full = stale || now >= next_clock || now >= next_status;
+            if !self.asleep && (full || now >= next_net) {
                 let started = monotonic_us();
+                next_net = now + STATUS_EVERY;
                 self.network = net::Network::read();
                 if self.opts.trace {
                     self.log(&format!("status read in {} us", monotonic_us() - started));
                 }
-                if let Some(b) = self.backlight.as_mut() {
-                    // A level saved on /data comes back once /data has come up.
-                    b.sync();
-                    b.read_adapter();
+                if full {
+                    if let Some(b) = self.backlight.as_mut() {
+                        // A level saved on /data comes back once /data has come up.
+                        b.sync();
+                        b.read_adapter();
+                    }
+                    self.refresh_screen_rows();
+                    battery_cache = system::battery();
                 }
-                self.refresh_screen_rows();
-                let st = system::status(&self.zone, &self.network);
+                let st = system::status_with(&self.zone, &self.network, battery_cache.clone());
                 if st != self.status {
                     self.status = st;
                     self.bar_dirty = true;
@@ -2649,7 +2677,13 @@ impl App {
                 }
                 next_clock =
                     now + Duration::from_secs(system::until_next_minute(&self.zone).max(1));
-                next_status = now + STATUS_EVERY;
+                if full {
+                    next_status = if power.is_some() {
+                        next_clock
+                    } else {
+                        now + STATUS_EVERY
+                    };
+                }
                 if self.home.note.is_none()
                     && let Some(n) = system_notice()
                 {

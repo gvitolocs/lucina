@@ -10,6 +10,7 @@
 //! * [`scsi`]: the SCSI commands the driver sends and the data it parses.
 //! * [`desc`]: device, geometry and unit descriptors.
 //! * [`gpt`]: the partition table, read for the bring-up log.
+//! * [`cache`]: whether a unit keeps writes in a volatile cache (MODE SENSE page 08), read for the boot log.
 //! * [`policy`]: which logical unit may be written (only the main user LUN) and which commands may reach a unit.
 //! * [`host`]: the controller: probe, reuse of the firmware's link or full bring-up, queries, SCSI commands.
 //!
@@ -26,6 +27,7 @@
 
 extern crate alloc;
 
+pub mod cache;
 pub mod desc;
 mod error;
 pub mod gpt;

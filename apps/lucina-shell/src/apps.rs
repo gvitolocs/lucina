@@ -144,10 +144,18 @@ pub fn prepare(m: &Manifest) -> io::Result<(String, bool)> {
     ensure_mounted().map_err(io::Error::other)?;
     std::fs::create_dir_all(RUN_DIR)?;
     let copy = format!("{RUN_DIR}/{}", m.id);
-    let _ = std::fs::remove_file(&copy);
-    std::fs::copy(&m.exec, &copy)?;
-    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755))?;
+    copy_program(&m.exec, &copy)?;
     Ok((copy, true))
+}
+
+/// Copies a program to `dst` and makes it executable, all under the spawn lock (spawn.rs): the copy's write descriptor is
+/// closed before the lock is let go, so no child forked by another thread can inherit it and make the exec fail with ETXTBSY.
+pub(crate) fn copy_program(src: &str, dst: &str) -> io::Result<()> {
+    crate::spawn::locked(|| {
+        let _ = std::fs::remove_file(dst);
+        std::fs::copy(src, dst)?;
+        std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755))
+    })
 }
 
 /// An app's folder with its files: one on /data runs from the apps' folder there, a disk app from
@@ -355,7 +363,7 @@ impl Running {
                 Ok(())
             });
         }
-        let child = cmd.spawn()?;
+        let child = crate::spawn::spawn(&mut cmd)?;
         drop(hold_write);
         // SAFETY: pidfd_open takes a pid and flags. Without it the shell looks every 200 ms.
         let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::c_int, 0) };
@@ -638,6 +646,50 @@ mod tests {
             terminal: false,
             intents: Vec::new(),
         }
+    }
+
+    /// copy_program holds the spawn lock while its write descriptor is open: forks by another thread never carry it into a child,
+    /// so exec of each copy succeeds (no ETXTBSY, raw os error 26).
+    #[test]
+    fn copy_program_overlap_does_not_break_exec() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("lucina-shell-copy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("big");
+        {
+            let mut f = File::create(&src).unwrap();
+            f.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+            f.write_all(&vec![b'#'; 64 << 20]).unwrap();
+        }
+        let src = src.to_str().unwrap().to_string();
+        let copies: Vec<String> = (0..5)
+            .map(|i| dir.join(format!("copy{i}")).to_str().unwrap().to_string())
+            .collect();
+        std::thread::scope(|s| {
+            let a = s.spawn(|| {
+                for c in &copies {
+                    copy_program(&src, c).unwrap();
+                }
+            });
+            let b = s.spawn(|| {
+                for _ in 0..200 {
+                    crate::spawn::spawn(&mut std::process::Command::new("/bin/true"))
+                        .unwrap()
+                        .wait()
+                        .unwrap();
+                }
+            });
+            a.join().unwrap();
+            b.join().unwrap();
+        });
+        for c in &copies {
+            let status = crate::spawn::spawn(&mut std::process::Command::new(c))
+                .unwrap_or_else(|e| panic!("{c}: {e} (raw {:?})", e.raw_os_error()))
+                .wait()
+                .unwrap();
+            assert!(status.success());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

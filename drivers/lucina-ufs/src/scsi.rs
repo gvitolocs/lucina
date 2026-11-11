@@ -2,8 +2,9 @@
 
 use crate::Error;
 pub use crate::write_rule::{
-    INQUIRY, MODE_SENSE_10, READ_10, READ_16, READ_CAPACITY_10, REPORT_LUNS, REQUEST_SENSE, SAI_READ_CAPACITY_16,
-    SERVICE_ACTION_IN_16, SYNCHRONIZE_CACHE_10, TEST_UNIT_READY, WRITE_10, WRITE_16,
+    INQUIRY, MODE_SENSE_10, READ_10, READ_16, READ_CAPACITY_10, REPORT_LUNS, REQUEST_SENSE,
+    SAI_READ_CAPACITY_16, SERVICE_ACTION_IN_16, SYNCHRONIZE_CACHE_10, TEST_UNIT_READY, WRITE_10,
+    WRITE_16,
 };
 
 pub const START_STOP_UNIT: u8 = 0x1b;
@@ -39,6 +40,104 @@ pub fn read_capacity_16(len: u32) -> [u8; 16] {
 pub fn synchronize_cache_10() -> [u8; 10] {
     // LBA 0 and 0 blocks: the whole medium.
     [SYNCHRONIZE_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+}
+
+/// The Caching mode page (SBC-3 6.4.5): WCE and RCD.
+pub const MODE_PAGE_CACHING: u8 = 0x08;
+/// MODE SENSE page control: current values.
+pub const MODE_PC_CURRENT: u8 = 0;
+/// MODE SENSE page control: which bits MODE SELECT could change.
+pub const MODE_PC_CHANGEABLE: u8 = 1;
+/// The MODE SENSE (10) parameter header (SPC-4 7.5.5).
+pub const MODE_SENSE_10_HEADER: usize = 8;
+
+/// MODE SENSE (10) of one page, without subpages. DBD is 0 (block descriptors may come back), as Linux
+/// `sd_read_cache_type` asks; LLBAA 0. Only reads: MODE SELECT is never sent.
+pub fn mode_sense_10(page: u8, pc: u8, alloc_len: u16) -> [u8; 10] {
+    let mut c = [0u8; 10];
+    c[0] = MODE_SENSE_10;
+    c[2] = (pc & 3) << 6 | (page & 0x3f);
+    c[7..9].copy_from_slice(&alloc_len.to_be_bytes());
+    c
+}
+
+/// The write cache bits of the Caching mode page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Caching {
+    /// Write cache enable: the device may report a write done before it is on the medium.
+    pub wce: bool,
+    /// Read cache disable.
+    pub rcd: bool,
+}
+
+/// What a MODE SENSE (10) answer for the Caching page says about writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModeSense {
+    /// Device-specific parameter WP: the unit is write protected.
+    pub wp: bool,
+    /// Device-specific parameter DPOFUA: the unit honours DPO and FUA in READ and WRITE.
+    pub dpofua: bool,
+    /// The Caching page, `None` if the answer does not hold it.
+    pub caching: Option<Caching>,
+}
+
+impl ModeSense {
+    /// Bytes in the whole answer, from its header (MODE DATA LENGTH + 2): what to ask for after reading only the
+    /// header, since the driver fails a transfer shorter than it asked for.
+    pub fn total_len(header: &[u8]) -> Result<usize, Error> {
+        if header.len() < MODE_SENSE_10_HEADER {
+            return Err(Error::BadData("MODE SENSE (10) header"));
+        }
+        Ok(u16::from_be_bytes([header[0], header[1]]) as usize + 2)
+    }
+
+    /// Parses a MODE SENSE (10) answer: the header, `BLOCK DESCRIPTOR LENGTH` bytes of block descriptors, then mode
+    /// pages until MODE DATA LENGTH or the data runs out. A page in subpage format (SPF) is skipped, never taken for
+    /// page 08.
+    pub fn parse(d: &[u8]) -> Result<Self, Error> {
+        let total = Self::total_len(d)?;
+        let end = total.min(d.len());
+        if end < MODE_SENSE_10_HEADER {
+            return Err(Error::BadData("MODE SENSE (10) header"));
+        }
+        let dsp = d[3];
+        let bdl = u16::from_be_bytes([d[6], d[7]]) as usize;
+        let mut pos = MODE_SENSE_10_HEADER + bdl;
+        if pos > end {
+            return Err(Error::BadData("MODE SENSE (10) block descriptors"));
+        }
+        let mut caching = None;
+        while pos + 2 <= end {
+            let spf = d[pos] & 0x40 != 0;
+            let code = d[pos] & 0x3f;
+            let (head, len) = if spf {
+                if pos + 4 > end {
+                    break;
+                }
+                (4, u16::from_be_bytes([d[pos + 2], d[pos + 3]]) as usize)
+            } else {
+                (2, d[pos + 1] as usize)
+            };
+            let body = pos + head;
+            if code == MODE_PAGE_CACHING && !spf {
+                // WCE and RCD are in byte 2 of the page, the first after its header.
+                if len < 1 || body >= end {
+                    return Err(Error::BadData("MODE SENSE (10) caching page"));
+                }
+                caching = Some(Caching {
+                    wce: d[body] & 0x04 != 0,
+                    rcd: d[body] & 0x01 != 0,
+                });
+                break;
+            }
+            pos = body + len;
+        }
+        Ok(Self {
+            wp: dsp & 0x80 != 0,
+            dpofua: dsp & 0x10 != 0,
+            caching,
+        })
+    }
 }
 
 /// READ or WRITE of `blocks` logical blocks at `lba`: the 10-byte form when it fits, as Linux sd does, else the

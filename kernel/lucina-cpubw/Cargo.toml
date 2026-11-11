@@ -1,0 +1,8 @@
+[package]
+name = "lucina-cpubw"
+version = "0.1.0"
+description = "Juno's CPU bandwidth votes: the OPP's two bandwidth cells, the icc aggregate, the RPMh BCM vote for the DDR path and the OSM L3 index, as Linux v6.12 computes them; no_std, no dependencies, proved by Verus, tested on the host"
+edition = "2024"
+publish = false
+
+[dependencies]

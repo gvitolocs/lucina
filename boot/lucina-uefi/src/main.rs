@@ -35,8 +35,8 @@ use lucina_boot::{
     board,
     image::{self, Image},
     uefi::{
-        self, Config, ConfigError, Fb, MAX_PATH, MAX_RANGES, MemDesc, PSTORE_BASES, PSTORE_SIZE,
-        RESERVED_MEMORY, RESERVED_MEMORY_EDITS, RangeError, TreeError, TreeValues, edits,
+        self, Config, ConfigError, Fb, MAX_FIRMWARE_RANGES, MAX_PATH, MAX_RANGES, MemDesc, PSTORE_BASES,
+        PSTORE_SIZE, RESERVED_MEMORY, RESERVED_MEMORY_EDITS, RangeError, TreeError, TreeValues, edits,
         kernel_window, memory_ranges, suggest_base, type_name, RngSeed, RNG_SEED_BYTES,
     },
 };
@@ -838,6 +838,15 @@ fn prepare(
     if let Some(note) = rng_note {
         values.set_rng_note(note);
     }
+    // The memory the boot services held, which the firmware's controllers may still use after ExitBootServices: a kernel
+    // started with `lucina.fwranges=keep` (patch 1216) keeps these ranges out of its allocator. An older kernel ignores it.
+    let fw_dropped = values.set_firmware_ranges(descriptors(&map_buf[..used], desc_size));
+    if fw_dropped != 0 {
+        say!(
+            out,
+            "firmware ranges: {fw_dropped} left out of the device tree (at most {MAX_FIRMWARE_RANGES})"
+        );
+    }
     // Nothing about the saved log may stop a boot.
     let pstore = pstore.filter(|&region| match values.set_pstore(&fdt, region) {
         Ok(()) => true,
@@ -1036,6 +1045,8 @@ fn boot(efi: Efi, mut p: Prepared, band: Option<Screen>) -> ! {
         if let Some(note) = p.rng_note {
             values.set_rng_note(note);
         }
+        // From this map, the one the exit below uses; nothing can be printed from here on.
+        values.set_firmware_ranges(descriptors(&p.map_buf[..used], desc_size));
         let (e, k) = edits(&values);
         let Ok(len) = patch(&fdt, &e[..k], p.dtb_out) else {
             stop(&band, 4)

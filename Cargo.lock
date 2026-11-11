@@ -3063,6 +3063,10 @@ name = "lucina-ci-gadget"
 version = "0.1.0"
 
 [[package]]
+name = "lucina-cpubw"
+version = "0.1.0"
+
+[[package]]
 name = "lucina-cpufreq"
 version = "0.1.0"
 
@@ -3470,6 +3474,7 @@ dependencies = [
  "log",
  "lucina-boot",
  "lucina-random",
+ "lucina-release",
  "lucina-ufs",
  "rustix",
  "sha2 0.10.9",
@@ -3650,6 +3655,13 @@ version = "0.1.0"
 [[package]]
 name = "lucina-wifi-wake"
 version = "0.1.0"
+
+[[package]]
+name = "lucina-wm-rules"
+version = "0.1.0"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "lucinadesk-core"

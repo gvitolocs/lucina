@@ -79,7 +79,7 @@ impl Pty {
                 Ok(())
             });
         }
-        let child = cmd.spawn()?;
+        let child = crate::spawn::spawn(&mut cmd)?;
         Ok(Pty { master, child })
     }
 

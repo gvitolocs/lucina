@@ -9,7 +9,13 @@
 //! ssh buildhost cat <repo>/out/juno/apps-set | ssh root@host lucina-install-disk apps
 //! ssh root@host lucina-install-disk apps-status
 //! ssh root@host lucina-install-disk apps-rollback
+//! lucina-install-disk netinstall --server http://<host>:<port> --keys <file> --board <id> --base <hex> [--go-back]
 //! ```
+//!
+//! `netinstall` is `--root` with the stream from the network instead of stdin: the board's signed manifest, then the image in chunks
+//! each checked against it (`lucina_remote::netinst`, docs/design/lucina-net-installer.md). It refuses a manifest that writes
+//! beyond the board's compiled targets or has a lower sequence than `\lucinaos\netinst.seq` (unless `--go-back`), and a disk without
+//! root-a and root-b gets a table only after a `yes` typed on the console.
 //!
 //! It takes the stream `lucina-reload` takes, and needs `ufs=on ufs.write=main` on the running kernel; the UFS driver
 //! refuses every write to any other unit whatever this program does.
@@ -58,7 +64,7 @@ extern crate eyra;
 use std::{
     ffi::CString,
     fs::{self, File, OpenOptions},
-    io::{self, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     os::unix::fs::FileExt,
     path::Path,
     process::ExitCode,
@@ -66,20 +72,22 @@ use std::{
 };
 
 use lucina_remote::{
+    appset,
     disk::{
         FOLDER, LBA, LOADER, MOUNT, Mounted, RawTable, check_target, errno, ext2_on, in_folder,
         make_one_block, on_esp, overwrite_block, partition_named, sum_of, sync_all,
         write_lun0_blocks,
     },
     disk_rules::{self, Slot},
+    esp::release_apps_mount,
     gptw,
     image::{self, Extent, read_extent, sum_extent_head, uuid_hex},
-    appset,
-    esp::release_apps_mount,
     install::{
         LAPTOP_ESP, config_block, generation, initrd_name, is_generated, kernel_name,
         loader_knows_quiet, named_files, new_config, root_of, with_generation, with_root,
     },
+    netinst::{self, VerifiedChunks},
+    netinst_rules,
     stream::{Header, Part, arm64_image, hex},
 };
 use sha2::{Digest, Sha256};
@@ -158,7 +166,10 @@ impl Options {
                 "--test-stall-at" => o.stall_at = Some(value()?.clone()),
                 "--root-mib" => {
                     let v = value()?;
-                    o.root_mib = Some(v.parse().map_err(|_| format!("--root-mib {v}: not a number"))?);
+                    o.root_mib = Some(
+                        v.parse()
+                            .map_err(|_| format!("--root-mib {v}: not a number"))?,
+                    );
                 }
                 "--sha" => o.sha = Some(value()?.clone()),
                 "--root" => o.root = true,
@@ -328,11 +339,18 @@ fn receive_part(input: &mut impl Read, path: &Path, part: &Part) -> Result<(), S
 }
 
 /// Writes an image stream to a partition. It holds no file system this tool would recognise until the last extent lands.
-fn apply_image(input: &mut impl Read, device: &str, opts: &Options) -> Result<image::Header, String> {
+fn apply_image(
+    input: &mut impl Read,
+    device: &str,
+    opts: &Options,
+) -> Result<image::Header, String> {
     let header = image::Header::read(input)?;
     let room = lucina_remote::disk::device_blocks(device)?;
     if header.blocks > room {
-        return Err(format!("the image has {} blocks, {device} has {room}", header.blocks));
+        return Err(format!(
+            "the image has {} blocks, {device} has {room}",
+            header.blocks
+        ));
     }
     let f = OpenOptions::new()
         .write(true)
@@ -367,7 +385,11 @@ fn apply_image(input: &mut impl Read, device: &str, opts: &Options) -> Result<im
                 f.write_all_at(&buf[..chunk], at)
             }
             .map_err(|x| format!("writing {device} at {at}: {x}"))?;
-            sum.update(if e.zero { &zeros[..chunk] } else { &buf[..chunk] });
+            sum.update(if e.zero {
+                &zeros[..chunk]
+            } else {
+                &buf[..chunk]
+            });
             at += chunk as u64;
             left -= chunk as u64;
             bytes += chunk as u64;
@@ -378,16 +400,24 @@ fn apply_image(input: &mut impl Read, device: &str, opts: &Options) -> Result<im
         }
         // The last extent is block 0: everything before it is on the medium first.
         if n + 2 == header.extents {
-            f.sync_all().map_err(|x| format!("flushing {device}: {x}"))?;
+            f.sync_all()
+                .map_err(|x| format!("flushing {device}: {x}"))?;
         }
     }
     let got: [u8; 32] = sum.finalize().into();
     if got != header.sha256 {
         // Block 0 is on the medium with a good superblock, so take it back: nothing may mistake this for the image.
-        let _ = f.write_all_at(&zeros[..LBA as usize], 0).and_then(|()| f.sync_all());
-        return Err(format!("the image's sha256 is {}, its header says {}", hex(&got), hex(&header.sha256)));
+        let _ = f
+            .write_all_at(&zeros[..LBA as usize], 0)
+            .and_then(|()| f.sync_all());
+        return Err(format!(
+            "the image's sha256 is {}, its header says {}",
+            hex(&got),
+            hex(&header.sha256)
+        ));
     }
-    f.sync_all().map_err(|x| format!("flushing {device}: {x}"))?;
+    f.sync_all()
+        .map_err(|x| format!("flushing {device}: {x}"))?;
     println!(
         "{device}: {} MiB written in {} ms, {} MiB/s",
         bytes >> 20,
@@ -423,7 +453,11 @@ fn verify_image(device: &str, table: &[Extent], header: &image::Header) -> Resul
     }
     let got: [u8; 32] = sum.finalize().into();
     if got != header.sha256 {
-        return Err(format!("{device} reads back as {}, it should be {}", hex(&got), hex(&header.sha256)));
+        return Err(format!(
+            "{device} reads back as {}, it should be {}",
+            hex(&got),
+            hex(&header.sha256)
+        ));
     }
     println!(
         "verified: {device} reads back, sums match, uuid {}, {} MiB in {} ms, {} MiB/s",
@@ -470,7 +504,10 @@ fn gpt(opts: &Options, what: &str) -> Result<(), String> {
     match what {
         "plan" => {
             let plan = gptw::plan(&table.view(), esp, root_blocks(opts))?;
-            println!("both copies of the table are sound; LUN 0 has {} blocks", table.disk_blocks);
+            println!(
+                "both copies of the table are sound; LUN 0 has {} blocks",
+                table.disk_blocks
+            );
             println!("  p1 EFI system partition, LBA {}-{}: stays", esp.0, esp.1);
             for p in &plan.partitions {
                 println!(
@@ -479,7 +516,7 @@ fn gpt(opts: &Options, what: &str) -> Result<(), String> {
                     p.name,
                     p.first,
                     p.last,
-                    (p.last - p.first + 1) * LBA >> 20
+                    ((p.last - p.first + 1) * LBA) >> 20
                 );
             }
             if plan.already {
@@ -498,9 +535,15 @@ fn gpt(opts: &Options, what: &str) -> Result<(), String> {
                 println!("this table is on the disk already: nothing written");
                 return Ok(());
             }
-            let sha = opts.sha.as_deref().ok_or("gpt write needs --sha <the sum gpt plan printed>")?;
+            let sha = opts
+                .sha
+                .as_deref()
+                .ok_or("gpt write needs --sha <the sum gpt plan printed>")?;
             if sha != plan.sha256 {
-                return Err(format!("--sha {sha} is not this plan's sum, {}: nothing written", plan.sha256));
+                return Err(format!(
+                    "--sha {sha} is not this plan's sum, {}: nothing written",
+                    plan.sha256
+                ));
             }
             save_gpt_backup(&table, opts)?;
             opts.stage("gpt-backup-saved");
@@ -517,7 +560,9 @@ fn gpt(opts: &Options, what: &str) -> Result<(), String> {
             if !gptw::plan(&after.view(), esp, root_blocks(opts))?.already {
                 return Err("the table does not read back as written".into());
             }
-            println!("WRITTEN: both copies read back sound. The kernel lists the new partitions after a restart.");
+            println!(
+                "WRITTEN: both copies read back sound. The kernel lists the new partitions after a restart."
+            );
             Ok(())
         }
         "repair" => match gptw::repair(&table.view())? {
@@ -566,11 +611,15 @@ fn save_gpt_backup(table: &RawTable, opts: &Options) -> Result<(), String> {
 
 /// The /data partition's file system. Refuses to replace one unless told to.
 fn data(opts: &Options) -> Result<(), String> {
-    let (device, _) = partition_named(gptw::DATA)?.ok_or("LUN 0 has no data partition: run gpt write first")?;
+    let (device, _) =
+        partition_named(gptw::DATA)?.ok_or("LUN 0 has no data partition: run gpt write first")?;
     if let Some(info) = ext2_on(&device)?
         && !opts.format
     {
-        println!("{device} already holds a file system, label {:?}: nothing written (--format replaces it)", info.label);
+        println!(
+            "{device} already holds a file system, label {:?}: nothing written (--format replaces it)",
+            info.label
+        );
         return Ok(());
     }
     let mut input = BufReader::with_capacity(1 << 16, io::stdin().lock());
@@ -589,12 +638,19 @@ fn running_root(opts: &Options) -> Result<Option<String>, String> {
         .find_map(|a| a.strip_prefix("lucina.root.uuid="))
         .map(str::to_string);
     match (here, opts.running.clone()) {
-        (Some(h), Some(r)) if h != r => Err(format!("this system runs root {h}, --running says {r}")),
+        (Some(h), Some(r)) if h != r => {
+            Err(format!("this system runs root {h}, --running says {r}"))
+        }
         (h, r) => Ok(h.or(r)),
     }
 }
 
 fn install(opts: &Options) -> Result<(), String> {
+    install_from(opts, BufReader::with_capacity(1 << 16, io::stdin().lock()))
+}
+
+/// `install` with the stream from `input`: stdin, or the net installer's verified chunks.
+fn install_from(opts: &Options, mut input: impl BufRead) -> Result<(), String> {
     release_apps_mount();
     let base = opts
         .base
@@ -606,7 +662,6 @@ fn install(opts: &Options) -> Result<(), String> {
         Path::new(STAGING_DIR).join("kernel"),
         Path::new(STAGING_DIR).join("initrd"),
     );
-    let mut input = BufReader::with_capacity(1 << 16, io::stdin().lock());
     let header = Header::read(&mut input).map_err(|e| format!("the stream's header: {e}"))?;
     receive_part(&mut input, &kernel_tmp, &header.kernel)?;
     receive_part(&mut input, &initrd_tmp, &header.initrd)?;
@@ -676,7 +731,14 @@ fn install(opts: &Options) -> Result<(), String> {
         Some((slot, a, b, line)) => Some(with_root(line, &device_of(*slot, a, b), &"0".repeat(32))),
         None => opts.cmdline.clone(),
     };
-    let probe = new_config(&old, next, base, probe_line.as_deref(), opts.pause_s, opts.quiet)?;
+    let probe = new_config(
+        &old,
+        next,
+        base,
+        probe_line.as_deref(),
+        opts.pause_s,
+        opts.quiet,
+    )?;
     config_block(&probe)?;
     for file in named_files(&probe, FOLDER)? {
         let made = file.ends_with(&kernel_name) || file.ends_with(&initrd_name);
@@ -717,8 +779,14 @@ fn install(opts: &Options) -> Result<(), String> {
             MARGIN,
         )
         .err(),
-        None => (!disk_rules::esp_has_room(free, reclaimable, header.kernel.size, header.initrd.size, MARGIN))
-            .then_some(disk_rules::RootRefusal::NoRoom),
+        None => (!disk_rules::esp_has_room(
+            free,
+            reclaimable,
+            header.kernel.size,
+            header.initrd.size,
+            MARGIN,
+        ))
+        .then_some(disk_rules::RootRefusal::NoRoom),
     };
     match refusal {
         None => {}
@@ -727,7 +795,11 @@ fn install(opts: &Options) -> Result<(), String> {
                 "{free} bytes free on the ESP and {reclaimable} to be freed, {needed} needed; nothing was written"
             ));
         }
-        Some(why) => return Err(format!("the root slot is refused ({why:?}); nothing was written")),
+        Some(why) => {
+            return Err(format!(
+                "the root slot is refused ({why:?}); nothing was written"
+            ));
+        }
     }
     let cmdline = match root {
         Some((slot, a, b, line)) => {
@@ -742,7 +814,9 @@ fn install(opts: &Options) -> Result<(), String> {
                 esp.unmount()?;
                 esp = Mounted::new(&device, false)?;
                 if Path::new(&prev_path).exists() {
-                    return Err(format!("{prev_path} is still there after its removal; nothing else was written"));
+                    return Err(format!(
+                        "{prev_path} is still there after its removal; nothing else was written"
+                    ));
                 }
                 println!("PREV.CFG removed: its root on {slot} is overwritten next");
             }
@@ -752,7 +826,10 @@ fn install(opts: &Options) -> Result<(), String> {
         None => opts.cmdline.clone(),
     };
     // The home screen's "Generation N" (lucina.generation=).
-    let cmdline = Some(with_generation(&cmdline.unwrap_or_else(|| command_line(&old)), next));
+    let cmdline = Some(with_generation(
+        &cmdline.unwrap_or_else(|| command_line(&old)),
+        next,
+    ));
     let new = new_config(
         &old,
         next,
@@ -925,18 +1002,25 @@ fn status(opts: &Options) -> Result<(), String> {
             Some((device, blocks)) => match ext2_on(&device)? {
                 Some(i) => println!(
                     "{name}: {device}, {} MiB, ext2 uuid {} label {:?}, {} MiB file system",
-                    blocks * LBA >> 20,
+                    (blocks * LBA) >> 20,
                     uuid_hex(&i.uuid),
                     i.label,
-                    i.blocks * LBA >> 20
+                    (i.blocks * LBA) >> 20
                 ),
-                None => println!("{name}: {device}, {} MiB, no file system", blocks * LBA >> 20),
+                None => println!(
+                    "{name}: {device}, {} MiB, no file system",
+                    (blocks * LBA) >> 20
+                ),
             },
             None => println!("{name}: no such partition"),
         }
     }
     if let Ok(prev) = fs::read_to_string(in_folder("PREV.CFG")) {
-        println!("previous: generation {}, root {:?}", generation(&prev), root_of(&prev));
+        println!(
+            "previous: generation {}, root {:?}",
+            generation(&prev),
+            root_of(&prev)
+        );
     }
     Ok(())
 }
@@ -1035,7 +1119,10 @@ const IMAGE_MANIFESTS: &str = "/usr/share/lucina/apps";
 /// (`start_disk_apps` runs only when the image has none, since 2026-11-02), so a set there would only take room the kernels need.
 fn image_has_apps() -> bool {
     fs::read_dir(IMAGE_MANIFESTS)
-        .map(|d| d.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".app")))
+        .map(|d| {
+            d.flatten()
+                .any(|e| e.file_name().to_string_lossy().ends_with(".app"))
+        })
         .unwrap_or(false)
 }
 
@@ -1186,6 +1273,157 @@ fn apps_rollback(opts: &Options) -> Result<(), String> {
     Ok(())
 }
 
+/// The options of `netinstall` that are not `install`'s.
+struct NetOptions {
+    server: String,
+    keys: String,
+    board: String,
+    go_back: bool,
+}
+
+fn net_options(args: &[String]) -> Result<(NetOptions, Vec<String>), String> {
+    let (mut server, mut keys, mut board, mut go_back) = (None, None, None, false);
+    let (mut rest, mut it) = (Vec::new(), args.iter());
+    while let Some(a) = it.next() {
+        let mut value = || {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{a} needs a value"))
+        };
+        match a.as_str() {
+            "--server" => server = Some(value()?),
+            "--keys" => keys = Some(value()?),
+            "--board" => board = Some(value()?),
+            "--go-back" => go_back = true,
+            _ => rest.push(a.clone()),
+        }
+    }
+    let need = |v: Option<String>, name: &str| v.ok_or_else(|| format!("netinstall needs {name}"));
+    Ok((
+        NetOptions {
+            server: need(server, "--server http://<host>:<port>")?,
+            keys: need(keys, "--keys <file>")?,
+            board: need(board, "--board <id>")?,
+            go_back,
+        },
+        rest,
+    ))
+}
+
+/// The sequence number of the manifest installed on this machine: `\lucinaos\netinst.seq` on the ESP. Absent is `None`; a file that
+/// is not a number is an error, not "absent".
+fn installed_seq(opts: &Options) -> Result<Option<u64>, String> {
+    release_apps_mount();
+    let (device, _) = check_target(opts.expected_esp())?;
+    let esp = Mounted::new(&device, true)?;
+    let path = on_esp(netinst_rules::SEQ_FILE);
+    let seq = match fs::read_to_string(&path) {
+        Ok(text) => Some(
+            netinst_rules::parse_seq(&text)
+                .ok_or_else(|| format!("{path} is not a sequence number"))?,
+        ),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{path}: {e}")),
+    };
+    drop(esp);
+    Ok(seq)
+}
+
+/// Records the installed manifest's sequence: a new name, flushed, then renamed over the old.
+fn write_seq(opts: &Options, seq: u64) -> Result<(), String> {
+    let (device, _) = check_target(opts.expected_esp())?;
+    let mut esp = Mounted::new(&device, false)?;
+    let folder = on_esp("lucinaos");
+    if !Path::new(&folder).exists() {
+        fs::create_dir(&folder).map_err(|e| format!("{folder}: {e}"))?;
+    }
+    let (new, path) = (
+        on_esp("lucinaos/netinst.seq.new"),
+        on_esp(netinst_rules::SEQ_FILE),
+    );
+    let _ = fs::remove_file(&new);
+    let mut out = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&new)
+        .map_err(|e| format!("{new}: {e}"))?;
+    out.write_all(netinst_rules::seq_text(seq).as_bytes())
+        .and_then(|()| out.sync_all())
+        .map_err(|e| format!("writing {new}: {e}"))?;
+    drop(out);
+    sync_all();
+    fs::rename(&new, &path).map_err(|e| format!("{new} -> {path}: {e}"))?;
+    sync_all();
+    esp.unmount()
+}
+
+/// One line from the machine's own console.
+fn read_tty_line() -> Result<String, String> {
+    let tty = File::open("/dev/tty").map_err(|e| format!("/dev/tty: {e}"))?;
+    let mut line = String::new();
+    BufReader::new(tty)
+        .read_line(&mut line)
+        .map_err(|e| format!("/dev/tty: {e}"))?;
+    Ok(line)
+}
+
+/// A disk without root-a and root-b: shows what `gpt plan` makes, and writes it only after a `yes` typed on the console.
+fn make_layout(opts: &mut Options) -> Result<(), String> {
+    let has = |name| partition_named(name).map(|p| p.is_some());
+    if !netinst_rules::needs_layout(has(gptw::ROOT_A)?, has(gptw::ROOT_B)?) {
+        return Ok(());
+    }
+    println!(
+        "netinstall: LUN 0 has no Lucina layout (root-a and root-b). This is what gpt write would make:"
+    );
+    gpt(opts, "plan")?;
+    print!("type yes to write this table to LUN 0: ");
+    let _ = io::stdout().flush();
+    if !netinst_rules::yes_typed(&read_tty_line()?) {
+        return Err("no yes was typed on the console: nothing was written".into());
+    }
+    println!("netinstall: yes was typed on the console; writing the table");
+    let plan = gptw::plan(
+        &RawTable::read()?.view(),
+        opts.expected_esp(),
+        root_blocks(opts),
+    )?;
+    opts.sha = Some(plan.sha256);
+    gpt(opts, "write")
+}
+
+/// `netinstall --server http://<host>:<port> --keys <file> --board <id> [--go-back] [install's options]`: the signed manifest,
+/// then the image it names chunk by chunk through `install` as `--root` runs it.
+fn netinstall(args: &[String]) -> Result<(), String> {
+    let (net, rest) = net_options(args)?;
+    let mut opts = Options::parse(&rest)?;
+    opts.root = true;
+    let keys = fs::read_to_string(&net.keys).map_err(|e| format!("{}: {e}", net.keys))?;
+    let installed = installed_seq(&opts)?;
+    match installed {
+        Some(n) => println!("netinstall: installed sequence on this machine: {n}"),
+        None => println!("netinstall: no installed sequence on this machine"),
+    }
+    let m = netinst::fetch_manifest(&net.server, &net.board, &keys, installed, net.go_back)?;
+    println!(
+        "netinstall: manifest verified: board {}, commit {}, date {}, seq {}, {} bytes in {} chunks",
+        m.board,
+        m.commit,
+        m.date,
+        m.seq,
+        m.size,
+        m.chunks.len()
+    );
+    make_layout(&mut opts)?;
+    let seq = m.seq;
+    let chunks = VerifiedChunks::new(&net.server, &format!("/{}/disk-stream", net.board), m)?;
+    install_from(&opts, BufReader::with_capacity(1 << 16, chunks))?;
+    write_seq(&opts, seq)
+        .map_err(|e| format!("INSTALLED, but the sequence {seq} was not recorded: {e}"))?;
+    println!("netinstall: sequence {seq} recorded");
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (command, rest) = match args.first().map(String::as_str) {
@@ -1196,6 +1434,7 @@ fn main() -> ExitCode {
         Some("apps") => ("apps", &args[1..]),
         Some("apps-status") => ("apps-status", &args[1..]),
         Some("apps-rollback") => ("apps-rollback", &args[1..]),
+        Some("netinstall") => return finish(netinstall(&args[1..])),
         _ => ("install", &args[..]),
     };
     let result = Options::parse(rest).and_then(|opts| match command {
@@ -1208,6 +1447,10 @@ fn main() -> ExitCode {
         "apps-rollback" => apps_rollback(&opts),
         _ => install(&opts),
     });
+    finish(result)
+}
+
+fn finish(result: Result<(), String>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

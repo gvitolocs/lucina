@@ -1,0 +1,9 @@
+[package]
+name = "lucina-wm-rules"
+version = "0.1.0"
+description = "Juno's window manager rules, pure and device-neutral: swipe tracking and release targets, spring and rubber band, spaces, the app switcher order, overview layout, tiling. no_std; the integer rules are proved by Verus. docs/design/juno-window-manager.md"
+edition = "2024"
+publish = false
+
+[dependencies]
+libm = "0.2"

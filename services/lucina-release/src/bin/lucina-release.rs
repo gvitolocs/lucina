@@ -12,6 +12,9 @@ usage:
   lucina-release sign <manifest.unsigned> > manifest
         the private key (32-byte seed, base64) is read ONLY from the environment variable LUCINA_RELEASE_KEY
   lucina-release verify --keys <file of base64 public keys, one per line> <manifest>
+  lucina-release serve <dir> --addr <ip:port>
+        GET and HEAD of the files of <dir> over HTTP/1.1, with byte ranges: the LAN server a net installer stick
+        downloads from (docs/design/lucina-net-installer.md section 4). One log line per request on stderr.
   lucina-release keygen-test
         prints a throwaway test seed and its public key. For tests and QEMU ONLY: never a release key.
 ";
@@ -115,6 +118,20 @@ fn check(mut args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+fn serve(mut args: Vec<String>) -> Result<(), String> {
+    let addr: std::net::SocketAddr = need(&mut args, "--addr")?
+        .parse()
+        .map_err(|_| "--addr is not an <ip:port> to listen on".to_string())?;
+    let [dir] = args.as_slice() else {
+        return Err("exactly one folder to serve is needed".into());
+    };
+    let dir = std::path::Path::new(dir);
+    if !dir.is_dir() {
+        return Err(format!("{} is not a folder", dir.display()));
+    }
+    lucina_release::serve::serve(dir, addr).map_err(|e| format!("serve: {e}"))
+}
+
 fn keygen_test() -> Result<(), String> {
     let mut seed = [0u8; 32];
     std::fs::File::open("/dev/urandom")
@@ -138,6 +155,7 @@ fn main() -> ExitCode {
         "make" => make(args),
         "sign" => sign(args),
         "verify" => check(args),
+        "serve" => serve(args),
         "keygen-test" => keygen_test(),
         _ => Err(format!("unknown command `{cmd}`\n{USAGE}")),
     };

@@ -38,12 +38,13 @@ pub fn enter() -> String {
 /// Out of standby: Wi-Fi to the saved network again, as lucina-watchd does it, then the mark goes. The command runs on its own
 /// (a thread waits for it), so the wake does not wait for the association.
 pub fn leave() -> String {
-    let started = Command::new(WIFI_COMMAND)
-        .args(["connect", "--saved"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    let started = crate::spawn::spawn(
+        Command::new(WIFI_COMMAND)
+            .args(["connect", "--saved"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
     let _ = fs::remove_file(MARK);
     match started {
         Ok(mut child) => {

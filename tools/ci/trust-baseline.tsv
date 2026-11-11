@@ -12,13 +12,15 @@ shipped/lucina-q6/rules	solver	8
 shipped/lucina-uvc/rules	solver	8
 shipped/lucina-venus/rules	solver	9
 shipped/lucina-voice-stream/rules	solver	1
+shipped/lucina-wm-rules/tile_rules	solver	7
 verus/aarch64-pt/descriptor	solver	33
 verus/aarch64-pt/walk	solver	75
 verus/armv7-pt/mirror	solver	8
 verus/bootimg/layout	solver	1
 verus/juno-audio-ledger/rules	solver	3
 verus/juno-audio-wake/rules	solver	4
-verus/juno-charge/rules	solver	2
+verus/juno-charge/rules	solver	3
+verus/juno-cpubw/rules	solver	4
 verus/juno-cpufreq/rules	escape	1
 verus/juno-cpufreq/rules	solver	2
 verus/juno-gpu-vm/rules	solver	9
@@ -30,6 +32,7 @@ verus/juno-kexec/rules	solver	20
 verus/juno-modem-witness/rules	solver	2
 verus/juno-parse-caps/rules	solver	4
 verus/juno-power/rules	solver	4
+verus/juno-rcu/rules	solver	7
 verus/juno-ring/rules	solver	12
 verus/juno-tcpbuf/rules	solver	6
 verus/juno-wifi-wake/rules	solver	3

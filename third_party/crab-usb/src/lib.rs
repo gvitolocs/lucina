@@ -29,7 +29,7 @@ pub use host::*;
 pub use crate::backend::kmod::*;
 pub use crate::backend::ty::{
     Event,
-    ep::{EndpointHandle, OwnedCompletion, OwnedRequest, SubmitError},
+    ep::{EndpointHandle, OwnedCompletion, OwnedRequest, RequestWait, SubmitError},
 };
 
 define_int_type!(BusAddr, u64);
@@ -38,7 +38,7 @@ pub type Mmio = NonNull<u8>;
 
 /// Which LucinaOS revision of crab-usb 0.12.1 this is (see LUCINA-CHANGES.md). It exists only in this copy: `aster-usb`
 /// uses it, so the kernel cannot compile against the crate from crates.io.
-pub const LUCINA_REVISION: u32 = 5;
+pub const LUCINA_REVISION: u32 = 6;
 
 /// For testing recovery from an event off its ring, which real hardware does not do on demand: every Nth change of
 /// endpoint between transfer events (0: none), the event gets the previous event's pointer, as a torn read of the event

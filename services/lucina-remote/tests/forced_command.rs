@@ -81,36 +81,56 @@ fn rig(name: &str) -> Option<Rig> {
         ),
     )
     .unwrap();
-    let port = {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    // A free port is picked by binding port 0 and letting go of it, and a parallel test can pick the same number in between: its server
+    // then answers our probe, and when that test ends the port is closed ("Connection refused" on the CI runner, 2026-11-11). So the
+    // port is ours only once OUR server's log says it listens on it; if it exited or could not bind, another port is tried.
     let server_log = dir.join("server.log");
-    let log = fs::File::create(&server_log).unwrap();
-    let server = Command::new(env!("CARGO_BIN_EXE_lucina-sshd"))
-        .args([
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--shell",
-            "/bin/sh",
-            "-v",
-        ])
-        .arg("--host-key")
-        .arg(&host)
-        .arg("--authorized-keys")
-        .arg(&authorized)
-        .stdout(log.try_clone().unwrap())
-        .stderr(log)
-        .spawn()
-        .unwrap();
-    let started = Instant::now();
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+    let mut attempt = 0;
+    let (port, server) = loop {
+        attempt += 1;
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let log = fs::File::create(&server_log).unwrap();
+        let mut server = Command::new(env!("CARGO_BIN_EXE_lucina-sshd"))
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{port}"),
+                "--shell",
+                "/bin/sh",
+                "-v",
+            ])
+            .arg("--host-key")
+            .arg(&host)
+            .arg("--authorized-keys")
+            .arg(&authorized)
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let listening = loop {
+            let text = fs::read_to_string(&server_log).unwrap_or_default();
+            if text.contains(&format!("listening on 127.0.0.1:{port}")) {
+                break true;
+            }
+            if server.try_wait().unwrap().is_some() || started.elapsed() > Duration::from_secs(5) {
+                break false;
+            }
+            sleep(Duration::from_millis(20));
+        };
+        if listening {
+            break (port, server);
+        }
+        let _ = server.kill();
+        let _ = server.wait();
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the server did not start"
+            attempt < 5,
+            "the server did not start: {}",
+            fs::read_to_string(&server_log).unwrap_or_default()
         );
-        sleep(Duration::from_millis(20));
-    }
+    };
     Some(Rig {
         dir,
         port,

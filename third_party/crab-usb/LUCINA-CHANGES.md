@@ -205,6 +205,50 @@ the fix is in this crate's API only.
 
 The kernel's callers (`aster-usb` storage and HID, `aster-usb-net` pipes and AX88179) move to the owned API in patch 1062.
 
+## A cancelled transfer is taken off the ring as Linux kills an URB (Juno patch 1196b, 2026-11-11; revision 6)
+
+`cancel_request` on xHCI only set a flag, and the request stayed in flight until its own event. It now follows
+`xhci_urb_dequeue`: the TD joins `cancelled_tds` (Linux `cancelled_td_list`) and a pass starts (`cancel_op`) unless one
+runs or a soft retry holds the endpoint; a TD cancelled meanwhile joins the next pass. A TD whose completion is in
+already is not cancelled (`usb_start_wait_urb` returns the completion of a transfer that finished as the timeout fired).
+
+- Stop Endpoint (`xhci_handle_cmd_stop_ep`): a context state error is read against the endpoint state in the output
+  device context. Halted: Reset Endpoint (no TSP) first, and the TD the endpoint halted on is stepped over too
+  (`find_halted_td`). Stopped: go on. Running: stop again (at most 3 times, ours; Linux has no bound), then the pass
+  is given up and the TDs' buffers go to the quarantine.
+- Invalidate (`xhci_invalidate_cancelled_tds`): the TR Dequeue Pointer and DCS come from the endpoint context of the
+  output device context (`xhci_get_hw_deq`; new `OutContext`, shared with the device, `Endpoint::set_out_context`);
+  without it, from a Stopped event. The cancelled TD holding that pointer gets a Set TR Dequeue Pointer to the TRB after
+  its last (`Ring::past_td`, `xhci_move_dequeue_past_td`: walked from the hardware pointer, the cycle state toggled at
+  the Link TRB); every other cancelled TD is turned into Transfer No-Ops that keep only their cycle bit
+  (`Ring::td_to_noop`, `trb_to_noop`). Linux 6.12 clears the chain bit and the other fields; the task text said to keep
+  the chain bit, this follows the source.
+- Give back (`xhci_handle_cmd_set_deq`, `xhci_giveback_invalidated_tds`): each cancelled TD is dropped (buffer and
+  mapping freed, or quarantined if the Set TR Dequeue Pointer failed for the TD the controller held, or the controller
+  is dead and not halted), `reclaim_request` returns `Err(Cancelled)`, and the doorbell restarts the remaining TDs.
+  The Stopped events of the TDs that go on are cleared first: a slot holds one event and drops a second.
+- `reclaim_request` drives the pass (as it does a soft retry) and returns `None` for a cancelled TD until it ends.
+  A Stopped, Stopped-Length-Invalid or Stopped-Short-Packet event on a TD that is not cancelled is not a completion
+  (`process_*_td`); it used to end the request with an error.
+- `submit_request` drives a pass its owner left unpolled (a cancel followed by a drop) and, while one still runs, queues
+  the TD without the doorbell, as Linux's `xhci_ring_ep_doorbell` does for `EP_STOP_CMD_PENDING | SET_DEQ_PENDING`;
+  the end of the pass rings it. The new TD is no part of the pass (`first_new_id`): it lies behind the enqueue point of
+  the stop, is never turned into No-Ops and the new dequeue pointer does not reach it. No-Op TRBs still ahead of the
+  controller count against the ring's room (`stale_noops`) until a later TD completes.
+- `Endpoint::stop_future`, which `Device::stop_endpoints` / `_disconnect` send before a reconfiguration, no longer sends
+  Stop Endpoint to an endpoint whose output-context state is already Stopped (a cancel pass leaves it so when no TD is
+  left to restart): the Context State Error failed `set_alternate`, and every later stream start with it. Linux sends no
+  Stop to reconfigure and takes the error on a stopped endpoint as done (`xhci_handle_cmd_stop_ep`). A halted endpoint
+  is reset first, a running one that answers with the error is stopped again (at most 3 times). The cancel pass reads
+  the error against the same state (`stop_state`).
+- `EndpointHandle::wait_with_id` returns a `RequestWait` that keeps the request id, so a caller with a deadline can
+  `cancel` it and go on polling the same wait until it ends.
+
+Tests: `ring.rs` (the new dequeue pointer and DCS, the wrap over the Link TRB, the No-Op conversion), `context.rs` (the
+output context read), `endpoint.rs` (the whole pass against a played controller: No-Op path, Set TR Dequeue Pointer
+path, a failed Set TR Dequeue Pointer, halted endpoint, endless race, joined pass, completion before cancel, Stopped
+events).
+
 ## Tests
 
 The tests are in the xHCI `device.rs` (`lucina_tests`, run by `scripts/ci.sh`), with the descriptors from the laptop's

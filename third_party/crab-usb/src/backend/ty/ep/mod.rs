@@ -300,8 +300,15 @@ impl EndpointHandle {
     /// Submits `request` and waits for it. Dropping the future before it completes leaves the request in flight, its
     /// buffer still owned by the endpoint.
     pub async fn wait(&self, request: OwnedRequest) -> Result<OwnedCompletion, TransferError> {
+        Ok(self.wait_with_id(request)?.await?)
+    }
+
+    /// Submits `request` and returns the wait for it, which keeps the request's id: a caller with a deadline polls it,
+    /// and at the deadline [`cancel`](Self::cancel)s [`RequestWait::id`] and goes on polling the same wait until it
+    /// completes (a cancelled request ends with `Err(Cancelled)` once the controller is done with its buffer).
+    pub fn wait_with_id(&self, request: OwnedRequest) -> Result<RequestWait<'_>, SubmitError> {
         let id = self.submit(request)?;
-        EndpointRequestFuture { id, endpoint: self }.await
+        Ok(RequestWait { id, endpoint: self })
     }
 
     #[allow(unused)]
@@ -339,12 +346,19 @@ impl EndpointHandle {
     }
 }
 
-struct EndpointRequestFuture<'a> {
+/// A request submitted with [`EndpointHandle::wait_with_id`], waiting for its completion.
+pub struct RequestWait<'a> {
     id: RequestId,
     endpoint: &'a EndpointHandle,
 }
 
-impl Future for EndpointRequestFuture<'_> {
+impl RequestWait<'_> {
+    pub fn id(&self) -> RequestId {
+        self.id
+    }
+}
+
+impl Future for RequestWait<'_> {
     type Output = Result<OwnedCompletion, TransferError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {

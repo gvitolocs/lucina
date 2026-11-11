@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 use std::io::Read;
 
 pub mod rules;
+pub mod serve;
 
 pub const MAGIC: &str = "LUCINA-MANIFEST 1";
 pub const DEFAULT_CHUNK: u32 = 4 * 1024 * 1024;
