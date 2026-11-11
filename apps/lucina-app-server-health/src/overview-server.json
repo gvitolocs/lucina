@@ -1,0 +1,404 @@
+{
+  "attention": [
+    {
+      "caused": [
+        "lucina-maps"
+      ],
+      "component_id": "gmaps-server",
+      "criticality": "medium",
+      "details": [
+        "user unit gmaps-server.service: inactive/dead",
+        "port 18210: not listening",
+        "sentinel: inactive (dead)"
+      ],
+      "failures_24h": 142,
+      "flapping": false,
+      "group": "Lucina",
+      "host": "buildhost",
+      "impact": {
+        "broken": [
+          {
+            "id": "lucina-maps",
+            "name": "lucina-maps name"
+          }
+        ],
+        "degraded": [],
+        "public_hostnames_broken": [
+          "maps.example.com"
+        ]
+      },
+      "key": "catalog:gmaps-server",
+      "kind": "service",
+      "logs": "journalctl --user -u gmaps-server -n 100 --no-pager",
+      "project": "secretary",
+      "restart": "systemctl --user restart gmaps-server",
+      "runbook": null,
+      "severity": "crit",
+      "since": "2026-10-28T18:00:00Z",
+      "sources": [
+        "catalog",
+        "sentinel"
+      ],
+      "summary": "Not running; port 18210 not listening",
+      "title": "gmaps-server name"
+    },
+    {
+      "caused": [],
+      "component_id": "oracle-peer1",
+      "criticality": "high",
+      "details": [
+        "unreachable: ssh: connect timed out"
+      ],
+      "failures_24h": null,
+      "flapping": false,
+      "group": "Lucina",
+      "host": null,
+      "impact": null,
+      "key": "catalog:oracle-peer1",
+      "kind": "host",
+      "logs": null,
+      "project": "secretary",
+      "restart": null,
+      "runbook": null,
+      "severity": "crit",
+      "since": "2026-10-28T19:00:00Z",
+      "sources": [
+        "catalog"
+      ],
+      "summary": "ssh: connect timed out",
+      "title": "oracle-peer1 / p2 (Oracle VM)"
+    },
+    {
+      "caused": [],
+      "component_id": "rails-sync",
+      "criticality": "high",
+      "details": [
+        "sentinel: failed (exit-code)"
+      ],
+      "failures_24h": null,
+      "flapping": false,
+      "group": "Lucina",
+      "host": "buildhost",
+      "impact": null,
+      "key": "catalog:rails-sync",
+      "kind": "timer",
+      "logs": null,
+      "project": "secretary",
+      "restart": null,
+      "runbook": null,
+      "severity": "warn",
+      "since": "2026-10-28T18:00:00Z",
+      "sources": [
+        "catalog",
+        "sentinel"
+      ],
+      "summary": "Failed",
+      "title": "rails-sync name"
+    },
+    {
+      "caused": [],
+      "component_id": null,
+      "criticality": null,
+      "details": [
+        "sentinel: active/running, 4 failures in 24h"
+      ],
+      "failures_24h": null,
+      "flapping": false,
+      "group": "Lucina",
+      "host": "buildhost",
+      "impact": null,
+      "key": "sentinel:buildhost:unit:lone-worker",
+      "kind": "service",
+      "logs": null,
+      "project": null,
+      "restart": null,
+      "runbook": null,
+      "severity": "warn",
+      "since": "2026-10-28T18:00:00Z",
+      "sources": [
+        "sentinel"
+      ],
+      "summary": "failed 4 times in 24 h",
+      "title": "lone-worker"
+    },
+    {
+      "caused": [],
+      "component_id": "buildhost",
+      "criticality": "high",
+      "details": [
+        "reachable: up 3 days, load 9 5 2, Tctl 95 °C"
+      ],
+      "failures_24h": null,
+      "flapping": false,
+      "group": "Lucina",
+      "host": null,
+      "impact": null,
+      "key": "catalog:buildhost",
+      "kind": "host",
+      "logs": null,
+      "project": "secretary",
+      "restart": null,
+      "runbook": null,
+      "severity": "warn",
+      "since": "2026-10-28T19:00:00Z",
+      "sources": [
+        "catalog"
+      ],
+      "summary": "up 3 days, load 9 5 2, Tctl 95 °C",
+      "title": "buildhost (home server)"
+    }
+  ],
+  "attention_count": 5,
+  "checks_ok": 5,
+  "checks_total": 8,
+  "flapping_count": 0,
+  "generated_at": "2026-10-28T21:50:00Z",
+  "hosts": [
+    {
+      "component_id": "buildhost",
+      "cpus": 16,
+      "disks": [
+        {
+          "free_gb": 422.0,
+          "mount": "/",
+          "size_gb": 1885.0,
+          "used_pct": 77.6
+        }
+      ],
+      "findings": [
+        "up 3 days, load 9 5 2, Tctl 95 °C"
+      ],
+      "history": null,
+      "id": "buildhost",
+      "kernel": null,
+      "last_report": "2026-10-28T21:48:00Z",
+      "limited": false,
+      "load": [
+        9.58,
+        5.03,
+        2.48
+      ],
+      "mem_used_pct": 33.3,
+      "name": "buildhost",
+      "os": "Ubuntu 26.04.1 LTS",
+      "reachable": true,
+      "role": "home server",
+      "state": "warn",
+      "tctl": 95.1,
+      "uptime": "23d 4h"
+    },
+    {
+      "component_id": "oracle-peer1",
+      "cpus": null,
+      "disks": [],
+      "findings": [],
+      "history": null,
+      "id": "oracle-peer1",
+      "kernel": null,
+      "last_report": "2026-10-28T21:45:00Z",
+      "limited": false,
+      "load": null,
+      "mem_used_pct": null,
+      "name": "peer1 / p2",
+      "os": null,
+      "reachable": false,
+      "role": "Oracle VM",
+      "state": "crit",
+      "tctl": null,
+      "uptime": null
+    },
+    {
+      "component_id": "buildhost2",
+      "cpus": null,
+      "disks": [],
+      "findings": [],
+      "history": null,
+      "id": "buildhost2",
+      "kernel": null,
+      "last_report": "2026-10-28T21:45:00Z",
+      "limited": true,
+      "load": null,
+      "mem_used_pct": null,
+      "name": "buildhost2",
+      "os": null,
+      "reachable": true,
+      "role": "Linux Mint laptop",
+      "state": "ok",
+      "tctl": null,
+      "uptime": null
+    },
+    {
+      "component_id": "mac",
+      "cpus": null,
+      "disks": [],
+      "findings": [],
+      "history": null,
+      "id": "mac",
+      "kernel": null,
+      "last_report": "2026-10-28T21:45:00Z",
+      "limited": false,
+      "load": null,
+      "mem_used_pct": null,
+      "name": "mac",
+      "os": null,
+      "reachable": false,
+      "role": "MacBook Air M4",
+      "state": "unknown",
+      "tctl": null,
+      "uptime": null
+    },
+    {
+      "component_id": null,
+      "cpus": null,
+      "disks": [],
+      "findings": [],
+      "history": null,
+      "id": "zz-other",
+      "kernel": null,
+      "last_report": "2026-10-28T21:45:00Z",
+      "limited": false,
+      "load": null,
+      "mem_used_pct": null,
+      "name": "zz-other",
+      "os": null,
+      "reachable": true,
+      "role": null,
+      "state": "ok",
+      "tctl": null,
+      "uptime": null
+    }
+  ],
+  "overall": "crit",
+  "services": [
+    {
+      "name": "Lucina",
+      "projects": [
+        {
+          "components": [
+            {
+              "criticality": "high",
+              "description": null,
+              "host": "buildhost",
+              "id": "gmaps-server",
+              "kind": "service",
+              "name": "gmaps-server name",
+              "state": "crit"
+            },
+            {
+              "criticality": "high",
+              "description": null,
+              "host": "buildhost",
+              "id": "lucina-maps",
+              "kind": "site",
+              "name": "lucina-maps name",
+              "state": "crit"
+            },
+            {
+              "criticality": "high",
+              "description": null,
+              "host": null,
+              "id": "buildhost",
+              "kind": "host",
+              "name": "buildhost (home server)",
+              "state": "warn"
+            },
+            {
+              "criticality": "high",
+              "description": null,
+              "host": null,
+              "id": "mac",
+              "kind": "host",
+              "name": "Mac (MacBook Air M4)",
+              "state": "idle"
+            },
+            {
+              "criticality": "high",
+              "description": null,
+              "host": null,
+              "id": "buildhost2",
+              "kind": "host",
+              "name": "buildhost2 (Linux Mint laptop)",
+              "state": "ok"
+            },
+            {
+              "criticality": "high",
+              "description": null,
+              "host": null,
+              "id": "oracle-peer1",
+              "kind": "host",
+              "name": "oracle-peer1 / p2 (Oracle VM)",
+              "state": "crit"
+            },
+            {
+              "criticality": "high",
+              "description": null,
+              "host": "buildhost",
+              "id": "rails-sync",
+              "kind": "timer",
+              "name": "rails-sync name",
+              "state": "ok"
+            }
+          ],
+          "id": "secretary",
+          "state": "crit"
+        }
+      ],
+      "state": "crit"
+    }
+  ],
+  "sources": {
+    "catalog": {
+      "at": "2026-10-28T21:45:00Z",
+      "error": null,
+      "ok": true
+    },
+    "ops": {
+      "at": "2026-10-28T21:50:00Z",
+      "error": null,
+      "ok": true
+    },
+    "sentinel": {
+      "at": "2026-10-28T21:48:00Z",
+      "error": null,
+      "ok": true
+    }
+  },
+  "timeline": [
+    {
+      "at": "2026-10-28T20:00:00Z",
+      "detail": "inactive (dead)",
+      "from": "ok",
+      "host": "buildhost",
+      "kind": "change",
+      "ops_id": null,
+      "project": null,
+      "severity": null,
+      "title": "gmaps-server",
+      "to": "crit"
+    },
+    {
+      "at": "2026-10-28T18:00:00Z",
+      "detail": null,
+      "from": null,
+      "host": null,
+      "kind": "deploy",
+      "ops_id": "op-1",
+      "project": "secretary",
+      "severity": null,
+      "title": "secretary-server deployed",
+      "to": null
+    },
+    {
+      "at": "2026-10-28T17:00:00Z",
+      "detail": null,
+      "from": null,
+      "host": null,
+      "kind": "incident",
+      "ops_id": "op-2",
+      "project": "buildhost",
+      "severity": "high",
+      "title": "buildhost overheating",
+      "to": null
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+[package]
+name = "lucina-app-support"
+version = "0.1.0"
+description = "What Juno's account apps share: a transport for /v1 off the UI thread, the cache files, text folding and dates"
+edition.workspace = true
+publish.workspace = true
+
+# No manifest.app here: scripts/gui-initramfs.sh only installs the crates that have one, so this stays a library.
+
+[dependencies]
+libc = "0.2"
+lucina-account = { path = "../../services/lucina-account" }
+lucina-app = { path = "../../apps/lucina-app" }
+serde_json = "1"
+# NFKD and NFD, for the same search folding as the web app (and lucina-grocery, which uses this crate too).
+unicode-normalization = "0.1"

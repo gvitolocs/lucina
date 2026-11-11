@@ -110,7 +110,7 @@ pub fn cargo_steps(owners: &BTreeSet<Owner>, changed: &[String]) -> Vec<(String,
         ));
         steps.push((
             "unit-tests".to_string(),
-            format!("cargo test --quiet --locked {p} --lib"),
+            format!("cargo test --quiet --locked {p} --bins --tests"),
             300,
         ));
     }

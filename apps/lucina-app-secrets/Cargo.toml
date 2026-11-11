@@ -1,0 +1,19 @@
+[package]
+name = "lucina-app-secrets"
+version = "0.1.0"
+description = "Secretary's Secrets on Juno: names and places in Infisical, and the paste-and-OK card. It never shows a stored value"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lucina-app = { path = "../../apps/lucina-app" }
+lucina-account = { path = "../../services/lucina-account", features = ["ui"] }
+serde_json = "1"
+
+[dev-dependencies]
+lucina-account = { path = "../../services/lucina-account", features = ["ui", "fake"] }
+lucina-ax = { path = "../../services/lucina-ax" }
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

@@ -13,4 +13,6 @@ paths = [
   '''boards/fortuna-secretary/src/ws\.rs$''',
   # Device logs and build outputs; never published (tools/ci/public-snapshot.rules).
   '''^evidence/''',
+  # Lock files: crate names and their sha256 checksums (a crate named crypto_secretbox reads as a key). Read by hand, 2026-11-10.
+  '''(^|/)Cargo\.lock$''',
 ]

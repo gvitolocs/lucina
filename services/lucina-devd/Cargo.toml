@@ -1,0 +1,37 @@
+[package]
+name = "lucina-devd"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Lucina's tools on Juno: dials out to her server with the machine's sign-in and runs her juno_* calls (screen, input, apps, files, status, settings, shell as the signed-in user, installs and reloads)"
+
+# Built as a static musl program for the initramfs (scripts/remote-initramfs.sh), as lucina-accountd is:
+#   cargo build --release -p lucina-devd --target aarch64-unknown-linux-musl
+
+[dependencies]
+libc = "0.2"
+png = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The machine's sign-in: a client from lucina-accountd, never the credential file.
+lucina-account = { path = "../../services/lucina-account" }
+# The keyboard map (`keys::code_for`), as the shell and the apps type.
+lucina-app = { path = "../../apps/lucina-app" }
+# lucina-eventd's readers: the `events` tool, `wait` on events, the forwarder.
+lucina-events = { path = "../../services/lucina-events" }
+# Keys, buttons, the wheel and the pointer, as lucina-app-desk's host writes them.
+lucina-inject = { path = "../../services/lucina-inject" }
+# Stage B: the apps' trees (`ui_tree`, `ui_act`), read through /run/lucina/ax (docs/research/juno-ax.md).
+lucina-ax = { path = "../../services/lucina-ax" }
+# Stage C: the apps' intents and her undo journal (docs/research/juno-intents.md).
+lucina-intent-host = { path = "../../services/lucina-intent-host" }
+lucina-intents = { path = "../../services/lucina-intents" }
+# The event log: the `reliability` tool reads it (docs/research/juno-event-log.md).
+lucina-evlog = { path = "../../kernel/lucina-evlog" }
+
+[dev-dependencies]
+lucina-account = { path = "../../services/lucina-account", features = ["fake"] }
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

@@ -1,0 +1,32 @@
+[package]
+name = "lucina-app-desk"
+version = "0.1.0"
+description = "A RustDesk viewer on Juno: lucinadesk-core for the protocol, rav1d for the video"
+license = "AGPL-3.0-only"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lucina-app = { path = "../../apps/lucina-app" }
+# The evdev writer, shared with lucina-devd.
+lucina-inject = { path = "../../services/lucina-inject" }
+libc = "0.2"
+lucina-vp8 = { path = "../../drivers/lucina-vp8" }
+# The browser host (`--host --web`): voxl's protocol, MIT, kept apart from the AGPL RustDesk code.
+lucina-desk-web = { path = "../../services/lucina-desk-web" }
+# The RustDesk protocol. AGPL, changed only upstream in the lucinadesk repo. A pinned commit, as for the other apps engines.
+lucinadesk-core = { git = "https://github.com/gvitolocs/lucinadesk-core", rev = "7d268486cfbd391ce66965da9cdef6719d35bc5c" }
+
+# The AV1 decoder: Rust with the NEON assembly of dav1d. From git, as the package on crates.io leaves out the header its assembly includes.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "2e7216c20ac2a75de204d6c8d7268b75a45959b4", default-features = false, features = ["asm", "asm_arm64_dotprod", "bitdepth_8", "bitdepth_16"] }
+[target.'cfg(not(target_arch = "aarch64"))'.dependencies]
+rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "2e7216c20ac2a75de204d6c8d7268b75a45959b4", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+
+[dev-dependencies]
+lucina-ax = { path = "../../services/lucina-ax" }
+serde_json = "1"
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

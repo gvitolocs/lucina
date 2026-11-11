@@ -1,0 +1,21 @@
+[package]
+name = "lucina-app-calendar"
+version = "0.1.0"
+description = "Secretary's Calendar on Juno: day, week and month views and new events, on the secretary-calendar engine"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lucina-app = { path = "../../apps/lucina-app" }
+lucina-account = { path = "../../services/lucina-account", features = ["ui"] }
+# The engine (its Event and, in the sample and test server, the expansion of recurring items). Pinned as lucina-reader
+# pins ink-*; changed only upstream in SecretaryIOS.
+secretary-calendar = { git = "https://github.com/gvitolocs/secretary-crates", rev = "92b5cab174406d17eeffd3b5bbf2cf2a19b4fa6a" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

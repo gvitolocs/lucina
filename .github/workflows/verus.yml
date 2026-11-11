@@ -8,6 +8,13 @@ on:
   push:
     branches: ['**']
   workflow_dispatch:
+    inputs:
+      deep:
+        description: Also run the deep tier (heavy configurations)
+        type: boolean
+        default: false
+  schedule:
+    - cron: '23 2 * * *'
 
 permissions:
   contents: read
@@ -46,10 +53,13 @@ jobs:
           REF: ${{ github.ref }}
           BEFORE: ${{ github.event.before }}
           SHA: ${{ github.sha }}
+          DEEP: ${{ inputs.deep }}
         run: |
           mkdir -p plan
+          extra=""
+          if [ "$DEEP" = true ]; then extra=--deep; fi
           tools/ci/lucina-ci/target/release/lucina-ci plan --event "$EVENT" --ref "$REF" --before "$BEFORE" --sha "$SHA" \
-            --plan plan/plan.txt --output "$GITHUB_OUTPUT"
+            --plan plan/plan.txt --output "$GITHUB_OUTPUT" $extra
           cp tools/ci/lucina-ci/target/release/lucina-ci plan/lucina-ci
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -88,12 +98,12 @@ jobs:
     needs: plan
     if: needs.plan.outputs.any == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: ${{ matrix.phase == 'deep' && 350 || 180 }}
     strategy:
       fail-fast: false
       max-parallel: ${{ fromJSON(vars.VERUS_MAX_PARALLEL || '4') }}
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
-    name: ${{ matrix.group }} (${{ matrix.phase }})
+    name: ${{ matrix.group }} (${{ matrix.phase }}) ${{ matrix.unit }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -116,21 +126,29 @@ jobs:
           plan/lucina-ci portable-workspace --write
           cargo metadata --format-version 1 > /dev/null
       - name: TLA+ checkers
-        if: matrix.phase == 'tla'
+        if: matrix.phase == 'tla' || matrix.phase == 'deep'
         run: |
           cargo install tla-mc --version 0.3.0 --locked
           cargo install tla-checker --version 0.24.11 --locked
+      - name: TLC, the Java cross-check (pinned release)
+        if: matrix.phase == 'deep'
+        run: |
+          curl -fsSL --retry 5 -o "$HOME/tla2tools.jar" https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          echo "e1f11b75c4b5bc4478ba0ac5cb6ae28e40a01b0016bc33e0aa97da22dfdbcd7f  $HOME/tla2tools.jar" | sha256sum -c --status
+          java -version
       - name: Run
         env:
           GROUP: ${{ matrix.group }}
           PHASE: ${{ matrix.phase }}
+          UNIT: ${{ matrix.unit }}
+          UNIT_MIN: ${{ matrix.phase == 'deep' && 330 || 60 }}
         run: |
           plan/lucina-ci run --group "$GROUP" --phase "$PHASE" --plan plan/plan.txt \
-            --verus ~/verus/verus-x86-linux/verus --out reports --unit-timeout-min 60
+            --verus ~/verus/verus-x86-linux/verus --out reports --unit-timeout-min "$UNIT_MIN" ${UNIT:+--unit "$UNIT"}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: reports-${{ matrix.group }}-${{ matrix.phase }}
+          name: reports-${{ matrix.group }}-${{ matrix.phase }}-${{ strategy.job-index }}
           path: reports/
           retention-days: 30
 

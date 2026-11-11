@@ -1,0 +1,58 @@
+[package]
+name = "lucina-account"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Juno's connection to the owner's Secretary account: /v1 client, QR sign-in, chat timeline, decisions, approvals"
+
+[dependencies]
+# Blocking HTTPS with rustls (ring) and the bundled webpki roots: Juno has no CA store. reqwest and tokio stay out: this
+# client talks to /v1, while secretary-core is the server's client for Lucina's /api/secretary contract.
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lucina-account-link = { path = "../../services/lucina-account-link" }
+# Lucina's token shapes, as web/src/lib/secrets.ts has them.
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-case"] }
+zeroize = "1"
+# Timeline merge and order, the sync cursor loop and pagination: the iPhone's rules, proved in SecretaryIOS
+# verification/verus/chat_merge.rs. Pinned as lucina-reader pins ink-*.
+lucina-app = { path = "../../apps/lucina-app", optional = true }
+secretary-chat = { git = "https://github.com/gvitolocs/secretary-crates", rev = "6c8c0ee58112af6233417db3e4b34733b161ba53" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[[example]]
+name = "net_probe"
+
+[features]
+# The sign-in screen on the Juno toolkit.
+ui = ["lucina-account-link/ui", "dep:lucina-app"]
+# An in-process stand-in for the Secretary server: the tests, and demos on the laptop without touching the live one.
+fake = []
+
+[[bin]]
+name = "lucina-secretary-fake"
+path = "src/bin/fake.rs"
+required-features = ["fake"]
+
+[[bin]]
+name = "lucina-accountd"
+path = "src/bin/accountd.rs"
+
+[[bin]]
+name = "lucina-account"
+path = "src/bin/account.rs"
+
+[[test]]
+name = "against_fake"
+required-features = ["fake"]
+
+[[test]]
+name = "service"
+required-features = ["fake"]
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

@@ -1,0 +1,21 @@
+[package]
+name = "lucina-app-vault"
+version = "0.1.0"
+description = "An Obsidian vault on Juno: plain Markdown on /data, wikilinks, backlinks, tags, search and graph, on the lucina-vault core"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lucina-app = { path = "../../apps/lucina-app" }
+# Sync with the owner vault on buildhost (src/sync.rs): the signed-in client and the system account service.
+lucina-account = { path = "../../services/lucina-account" }
+serde_json = "1"
+# The one core of the iOS, Mac and Android vault pages. Changed only upstream in SecretaryIOS.
+lucina-vault = { git = "https://github.com/gvitolocs/secretary-crates", rev = "7f79a4ebf6ee23280d9f154881effb31805c95a3" }
+
+[dev-dependencies]
+tempfile = "3"
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

@@ -1,0 +1,18 @@
+[package]
+name = "lucina-notebooks-sample"
+version = "0.1.0"
+description = "The real lucina-notebooks engine with made-up data and a made-up model, on loopback: for lucina-app-notebooks' tests and its QEMU run"
+edition.workspace = true
+publish.workspace = true
+
+# No manifest.app and no lucina-app- name: it is never installed. scripts/qemu-notebooks.sh adds it to the test image only.
+
+[dependencies]
+# The engine. Changed only upstream in SecretaryIOS.
+lucina-notebooks = { git = "https://github.com/gvitolocs/secretary-crates", rev = "7bd419174a7e51009341cc0fa29caae45c7d4660" }
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros"] }
+tower-service = "0.3"

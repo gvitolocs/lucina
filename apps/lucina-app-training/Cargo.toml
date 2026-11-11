@@ -1,0 +1,21 @@
+[package]
+name = "lucina-app-training"
+version = "0.1.0"
+description = "Secretary's Training on Juno: workouts, routines, journal, progress, on the secretary-gym engine's routes"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lucina-app = { path = "../../apps/lucina-app" }
+lucina-account = { path = "../../services/lucina-account", features = ["ui"] }
+lucina-files = { path = "../../services/lucina-files" }
+# The wire types, and in sample mode and the tests the engines themselves. Changed only upstream in SecretaryIOS.
+secretary-gym = { git = "https://github.com/gvitolocs/secretary-crates", rev = "22dc3aab8b1cf2a314cc32ec295ab5991fb81f27" }
+secretary-body = { git = "https://github.com/gvitolocs/secretary-crates", rev = "22dc3aab8b1cf2a314cc32ec295ab5991fb81f27" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+serde_json = "1"
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

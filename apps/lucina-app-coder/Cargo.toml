@@ -1,0 +1,20 @@
+[package]
+name = "lucina-app-coder"
+version = "0.1.0"
+description = "CodeCor on Juno: every coding agent as a native app; --terminal keeps the local Qwen launcher in the terminal"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc = "0.2"
+lucina-app = { path = "../../apps/lucina-app" }
+lucina-agents-client = { path = "../../services/lucina-agents-client" }
+lucina-account = { path = "../../services/lucina-account", features = ["ui"] }
+# The wire types and state buckets. Changed only upstream in SecretaryIOS.
+lucina-agents = { git = "https://github.com/gvitolocs/secretary-crates", rev = "7bd419174a7e51009341cc0fa29caae45c7d4660" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

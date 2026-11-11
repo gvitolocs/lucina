@@ -1,0 +1,11 @@
+[package]
+name = "lucina-picture-view"
+version = "0.1.0"
+description = "One picture on a Juno screen: decoding with the EXIF turn and JPEG XL, zoom and pan. Used by the viewer, Gallery and Drive"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lucina-app = { path = "../../apps/lucina-app" }
+# The viewer core every Secretary app shares: zoom and pan, progressive JPEG XL. Changed only upstream in SecretaryIOS.
+secretary-image = { git = "https://github.com/gvitolocs/secretary-crates", rev = "7bd419174a7e51009341cc0fa29caae45c7d4660" }

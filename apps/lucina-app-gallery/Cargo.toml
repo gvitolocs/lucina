@@ -1,0 +1,21 @@
+[package]
+name = "lucina-app-gallery"
+version = "0.1.0"
+description = "Secretary's Gallery on Juno: the photos as thumbnails first, viewed full screen, small on one CPU"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lucina-app = { path = "../../apps/lucina-app" }
+lucina-nav = { path = "../../services/lucina-nav" }
+lucina-account = { path = "../../services/lucina-account", features = ["ui"] }
+lucina-files = { path = "../../services/lucina-files" }
+lucina-picture-view = { path = "../../apps/lucina-picture-view" }
+lucina-app-support = { path = "../../apps/lucina-app-support" }
+# The viewer core every Secretary app shares: zoom and pan, ThumbHash. Changed only upstream in SecretaryIOS.
+secretary-image = { git = "https://github.com/gvitolocs/secretary-crates", rev = "7bd419174a7e51009341cc0fa29caae45c7d4660" }
+serde_json = "1"
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

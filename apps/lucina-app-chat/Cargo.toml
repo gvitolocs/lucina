@@ -1,0 +1,20 @@
+[package]
+name = "lucina-app-chat"
+version = "0.1.0"
+description = "Lucina's chat on Juno: the same timeline as the phone and the web"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lucina-app = { path = "../../apps/lucina-app" }
+lucina-account = { path = "../../services/lucina-account", features = ["ui"] }
+lucina-voice-stream = { path = "../../drivers/lucina-voice-stream", features = ["net"] }
+lucina-audio-decode = { path = "../../drivers/lucina-audio-decode" }
+
+[dev-dependencies]
+serde_json = "1"
+lucina-account = { path = "../../services/lucina-account", features = ["ui", "fake"] }
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

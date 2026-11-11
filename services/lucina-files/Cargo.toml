@@ -1,0 +1,15 @@
+[package]
+name = "lucina-files"
+version = "0.1.0"
+description = "What Juno's file-handling apps share: the media server's routes, the Drive's model, a picture cache on /data, a file picker"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lucina-app = { path = "../../apps/lucina-app" }
+lucina-nav = { path = "../../services/lucina-nav" }
+lucina-account = { path = "../../services/lucina-account", features = ["ui"] }
+lucina-app-support = { path = "../../apps/lucina-app-support" }
+libc = "0.2"
+png = "0.18"
+serde_json = "1"

@@ -1,0 +1,20 @@
+[package]
+name = "lucina-app-player"
+version = "0.1.0"
+description = "Audio player on Juno: this laptop's files and the media library, with Secretary's queue and resume"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lucina-app = { path = "../../apps/lucina-app" }
+lucina-app-support = { path = "../../apps/lucina-app-support" }
+lucina-account = { path = "../../services/lucina-account", features = ["ui"] }
+lucina-audio-decode = { path = "../../drivers/lucina-audio-decode" }
+# Queue and resume positions, as the other Secretary apps have them. Changed only upstream in SecretaryIOS.
+secretary-player = { git = "https://github.com/gvitolocs/secretary-crates", rev = "22dc3aab8b1cf2a314cc32ec295ab5991fb81f27" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

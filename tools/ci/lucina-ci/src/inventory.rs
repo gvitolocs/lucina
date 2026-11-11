@@ -36,6 +36,7 @@ impl Unit {
             "verus" | "shipped" => "proofs",
             "mutants" | "mutations" => "mutants",
             "models" => "models",
+            "deep" => "deep",
             "full" => "full",
             _ => "tla",
         }
@@ -380,6 +381,29 @@ pub fn discover(root: &Path) -> Result<Vec<Unit>, String> {
             "scripts/verify-models.sh".into(),
         ],
     });
+
+    // The deep tier: every heavy TLA+ configuration (`*.heavy.cfg`, too big for a laptop), once with tla-mc and once with TLC, the
+    // cross-check, each on its own runner. Only on demand, nightly and on main: docs/ci/VERUS.md.
+    let heavy = git(
+        root,
+        &["ls-files", "--", "specs/juno/*/*.heavy.cfg"],
+    )?;
+    let dirs: BTreeSet<String> = heavy.lines().filter_map(model_dir).collect();
+    for d in dirs {
+        let inputs = vec![
+            format!("specs/juno/{d}/"),
+            "specs/juno/run.sh".to_string(),
+        ];
+        let base = format!("ONLY={d} VERIFY_HEAVY=1 TLA_MAX_STATES=2000000000");
+        units.push(Unit {
+            name: format!("deep/tla-mc/{d}"),
+            group: group_of("deep")?,
+            kind: "deep".into(),
+            target: format!("{base} bash specs/juno/run.sh"),
+            inputs: inputs.clone(),
+        });
+        units.push(Unit { name: format!("deep/tlc/{d}"), group: group_of("deep")?, kind: "deep".into(), target: format!("{base} CHECKER=tlc TLC_HEAP=10g JAVA=java TLA_JAR=\"$HOME/tla2tools.jar\" bash specs/juno/run.sh"), inputs });
+    }
     // The whole of scripts/verify.sh on one machine: the end-to-end check that no proof slipped between the units.
     units.push(Unit {
         name: "full/verify-sh".into(),
@@ -489,9 +513,31 @@ pub fn to_markdown(units: &[Unit]) -> String {
     s
 }
 
+/// The model directory of a heavy configuration: the folder that holds the `.cfg`, whatever the layout above it
+/// (`specs/juno/<dir>/X.heavy.cfg` here, `specs/juno/<dir>/X.heavy.cfg` in the public copy).
+fn model_dir(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .parent()?
+        .file_name()?
+        .to_str()
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_heavy_config_names_its_model_directory_in_either_layout() {
+        assert_eq!(
+            model_dir("specs/juno/idle-wake/JunoIdleWake3.heavy.cfg").as_deref(),
+            Some("idle-wake")
+        );
+        assert_eq!(
+            model_dir("specs/juno/idle-wake/JunoIdleWake3.heavy.cfg").as_deref(),
+            Some("idle-wake")
+        );
+    }
 
     fn unit(inputs: &[&str]) -> Unit {
         Unit {

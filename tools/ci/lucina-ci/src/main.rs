@@ -164,6 +164,13 @@ fn cmd_plan(a: &Args) -> Result<i32, String> {
     let branch = git_ref.strip_prefix("refs/heads/").unwrap_or("");
     let only_group = branch.strip_prefix("proof/");
     let full = event != "push" || branch == "main";
+    // The deep tier runs on demand (--deep), nightly, and on main; never on an ordinary push or pull request.
+    let deep = a.has("--deep") || event == "schedule" || (event == "push" && branch == "main");
+    let pool: Vec<Unit> = units
+        .iter()
+        .filter(|u| deep || u.phase() != "deep")
+        .cloned()
+        .collect();
     let changed: Option<Vec<String>> = if full {
         None
     } else {
@@ -182,14 +189,22 @@ fn cmd_plan(a: &Args) -> Result<i32, String> {
         None
     };
     let single = one.is_some();
-    let chosen = one.unwrap_or_else(|| select(&units, changed.as_deref(), only_group));
-    let rows: BTreeSet<(String, String)> = chosen
+    let chosen = one.unwrap_or_else(|| select(&pool, changed.as_deref(), only_group));
+    // A deep unit gets a runner of its own; the others share one per group and phase.
+    let rows: BTreeSet<(String, String, String)> = chosen
         .iter()
-        .map(|u| (u.group.clone(), u.phase().to_string()))
+        .map(|u| {
+            let unit = if u.phase() == "deep" {
+                u.name.clone()
+            } else {
+                String::new()
+            };
+            (u.group.clone(), u.phase().to_string(), unit)
+        })
         .collect();
     let items: Vec<String> = rows
         .iter()
-        .map(|(g, p)| format!("{{\"group\":\"{g}\",\"phase\":\"{p}\"}}"))
+        .map(|(g, p, u)| format!("{{\"group\":\"{g}\",\"phase\":\"{p}\",\"unit\":\"{u}\"}}"))
         .collect();
     let matrix = format!("{{\"include\":[{}]}}", items.join(","));
     let plan: String = chosen.iter().map(|u| format!("{}\n", u.name)).collect();

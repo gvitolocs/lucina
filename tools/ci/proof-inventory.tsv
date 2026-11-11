@@ -1,4 +1,6 @@
 # Generated: lucina-ci inventory --write. Do not edit. unit<TAB>group<TAB>kind<TAB>target<TAB>inputs
+deep/tla-mc/idle-wake	deep	deep	ONLY=idle-wake VERIFY_HEAVY=1 TLA_MAX_STATES=2000000000 bash specs/juno/run.sh	specs/juno/idle-wake/,specs/juno/run.sh
+deep/tlc/idle-wake	deep	deep	ONLY=idle-wake VERIFY_HEAVY=1 TLA_MAX_STATES=2000000000 CHECKER=tlc TLC_HEAP=10g JAVA=java TLA_JAR="$HOME/tla2tools.jar" bash specs/juno/run.sh	specs/juno/idle-wake/,specs/juno/run.sh
 full/verify-sh	full	full	scripts/verify.sh	verification/
 models/stateright	models	models	scripts/verify-models.sh	Cargo.lock,Cargo.toml,crates/,scripts/verify-models.sh
 mutants/fortuna-library	fortuna	mutants	verification/fortuna-library/mutants.sh	boards/fortuna-library/,verification/fortuna-library/

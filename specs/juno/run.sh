@@ -29,6 +29,8 @@ tla=${TLA:-$HOME/.cargo/bin/tla}
 max_states=${TLA_MAX_STATES:-50000000}
 workers=${WORKERS:-4}
 java=${JAVA:-$HOME/tools/jdk-21.0.12.1+1/bin/java}
+# A bare name (JAVA=java on a CI runner) is looked up on PATH; [ -x ] below needs a path.
+case "$java" in */*) ;; *) java=$(command -v "$java" || echo "$java") ;; esac
 jar=${TLA_JAR:-$HOME/tools/tla/tla2tools.jar}
 case "$checker" in
     auto | tla-mc) [ -x "$tlamc" ] || { echo "juno-tla: no tla-mc at $tlamc (cargo install tla-mc --version 0.3.0 --locked)" >&2; exit 2; } ;;
@@ -67,8 +69,11 @@ run_tlc() {
 }
 
 status=0
+matched=0
+checked=0
 for dir in "$here"/*/; do
     [ -z "${ONLY:-}" ] || [ "$(basename "$dir")" = "$ONLY" ] || continue
+    matched=1
     for tla_file in "$dir"*.tla; do
         [ -e "$tla_file" ] || continue
         module=$(basename "$tla_file" .tla)
@@ -99,6 +104,16 @@ for dir in "$here"/*/; do
                 status=1
                 continue
             fi
+            want=$(sed -n 's/.*expect-states: *\([0-9][0-9]*\).*/\1/p' "$cfg" | head -n 1)
+            if [ -n "$want" ] && [ "$expect" = pass ]; then
+                # The last count in the log: TLC prints running totals in its progress lines, its final total last.
+                found=$(grep -oE '[0-9,]+ distinct states found|Reachable states: [0-9]+' "$log" | tail -n 1 | tr -d , | grep -oE '[0-9]+' | head -n 1)
+                if [ "$found" != "$want" ]; then
+                    echo "FAIL  $name ($used: expected $want distinct states, found ${found:-none}); log $log"
+                    status=1
+                    continue
+                fi
+            fi
             line="ok    $name ($used: $got${what:+, $what})"
             if [ "${TLC_CROSSCHECK:-0}" = 1 ] && [ "$checker" != tlc ]; then
                 log="$meta/tlc.log"
@@ -111,8 +126,11 @@ for dir in "$here"/*/; do
                 line="$line; TLC agrees"
             fi
             echo "$line"
+            checked=$((checked + 1))
             rm -rf "$meta"
         done
     done
 done
+if [ -n "${ONLY:-}" ] && [ "$matched" = 0 ]; then echo "FAIL  ONLY=$ONLY names no model directory"; status=1; fi
+if [ "$checked" = 0 ]; then echo "FAIL  no configuration was checked"; status=1; fi
 exit $status

@@ -25,7 +25,7 @@ lucina-remote = { path = "../../services/lucina-remote" }
 # that the calendar app pins, and the agents client for the pipeline board. Events come through lucina-app.
 lucina-account = { path = "../../services/lucina-account" }
 lucina-agents-client = { path = "../../services/lucina-agents-client" }
-secretary-calendar = { git = "file:///home/user/Projects/Lucina/SecretaryIOS", rev = "1dd77a2b109c30a0ded12a9df2bc3da5f006d633" }
+secretary-calendar = { git = "https://github.com/gvitolocs/secretary-crates", rev = "92b5cab174406d17eeffd3b5bbf2cf2a19b4fa6a" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10"
 # The Linux ABI: poll and the pty.
