@@ -9,6 +9,7 @@
 //! * [`panel`]: the panel from ABL's `msm_drm.dsi_display0=` and the device tree that matches it.
 //! * [`plan`]: where everything goes in RAM: kernel, device tree, and what has to move out of the way first.
 //! * [`band`]: the status band LucinaBoot paints on the boot framebuffer, its only output on surya.
+//! * [`board`]: which board LucinaUEFI is on: the device tree's `compatible` and SMBIOS against `\LUCINA\BOARDS`.
 //! * [`menu`]: what LucinaLoader (the UEFI boot menu that replaces GRUB for Linux) decides: menu file, keys, theme.
 //! * [`uefi`]: what LucinaUEFI (the UEFI loader for laptops) decides: config, memory map, framebuffer, tree edits.
 //!
@@ -20,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod band;
+pub mod board;
 pub mod image;
 pub mod menu;
 pub mod panel;

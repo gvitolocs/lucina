@@ -8,6 +8,7 @@
 //!   lucina-ci merge-check ...                  the lagent merge gate: did GitHub verify this commit?
 //!   lucina-ci green-commit|sync-plan|sync-gate the automatic public sync and the install gate (docs/ci/PUBLIC-SYNC.md)
 
+mod coverage;
 mod fast;
 mod inventory;
 mod runner;
@@ -103,7 +104,21 @@ fn cmd_inventory(a: &Args) -> Result<i32, String> {
         );
         return Ok(1);
     }
-    println!("{} units: inventory current", units.len());
+    // The public snapshot must hold every file a proof reads (the private tree only: the public one has no crates/ folder).
+    let gaps = coverage::check(&root, &units)?;
+    if !gaps.is_empty() {
+        for (unit, file) in &gaps {
+            eprintln!("{unit} reads {file}, which tools/ci/public-snapshot.rules leaves out");
+        }
+        eprintln!(
+            "the public copy would fail on GitHub with a missing file: add the crate to a `group` line (or the path to `include`) in tools/ci/public-snapshot.rules"
+        );
+        return Ok(1);
+    }
+    println!(
+        "{} units: inventory current, snapshot holds what the proofs read",
+        units.len()
+    );
     Ok(0)
 }
 
@@ -526,7 +541,7 @@ fn parse_runs(text: &str) -> Vec<CheckRun> {
     text.lines()
         .filter_map(|l| {
             let f: Vec<&str> = l.split('\t').collect();
-            (f.len() == 4).then(|| CheckRun {
+            (f.len() >= 4).then(|| CheckRun {
                 name: f[0].into(),
                 status: f[1].into(),
                 conclusion: f[2].into(),
@@ -564,7 +579,7 @@ fn cmd_merge_check(a: &Args) -> Result<i32, String> {
     } else {
         REQUIRED_CHECKS.iter().map(|s| s.to_string()).collect()
     };
-    let jq = r#".check_runs | sort_by(.id) | reverse | .[] | [.name, .status, (.conclusion // ""), .app.slug] | @tsv"#;
+    let jq = r#".check_runs | sort_by(.id) | reverse | .[] | [.name, .status, (.conclusion // ""), .app.slug, .id] | @tsv"#;
     let path = format!("repos/{repo}/commits/{sha}/check-runs?per_page=100");
     let o = Command::new("gh")
         .args(["api", "--paginate", &path, "--jq", jq])
@@ -576,7 +591,33 @@ fn cmd_merge_check(a: &Args) -> Result<i32, String> {
         );
         return Ok(1);
     }
-    let runs = parse_runs(&String::from_utf8_lossy(&o.stdout));
+    let text = String::from_utf8_lossy(&o.stdout).into_owned();
+    let runs = parse_runs(&text);
+    // A finished failed gate run in which no compile, test or proof step started (the runner's network failed in a setup step) is
+    // not a verdict on the commit: dropped, and the newest remaining result decides (docs/ci/AUTO-SYNC.md). A failure that ran stays.
+    let ids: Vec<String> = text
+        .lines()
+        .map(|l| l.split('\t').nth(4).unwrap_or("").to_string())
+        .collect();
+    let infra: Vec<bool> = runs
+        .iter()
+        .zip(&ids)
+        .map(|(r, id)| {
+            let finished_red = r.status == "completed" && r.conclusion != "success";
+            let non_verdict = finished_red
+                && r.app == "github-actions"
+                && required.contains(&r.name)
+                && gate_run_is_infra(&repo, id);
+            if non_verdict {
+                println!(
+                    "merge-check: not counting {} run {id} ({}): no compile, test or proof step started, only the runner's setup failed",
+                    r.name, r.conclusion
+                );
+            }
+            non_verdict
+        })
+        .collect();
+    let runs = sync::drop_non_verdicts(&runs, &infra);
     match verdict::merge_verdict(&runs, &required) {
         MergeVerdict::Pass => {}
         MergeVerdict::Pending(w) => {
@@ -732,6 +773,33 @@ fn cmd_sync_plan(a: &Args) -> Result<i32, String> {
     }
 }
 
+/// `alert-plan --seen no|held|told --newest yes|no`: prints `record notify` words (sync::alert_plan).
+fn cmd_alert_plan(a: &Args) -> Result<i32, String> {
+    let seen = match a.need("--seen")?.as_str() {
+        "no" => sync::SeenCause::No,
+        "held" => sync::SeenCause::HeldBack,
+        "told" => sync::SeenCause::Told,
+        o => return Err(format!("--seen {o}: no, held or told")),
+    };
+    let p = sync::alert_plan(seen, a.val("--newest").as_deref() == Some("yes"));
+    println!(
+        "{} {}",
+        if p.record { "record" } else { "quiet" },
+        if p.notify { "notify" } else { "hold" }
+    );
+    Ok(0)
+}
+
+/// `infra-check`: a failed job's log on stdin; exit 0 when the runner's network failed, not a test (sync::is_infra_failure).
+fn cmd_infra_check() -> Result<i32, String> {
+    use std::io::Read;
+    let mut log = String::new();
+    std::io::stdin()
+        .read_to_string(&mut log)
+        .map_err(|e| format!("stdin: {e}"))?;
+    Ok(if sync::is_infra_failure(&log) { 0 } else { 1 })
+}
+
 /// `sync-gate --repo R --sha PUBSHA --fast-forward yes|no [--scan-clean yes]`: exit 0 main may move, 10 wait, 11 a gate never started (transient), 1 stop for good, 3 no answer.
 fn cmd_sync_gate(a: &Args) -> Result<i32, String> {
     let repo = a.need("--repo")?;
@@ -761,6 +829,55 @@ fn cmd_sync_gate(a: &Args) -> Result<i32, String> {
             })
         }
     }
+}
+
+/// Did this gate's run fail only because the runner's setup did? The gate is a job of a workflow run: its failed sibling jobs of the
+/// same attempt are read, and every one must be an infrastructure failure (`sync::is_infra_failure`, the narrow classifier) and
+/// at least one must exist. Anything gh cannot answer counts as a real failure.
+fn gate_run_is_infra(repo: &str, check_run_id: &str) -> bool {
+    let gh = |args: &[&str]| -> Option<String> {
+        let o = Command::new("gh").args(args).output().ok()?;
+        o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    let Some(job) = gh(&[
+        "api",
+        &format!("repos/{repo}/actions/jobs/{check_run_id}"),
+        "--jq",
+        "[.run_id, .run_attempt] | @tsv",
+    ]) else {
+        return false;
+    };
+    let mut w = job.split_whitespace();
+    let (Some(run), Some(attempt)) = (w.next(), w.next()) else {
+        return false;
+    };
+    let Some(jobs) = gh(&[
+        "api",
+        &format!("repos/{repo}/actions/runs/{run}/attempts/{attempt}/jobs"),
+        "--jq",
+        r#".jobs[] | select(.conclusion == "failure") | [.id, .name] | @tsv"#,
+    ]) else {
+        return false;
+    };
+    let mut failed = 0;
+    for l in jobs.lines() {
+        let Some((id, name)) = l.split_once('\t') else {
+            continue;
+        };
+        if name.ends_with("-gate") {
+            continue;
+        }
+        failed += 1;
+        let Some(log) = gh(&["run", "view", "--job", id, "-R", repo, "--log"]) else {
+            return false;
+        };
+        if !sync::is_infra_failure(&log) {
+            return false;
+        }
+    }
+    failed > 0
 }
 
 /// Members that can build from this checkout alone: those with no absolute path or `file://` git dependency, and none reaching
@@ -915,6 +1032,8 @@ fn main() -> ExitCode {
         "green-commit" => cmd_green_commit(&a),
         "sync-plan" => cmd_sync_plan(&a),
         "sync-gate" => cmd_sync_gate(&a),
+        "infra-check" => cmd_infra_check(),
+        "alert-plan" => cmd_alert_plan(&a),
         "portable-workspace" => cmd_portable_workspace(&a),
         "snapshot" => cmd_snapshot(&a),
         "check-fast" => cmd_check_fast(&a),

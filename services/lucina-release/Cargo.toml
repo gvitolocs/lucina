@@ -1,0 +1,15 @@
+[package]
+name = "lucina-release"
+version = "0.1.0"
+description = "Net installer step 1: signed per-board manifests with chunk hashes (docs/design/lucina-net-installer.md, sections 4 and 5), and the pure rules the installer checks them with, proved by Verus"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
+sha2 = "0.10"
+base64 = "0.22"
+
+[[bin]]
+name = "lucina-release"
+path = "src/bin/lucina-release.rs"

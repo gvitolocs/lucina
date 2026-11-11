@@ -2847,6 +2847,7 @@ name = "lucina-app-reliability"
 version = "0.1.0"
 dependencies = [
  "eyra",
+ "libc",
  "lucina-app",
  "lucina-evlog",
  "serde_json",
@@ -3449,6 +3450,15 @@ dependencies = [
 [[package]]
 name = "lucina-rcu"
 version = "0.1.0"
+
+[[package]]
+name = "lucina-release"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek 2.2.0",
+ "sha2 0.10.9",
+]
 
 [[package]]
 name = "lucina-remote"

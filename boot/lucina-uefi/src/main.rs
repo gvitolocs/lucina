@@ -31,6 +31,7 @@ use lucina_boot::{
     trial,
     Range,
     band::Status as BandStatus,
+    board,
     image::{self, Image},
     uefi::{
         self, Config, ConfigError, Fb, MAX_PATH, MAX_RANGES, MemDesc, PSTORE_BASES, PSTORE_SIZE,
@@ -52,6 +53,8 @@ const FALLBACK_CONFIG: &str = "\\LUCINA\\BOOT.CFG";
 const LINUX_STICK_CONFIG: &str = "\\asterinas\\BOOT.CFG";
 /// The log's name next to BOOT.CFG (or the loader) when BOOT.CFG names none.
 const LOG_NAME: &str = "LOG.TXT";
+/// The board table (`lucina_boot::board`), from the root of the volume the loader booted from.
+const BOARDS_PATH: &str = "\\LUCINA\\BOARDS";
 /// Largest device tree read from the firmware's configuration table.
 const DTB_LIMIT: usize = 8 << 20;
 /// Room the edits may add to the device tree.
@@ -76,6 +79,8 @@ enum Fail {
     Image(image::Error),
     Initrd(Status),
     NoDeviceTree,
+    /// `board = auto` and no rule matches: the screen and the log have the lines to add.
+    UnknownBoard,
     DeviceTree(Status),
     Fdt(lucina_fdt::Error),
     Tree(TreeError),
@@ -91,7 +96,11 @@ impl Fail {
             Fail::Config(..) | Fail::ConfigSyntax(_) => 1,
             Fail::NoKernel | Fail::Kernel(..) | Fail::Image(_) => 2,
             Fail::Initrd(_) => 3,
-            Fail::NoDeviceTree | Fail::DeviceTree(_) | Fail::Fdt(_) | Fail::Tree(_) => 4,
+            Fail::NoDeviceTree
+            | Fail::UnknownBoard
+            | Fail::DeviceTree(_)
+            | Fail::Fdt(_)
+            | Fail::Tree(_) => 4,
             Fail::MemoryMap(_) | Fail::Ranges(_) => 5,
             Fail::El3 => 7,
         }
@@ -110,6 +119,9 @@ impl fmt::Display for Fail {
             Fail::NoDeviceTree => f.write_str(
                 "no dtb= in the config and no device tree from the firmware (ACPI only?)",
             ),
+            Fail::UnknownBoard => {
+                write!(f, "unknown board: add one of these lines to {BOARDS_PATH}")
+            }
             Fail::DeviceTree(s) => write!(f, "device tree: {}", status_name(*s)),
             Fail::Fdt(e) => write!(f, "device tree: {e}"),
             Fail::Tree(e) => write!(f, "{e}"),
@@ -241,7 +253,7 @@ fn pages(bytes: usize) -> usize {
 /// Reads a whole file into fresh pages placed by `place`, falling back to anywhere.
 /// A few bytes of text, for the trial's argument.
 struct TextBuf {
-    bytes: [u8; 48],
+    bytes: [u8; 96],
     len: usize,
 }
 
@@ -427,6 +439,60 @@ fn load_kernel(
     Err(Fail::NoKernel)
 }
 
+/// `board = auto`: which board this is, from the firmware device tree's root `compatible` and SMBIOS, against `\LUCINA\BOARDS`.
+/// An unknown board prints the lines to add, waits for a key and fails: nothing is started.
+fn find_board(efi: &Efi, dir: &efi::Dir<'_>, out: &mut Out<'_>) -> Result<&'static str, Fail> {
+    let compatible = efi
+        .config_table(&DTB_TABLE)
+        .and_then(|a| efi.device_tree_at(a, DTB_LIMIT))
+        .and_then(|d| Fdt::new(d).ok())
+        .and_then(|f| f.root().ok())
+        .and_then(|r| r.property("compatible").ok().flatten());
+    let strings = || {
+        compatible
+            .iter()
+            .flat_map(|p| p.strings())
+            .filter_map(Result::ok)
+    };
+    let smbios = efi
+        .config_table(&SMBIOS3_TABLE)
+        .and_then(|a| efi.smbios3_table(a))
+        .and_then(board::smbios_system);
+    let table: &'static str = match read_file(efi, dir, BOARDS_PATH, Place::Anywhere) {
+        Ok(t) => core::str::from_utf8(t)
+            .map_err(|_| Fail::Config("BOARDS not UTF-8", efi::LOAD_ERROR))?,
+        Err(s) => {
+            say!(out, "board: {BOARDS_PATH}: {}", status_name(s));
+            ""
+        }
+    };
+    let bad = board::malformed(table);
+    if bad > 0 {
+        say!(
+            out,
+            "board: {bad} malformed line(s) in {BOARDS_PATH} are ignored"
+        );
+    }
+    if let Some((id, line)) = board::pick(table, strings(), smbios) {
+        say!(out, "board: {id} (rule at {BOARDS_PATH} line {line})");
+        return Ok(id);
+    }
+    out.release();
+    if let Some(c) = strings().next() {
+        say!(out, "compatible \"{c}\" <new-board-id>");
+    }
+    if let Some((m, p)) = smbios {
+        say!(out, "smbios \"{m}\" \"{p}\" <new-board-id>");
+    }
+    say!(
+        out,
+        "unknown board: add one of these lines to {BOARDS_PATH}"
+    );
+    say!(out, "press a key to return to the firmware");
+    // The log is written by the error path below, before the wait would end.
+    Err(Fail::UnknownBoard)
+}
+
 fn prepare(
     efi: &Efi,
     out: &mut Out<'_>,
@@ -506,6 +572,11 @@ fn prepare(
     if !cfg.quiet {
         out.release();
     }
+    let board = if cfg.board {
+        Some(find_board(efi, &dir, out)?)
+    } else {
+        None
+    };
     // Arguments from whoever started the loader (GRUB's `chainloader <file> <args>`) join BOOT.CFG's.
     let mut args = [0u8; 1024];
     let cmdline: &'static str = match uefi::load_options_args(efi.load_options(), &mut args) {
@@ -520,7 +591,7 @@ fn prepare(
         None => cfg.cmdline,
     };
     // The trial's word to userspace, `lucina.trial=on:16` or `rolledback:16`, joins the rest.
-    let mut trial_text = TextBuf { bytes: [0; 48], len: 0 };
+    let mut trial_text = TextBuf { bytes: [0; 96], len: 0 };
     let cmdline: &'static str = match trial_arg {
         Some((rolled_back, generation)) => {
             let _ = write!(
@@ -532,6 +603,22 @@ fn prepare(
                 .allocate_pages(Place::Anywhere, 1)
                 .map_err(|s| Fail::Config("cmdline", s))?;
             uefi::merge_cmdline(cmdline, trial_text.as_str(), buf)
+                .ok_or(Fail::Config("cmdline too long", efi::LOAD_ERROR))?
+        }
+        None => cmdline,
+    };
+    // The board's name to userspace joins the rest, before ` -- `.
+    let mut board_text = TextBuf {
+        bytes: [0; 96],
+        len: 0,
+    };
+    let cmdline: &'static str = match board {
+        Some(id) => {
+            let _ = write!(board_text, "lucinaos.board={id}");
+            let buf = efi
+                .allocate_pages(Place::Anywhere, 1)
+                .map_err(|s| Fail::Config("cmdline", s))?;
+            uefi::merge_cmdline(cmdline, board_text.as_str(), buf)
                 .ok_or(Fail::Config("cmdline too long", efi::LOAD_ERROR))?
         }
         None => cmdline,
@@ -638,7 +725,16 @@ fn prepare(
         None => None,
     };
 
-    let mut src: &'static [u8] = match cfg.dtb {
+    // The board's device tree, unless BOOT.CFG names one.
+    let mut board_dtb = TextBuf {
+        bytes: [0; 96],
+        len: 0,
+    };
+    if let (None, Some(id)) = (cfg.dtb, board) {
+        let _ = write!(board_dtb, "\\LUCINA\\DTB\\{id}.dtb");
+    }
+    let dtb_path = cfg.dtb.or((board_dtb.len > 0).then(|| board_dtb.as_str()));
+    let mut src: &'static [u8] = match dtb_path {
         Some(p) => {
             let mut path = [0u8; MAX_PATH];
             let buf = base
@@ -1011,8 +1107,13 @@ extern "efiapi" fn efi_main(image: efi::Handle, st: *mut efi::SystemTable) -> St
                     let _ = dir.write_file(p, out.log_bytes());
                 }
             }
-            say!(out, "returning to the firmware in {ERROR_PAUSE_S} s");
-            efi.stall_ms(ERROR_PAUSE_S * 1000);
+            if let Fail::UnknownBoard = f {
+                // The lines to add are on the screen: wait for the key `find_board` asked for.
+                efi.wait_key();
+            } else {
+                say!(out, "returning to the firmware in {ERROR_PAUSE_S} s");
+                efi.stall_ms(ERROR_PAUSE_S * 1000);
+            }
         }
         r
     };

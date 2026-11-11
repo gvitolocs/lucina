@@ -115,6 +115,131 @@ pub fn gate_step(runs: &[CheckRun], required: &[String], since_push_secs: u64) -
     }
 }
 
+/// Steps that only set the job up: the runner's container, tools and downloads. A network failure counts only in these.
+const SETUP_STEPS: &[&str] = &["Set up job", "Initialize containers", "Tools"];
+
+/// Did a failed job fail because the runner's network or package mirror did, in a setup step, before any compile, test or proof
+/// started? Then, and only then, it is judged again once. The log is `gh run view --job N --log`: `job<TAB>step<TAB>time text`.
+/// Narrow on purpose: every network line must come from a setup step, and any compiler error, test result, "Compiling"/"Running"
+/// line or proof verdict anywhere in the log makes it a real failure, whatever else it contains. Seen 2026-11-11: "Could not
+/// resolve archive.ubuntu.com" in Tools.
+pub fn is_infra_failure(log: &str) -> bool {
+    const INFRA: &[&str] = &[
+        "Could not resolve",
+        "Temporary failure in name resolution",
+        "Unable to locate package",
+        "Failed to fetch http",
+        "the package mirror did not answer",
+        "Connection timed out",
+        "Could not connect to",
+        "curl: (6)",
+        "curl: (7)",
+        "curl: (28)",
+        "curl: (35)",
+    ];
+    // Verdicts: wherever they appear, the job got past setup.
+    const STARTED: &[&str] = &[
+        "test result:",
+        "panicked at",
+        "error[E",
+        "could not compile",
+        "verification results",
+        "proof_failed",
+        "mutant_survived",
+    ];
+    // Build and test output; the runner's own setup and cleanup lines ("Checking docker version", "status=running") are not it.
+    const WORK: &[&str] = &[
+        "Compiling ",
+        "Checking ",
+        "Running unittests",
+        "Running tests/",
+        "running ",
+        " FAILED",
+    ];
+    let mut network_in_setup = false;
+    for line in log.lines() {
+        let mut f = line.splitn(3, '\t');
+        let (Some(_job), Some(step), Some(text)) = (f.next(), f.next(), f.next()) else {
+            // Not the three-column form: the step is unknown, so it cannot count as a setup step.
+            if STARTED.iter().chain(WORK).any(|m| line.contains(m)) {
+                return false;
+            }
+            continue;
+        };
+        if STARTED.iter().any(|m| text.contains(m)) {
+            return false;
+        }
+        let runner_step =
+            SETUP_STEPS.contains(&step) || ["Stop containers", "Complete job"].contains(&step);
+        if !runner_step && WORK.iter().any(|m| text.contains(m)) {
+            return false;
+        }
+        if INFRA.iter().any(|m| text.contains(m)) {
+            if !SETUP_STEPS.contains(&step) {
+                return false;
+            }
+            network_in_setup = true;
+        }
+    }
+    network_in_setup
+}
+
+/// A finished gate run in which no compile, test or proof step started (`infra`, from `is_infra_failure` on its failed jobs) is not
+/// a verdict on the commit: it is dropped, and the newest remaining result decides, as `merge_verdict` always did. A commit with no
+/// verdict at all has no result, so it is not green. A real failure is a verdict and stays; a run still going stays too (it is not
+/// finished, and the merge waits for it). `runs` is newest first, `infra` says per run whether it was no verdict.
+pub fn drop_non_verdicts(runs: &[CheckRun], infra: &[bool]) -> Vec<CheckRun> {
+    runs.iter()
+        .zip(infra)
+        .filter(|(r, i)| !(**i && r.status == "completed" && r.conclusion != "success"))
+        .map(|(r, _)| CheckRun {
+            name: r.name.clone(),
+            status: r.status.clone(),
+            conclusion: r.conclusion.clone(),
+            app: r.app.clone(),
+        })
+        .collect()
+}
+
+/// What the earlier alerts for the same failing cause were.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeenCause {
+    /// First time this cause fails.
+    No,
+    /// It failed on an older tip whose message to the owner was held back (a newer tip was already coming).
+    HeldBack,
+    /// The owner was told about this cause already.
+    Told,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AlertPlan {
+    /// The ALERT file and the ops record.
+    pub record: bool,
+    /// The message to the owner through Lucina.
+    pub notify: bool,
+}
+
+/// An alert through Lucina is for a state the owner has to know about: the newest main failed, or the same cause failed on two tips in
+/// a row. A failed tip that is no longer the newest main (the newer one is already queued or syncing) is recorded, not announced.
+/// The same cause after the owner was told is quiet.
+pub fn alert_plan(seen: SeenCause, is_newest_tip: bool) -> AlertPlan {
+    match seen {
+        SeenCause::Told => AlertPlan {
+            record: false,
+            notify: false,
+        },
+        SeenCause::HeldBack => AlertPlan {
+            record: true,
+            notify: true,
+        },
+        SeenCause::No => AlertPlan {
+            record: true,
+            notify: is_newest_tip,
+        },
+    }
+}
+
 /// The last check before `main` moves. A scan finding, a non-fast-forward or anything but two green gates stops it.
 pub fn may_move_main(scan_clean: bool, gates: &GateStep, fast_forward: bool) -> Result<(), String> {
     if !scan_clean {
@@ -264,6 +389,106 @@ mod tests {
             plan("a", Some(&("a".into(), Last::Started)), 0),
             Plan::Sync("a".into())
         );
+    }
+
+    #[test]
+    fn infra_failures_are_told_from_test_failures() {
+        let l = |step: &str, text: &str| format!("test\t{step}\t2026-11-11T13:49:20.1Z {text}\n");
+        // Today's log: the package mirror in the Tools step, nothing after it.
+        let dns = l(
+            "Tools",
+            "W: Failed to fetch http://archive.ubuntu.com/x  Could not resolve 'archive.ubuntu.com'",
+        ) + &l("Tools", "E: Unable to locate package curl")
+            + &l("Tools", "##[error]Process completed with exit code 100.");
+        assert!(is_infra_failure(&dns));
+        assert!(is_infra_failure(&l(
+            "Set up job",
+            "curl: (6) Could not resolve host: x"
+        )));
+        // A network error AND a failed test: a real failure, whatever else the log contains.
+        let both = dns.clone()
+            + &l("Run the tests", "test result: FAILED. 116 passed; 1 failed")
+            + &l("Run the tests", "test apps::a_test ... FAILED");
+        assert!(!is_infra_failure(&both));
+        // A network error in a later step (a test that fetches, a download in the build) is not a setup failure.
+        assert!(!is_infra_failure(&l(
+            "Run the tests",
+            "curl: (6) Could not resolve host"
+        )));
+        // Anything that compiled or ran means the setup worked.
+        assert!(!is_infra_failure(
+            &(dns.clone() + &l("Run the tests", "   Compiling serde v1.0"))
+        ));
+        assert!(!is_infra_failure(
+            &(dns.clone() + &l("Build", "error[E0308]: mismatched types"))
+        ));
+        assert!(!is_infra_failure(
+            &(dns.clone() + &l("Proofs", "verification results:: 3 verified, 1 errors"))
+        ));
+        assert!(!is_infra_failure(
+            &(dns.clone() + &l("x", "thread 'a' panicked at src/a.rs:1:1"))
+        ));
+        // A log of unknown shape never counts as infra.
+        assert!(!is_infra_failure(
+            "E: Unable to locate package curl\nCould not resolve x"
+        ));
+        assert!(!is_infra_failure(&l("Tools", "everything fine")));
+        assert!(!is_infra_failure(""));
+    }
+
+    #[test]
+    fn a_run_that_never_started_is_not_a_verdict() {
+        let req = vec!["rust-gate".to_string()];
+        let ok = run("rust-gate", "completed", "success");
+        let red = run("rust-gate", "completed", "failure");
+        let verdict = |runs: &[CheckRun], infra: &[bool]| {
+            merge_verdict(&drop_non_verdicts(runs, infra), &req)
+        };
+        // Today: success at 13:48, then a later failure before any test started: the newest verdict (success) decides.
+        assert_eq!(
+            verdict(&[red.clone(), ok.clone()], &[true, false]),
+            MergeVerdict::Pass
+        );
+        // A later failure that did run is a verdict, and it decides.
+        assert!(matches!(
+            verdict(&[red.clone(), ok.clone()], &[false, false]),
+            MergeVerdict::Refuse(_)
+        ));
+        // No verdict at all is not green.
+        assert!(matches!(
+            verdict(std::slice::from_ref(&red), &[true]),
+            MergeVerdict::Refuse(_)
+        ));
+        // The non-verdict hides nothing: an older real failure still decides.
+        assert!(matches!(
+            verdict(&[red.clone(), red.clone()], &[true, false]),
+            MergeVerdict::Refuse(_)
+        ));
+        // A success is never dropped, and a run still going is not a finished non-verdict.
+        assert_eq!(
+            verdict(std::slice::from_ref(&ok), &[true]),
+            MergeVerdict::Pass
+        );
+        let going = run("rust-gate", "in_progress", "");
+        assert!(matches!(
+            verdict(&[going, ok], &[true, false]),
+            MergeVerdict::Pending(_)
+        ));
+    }
+
+    #[test]
+    fn the_owner_hears_about_the_newest_tip_or_a_repeated_cause() {
+        let p = |record, notify| AlertPlan { record, notify };
+        // The newest main failed: told.
+        assert_eq!(alert_plan(SeenCause::No, true), p(true, true));
+        // An older tip failed while a newer one is already coming: recorded, not announced.
+        assert_eq!(alert_plan(SeenCause::No, false), p(true, false));
+        // The same cause on a second tip in a row: told now, whether or not that tip is the newest.
+        assert_eq!(alert_plan(SeenCause::HeldBack, false), p(true, true));
+        assert_eq!(alert_plan(SeenCause::HeldBack, true), p(true, true));
+        // Already told: quiet, on any tip.
+        assert_eq!(alert_plan(SeenCause::Told, true), p(false, false));
+        assert_eq!(alert_plan(SeenCause::Told, false), p(false, false));
     }
 
     #[test]

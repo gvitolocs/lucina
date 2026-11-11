@@ -73,11 +73,20 @@ jobs:
       - name: Tools
         run: |
           # The tests start ffmpeg and ffprobe, mkfs.fat and fsck.fat, ssh-keygen and kill.
-          apt-get update -qq
-          apt-get install -yqq --no-install-recommends ca-certificates curl git build-essential pkg-config clang ffmpeg dosfstools openssh-client procps
+          # The runner's DNS or mirror can fail for a minute (2026-11-11 13:49: "Could not resolve archive.ubuntu.com" failed two runs of a
+          # commit that had passed). Only the download steps retry; the tests below never do. The rustup-init checksum is still checked.
+          for attempt in 1 2 3 4; do
+            # The container's own resolver (Docker's 127.0.0.11, forwarding to the runner's) failed for over 25 minutes from 13:49 while the
+            # runner itself resolved fine. If the mirror does not resolve, ask public resolvers directly (the container is root).
+            # Nothing else in the environment changes, and when the default resolver works this line does nothing.
+            getent hosts archive.ubuntu.com > /dev/null || { echo "::warning::the container's resolver failed; using public resolvers"; printf 'nameserver 1.1.1.1\nnameserver 9.9.9.9\nnameserver 8.8.8.8\n' > /etc/resolv.conf; }
+            if apt-get -o Acquire::Retries=5 update -qq && apt-get -o Acquire::Retries=5 install -yqq --no-install-recommends ca-certificates curl git build-essential pkg-config clang ffmpeg dosfstools openssh-client procps; then break; fi
+            [ "$attempt" -lt 4 ] || { echo "::error::the package mirror did not answer in 4 attempts"; exit 100; }
+            sleep $((attempt * 20))
+          done
           base=https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu
-          curl -fsSL -o rustup-init "$base/rustup-init"
-          echo "$(curl -fsSL "$base/rustup-init.sha256" | cut -d' ' -f1)  rustup-init" | sha256sum -c --status
+          curl -fsSL --retry 5 --retry-all-errors -o rustup-init "$base/rustup-init"
+          echo "$(curl -fsSL --retry 5 --retry-all-errors "$base/rustup-init.sha256" | cut -d' ' -f1)  rustup-init" | sha256sum -c --status
           chmod +x rustup-init && ./rustup-init -y --profile minimal --default-toolchain "$RUST_CI_TOOLCHAIN" --no-modify-path
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           rm rustup-init

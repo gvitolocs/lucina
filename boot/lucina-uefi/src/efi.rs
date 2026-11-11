@@ -111,7 +111,7 @@ pub struct SystemTable {
     firmware_vendor: *const u16,
     firmware_revision: u32,
     console_in_handle: Handle,
-    con_in: *mut c_void,
+    con_in: *mut TextInput,
     console_out_handle: Handle,
     con_out: *mut TextOutput,
     standard_error_handle: Handle,
@@ -126,6 +126,12 @@ pub struct SystemTable {
 struct ConfigurationTable {
     vendor_guid: Guid,
     vendor_table: *const c_void,
+}
+
+#[repr(C)]
+struct TextInput {
+    reset: usize,
+    read_key_stroke: unsafe extern "efiapi" fn(*mut TextInput, *mut [u16; 2]) -> Status,
 }
 
 #[repr(C)]
@@ -457,6 +463,42 @@ impl Efi {
             }
             let total = u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize;
             (total <= limit).then(|| core::slice::from_raw_parts(addr as usize as *const u8, total))
+        }
+    }
+
+    /// The SMBIOS structure table behind the SMBIOS 3 entry point at `addr` (at most 1 MiB).
+    pub fn smbios3_table(&self, addr: u64) -> Option<&'static [u8]> {
+        // SAFETY: the SMBIOS3 configuration table points at the entry point, which the firmware keeps (boot services data at
+        // least); its signature is checked before the table address and size are trusted, and the table is capped.
+        unsafe {
+            let ep = core::slice::from_raw_parts(addr as usize as *const u8, 24);
+            if &ep[..5] != b"_SM3_" {
+                return None;
+            }
+            let size = u32::from_le_bytes([ep[12], ep[13], ep[14], ep[15]]) as usize;
+            let at = u64::from_le_bytes([
+                ep[16], ep[17], ep[18], ep[19], ep[20], ep[21], ep[22], ep[23],
+            ]);
+            (at != 0 && size > 0 && size <= 1 << 20)
+                .then(|| core::slice::from_raw_parts(at as usize as *const u8, size))
+        }
+    }
+
+    /// Waits for a key on the firmware console and takes it.
+    pub fn wait_key(&self) {
+        // SAFETY: con_in is live while boot services are; ReadKeyStroke writes one key into the buffer.
+        unsafe {
+            let con_in = (*self.st).con_in;
+            if con_in.is_null() {
+                return;
+            }
+            loop {
+                let mut key = [0u16; 2];
+                if ((*con_in).read_key_stroke)(con_in, &mut key) == SUCCESS {
+                    return;
+                }
+                (self.bs().stall)(50_000);
+            }
         }
     }
 

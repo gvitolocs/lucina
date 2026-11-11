@@ -8,6 +8,8 @@ publish.workspace = true
 [dependencies]
 lucina-app = { path = "../../apps/lucina-app" }
 lucina-evlog = { path = "../../kernel/lucina-evlog" }
+# The Linux ABI: the inotify queue and poll that wake the log reader.
+libc = "0.2"
 serde_json = "1"
 
 # Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.

@@ -71,11 +71,19 @@ pub struct Config<'a> {
     pub pstore: bool,
     /// Whether to ask the firmware's `EFI_RNG_PROTOCOL` for the kernel's seed.
     pub rng: bool,
+    /// `board = auto`: find the board from the device tree and SMBIOS (`crate::board`), start nothing on an unknown one.
+    pub board: bool,
 }
 
 /// The generation the installer wrote on a configuration's first lines.
 pub fn config_generation(text: &str) -> Option<u32> {
-    text.lines().find_map(|l| l.trim().strip_prefix("# lucina-install-disk generation ")?.trim().parse().ok())
+    text.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("# lucina-install-disk generation ")?
+            .trim()
+            .parse()
+            .ok()
+    })
 }
 
 /// The size of the RAM region for the kernel's saved crash log (`lucina_crash::store`).
@@ -153,8 +161,9 @@ impl<'a> Config<'a> {
             log: None,
             pstore: true,
             rng: true,
+            board: false,
         };
-        let (mut n_kernels, mut seen) = (0usize, [false; 9]);
+        let (mut n_kernels, mut seen) = (0usize, [false; 10]);
         for (i, raw) in text.lines().enumerate() {
             let line_no = i + 1;
             let line = raw.trim_end_matches('\r');
@@ -239,6 +248,13 @@ impl<'a> Config<'a> {
                     c.rng = match value {
                         "off" => false,
                         "on" => true,
+                        _ => return Err(bad),
+                    };
+                }
+                "board" => {
+                    once(9)?;
+                    c.board = match value {
+                        "auto" => true,
                         _ => return Err(bad),
                     };
                 }
@@ -1583,6 +1599,19 @@ mod tests {
     }
 
     #[test]
+    fn board_key() {
+        let base = "kernel = K.IMG 0xa0000000\n";
+        assert!(!Config::parse(base).unwrap().board);
+        assert!(
+            Config::parse(&format!("{base}board = auto\n"))
+                .unwrap()
+                .board
+        );
+        assert!(Config::parse(&format!("{base}board = galaxy\n")).is_err());
+        assert!(Config::parse(&format!("{base}board = auto\nboard = auto\n")).is_err());
+    }
+
+    #[test]
     fn paths_resolve_next_to_the_config() {
         let mut buf = [0u8; MAX_PATH];
         assert_eq!(parent_dir("\\asterinas\\BOOTAA64.EFI"), "\\asterinas");
@@ -1653,7 +1682,10 @@ mod tests {
         let new = Fdt::new(&out[..len]).unwrap();
         let value = new.property("/chosen", "rng-seed").unwrap().unwrap();
         assert_eq!(value.value, &[7; RNG_SEED_BYTES]);
-        let source = new.property("/chosen", "lucina,rng-source").unwrap().unwrap();
+        let source = new
+            .property("/chosen", "lucina,rng-source")
+            .unwrap()
+            .unwrap();
         assert_eq!(source.as_str().unwrap(), "EFI_RNG_PROTOCOL raw, 123 us");
 
         v.wipe_rng_seed();
@@ -1666,7 +1698,11 @@ mod tests {
         let (e, n) = edits(&v);
         let len = patch(&fdt, &e[..n], &mut out).unwrap();
         let new = Fdt::new(&out[..len]).unwrap();
-        assert!(new.property("/chosen", "lucina,rng-source").unwrap().is_none());
+        assert!(
+            new.property("/chosen", "lucina,rng-source")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

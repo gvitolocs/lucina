@@ -111,6 +111,7 @@ pub enum MergeVerdict {
 }
 
 /// One check run: name, status, conclusion, app slug. Newest first, as the checks API returns them for one name.
+#[derive(Clone)]
 pub struct CheckRun {
     pub name: String,
     pub status: String,

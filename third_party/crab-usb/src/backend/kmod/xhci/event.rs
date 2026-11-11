@@ -45,6 +45,10 @@ fn read_event_words(
     Some([read_word(0), read_word(1), read_word(2), control])
 }
 
+/// Unknown event TRBs logged so far, and how many at most: a storm of them must not cost the console's time.
+static UNKNOWN_LOGGED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+const LOG_BUDGET: usize = 16;
+
 impl EventRing {
     pub fn new(max_segments: usize, dma: &Kernel) -> Result<Self> {
         let segment_count = EVENT_RING_SEGMENTS.min(max_segments.max(1));
@@ -84,7 +88,11 @@ impl EventRing {
             match Allowed::try_from(raw) {
                 Ok(allowed) => return Some(allowed),
                 // It is the controller's and it is consumed: stopping here would stop the ring for good.
-                Err(_) => warn!("xhci: unknown event TRB {raw:08x?} skipped"),
+                Err(_) => {
+                    if UNKNOWN_LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < LOG_BUDGET {
+                        warn!("xhci: unknown event TRB {raw:08x?} skipped");
+                    }
+                }
             }
         }
     }

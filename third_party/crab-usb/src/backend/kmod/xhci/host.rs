@@ -100,6 +100,9 @@ async fn reg_handshake(
     }
 }
 
+/// Events one `clean_event_ring` call handles at most: the event ring's two segments.
+const EVENT_BUDGET: usize = 2 * super::ring::TRBS_PER_SEGMENT;
+
 /// The ERDP value to write: the dequeue pointer, the ERST segment index (DESI) and, when `clear_ehb`, EHB as 1
 /// (RW1C: clears it). EHB written as 0 keeps it.
 fn erdp_write_value(dequeue: u64, segment_index: u8, clear_ehb: bool) -> u64 {
@@ -952,8 +955,15 @@ impl EventHandler {
         let mut other_events = 0usize;
         let mut controller_fault = false;
         let mut event_loop = 0usize;
+        let mut drained = 0usize;
 
-        while let Some(allowed) = self.event_ring(guard).next() {
+        // One ring's worth of events per call at most (2 segments of TRBS_PER_SEGMENT): a controller that keeps posting cannot
+        // hold the caller here, and what is left re-raises the interrupter once ERDP is written with EHB cleared (xHCI 4.17.2),
+        // as Linux's xhci_irq relies on. Juno, 2026-11-10: CPU 2 sat 20 s in this loop under a vendor-mode AX88179A.
+        while drained < EVENT_BUDGET
+            && let Some(allowed) = self.event_ring(guard).next()
+        {
+            drained += 1;
             match allowed {
                 Allowed::CommandCompletion(c) => {
                     command_events += 1;

@@ -12,6 +12,8 @@ use crate::{BusAddr, queue::Finished, usb_if::err::TransferError};
 
 /// How many events off their ring are logged; a controller gone wrong must not fill the screen.
 static OFF_RING_LOG_BUDGET: AtomicUsize = AtomicUsize::new(16);
+/// Transfer events with no route logged so far (each still counts as a controller fault).
+static NO_ROUTE_LOGGED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TransferId(pub(crate) BusAddr);
@@ -135,6 +137,7 @@ impl TransferResultHandler {
                 false
             }
         } else {
+            if NO_ROUTE_LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 16 {
             error!(
                 "xhci: controller fault: transfer event has no active endpoint route slot={} \
                  ep={} ptr={:#x} code={:?} len={}",
@@ -144,6 +147,7 @@ impl TransferResultHandler {
                 res.completion_code(),
                 res.trb_transfer_length()
             );
+            }
             false
         }
     }

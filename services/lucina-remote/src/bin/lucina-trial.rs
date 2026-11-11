@@ -88,24 +88,68 @@ fn wait_for(path: &str, limit: Duration) -> bool {
     true
 }
 
-fn mount_esp() -> Result<Mounted, String> {
+/// The ESP read-only, for a read. Mounting read-write when nothing is written left the volume to the vfat driver at every boot,
+/// and resets followed some of those mounts (crash-recovery, 2026-11-11). Every mount says why in the kernel log.
+fn esp_for_reading(why: &str) -> Result<Mounted, String> {
     release_apps_mount();
     let (device, _) = disk::check_target(LAPTOP_ESP)?;
+    kmsg(&format!("ESP read-only: {why}"));
+    Mounted::new(&device, true)
+}
+
+/// The ESP read-write, only around a write; the caller syncs and drops it (unmount) at once.
+fn esp_for_writing(why: &str) -> Result<Mounted, String> {
+    release_apps_mount();
+    let (device, _) = disk::check_target(LAPTOP_ESP)?;
+    kmsg(&format!("ESP read-write: {why}"));
     Mounted::new(&device, false)
 }
 
+/// This boot's generation, from `lucina.generation=` on the kernel command line (the installer writes it since 2026-11-09).
+fn generation_on_cmdline() -> Option<u32> {
+    let line = fs::read_to_string("/proc/cmdline").ok()?;
+    line.split_ascii_whitespace()
+        .take_while(|w| *w != "--")
+        .find_map(|w| w.strip_prefix("lucina.generation="))
+        .and_then(|g| g.parse().ok())
+}
+
+/// The generation whose loader settle window is known to be closed (written here when it closes): later boots of it need no ESP.
+const SETTLED: &str = "/data/lucina/trial-settled";
+
+fn settled_generation() -> Option<u32> {
+    fs::read_to_string(SETTLED).ok()?.trim().parse().ok()
+}
+
+fn note_settled(generation: u32) {
+    if fs::write(SETTLED, format!("{generation}\n")).is_ok() {
+        if let Ok(f) = fs::File::open(SETTLED) {
+            let _ = f.sync_all();
+        }
+        if let Ok(dir) = fs::File::open("/data/lucina") {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
 fn mark_good(generation: u32) -> Result<(), String> {
-    let _esp = mount_esp()?;
-    let newest = disk::read_trial();
+    let newest = {
+        let _esp = esp_for_reading("the trial record, before the good mark")?;
+        disk::read_trial()
+    };
     let record = newest.record.ok_or("no record")?;
     if record.generation != generation {
-        return Err(format!("the record is about generation {}", record.generation));
+        return Err(format!(
+            "the record is about generation {}",
+            record.generation
+        ));
     }
     if record.seq == u32::MAX {
         return Err("the record's count is spent".into());
     }
     // AB-3: the good mark opens the settle window the loader counts.
     let good = trial::mark_good(record);
+    let _esp = esp_for_writing("the good mark")?;
     disk::write_trial(newest.write_to, &good)?;
     sync_all();
     Ok(())
@@ -117,31 +161,60 @@ fn settle_lasted() {
     if !wait_for(FIRST_FRAME, Duration::from_secs(120)) {
         return;
     }
+    let on_cmdline = generation_on_cmdline();
+    // A generation whose window closed on an earlier boot: nothing to read, no mount at all.
+    if on_cmdline.is_some() && on_cmdline == settled_generation() {
+        return;
+    }
     let Some(before) = shell() else { return };
     sleep(STABLE);
     if shell() != Some(before) {
         return;
     }
     let result = (|| -> Result<Option<Record>, String> {
-        let _esp = mount_esp()?;
-        let current = generation(&fs::read_to_string(in_folder("BOOT.CFG")).map_err(|e| format!("BOOT.CFG: {e}"))?);
-        let newest = disk::read_trial();
+        let (current, newest) = {
+            let _esp = esp_for_reading("the settle window")?;
+            let current = match on_cmdline {
+                Some(g) => g,
+                None => generation(
+                    &fs::read_to_string(in_folder("BOOT.CFG"))
+                        .map_err(|e| format!("BOOT.CFG: {e}"))?,
+                ),
+            };
+            (current, disk::read_trial())
+        };
         let Some(next) = newest.record.and_then(|r| trial::lasted(r, current)) else {
+            // Settled (or not this generation's record): later boots of this generation skip the ESP.
+            if newest
+                .record
+                .is_some_and(|r| r.generation == current && r.settle == 0)
+            {
+                note_settled(current);
+            }
             return Ok(None);
         };
-        disk::write_trial(newest.write_to, &next)?;
-        sync_all();
+        {
+            let _esp = esp_for_writing("one boot of the settle window used")?;
+            disk::write_trial(newest.write_to, &next)?;
+            sync_all();
+        }
+        if next.settle == 0 {
+            note_settled(current);
+        }
         Ok(Some(next))
     })();
     match result {
-        Ok(Some(r)) => kmsg(&format!("generation {} lasted: {} settle boots left", r.generation, r.settle)),
+        Ok(Some(r)) => kmsg(&format!(
+            "generation {} lasted: {} settle boots left",
+            r.generation, r.settle
+        )),
         Ok(None) => {}
         Err(e) => kmsg(&format!("settle window: {e}")),
     }
 }
 
 fn settle_on_previous(failed: u32) -> Result<u32, String> {
-    let _esp = mount_esp()?;
+    let _esp = esp_for_writing("back to PREV.CFG")?;
     let prev = fs::read_to_string(in_folder("PREV.CFG")).map_err(|e| format!("PREV.CFG: {e}"))?;
     overwrite_block(&in_folder("BOOT.CFG"), &config_block(&prev)?)?;
     sync_all();
@@ -166,10 +239,19 @@ fn after_crash() {
     let _ = fs::remove_file(OPEN_APP);
     let crashed = Command::new("/sbin/lucina-crash")
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").contains("last boot crashed"))
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .contains("last boot crashed")
+        })
         .unwrap_or(false);
     if crashed {
-        notice(&format!("Lucina Juno restarted after a crash while {} was open", app.trim()));
+        notice(&format!(
+            "Lucina Juno restarted after a crash while {} was open",
+            app.trim()
+        ));
     }
 }
 
@@ -178,7 +260,11 @@ fn read_settle() -> Option<Settle> {
     let text = fs::read_to_string(SETTLE).ok()?;
     let mut f = text.split_ascii_whitespace().map(|w| w.parse::<u32>().ok());
     let (generation, boots, bad) = (f.next()??, f.next()??, f.next()??);
-    Some(Settle { generation, boots, bad })
+    Some(Settle {
+        generation,
+        boots,
+        bad,
+    })
 }
 
 /// Written whole or not at all: a new file, synced, renamed over the old, and the folder synced.
@@ -200,7 +286,11 @@ fn last_boot_bad() -> bool {
     Command::new("/sbin/lucina-crash")
         .output()
         .map(|o| {
-            let line = String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").to_string();
+            let line = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
             line.contains("last boot crashed") || line.contains("last boot vanished")
         })
         .unwrap_or(false)
@@ -219,9 +309,13 @@ fn settle_check() -> Result<(), String> {
         return Ok(());
     }
     let last_bad = last_boot_bad();
-    let esp = mount_esp()?;
-    let current = generation(&fs::read_to_string(in_folder("BOOT.CFG")).map_err(|e| format!("BOOT.CFG: {e}"))?);
-    let previous = fs::read_to_string(in_folder("PREV.CFG")).ok().map(|t| generation(&t));
+    let esp = esp_for_reading("BOOT.CFG and PREV.CFG for the settle count")?;
+    let current = generation(
+        &fs::read_to_string(in_folder("BOOT.CFG")).map_err(|e| format!("BOOT.CFG: {e}"))?,
+    );
+    let previous = fs::read_to_string(in_folder("PREV.CFG"))
+        .ok()
+        .map(|t| generation(&t));
     let have_previous = previous.is_some_and(|p| p != current && p != 0);
     drop(esp);
     let step = trial::settle_step(Some(prev), current, last_bad, have_previous);
@@ -294,7 +388,12 @@ fn show(paths: &[String]) -> ExitCode {
         let record = fs::read(path).ok().and_then(|b| Record::decode(&b));
         println!("{path}: {record:?}");
     }
-    let read = |i: usize| paths.get(i).and_then(|p| fs::read(p).ok()).and_then(|b| Record::decode(&b));
+    let read = |i: usize| {
+        paths
+            .get(i)
+            .and_then(|p| fs::read(p).ok())
+            .and_then(|b| Record::decode(&b))
+    };
     println!("newest: {:?}", trial::newest(read(0), read(1)).record);
     ExitCode::SUCCESS
 }
@@ -308,12 +407,26 @@ fn write_for_a_test(args: &[String]) -> ExitCode {
         Some("failed") => Some(State::Failed),
         _ => None,
     };
-    let (Some(path), Some(seq), Some(generation), Some(state), Some(tries)) = (args.first(), number(1), number(2), state, number(4)) else {
-        eprintln!("usage: lucina-trial write <file> <seq> <generation> <trial|good|failed> <tries> [settle]");
+    let (Some(path), Some(seq), Some(generation), Some(state), Some(tries)) =
+        (args.first(), number(1), number(2), state, number(4))
+    else {
+        eprintln!(
+            "usage: lucina-trial write <file> <seq> <generation> <trial|good|failed> <tries> [settle]"
+        );
         return ExitCode::FAILURE;
     };
     let settle = number(5).unwrap_or(0);
-    match fs::write(path, Record { seq, generation, state, tries, settle }.encode()) {
+    match fs::write(
+        path,
+        Record {
+            seq,
+            generation,
+            state,
+            tries,
+            settle,
+        }
+        .encode(),
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{path}: {e}");

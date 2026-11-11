@@ -57,6 +57,7 @@ mutants/juno-vsync	juno-gpu-media	mutants	verification/juno-vsync/mutants.sh	dri
 mutants/juno-wdt	boot-storage	mutants	verification/juno-wdt/mutants.sh	kernel/lucina-wdt/,verification/juno-wdt/
 mutants/juno-wifi-wake	juno-net-security	mutants	verification/juno-wifi-wake/mutants.sh	drivers/lucina-wifi-wake/,verification/juno-wifi-wake/,verification/juno-wifi-wake/rules.rs
 mutants/lucinanet-mse	juno-gpu-media	mutants	verification/lucinanet-mse/mutants.sh	drivers/lucina-video/,verification/lucinanet-mse/
+mutants/net-installer	boot-storage	mutants	verification/net-installer/mutants.sh	boot/gbgo/boot.toml,kernel/lucina-boot/,kernel/lucina-fdt/,services/lucina-release/,verification/fdt/header.rs,verification/net-installer/,verification/net-installer/rules.rs
 mutants/phone-glass	juno-gpu-media	mutants	verification/phone-glass/mutants.sh	apps/lucina-glass/,verification/phone-glass/
 mutants/voice-stream	juno-audio-voice	mutants	verification/voice-stream/mutants.sh	drivers/lucina-voice-stream/,verification/voice-stream/
 mutations/global	global-mutations	mutations	scripts/verify-mutations.sh	scripts/verify-mutations.sh,verification/
@@ -125,4 +126,5 @@ verus/juno-taskcpu/rules	kernel-memory	verus	verification/juno-taskcpu/rules.rs	
 verus/juno-tcpbuf/rules	juno-net-security	verus	verification/juno-tcpbuf/rules.rs	third_party/smoltcp/src/storage/paged_math.rs,verification/juno-tcpbuf/,verification/juno-tcpbuf/rules.rs
 verus/juno-vsync/rules	juno-gpu-media	verus	verification/juno-vsync/rules.rs	drivers/lucina-adreno/,verification/juno-vsync/,verification/juno-vsync/rules.rs
 verus/juno-wifi-wake/rules	juno-net-security	verus	verification/juno-wifi-wake/rules.rs	drivers/lucina-wifi-wake/,verification/juno-wifi-wake/,verification/juno-wifi-wake/rules.rs
+verus/net-installer/rules	boot-storage	verus	verification/net-installer/rules.rs	boot/gbgo/boot.toml,kernel/lucina-boot/,kernel/lucina-fdt/,services/lucina-release/,verification/fdt/header.rs,verification/net-installer/,verification/net-installer/rules.rs
 verus/vostd-port/frame_linked_list	kernel-memory	verus	verification/vostd-port/frame_linked_list.rs	verification/vostd-port/,verification/vostd-port/frame_linked_list.rs
