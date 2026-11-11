@@ -6,11 +6,13 @@
 //!   lucina-ci selftest ...                     prove the cap, timeouts and verdicts work on this machine
 //!   lucina-ci gate --plan F --reports D        every planned unit verified on this commit?
 //!   lucina-ci merge-check ...                  the lagent merge gate: did GitHub verify this commit?
+//!   lucina-ci green-commit|sync-plan|sync-gate the automatic public sync and the install gate (docs/ci/PUBLIC-SYNC.md)
 
 mod fast;
 mod inventory;
 mod runner;
 mod snapshot;
+mod sync;
 mod verdict;
 
 use inventory::Unit;
@@ -601,6 +603,166 @@ fn cmd_merge_check(a: &Args) -> Result<i32, String> {
     Ok(0)
 }
 
+fn required_checks(a: &Args) -> Vec<String> {
+    if a.has("--require") {
+        a.vals("--require")
+    } else {
+        REQUIRED_CHECKS.iter().map(|s| s.to_string()).collect()
+    }
+}
+
+/// Check runs of one commit, newest first; `Err` when GitHub does not answer.
+fn fetch_runs(repo: &str, sha: &str) -> Result<Vec<CheckRun>, String> {
+    let jq = r#".check_runs | sort_by(.id) | reverse | .[] | [.name, .status, (.conclusion // ""), .app.slug] | @tsv"#;
+    let path = format!("repos/{repo}/commits/{sha}/check-runs?per_page=100");
+    let o = Command::new("gh")
+        .args(["api", "--paginate", &path, "--jq", jq])
+        .output()
+        .map_err(|e| format!("cannot run gh: {e}"))?;
+    if !o.status.success() {
+        return Err(format!("GitHub did not answer for {sha}"));
+    }
+    Ok(parse_runs(&String::from_utf8_lossy(&o.stdout)))
+}
+
+/// `green-commit --repo R --private DIR [--verify FULLSHA]`: the newest private commit whose public sync is proven.
+/// Prints the full sha. Exit 0 found, 1 none is proven (or `--verify`'s commit is not), 3 GitHub did not answer.
+fn cmd_green_commit(a: &Args) -> Result<i32, String> {
+    let repo = a.need("--repo")?;
+    let private = a.need("--private")?;
+    let only = a.val("--verify");
+    let required = required_checks(a);
+    let limit = a.num("--limit", 40)?;
+    let jq = r#".[] | [.sha, (.commit.message | split("\n") | .[0])] | @tsv"#;
+    let o = Command::new("gh")
+        .args([
+            "api",
+            &format!("repos/{repo}/commits?sha=main&per_page={limit}"),
+            "--jq",
+            jq,
+        ])
+        .output()
+        .map_err(|e| format!("cannot run gh: {e}"))?;
+    if !o.status.success() {
+        eprintln!("green-commit: GitHub did not answer: no commit can be called proven");
+        return Ok(3);
+    }
+    let resolve = |short: &str| -> Option<String> {
+        let o = Command::new("git")
+            .args([
+                "-C",
+                &private,
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{short}^{{commit}}"),
+            ])
+            .output()
+            .ok()?;
+        o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    // Fetch check runs lazily, newest first, and stop at the first proven answer.
+    let mut commits = Vec::new();
+    for l in String::from_utf8_lossy(&o.stdout).lines() {
+        let Some((sha, msg)) = l.split_once('\t') else {
+            continue;
+        };
+        let Some(short) = sync::parse_sync_subject(msg) else {
+            continue;
+        };
+        let Some(full) = resolve(&short) else {
+            continue;
+        };
+        if only.as_deref().is_some_and(|v| v != full) {
+            continue;
+        }
+        let runs = match fetch_runs(&repo, sha) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("green-commit: {e}");
+                return Ok(3);
+            }
+        };
+        let c = sync::PublicCommit {
+            sha: sha.into(),
+            message: msg.into(),
+            runs,
+        };
+        if let Some((priv_sha, pub_sha)) = sync::newest_proven(
+            std::slice::from_ref(&c),
+            &required,
+            only.as_deref(),
+            &resolve,
+        ) {
+            println!("{priv_sha}");
+            eprintln!("green-commit: {priv_sha} is proven by public commit {pub_sha}");
+            return Ok(0);
+        }
+        commits.push(c);
+    }
+    match only {
+        Some(v) => eprintln!(
+            "green-commit: {v} has no proven public sync (not synced yet, red, or still running)"
+        ),
+        None => eprintln!("green-commit: none of the last {limit} public syncs is proven"),
+    }
+    Ok(1)
+}
+
+/// `sync-plan --main SHA --state FILE`: prints `sync <sha>` (exit 0) or `skip: <why>` (exit 10).
+fn cmd_sync_plan(a: &Args) -> Result<i32, String> {
+    let main = a.need("--main")?;
+    let state = fs::read_to_string(a.need("--state")?)
+        .ok()
+        .and_then(|t| sync::parse_state(&t));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    match sync::plan(&main, state.as_ref(), now) {
+        sync::Plan::Sync(s) => {
+            println!("sync {s}");
+            Ok(0)
+        }
+        sync::Plan::Skip(w) => {
+            println!("skip: {w}");
+            Ok(10)
+        }
+    }
+}
+
+/// `sync-gate --repo R --sha PUBSHA --fast-forward yes|no [--scan-clean yes]`: exit 0 main may move, 10 wait, 11 a gate never started (transient), 1 stop for good, 3 no answer.
+fn cmd_sync_gate(a: &Args) -> Result<i32, String> {
+    let repo = a.need("--repo")?;
+    let sha = a.need("--sha")?;
+    let ff = a.val("--fast-forward").as_deref() == Some("yes");
+    let clean = a.val("--scan-clean").as_deref() != Some("no");
+    let runs = match fetch_runs(&repo, &sha) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("sync-gate: {e}");
+            return Ok(3);
+        }
+    };
+    let since = a.num("--since-push-secs", sync::START_GRACE_SECS)?;
+    let step = sync::gate_step(&runs, &required_checks(a), since);
+    match sync::may_move_main(clean, &step, ff) {
+        Ok(()) => {
+            println!("sync-gate: both gates success on {sha}");
+            Ok(0)
+        }
+        Err(w) => {
+            println!("sync-gate: {w}");
+            Ok(match step {
+                sync::GateStep::Wait(_) if clean && ff => 10,
+                sync::GateStep::Stuck(_) if clean && ff => 11,
+                _ => 1,
+            })
+        }
+    }
+}
+
 /// Members that can build from this checkout alone: those with no absolute path or `file://` git dependency, and none reaching
 /// one through a sibling. `manifests`: member directory -> Cargo.toml text.
 fn portable_members(
@@ -750,6 +912,9 @@ fn main() -> ExitCode {
         "selftest" => cmd_selftest(&a),
         "gate" => cmd_gate(&a),
         "merge-check" => cmd_merge_check(&a),
+        "green-commit" => cmd_green_commit(&a),
+        "sync-plan" => cmd_sync_plan(&a),
+        "sync-gate" => cmd_sync_gate(&a),
         "portable-workspace" => cmd_portable_workspace(&a),
         "snapshot" => cmd_snapshot(&a),
         "check-fast" => cmd_check_fast(&a),

@@ -579,8 +579,31 @@ mod tests {
         );
     }
 
+    /// A script file that is open for writing while another test thread forks is held open by the forked child until its exec, and
+    /// exec of a file with a writer fails with ETXTBSY ("Text file busy"): seen on the CI runner as a flaky start() error in
+    /// a_killed_app_leaves_no_hold. Writing the scripts and forking the apps never overlap: both take this lock.
+    static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+        SPAWN.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn start_serialized(
+        app: usize,
+        manifest: &Manifest,
+        app_dir: &str,
+        tz: &str,
+        trace: bool,
+        args: &[String],
+        env: &[(String, String)],
+    ) -> io::Result<Running> {
+        let _g = spawn_lock();
+        Running::start(app, manifest, app_dir, tz, trace, args, env)
+    }
+
     fn manifest(script: &str) -> (Manifest, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
+        let _g = spawn_lock();
         let dir = std::env::temp_dir().join(format!(
             "lucina-shell-apps-{}-{:?}",
             std::process::id(),
@@ -737,7 +760,7 @@ mod tests {
                 "/run/lucina/intents/c1.json".to_string(),
             ),
         ];
-        let mut r = Running::start(0, &m, "/", "UTC0", false, &[], &env).unwrap();
+        let mut r = start_serialized(0, &m, "/", "UTC0", false, &[], &env).unwrap();
         wait(&mut r);
         assert!(
             r.tail
@@ -753,7 +776,7 @@ mod tests {
     fn args_follow_the_program() {
         let (m, d) = manifest("echo \"got $1|$2\" >&2; exit 0");
         let args = ["/data/home/a b.mp4".to_string(), "x".to_string()];
-        let mut r = Running::start(0, &m, "/", "UTC0", false, &args, &[]).unwrap();
+        let mut r = start_serialized(0, &m, "/", "UTC0", false, &args, &[]).unwrap();
         wait(&mut r);
         assert!(
             r.tail.iter().any(|l| l == "got /data/home/a b.mp4|x"),
@@ -766,7 +789,7 @@ mod tests {
     #[test]
     fn a_clean_exit_is_not_a_failure() {
         let (m, d) = manifest("exit 0");
-        let mut r = Running::start(3, &m, "/", "UTC0", false, &[], &[]).unwrap();
+        let mut r = start_serialized(3, &m, "/", "UTC0", false, &[], &[]).unwrap();
         let e = wait(&mut r);
         assert_eq!(e.app, 3);
         assert_eq!(e.what, "It closed.");
@@ -778,7 +801,7 @@ mod tests {
     fn a_failure_says_why_with_the_last_lines() {
         let (m, d) =
             manifest("echo first >&2\necho \"id $LUCINA_APP_ID shell $LUCINA_SHELL\"\nexit 3");
-        let mut r = Running::start(0, &m, "/", "UTC0", false, &[], &[]).unwrap();
+        let mut r = start_serialized(0, &m, "/", "UTC0", false, &[], &[]).unwrap();
         let e = wait(&mut r);
         assert!(e.failed);
         assert_eq!(e.what, "It stopped with exit status 3.");
@@ -789,7 +812,7 @@ mod tests {
     #[test]
     fn a_signal_is_a_failure() {
         let (m, d) = manifest("kill -SEGV $$");
-        let mut r = Running::start(0, &m, "/", "UTC0", false, &[], &[]).unwrap();
+        let mut r = start_serialized(0, &m, "/", "UTC0", false, &[], &[]).unwrap();
         let e = wait(&mut r);
         assert!(e.failed);
         assert!(e.what.contains("SIGSEGV"), "{}", e.what);
@@ -800,14 +823,14 @@ mod tests {
     fn stop_ends_a_polite_app_and_kills_a_stubborn_one() {
         // sh ends on SIGTERM by default: that is the user going home, not a failure.
         let (m, d) = manifest("sleep 100");
-        let mut r = Running::start(0, &m, "/", "UTC0", false, &[], &[]).unwrap();
+        let mut r = start_serialized(0, &m, "/", "UTC0", false, &[], &[]).unwrap();
         r.stop(Instant::now());
         let e = wait(&mut r);
         assert!(!e.failed, "{}", e.what);
         std::fs::remove_dir_all(d).ok();
 
         let (m, d) = manifest("trap '' TERM\necho ready\nwhile :; do sleep 1; done");
-        let mut r = Running::start(0, &m, "/", "UTC0", false, &[], &[]).unwrap();
+        let mut r = start_serialized(0, &m, "/", "UTC0", false, &[], &[]).unwrap();
         // Until it has set its trap.
         let t0 = Instant::now();
         while r.tail.is_empty() {
@@ -835,7 +858,7 @@ mod tests {
             terminal: false,
             intents: Vec::new(),
         };
-        assert!(Running::start(0, &m, "/", "UTC0", false, &[], &[]).is_err());
+        assert!(start_serialized(0, &m, "/", "UTC0", false, &[], &[]).is_err());
     }
 
     /// Look at the app until `want` holds, for at most ten seconds.
@@ -857,7 +880,7 @@ mod tests {
         let (m, d) = manifest(
             "echo 'display-required on playing video' >&3\nsleep 0.3\necho 'display-required off' >&3\nsleep 100",
         );
-        let mut r = Running::start(0, &m, "/", "UTC0", false, &[], &[]).unwrap();
+        let mut r = start_serialized(0, &m, "/", "UTC0", false, &[], &[]).unwrap();
         until(&mut r, |r| r.display_hold() == Some("playing video"));
         until(&mut r, |r| r.display_hold().is_none());
         r.stop(Instant::now());
@@ -868,7 +891,7 @@ mod tests {
     #[test]
     fn closing_the_descriptor_ends_the_hold() {
         let (m, d) = manifest("echo 'display-required on x' >&3\nexec 3>&-\nsleep 100");
-        let mut r = Running::start(0, &m, "/", "UTC0", false, &[], &[]).unwrap();
+        let mut r = start_serialized(0, &m, "/", "UTC0", false, &[], &[]).unwrap();
         // Either the line or the end of file is seen first; the end of file must leave no hold while the app still runs.
         until(&mut r, |r| r.hold_pipe.is_none());
         assert_eq!(r.display_hold(), None);
@@ -882,7 +905,7 @@ mod tests {
     fn a_killed_app_leaves_no_hold() {
         // A child keeps descriptor 3 open after the app dies: the exit alone must drop the hold.
         let (m, d) = manifest("echo 'display-required on playing' >&3\nsleep 100 &\nwait");
-        let mut r = Running::start(0, &m, "/", "UTC0", false, &[], &[]).unwrap();
+        let mut r = start_serialized(0, &m, "/", "UTC0", false, &[], &[]).unwrap();
         until(&mut r, |r| r.display_hold() == Some("playing"));
         // SAFETY: a plain kill of the app's own process, not its group.
         unsafe { libc::kill(r.pid() as libc::pid_t, libc::SIGKILL) };
