@@ -8,6 +8,29 @@ use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+/// Verus rlimit for one unit by name, and for no other: the unit and the rlimit value it is raised to. Every entry is a
+/// raised solver resource limit that `tools/ci/trust-allow.tsv` records with a reason and that `trust` counts as a
+/// `--rlimit` site; every other unit gets the Verus default. The value is a number, so no other Verus argument can be
+/// written into this table.
+pub(crate) const VERUS_ARGS: &[(&str, u32)] = &[
+    // `step` in crates/lucina-surface-rules/src/rules.rs: path and case splitting over its 13 arms.
+    ("verus/juno-surface/rules", 20),
+];
+
+/// The extra arguments the verus unit `unit` is run with, as written for the shell: the table's rlimit rendered as the one
+/// flag below, and nothing for a unit the table does not name. `--rlimit` is written in `rlimit_arg` and nowhere else, so
+/// this is the one place that turns a table entry into an argument.
+pub fn verus_args(unit: &str) -> String {
+    VERUS_ARGS
+        .iter()
+        .find(|(name, _)| *name == unit)
+        .map_or_else(String::new, |(_, limit)| rlimit_arg(*limit))
+}
+
+fn rlimit_arg(limit: u32) -> String {
+    format!("--rlimit {limit}")
+}
+
 const GIB: u64 = 1 << 30;
 /// Left to the system on top of the verification budget.
 const RESERVE: u64 = 2 * GIB;
@@ -607,6 +630,46 @@ pub fn report_field(json: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rlimit_table_selects_by_unit_name() {
+        // One entry, a number, and no other unit gets anything. The exact string the surface unit is run with is pinned by
+        // `inventory::tests::only_the_named_verus_unit_gets_extra_arguments`; writing that string here as well would give
+        // this scanned file a second `--rlimit` site for the one table entry.
+        let (unit, limit) = VERUS_ARGS.first().copied().expect("the table has no entry");
+        assert_eq!((unit, limit), ("verus/juno-surface/rules", 20));
+        assert_eq!(VERUS_ARGS.len(), 1);
+        assert_eq!(verus_args(unit), rlimit_arg(limit));
+        assert!(verus_args("verus/juno-charge/rules").is_empty());
+        assert!(verus_args("mutants/juno-surface").is_empty());
+        assert!(verus_args("").is_empty());
+    }
+
+    #[test]
+    fn the_trust_scanner_counts_this_table_and_nothing_else() {
+        // One `--rlimit` site per entry, with the value the entry is rendered with: a second entry needs a second allow
+        // count in `tools/ci/trust-allow.tsv`, and a raise needs its max_value raised there.
+        let scan = crate::trust::scan_flags(crate::trust::RUNNER_SOURCE, "", false);
+        let counted: Vec<Option<u64>> = scan
+            .markers
+            .iter()
+            .filter(|m| m.class == crate::trust::Class::Rlimit)
+            .map(|m| m.value)
+            .collect();
+        let rendered: Vec<Option<u64>> = VERUS_ARGS
+            .iter()
+            .map(|(_, limit)| {
+                crate::trust::parse_value(rlimit_arg(*limit).rsplit_once(' ').unwrap().1)
+            })
+            .collect();
+        assert_eq!(counted, rendered);
+        assert_eq!(counted.len(), VERUS_ARGS.len());
+        assert_eq!(
+            scan.markers.len(),
+            VERUS_ARGS.len(),
+            "no other flag is passed"
+        );
+    }
 
     #[test]
     fn budget_on_a_16_gb_runner_is_12_gib() {

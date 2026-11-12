@@ -45,7 +45,14 @@ impl Unit {
     /// The shell command, run from the repo root with VERUS set.
     pub fn command(&self) -> String {
         match self.kind.as_str() {
-            "verus" => format!("\"$VERUS\" {}", self.target),
+            "verus" => {
+                let extra = crate::runner::verus_args(&self.name);
+                if extra.is_empty() {
+                    format!("\"$VERUS\" {}", self.target)
+                } else {
+                    format!("\"$VERUS\" {extra} {}", self.target)
+                }
+            }
             "shipped" => format!(
                 "VERIFY_SHIPPED_ONLY={} bash scripts/verify-shipped.sh",
                 self.target
@@ -547,6 +554,21 @@ mod tests {
             target: "t".into(),
             inputs: inputs.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn only_the_named_verus_unit_gets_extra_arguments() {
+        assert_eq!(unit(&[]).command(), "\"$VERUS\" t");
+        let mut raised = unit(&[]);
+        raised.name = "verus/juno-surface/rules".into();
+        raised.target = "verification/juno-surface/rules.rs".into();
+        assert_eq!(
+            raised.command(),
+            "\"$VERUS\" --rlimit 20 verification/juno-surface/rules.rs"
+        );
+        // The table is keyed on the unit name, so the same file under another kind gets nothing.
+        raised.kind = "mutants".into();
+        assert_eq!(raised.command(), "bash verification/juno-surface/rules.rs");
     }
 
     #[test]

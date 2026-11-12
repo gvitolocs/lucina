@@ -1,4 +1,5 @@
 # Generated: lucina-ci trust --write. Do not edit. unit<TAB>class<TAB>count (zero is not listed)
+flags/tools/ci/lucina-ci/src/runner.rs	rlimit	1
 shipped/fortuna-look/rules	solver	8
 shipped/fortuna-voice/rules	solver	7
 shipped/gpui-juno/clip	solver	7

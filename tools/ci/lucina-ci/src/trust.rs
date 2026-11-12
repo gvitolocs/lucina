@@ -957,11 +957,14 @@ fn carries_spec(raw: &[&str], cleaned: &[String], proof: &[bool], n: usize) -> b
 /// Files outside `scripts/verify*.sh` and `verification/*/mutants.sh` that run Verus or pass it arguments.
 pub const FLAG_FILES: [&str; 5] = [
     "scripts/verus-one.sh",
-    "tools/ci/lucina-ci/src/runner.rs",
+    RUNNER_SOURCE,
     ".github/workflows/verus.yml",
     "tools/ci/install-verus.sh",
     "tools/ci/proof-inventory.tsv",
 ];
+/// The runner source. It passes a per-unit Verus argument from a typed table, `runner::VERUS_ARGS`, so that argument is
+/// counted from the table and not from a command line in its text; see [`scan_flags`].
+pub const RUNNER_SOURCE: &str = "tools/ci/lucina-ci/src/runner.rs";
 pub const FLAG_UNIT_PREFIX: &str = "flags/";
 
 /// What a Verus command-line flag does to checking. `None` for a token that is not a Verus flag we know.
@@ -1007,7 +1010,8 @@ fn flag_effect(tok: &str, next: Option<&str>) -> Option<Hit> {
 /// The Verus flags in a script, workflow or Rust source. Only logical lines (continuations joined) that mention `verus` are
 /// read; `#` and `//` comment lines are skipped. A flag on a line that does not mention Verus, such as an argument array
 /// spread over several lines, is not seen (stated in `docs/ci/TRUST-FLAGS.md`). With `record_only` (mutant scripts, which run
-/// Verus on planted-bug copies) every hit is class info: recorded, not ratcheted.
+/// Verus on planted-bug copies) every hit is class info: recorded, not ratcheted. [`RUNNER_SOURCE`] is scanned for its typed
+/// argument table too, which holds no flag text for these lines to see.
 pub fn scan_flags(path: &str, text: &str, record_only: bool) -> FileScan {
     let mut scan = FileScan {
         path: path.to_string(),
@@ -1052,6 +1056,28 @@ pub fn scan_flags(path: &str, text: &str, record_only: bool) -> FileScan {
                 });
             }
         }
+    }
+    // The runner raises a unit's rlimit from its typed table, where the flag and the number are never on one line, so the
+    // table is read from the code it is written in: one `--rlimit` site per entry, at the entry's line.
+    if path == RUNNER_SOURCE {
+        for (unit, limit) in crate::runner::VERUS_ARGS {
+            let needle = format!("\"{unit}\"");
+            scan.markers.push(Marker {
+                kind: "--rlimit",
+                class: if record_only {
+                    Class::Info
+                } else {
+                    Class::Rlimit
+                },
+                file: path.to_string(),
+                line: text
+                    .lines()
+                    .position(|l| l.contains(&needle))
+                    .map_or(1, |l| l + 1),
+                value: parse_value(&limit.to_string()),
+            });
+        }
+        scan.markers.sort_by_key(|m| m.line);
     }
     scan
 }
@@ -1383,7 +1409,8 @@ pub struct Allow {
     pub max_value: Option<u64>,
 }
 
-/// Valid entries and the problems found. An entry without a reason is a problem and permits nothing.
+/// Valid entries and the problems found. An entry without a reason is a problem and permits nothing, and a `max_value`
+/// column is a problem on any line but a `rlimit` one, where it caps the value the unit may be run with.
 pub fn parse_allow(text: &str) -> (Vec<Allow>, Vec<String>) {
     let mut ok = Vec::new();
     let mut bad = Vec::new();
@@ -1411,6 +1438,13 @@ pub fn parse_allow(text: &str) -> (Vec<Allow>, Vec<String>) {
         };
         let mut max_value = None;
         if let Some(v) = f.get(4).map(|v| v.trim()).filter(|v| !v.is_empty()) {
+            if class != Class::Rlimit {
+                bad.push(format!(
+                    "{at}: only class rlimit has a max_value fifth column, this line is class {}",
+                    class.name()
+                ));
+                continue;
+            }
             match parse_value(v) {
                 Some(x) => max_value = Some(x),
                 None => {
@@ -2401,6 +2435,25 @@ assert(x) by(integer_ring);
     }
 
     #[test]
+    fn only_an_rlimit_allow_line_may_carry_a_max_value() {
+        let (ok, bad) = parse_allow("u\trlimit\t1\tthe surface step needs it\t20\n");
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(ok[0].max_value, Some(20_000));
+        // Any other class has no value to cap, so a fifth column there is a line that means nothing.
+        for class in ["assumption", "escape", "unsafe", "loosen", "flag"] {
+            let (ok, bad) = parse_allow(&format!("u\t{class}\t1\treason\t20\n"));
+            assert!(ok.is_empty(), "{class}: {ok:?}");
+            assert_eq!(bad.len(), 1, "{class}");
+            assert!(bad[0].contains("max_value"), "{bad:?}");
+        }
+        // A tab where the column would be is no column.
+        let (ok, bad) = parse_allow("u\tloosen\t2\treason\t\nu\tflag\t1\treason\t\n");
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(ok.len(), 2);
+        assert!(ok.iter().all(|a| a.max_value.is_none()));
+    }
+
+    #[test]
     fn the_allow_file_gains_a_fifth_column_and_old_lines_still_parse() {
         let old = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../trust-allow.tsv"),
@@ -2408,7 +2461,11 @@ assert(x) by(integer_ring);
         .unwrap_or_default();
         let (ok, bad) = parse_allow(&old);
         assert!(bad.is_empty(), "{bad:?}");
-        assert!(ok.iter().all(|a| a.max_value.is_none()));
+        // A fifth column means something only for class rlimit: no other line of the committed file carries one.
+        assert!(
+            ok.iter()
+                .all(|a| a.max_value.is_none() || a.class == Class::Rlimit.name())
+        );
         let (ok, bad) = parse_allow("u\tflag\t1\tr\nu\tloosen\t2\tr\t\n");
         assert!(bad.is_empty());
         assert_eq!(ok.len(), 2);
@@ -2463,6 +2520,27 @@ echo --no-verify without the tool
             scan_flags("a.sh", "\"$verus\" \"$f\"\n", false)
                 .markers
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_runner_argument_table_is_counted_as_an_rlimit_site() {
+        // The runner writes its argument from the typed table, so the table is counted even where its text has no flag.
+        let s = scan_flags(RUNNER_SOURCE, "", false);
+        assert_eq!(s.markers.len(), crate::runner::VERUS_ARGS.len());
+        for m in &s.markers {
+            assert_eq!((m.kind, m.class.name()), ("--rlimit", "rlimit"));
+            assert!(m.value.is_some(), "a table value is a number");
+        }
+        // Another file's text is read as text: a table written there is nothing the runner runs.
+        assert!(
+            scan_flags(
+                "scripts/verify.sh",
+                "verus=$(echo x) # const VERUS_ARGS: &[(\"verus/a\", 20)]\n",
+                false,
+            )
+            .markers
+            .is_empty()
         );
     }
 
