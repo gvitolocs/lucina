@@ -432,19 +432,22 @@ fn exec_body(t: &[Tok], vb: &[bool], cls: &mut [Cls], lo: usize, hi: usize) {
     }
 }
 
-fn runs(t: &[Tok], cls: &[Cls], want: Cls) -> String {
+/// The `want` tokens in order, one run per stretch of them, `;;` between the runs. `skip` names tokens that are proof text standing
+/// inside the code: a `proof!` block in the middle of an executable body says nothing about the code, and where the prover put it
+/// says even less, so it neither joins a run nor cuts it.
+fn runs(t: &[Tok], cls: &[Cls], want: Cls, skip: &[bool]) -> String {
     let mut parts: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < t.len() {
-        if cls[i] == want {
-            let a = i;
-            while i < t.len() && cls[i] == want {
-                i += 1;
-            }
-            parts.push(spec::norm_tokens(&t[a..i]));
-        } else {
-            i += 1;
+    let mut run: Vec<Tok> = Vec::new();
+    for (k, x) in t.iter().enumerate() {
+        if cls[k] == want {
+            run.push(x.clone());
+        } else if !skip.get(k).copied().unwrap_or(false) && !run.is_empty() {
+            parts.push(spec::norm_tokens(&run));
+            run.clear();
         }
+    }
+    if !run.is_empty() {
+        parts.push(spec::norm_tokens(&run));
     }
     parts.join(" ;; ")
 }
@@ -490,12 +493,14 @@ fn gated_extent(t: &[Tok], after: usize) -> (usize, usize) {
     (j, t.len())
 }
 
-/// Close of the delimiter opened at `open` (`(`, `[` or `{`).
-fn match_delim(t: &[Tok], open: usize) -> usize {
-    let (o, c) = match t[open].s.as_str() {
+/// End (exclusive) of the delimited tree opened at `open` (`(`, `[` or `{`), or None when it never closes: an unclosed stretch is
+/// not a complete tree, and a token stream that does not close is no one's proof block.
+fn delim_end(t: &[Tok], open: usize) -> Option<usize> {
+    let (o, c) = match t.get(open)?.s.as_str() {
         "(" => ("(", ")"),
         "[" => ("[", "]"),
-        _ => ("{", "}"),
+        "{" => ("{", "}"),
+        _ => return None,
     };
     let mut d = 0i32;
     for (k, x) in t.iter().enumerate().skip(open) {
@@ -504,11 +509,11 @@ fn match_delim(t: &[Tok], open: usize) -> usize {
         } else if x.s == c {
             d -= 1;
             if d == 0 {
-                return k;
+                return Some(k + 1);
             }
         }
     }
-    t.len().saturating_sub(1)
+    None
 }
 
 /// Words by which a file says what Verus verifies when it is not written in `verus! { }` or `//@` lines.
@@ -587,13 +592,93 @@ fn steering_attr(t: &[Tok], a: usize, e: usize) -> bool {
     }
 }
 
+/// The attribute `t[a..e]` is exactly this token sequence and nothing else.
+fn is_gate(t: &[Tok], a: usize, e: usize, want: &[&str]) -> bool {
+    e - a == want.len() && t[a..e].iter().zip(want).all(|(x, w)| x.s == *w)
+}
+
+/// The gate of a ghost block, and nothing else: `#[cfg(verus_keep_ghost)]`.
+fn ghost_gate(t: &[Tok], a: usize, e: usize) -> bool {
+    is_gate(
+        t,
+        a,
+        e,
+        &["#", "[", "cfg", "(", "verus_keep_ghost", ")", "]"],
+    )
+}
+
+/// The opposite gate, `#[cfg(not(verus_keep_ghost))]`: what it gates is compiled by the shipped build, so it is code.
+fn unghost_gate(t: &[Tok], a: usize, e: usize) -> bool {
+    is_gate(
+        t,
+        a,
+        e,
+        &[
+            "#",
+            "[",
+            "cfg",
+            "(",
+            "not",
+            "(",
+            "verus_keep_ghost",
+            ")",
+            ")",
+            "]",
+        ],
+    )
+}
+
+/// Is `proof` / `proof_with` here the bare name of a macro call, not the last segment of a path (`foo::proof!`) or a method
+/// (`x.proof!`)? Only the bare name is Verus's ghost block.
+fn bare_proof_name(t: &[Tok], k: usize) -> bool {
+    k == 0 || !matches!(t[k - 1].s.as_str(), "::" | ".")
+}
+
+/// Does this file bring a macro of its own in under the name `proof` or `proof_with`? Then `proof!` is that macro and not Verus's
+/// ghost block, and the file gets no special treatment for such calls. Seen here: a `macro_rules!` of that name, a rename to it
+/// (`use m as proof`) and a plain import of it (`use foo::proof;`, `use foo::{proof, ..};`). A macro defined in another file that
+/// reaches this one only by a glob (`use foo::*;`) cannot be told from Verus's own, so it is not treated as an own macro.
+fn own_proof_macro(t: &[Tok]) -> bool {
+    let n = t.len();
+    let name = |x: &Tok| x.ident && matches!(x.s.as_str(), "proof" | "proof_with");
+    for k in 0..n.saturating_sub(2) {
+        if t[k].s == "macro_rules" && t[k + 1].s == "!" && name(&t[k + 2]) {
+            return true;
+        }
+    }
+    for k in 0..n {
+        if !kwlike(&t[k], "use") {
+            continue;
+        }
+        let mut j = k + 1;
+        while j < n && t[j].s != ";" {
+            // The name is bound here when it ends a path or a group element (`use foo::proof;`, `use foo::{proof, x};`), or when
+            // something is renamed to it (`use foo::m as proof;`). `use proof::x;` binds `x`, and `use foo::proof as p;` binds `p`.
+            if t[j].s == "as" && t.get(j + 1).is_some_and(name)
+                || name(&t[j])
+                    && matches!(t.get(j + 1).map_or("", |x| x.s.as_str()), ";" | "," | "}")
+            {
+                return true;
+            }
+            j += 1;
+        }
+    }
+    false
+}
+
 /// Attribute-style proofs and gating (fix list 2 and 3 of the review): every steering attribute that no statement span took is PROOF
 /// text (item-level `#[cfg(any())]` on a `mod`/`impl`, inner `#![cfg(..)]`, `#[cfg_attr(verus_keep_ghost, verus_spec(invariant ..))]`
 /// on a loop), as are `proof! { }` / `proof_with! { }` blocks. Then FAIL CLOSED: a `verus_spec`/`verus_verify`/`verus_keep_ghost`
 /// left in executable text is an error naming the place.
-fn attr_pass(path: &str, t: &[Tok], cls: &mut [Cls], errors: &mut Vec<String>) {
+///
+/// `ghost[k]` is set only where `t[k]` belongs to a closed `proof!`/`proof_with!` block with the exact `#[cfg(verus_keep_ghost)]`
+/// gate directly in front of it: such a block is proof text whose PLACE in the code says nothing about the code, so it may not cut an
+/// exec run either. An ungated block, or one behind another attribute, is classified as before: proof text that cuts the exec run.
+fn attr_pass(path: &str, t: &[Tok], cls: &mut [Cls], ghost: &mut [bool], errors: &mut Vec<String>) {
     let n = t.len();
+    let own = own_proof_macro(t);
     let mut k = 0;
+    let mut last_attr: Option<(usize, usize)> = None;
     while k < n {
         if cls[k] == Cls::Exec && t[k].s == "#" {
             if let Some(e) = spec::attr_end(t, k) {
@@ -604,21 +689,53 @@ fn attr_pass(path: &str, t: &[Tok], cls: &mut [Cls], errors: &mut Vec<String>) {
                         }
                     }
                 }
+                last_attr = Some((k, e.min(n)));
                 k = e;
                 continue;
             }
-        } else if cls[k] == Cls::Exec
+        } else if !own
+            && cls[k] == Cls::Exec
             && (kwlike(&t[k], "proof") || kwlike(&t[k], "proof_with"))
+            && bare_proof_name(t, k)
             && t.get(k + 1).is_some_and(|x| x.s == "!")
             && t.get(k + 2)
                 .is_some_and(|x| matches!(x.s.as_str(), "{" | "(" | "["))
         {
-            let mut e = match_delim(t, k + 2) + 1;
+            let end = delim_end(t, k + 2);
+            let mut e = end.unwrap_or(n).min(n);
             if e < n && t[e].s == ";" {
                 e += 1;
             }
-            for c in cls.iter_mut().take(e.min(n)).skip(k) {
-                *c = Cls::Proof;
+            let e = e.min(n);
+            // The attribute directly in front of a block that closes, if there is one. The two gates point opposite ways:
+            // `#[cfg(verus_keep_ghost)]` makes the block ghost text, `#[cfg(not(verus_keep_ghost))]` puts it in the shipped build.
+            let gate = match last_attr {
+                Some((a, e0)) if end.is_some() && e0 == k => {
+                    Some((a, ghost_gate(t, a, e0), unghost_gate(t, a, e0)))
+                }
+                _ => None,
+            };
+            match gate {
+                // Ghost gate: the pair is proof text and invisible to the code stream, so adding, removing or moving it leaves
+                // exec_fp alone. Only a block that closes is exempt: an unclosed one still swallows the rest of the file into
+                // proof text as before, but exempts nothing from the code — what it hides there, it hides for good.
+                Some((a, true, _)) => {
+                    for c in cls.iter_mut().take(e).skip(k) {
+                        *c = Cls::Proof;
+                    }
+                    for g in ghost.iter_mut().take(e).skip(a) {
+                        *g = true;
+                    }
+                }
+                // The not-gate: the block is compiled by the normal build, so it stays code through and through and an edit inside
+                // it is a code change. The gate itself is proof text, being what switches Verus off.
+                Some((_, false, true)) => {}
+                // A bare block, or one behind another attribute: proof text whose place in the code still shows, as before.
+                _ => {
+                    for c in cls.iter_mut().take(e).skip(k) {
+                        *c = Cls::Proof;
+                    }
+                }
             }
             k = e;
             continue;
@@ -831,7 +948,8 @@ pub fn classify(path: &str, src: &str) -> FileClass {
         }
         k += 1;
     }
-    attr_pass(path, t, &mut cls, &mut errors);
+    let mut ghost = vec![false; n];
+    attr_pass(path, t, &mut cls, &mut ghost, &mut errors);
     // Cross-checks against the freeze's own scan.
     let hk: usize = sc
         .spans
@@ -859,7 +977,7 @@ pub fn classify(path: &str, src: &str) -> FileClass {
             Cls::Proof => 2,
         }] += 1;
     }
-    let mut exec_text = runs(t, &cls, Cls::Exec);
+    let mut exec_text = runs(t, &cls, Cls::Exec, &ghost);
     let code_toks = {
         let by_lo: HashMap<usize, usize> = sc
             .spans
@@ -892,7 +1010,7 @@ pub fn classify(path: &str, src: &str) -> FileClass {
         out
     };
     // `//@omit` lines decide what the verifier sees of the shipped code: they are proof text.
-    let mut proof_text = runs(t, &cls, Cls::Proof);
+    let mut proof_text = runs(t, &cls, Cls::Proof, &[]);
     for l in src.lines().filter(|l| l.trim_end().ends_with("//@omit")) {
         proof_text.push_str(" ;; omit: ");
         proof_text.push_str(&l.split_whitespace().collect::<Vec<_>>().join(" "));
@@ -4286,6 +4404,348 @@ pub fn step_for(steps: &[Step], cap: usize) -> usize {
         let ex = k(&ATTR.replace("i += 1;", "i += 2;"));
         assert_eq!((&ex.0, &ex.1), (&b.0, &b.1));
         assert_ne!(ex.2, b.2);
+    }
+
+    const ROWS_BASE: &str = r#"
+verus! {
+pub fn rows_ok(rows: &[(u32, u32)], height: u32) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut i: usize = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            0 <= i <= rows@.len(),
+            total as int == rows_sum(rows@.subrange(0, i as int)),
+        decreases rows@.len() - i
+    ))]
+    while i < rows.len() {
+        let (y, h) = rows[i];
+        if h == 0 || y >= height || h > height - y {
+            return None;
+        }
+        if h as u64 > u64::MAX - total {
+            return None;
+        }
+        total = total + h as u64;
+        i += 1;
+    }
+    Some(total)
+}
+}
+"#;
+
+    const ROWS_WITH: &str = r#"
+verus! {
+pub fn rows_ok(rows: &[(u32, u32)], height: u32) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut i: usize = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            0 <= i <= rows@.len(),
+            total as int == rows_sum(rows@.subrange(0, i as int)),
+        decreases rows@.len() - i
+    ))]
+    while i < rows.len() {
+        let (y, h) = rows[i];
+        if h == 0 || y >= height || h > height - y {
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert(!row_inside(rows@[i as int], height));
+            }
+            return None;
+        }
+        if h as u64 > u64::MAX - total {
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert(rows@.subrange(0, i as int + 1).drop_last() =~= rows@.subrange(0, i as int));
+                lemma_rows_prefix_le(rows@, i as int + 1);
+            }
+            return None;
+        }
+        total = total + h as u64;
+        i += 1;
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(rows@.subrange(0, i as int).drop_last() =~= rows@.subrange(0, i as int - 1));
+        }
+    }
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(rows@.subrange(0, i as int) =~= rows@);
+    }
+    Some(total)
+}
+}
+"#;
+
+    // The four ghost blocks of `rows_ok` (aeaa4f6fa, a prover's commit that changed no executable line) each cut one exec run in two,
+    // and the `;;` of the cut is part of exec_fp: the block was proof text, but where the prover put it was code.
+
+    const PB_REFUSAL: &str = concat!(
+        "            #[cfg(verus_keep_ghost)]\n",
+        "            proof! {\n",
+        "                assert(!row_inside(rows@[i as int], height));\n",
+        "            }\n",
+    );
+    const PB_OVERFLOW: &str = concat!(
+        "            #[cfg(verus_keep_ghost)]\n",
+        "            proof! {\n",
+        "                assert(rows@.subrange(0, i as int + 1).drop_last() =~= rows@.subrange(0, i as int));\n",
+        "                lemma_rows_prefix_le(rows@, i as int + 1);\n",
+        "            }\n",
+    );
+    const PB_STEP: &str = concat!(
+        "        #[cfg(verus_keep_ghost)]\n",
+        "        proof! {\n",
+        "            assert(rows@.subrange(0, i as int).drop_last() =~= rows@.subrange(0, i as int - 1));\n",
+        "        }\n",
+    );
+    const PB_DONE: &str = concat!(
+        "    #[cfg(verus_keep_ghost)]\n",
+        "    proof! {\n",
+        "        assert(rows@.subrange(0, i as int) =~= rows@);\n",
+        "    }\n",
+    );
+    const ALL_PB: &[&str] = &[PB_REFUSAL, PB_OVERFLOW, PB_STEP, PB_DONE];
+
+    /// `ROWS_WITH` with the blocks kept that are (`keep_it`) or are not (`!keep_it`) the one named `pick`.
+    fn rows_cut(pick: &str, keep_it: bool) -> String {
+        ALL_PB.iter().fold(ROWS_WITH.to_string(), |s, b| {
+            if (*b == pick) == keep_it {
+                s
+            } else {
+                s.replace(b, "")
+            }
+        })
+    }
+
+    #[test]
+    fn a_whole_gated_proof_block_is_proof_text_and_not_code() {
+        let (b, w) = (fp_of(ROWS_BASE), fp_of(ROWS_WITH));
+        assert_ne!(b.proof, w.proof, "the blocks are proof text");
+        assert_eq!(
+            (&w.stmt, &w.exec, &w.data),
+            (&b.stmt, &b.exec, &b.data),
+            "the four rows_ok blocks moved the code:\n{}",
+            classify("c/src/rules.rs", ROWS_WITH).exec_text
+        );
+        for p in ALL_PB {
+            for (name, src) in [("lone", rows_cut(p, true)), ("missing", rows_cut(p, false))] {
+                let f = fp_of(&src);
+                assert_eq!(
+                    (&f.stmt, &f.exec, &f.data),
+                    (&b.stmt, &b.exec, &b.data),
+                    "the {name} block {p:?} moved the code"
+                );
+                assert_ne!(
+                    f.proof, b.proof,
+                    "the {name} block {p:?} left the proof text alone"
+                );
+            }
+        }
+        // the same block one statement earlier: the code is the same code
+        let moved = ROWS_WITH.replace(PB_STEP, "").replace(
+            "        total = total + h as u64;",
+            &format!("{PB_STEP}        total = total + h as u64;"),
+        );
+        let m = fp_of(&moved);
+        assert_eq!((&m.stmt, &m.exec, &m.data), (&b.stmt, &b.exec, &b.data));
+        assert_ne!(m.proof, b.proof);
+    }
+
+    const ONE: &str = r#"
+verus! {
+pub fn f(x: u32) -> (y: u32) ensures y > x {
+    let mut y = x;
+    y += 1;
+    y
+}
+}
+"#;
+
+    /// `src` with `block` put between `let mut y = x;` and `y += 1;`, in the middle of the executable body.
+    fn in_middle(src: &str, block: &str) -> String {
+        src.replace("    y += 1;", &format!("{block}    y += 1;"))
+    }
+
+    #[test]
+    fn a_proof_block_of_any_shape_stays_out_of_the_code() {
+        let b = fp_of(ONE);
+        for block in [
+            "    #[cfg(verus_keep_ghost)]\n    proof! { g(y); }\n",
+            "    #[cfg(verus_keep_ghost)]\n    proof! { g(y); };\n",
+            "    #[cfg(verus_keep_ghost)]\n    proof!(g(y));\n",
+            "    #[cfg(verus_keep_ghost)]\n    proof![g(y)];\n",
+            "    #[cfg(verus_keep_ghost)]\n    proof_with! { g(y); }\n",
+            "    #[cfg(verus_keep_ghost)]\n    proof_with!(g(y));\n",
+        ] {
+            let w = fp_of(&in_middle(ONE, block));
+            assert_eq!(
+                (&w.stmt, &w.exec, &w.data),
+                (&b.stmt, &b.exec, &b.data),
+                "{block:?} moved the code"
+            );
+            assert_ne!(w.proof, b.proof, "{block:?} left the proof text alone");
+        }
+    }
+
+    /// The exemption is the GATE, not the call: `proof!` without `#[cfg(verus_keep_ghost)]` is a macro any crate can define and the
+    /// normal build can compile, so it keeps its place in the code stream exactly as it had before this rule existed.
+    #[test]
+    fn an_ungated_proof_block_still_shows_in_the_code() {
+        let b = fp_of(ONE);
+        for block in ["    proof! { g(y); }\n", "    proof! { g(y); };\n"] {
+            let src = in_middle(ONE, block);
+            let w = fp_of(&src);
+            // Its body is proof text and its place is code: exactly what this branch did before the rule landed.
+            assert_ne!(
+                w.exec, b.exec,
+                "{block:?}: a bare block hid its place from the code"
+            );
+            assert_ne!(
+                w.proof, b.proof,
+                "{block:?}: a bare block is not proof text"
+            );
+            assert_eq!((&w.stmt, &w.data), (&b.stmt, &b.data), "{block:?}");
+            // and an edit inside it stays a proof change, not a code change — it is the same class as before
+            let edited = fp_of(&src.replace("g(y)", "g(y, z)"));
+            assert_eq!(
+                edited.exec, w.exec,
+                "{block:?}: the class of a bare block moved"
+            );
+            assert_ne!(
+                edited.proof, w.proof,
+                "{block:?}: the body of a bare block is code"
+            );
+            // the same block further down the same body is a different code fingerprint: the gate, not the block, is what is invisible
+            let moved = fp_of(&ONE.replace("    y += 1;", &format!("    y += 1;\n{block}")));
+            assert_ne!(
+                moved.exec, w.exec,
+                "{block:?}: where a bare block sits was free"
+            );
+        }
+    }
+
+    /// `#[cfg(not(verus_keep_ghost))]` is the opposite gate: what it gates is in the shipped build, so the block is code in full and
+    /// an edit inside it is a code change.
+    #[test]
+    fn a_not_gated_proof_block_is_code_through_and_through() {
+        let b = fp_of(ONE);
+        let block = "    #[cfg(not(verus_keep_ghost))]\n    proof! { g(y); }\n";
+        let src = in_middle(ONE, block);
+        let w = fp_of(&src);
+        assert_ne!(w.exec, b.exec, "a not-gated block hid itself from the code");
+        let edited = fp_of(&src.replace("g(y)", "g(y, z)"));
+        assert_ne!(
+            edited.exec, w.exec,
+            "an edit inside a not-gated block left the code alone"
+        );
+    }
+
+    #[test]
+    fn the_ghost_gate_in_front_of_anything_else_is_code() {
+        let b = fp_of(ONE);
+        for gated in ["let mut z = y;", "y += 2;", "if y > 0 { y -= 1; }", "g(y);"] {
+            let block = format!("    #[cfg(verus_keep_ghost)]\n    {gated}\n");
+            let w = fp_of(&in_middle(ONE, &block));
+            assert_ne!(w.exec, b.exec, "the gate on `{gated}` hid code");
+        }
+        // `not(..)` is the other way round: the block is compiled by the normal build, so its place is code
+        let w = fp_of(&in_middle(
+            ONE,
+            "    #[cfg(not(verus_keep_ghost))]\n    proof! { g(y); }\n",
+        ));
+        assert_ne!(w.exec, b.exec, "a not(verus_keep_ghost) gate hid code");
+    }
+
+    #[test]
+    fn a_file_that_brought_its_own_proof_macro_has_no_ghost_blocks() {
+        for header in [
+            "macro_rules! proof { ($e:expr) => { $e }; }\n",
+            "macro_rules! proof_with { ($e:expr) => { $e }; }\n",
+            "use crate::ghost::m as proof;\n",
+            "use crate::ghost::{m as proof_with, n};\n",
+            "use crate::ghost::proof;\n",
+            "use crate::ghost::proof_with;\n",
+            "use crate::ghost::{proof, n};\n",
+            "use crate::ghost::{n, proof_with};\n",
+            "use crate::ghost::{a::{proof, b}, n};\n",
+        ] {
+            let src = format!("{header}{ONE}");
+            let b = fp_of(&src);
+            let block = "    #[cfg(verus_keep_ghost)]\n    proof! { g(y); }\n";
+            let w = fp_of(&in_middle(&src, block));
+            assert_ne!(
+                w.exec, b.exec,
+                "{header:?}: `proof!` is this file's own macro"
+            );
+            // and a change inside the block is a code change there
+            let edited = fp_of(&in_middle(&src, block).replace("g(y)", "g(x)"));
+            assert_ne!(
+                edited.exec, w.exec,
+                "{header:?}: the body of the own macro is code"
+            );
+        }
+    }
+
+    /// A `use` that does not bind the name leaves the file alone: only a name `proof`/`proof_with` in scope is an own macro.
+    #[test]
+    fn a_use_that_binds_another_name_keeps_the_ghost_block_exemption() {
+        for header in [
+            "use crate::ghost::proof::n;\n",
+            "use crate::ghost::proof_as_medicine;\n",
+            "use crate::ghost::proof::deep::n;\n",
+            "use crate::ghost::{n, o};\n",
+        ] {
+            let src = format!("{header}{ONE}");
+            let b = fp_of(&src);
+            let w = fp_of(&in_middle(
+                &src,
+                "    #[cfg(verus_keep_ghost)]\n    proof! { g(y); }\n",
+            ));
+            assert_eq!(
+                (&w.stmt, &w.exec, &w.data),
+                (&b.stmt, &b.exec, &b.data),
+                "{header:?}: a path that passes through the word cost the file its exemption"
+            );
+            assert_ne!(w.proof, b.proof, "{header:?}");
+        }
+    }
+
+    #[test]
+    fn a_proof_call_behind_a_path_or_under_another_name_is_code() {
+        let b = classify("c/src/one.rs", ONE);
+        assert!(b.errors.is_empty(), "{:?}", b.errors);
+        for block in [
+            "    #[cfg(verus_keep_ghost)]\n    foo::proof! { g(y); }\n",
+            "    #[cfg(verus_keep_ghost)]\n    ::proof! { g(y); }\n",
+            "    #[cfg(verus_keep_ghost)]\n    my_proof! { g(y); }\n",
+            "    #[cfg(verus_keep_ghost)]\n    proof_with_extra! { g(y); }\n",
+        ] {
+            let src = in_middle(ONE, block);
+            let c = classify("c/src/one.rs", &src);
+            assert!(c.errors.is_empty(), "{block:?}: {:?}", c.errors);
+            assert!(
+                c.exec_text.contains("proof"),
+                "{block:?} left the code: {}",
+                c.exec_text
+            );
+            let edited = classify("c/src/one.rs", &src.replace("g(y)", "g(x)"));
+            assert_ne!(
+                edited.exec_text, c.exec_text,
+                "{block:?}: the body of the call hid from the code"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unclosed_proof_block_is_not_a_ghost_block() {
+        let b = classify("c/src/one.rs", ONE);
+        let src = in_middle(ONE, "    #[cfg(verus_keep_ghost)]\n    proof! { g(y);\n");
+        let c = classify("c/src/one.rs", &src);
+        assert_ne!(
+            c.exec_text, b.exec_text,
+            "an unclosed block left the code untouched"
+        );
     }
 
     #[test]

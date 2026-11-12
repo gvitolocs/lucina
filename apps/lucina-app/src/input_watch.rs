@@ -8,10 +8,13 @@
 use std::{
     fs::File,
     io::{Read, Write},
-    os::fd::{AsRawFd, FromRawFd, RawFd},
+    os::fd::{AsRawFd, RawFd},
     path::Path,
     time::{Duration, Instant},
 };
+// Only the Linux `start` turns pipe2's descriptors into files.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::fd::FromRawFd;
 
 use crate::events::{
     Reader,
@@ -55,6 +58,7 @@ pub struct Seen {
 
 impl InputWatch {
     /// Starts the waiting thread; `None` when no pipe or thread could be had (the timed rescans stay).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn start() -> Option<InputWatch> {
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: `fds` holds room for the two descriptors pipe2 writes.
@@ -68,6 +72,14 @@ impl InputWatch {
             .spawn(move || run(write))
             .ok()?;
         Some(InputWatch { read })
+    }
+
+    /// Starts the waiting thread; `None` when no pipe or thread could be had (the timed rescans stay).
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub fn start() -> Option<InputWatch> {
+        // `/dev/input` is the Linux input ABI and exists nowhere else: there is no device to be told of, so
+        // no watcher runs here and every app keeps its timed rescans, as it does while the hub is away.
+        None
     }
 
     pub fn fd(&self) -> RawFd {
@@ -123,6 +135,9 @@ fn fold(mut seen: Seen, bytes: &[u8]) -> Seen {
     seen
 }
 
+/// The hub thread. Only the Linux `start` above spawns it; off Linux it is compiled, so the rest of the file stays the
+/// same everywhere, but nothing ever starts it.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
 fn run(mut write: File) {
     let filter = Filter {
         kind: vec!["input.*".into()],

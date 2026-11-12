@@ -8,7 +8,10 @@
 //! - `tcp` (Juno boot 11, patch 1053): listens on 127.0.0.1, makes up to `count` connections to itself, sends 16 KiB each
 //!   way on each and keeps them open, so that a kernel whose TCP buffers need a contiguous block runs out where one that
 //!   takes them a page at a time gives ENOMEM (or drops a SYN) at worst.
+//!
 //! Prints one line and exits 0.
+//!
+//! Other modes: `hog`, `malloc`, `unmap` and `balance [cpus]` (patch 1272); see each function.
 
 use std::{thread::sleep, time::Duration};
 
@@ -46,13 +49,21 @@ fn malloc_loop(rounds: usize) {
             _ => failed += 1,
         }
     }
-    println!("memfrag: exec 600 in {} ms, {failed} failed, free {} kB", t.elapsed().as_millis(), mem_free_kb());
+    println!(
+        "memfrag: exec 600 in {} ms, {failed} failed, free {} kB",
+        t.elapsed().as_millis(),
+        mem_free_kb()
+    );
     for round in 0..rounds {
         let t = std::time::Instant::now();
         for i in 0..2_000_000u32 {
             std::hint::black_box(Box::new([i as u8; 64]));
         }
-        println!("memfrag: malloc round {round} in {} ms, free {} kB", t.elapsed().as_millis(), mem_free_kb());
+        println!(
+            "memfrag: malloc round {round} in {} ms, free {} kB",
+            t.elapsed().as_millis(),
+            mem_free_kb()
+        );
     }
     println!("memfrag: malloc ok {rounds}");
 }
@@ -65,7 +76,12 @@ fn unmap_churn(rounds: usize) {
     let deferred = || {
         std::fs::read_to_string("/proc/meminfo")
             .ok()
-            .and_then(|t| t.lines().find_map(|l| l.strip_prefix("DeferredFrees:").map(|v| v.trim().parse::<u64>().unwrap_or(0))))
+            .and_then(|t| {
+                t.lines().find_map(|l| {
+                    l.strip_prefix("DeferredFrees:")
+                        .map(|v| v.trim().parse::<u64>().unwrap_or(0))
+                })
+            })
             .unwrap_or(0)
     };
     let start_kb = mem_free_kb();
@@ -73,10 +89,20 @@ fn unmap_churn(rounds: usize) {
     for round in 0..rounds {
         // SAFETY: an anonymous private mapping at an address the kernel chooses; nothing else refers to it.
         let p = unsafe {
-            libc::mmap(core::ptr::null_mut(), SIZE, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+            libc::mmap(
+                core::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
         };
         if p == libc::MAP_FAILED {
-            println!("memfrag: unmap: mmap failed in round {round} (errno {})", errno());
+            println!(
+                "memfrag: unmap: mmap failed in round {round} (errno {})",
+                errno()
+            );
             return;
         }
         let p = p.cast::<u8>();
@@ -105,10 +131,20 @@ fn hog() {
     loop {
         // SAFETY: an anonymous private mapping at an address the kernel chooses; nothing else refers to it.
         let p = unsafe {
-            libc::mmap(core::ptr::null_mut(), CHUNK, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+            libc::mmap(
+                core::ptr::null_mut(),
+                CHUNK,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
         };
         if p == libc::MAP_FAILED {
-            println!("memfrag: hog: mmap failed at {mib} MiB (errno {}); touching what it has", errno());
+            println!(
+                "memfrag: hog: mmap failed at {mib} MiB (errno {}); touching what it has",
+                errno()
+            );
             sleep(Duration::from_secs(1));
             continue;
         }
@@ -118,10 +154,94 @@ fn hog() {
             unsafe { p.add(off).write_volatile(1) };
         }
         mib += CHUNK >> 20;
-        if mib % 256 == 0 {
+        if mib.is_multiple_of(256) {
             println!("memfrag: hog: {mib} MiB, free {} kB", mem_free_kb());
         }
     }
+}
+
+/// One line on stdout with `write(2)`, whose error is ignored: once memory is gone the console may refuse it, and
+/// `println!` would then panic.
+fn say(line: &str) {
+    let text = format!("{line}\n");
+    // SAFETY: writes from a buffer of that length to stdout.
+    unsafe { libc::write(1, text.as_ptr().cast(), text.len()) };
+}
+
+fn errno_text(ret: libc::c_int) -> String {
+    if ret == 0 {
+        "ok".into()
+    } else {
+        format!("errno {}", errno())
+    }
+}
+
+/// Maps `len` bytes of anonymous memory and writes each page; null when the mapping failed.
+fn touched(len: usize) -> *mut u8 {
+    // SAFETY: an anonymous private mapping at an address the kernel chooses; nothing else refers to it.
+    let p = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        return core::ptr::null_mut();
+    }
+    let p = p.cast::<u8>();
+    for off in (0..len).step_by(PAGE) {
+        // SAFETY: inside the mapping just made, which is readable and writable.
+        unsafe { p.add(off).write_volatile(1) };
+    }
+    p
+}
+
+/// Pins the calling thread to one CPU.
+fn pin_to(cpu: usize) -> libc::c_int {
+    // SAFETY: a zeroed cpu_set_t is a valid empty set; CPU_SET and sched_setaffinity read and write only it.
+    unsafe {
+        let mut set: libc::cpu_set_t = core::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        libc::sched_setaffinity(0, core::mem::size_of::<libc::cpu_set_t>(), &set)
+    }
+}
+
+/// `lucina-memfrag balance [cpus]` (patch 1272's test): a holder pinned to each CPU but the first touches one page while
+/// the global pool is full, so that its CPU's local pool takes its share of it, and sleeps, so that nothing balances it
+/// back; this process, pinned to CPU 0, then takes memory until the OOM killer ends it. On its way the global pool goes
+/// down to a few pages while CPU 0's local pool is empty, the state in which the frame allocator's balancing step had an
+/// amount under a page to move, wrapped its order to 2^32 - 1 and recursed until the stack overflowed (before 1272).
+fn balance(cpus: usize) {
+    for cpu in 1..cpus.max(2) {
+        // SAFETY: the child pins itself, touches a page and sleeps; it never returns into this program's state.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            let r = pin_to(cpu);
+            let p = touched(PAGE);
+            say(&format!(
+                "memfrag: balance: holder on CPU {cpu} ({}), touched {}, free {} kB",
+                errno_text(r),
+                !p.is_null(),
+                mem_free_kb()
+            ));
+            loop {
+                // SAFETY: waits for a signal; nothing else.
+                unsafe { libc::pause() };
+            }
+        }
+    }
+    sleep(Duration::from_secs(2));
+    let r = pin_to(0);
+    say(&format!(
+        "memfrag: balance: hog on CPU 0 ({}), free {} kB",
+        errno_text(r),
+        mem_free_kb()
+    ));
+    hog();
 }
 
 fn main() {
@@ -130,8 +250,22 @@ fn main() {
     if first.as_deref() == Some("noop") {
         return;
     }
+    if first.as_deref() == Some("balance") {
+        balance(
+            std::env::args()
+                .nth(2)
+                .and_then(|a| a.parse().ok())
+                .unwrap_or(4),
+        );
+        return;
+    }
     if first.as_deref() == Some("unmap") {
-        unmap_churn(std::env::args().nth(2).and_then(|a| a.parse().ok()).unwrap_or(20));
+        unmap_churn(
+            std::env::args()
+                .nth(2)
+                .and_then(|a| a.parse().ok())
+                .unwrap_or(20),
+        );
         return;
     }
     if first.as_deref() == Some("hog") {
@@ -139,15 +273,26 @@ fn main() {
         return;
     }
     if first.as_deref() == Some("malloc") {
-        malloc_loop(std::env::args().nth(2).and_then(|a| a.parse().ok()).unwrap_or(6));
+        malloc_loop(
+            std::env::args()
+                .nth(2)
+                .and_then(|a| a.parse().ok())
+                .unwrap_or(6),
+        );
         return;
     }
-    let leave_kb: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(96 * 1024);
+    let leave_kb: usize = args
+        .next()
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(96 * 1024);
     let pipes: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(1000);
     let tcp = args.next().as_deref() == Some("tcp");
 
     // Room for the pipes' descriptors.
-    let limit = libc::rlimit { rlim_cur: (2 * pipes + 64) as libc::rlim_t, rlim_max: (2 * pipes + 64) as libc::rlim_t };
+    let limit = libc::rlimit {
+        rlim_cur: (2 * pipes + 64) as libc::rlim_t,
+        rlim_max: (2 * pipes + 64) as libc::rlim_t,
+    };
     // SAFETY: setrlimit reads the struct, which lives through the call.
     unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
 
@@ -156,7 +301,14 @@ fn main() {
     while mem_free_kb() > leave_kb + (CHUNK >> 10) {
         // SAFETY: an anonymous private mapping at an address the kernel chooses; nothing else refers to it.
         let p = unsafe {
-            libc::mmap(core::ptr::null_mut(), CHUNK, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+            libc::mmap(
+                core::ptr::null_mut(),
+                CHUNK,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
         };
         if p == libc::MAP_FAILED {
             break;
@@ -240,7 +392,9 @@ fn tcp_connections(count: usize, start_kb: usize, filled_kb: usize, holed_kb: us
             return;
         }
     };
-    let addr = listener.local_addr().expect("a bound listener has an address");
+    let addr = listener
+        .local_addr()
+        .expect("a bound listener has an address");
     let out = vec![0x5au8; TCP_BYTES];
     let mut back = vec![0u8; TCP_BYTES];
     let (mut ok, mut enomem, mut timeout, mut other) = (0usize, 0usize, 0usize, 0usize);

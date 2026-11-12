@@ -68,6 +68,10 @@ use lucina_remote::{
 const DATA: &str = "/data";
 const RUN: &str = "/run/lucina";
 const FSCK: &str = "/sbin/e2fsck";
+/// The first backup superblock of a Juno data partition: mke2fs's `sparse_super` places backups at 32768, 98304, 163840,
+/// 229376 and 294912 blocks (docs/research/juno-data-cuts.md). Used only when the primary cannot be read or a check leaves errors.
+const BACKUP_SUPERBLOCK: &str = "32768";
+const BACKUP_BLOCK_SIZE: &str = "4096";
 const SYNC_EVERY: Duration = Duration::from_secs(10);
 const DEVICE_WAIT: Duration = Duration::from_secs(20);
 const SEED_FILE: &str = "/data/lucina/random-seed";
@@ -224,11 +228,22 @@ struct Checked {
     why: String,
 }
 
-/// Runs e2fsck, answering yes to everything: nobody is there to ask, and a /data that mounts is the point.
-fn check(device: &str, state: u16, log: &mut String) -> Result<Checked, String> {
+/// Whether a finished check should be tried again from the backup superblock: only when it did not start there and it left
+/// errors (exit 4 and above; 0, 1 and 2 are a clean or repaired file system).
+fn retry_from_backup(code: i32, from_backup: bool) -> bool {
+    !from_backup && code >= 4
+}
+
+/// Runs e2fsck once, answering yes to everything. `backup` makes it read the first backup superblock instead of the primary.
+fn run_fsck(device: &str, backup: bool, log: &mut String) -> Result<(i32, String, u128), String> {
     let started = Instant::now();
-    let out = Command::new(FSCK)
-        .args(["-f", "-y", device])
+    let mut command = Command::new(FSCK);
+    command.args(["-f", "-y"]);
+    if backup {
+        command.args(["-b", BACKUP_SUPERBLOCK, "-B", BACKUP_BLOCK_SIZE]);
+    }
+    let out = command
+        .arg(device)
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("{FSCK}: {e}"))?;
@@ -236,8 +251,40 @@ fn check(device: &str, state: u16, log: &mut String) -> Result<Checked, String> 
     let all = [out.stdout.as_slice(), out.stderr.as_slice()].concat();
     let _ = fs::write(format!("{RUN}/e2fsck.log"), &all);
     let ms = started.elapsed().as_millis();
-    log.push_str(&format!("e2fsck: exit {code} in {ms} ms\n"));
-    let report = fsck::parse(&String::from_utf8_lossy(&all), code);
+    log.push_str(&format!(
+        "e2fsck{}: exit {code} in {ms} ms\n",
+        if backup {
+            format!(" -b {BACKUP_SUPERBLOCK} -B {BACKUP_BLOCK_SIZE}")
+        } else {
+            String::new()
+        }
+    ));
+    Ok((code, String::from_utf8_lossy(&all).into_owned(), ms))
+}
+
+/// Runs e2fsck, answering yes to everything: nobody is there to ask, and a /data that mounts is the point.
+///
+/// A primary superblock whose magic was destroyed makes e2fsck refuse or leave errors (exit 4 and above); a check that leaves
+/// errors is retried once from the first backup superblock, which also repairs the primary. `backup` starts at the backup
+/// superblock (the caller already found that the primary is unreadable).
+fn check(
+    device: &str,
+    state: u16,
+    backup: bool,
+    why: Option<String>,
+    log: &mut String,
+) -> Result<Checked, String> {
+    let (mut code, mut text, mut ms) = run_fsck(device, backup, log)?;
+    if retry_from_backup(code, backup) {
+        log.push_str(&format!(
+            "e2fsck exit {code}: trying backup superblock {BACKUP_SUPERBLOCK}\n"
+        ));
+        say_in_kernel_log(&format!(
+            "/data check left errors (exit {code}): trying backup superblock {BACKUP_SUPERBLOCK}"
+        ));
+        (code, text, ms) = run_fsck(device, true, log)?;
+    }
+    let report = fsck::parse(&text, code);
     let summary = report.summary(ms);
     log.push_str(&format!("e2fsck summary: {summary}\n"));
     let _ = fs::write(format!("{RUN}/e2fsck.summary"), format!("{summary}\n"));
@@ -246,29 +293,65 @@ fn check(device: &str, state: u16, log: &mut String) -> Result<Checked, String> 
     if !(0..=2).contains(&code) {
         return Err(format!("e2fsck exit {code}, see {RUN}/e2fsck.log"));
     }
-    let why = if state & STATE_ERROR != 0 {
-        format!("the file system's error flag was set (state {state})")
-    } else if state == 0 {
-        "the last boot did not end with lucina-data clean (state 0: mounted, not marked clean)"
-            .to_string()
-    } else {
-        format!("the superblock state was {state}, not clean")
-    };
+    let why = why.unwrap_or_else(|| {
+        if state & STATE_ERROR != 0 {
+            format!("the file system's error flag was set (state {state})")
+        } else if state == 0 {
+            "the last boot did not end with lucina-data clean (state 0: mounted, not marked clean)"
+                .to_string()
+        } else {
+            format!("the superblock state was {state}, not clean")
+        }
+    });
     Ok(Checked { report, ms, why })
 }
 
 fn bring_up(log: &mut String) -> Result<Option<Checked>, String> {
     let device = device()?;
     let t0 = Instant::now();
-    let info =
-        disk::ext2_on(&device)?.ok_or_else(|| format!("{device} holds no ext2 file system"))?;
-    let mut checked = None;
-    if needs_check(info.state) {
+    // A destroyed primary magic is not "holds no ext2 file system": e2fsck can still repair the file system from a backup
+    // superblock and restore the primary. Only after that may the mount go ahead.
+    let mut checked = match disk::ext2_on(&device)? {
+        Some(info) => {
+            if needs_check(info.state) {
+                log.push_str(&format!(
+                    "not clean: checking (superblock state {})\n",
+                    info.state
+                ));
+                Some(check(&device, info.state, false, None, log)?)
+            } else {
+                None
+            }
+        }
+        None => {
+            log.push_str(&format!(
+                "{device}: the primary superblock is not readable as ext2 (magic gone); trying backup superblock {BACKUP_SUPERBLOCK}\n"
+            ));
+            say_in_kernel_log(&format!(
+                "{device}: primary superblock magic gone, trying backup superblock {BACKUP_SUPERBLOCK}"
+            ));
+            Some(check(
+                &device,
+                0,
+                true,
+                Some(format!(
+                    "the primary superblock's magic was gone; e2fsck used backup superblock {BACKUP_SUPERBLOCK}"
+                )),
+                log,
+            )?)
+        }
+    };
+    let info = disk::ext2_on(&device)?.ok_or_else(|| {
+        format!(
+            "{device} still holds no ext2 file system after a check from backup superblock {BACKUP_SUPERBLOCK}"
+        )
+    })?;
+    if checked.is_none() && needs_check(info.state) {
         log.push_str(&format!(
             "not clean: checking (superblock state {})\n",
             info.state
         ));
-        checked = Some(check(&device, info.state, log)?);
+        checked = Some(check(&device, info.state, false, None, log)?);
     }
     set_state(&device, 0)?;
     let t1 = Instant::now();
@@ -705,6 +788,28 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("lucina-data: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_from_backup;
+
+    #[test]
+    fn backup_superblock_retry_only_once_and_only_on_errors() {
+        for code in [4, 8, 12, 16, 32] {
+            assert!(retry_from_backup(code, false), "exit {code} should retry");
+            assert!(
+                !retry_from_backup(code, true),
+                "exit {code} from the backup superblock must not retry again"
+            );
+        }
+        for code in [-1, 0, 1, 2] {
+            assert!(
+                !retry_from_backup(code, false),
+                "exit {code} needs no backup superblock"
+            );
         }
     }
 }

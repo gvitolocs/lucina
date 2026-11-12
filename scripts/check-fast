@@ -1,9 +1,149 @@
 #!/usr/bin/env bash
 # The fast local check, run in your worktree before a commit: only what the change touched, capped. docs/ci/SHIFT-LEFT.md.
 # Usage: scripts/check-fast [--base REF] [--no-build] [--proofs [--mutants] [--all-proofs]]
+#   CHECK_FAST_FILTER_ONLY=<log>  run only the gate pass below over an existing check-fast log, and exit: how a test
+#                                 reads a log without building, queueing or filling a disk.
+#   CHECK_FAST_BIN=<path>         run that binary instead of the built release, and leave it where it is: the stub of
+#                                 `lucina-ci check-fast` scripts/tests/check-fast-oos-test.sh drives end to end.
+#   CHECK_FAST_LOG=<path>         write the raw unfiltered output there and keep it (a private temp file is deleted):
+#                                 the same test reads what the pass folded.
+#   LUCINA_CHECK_TMP=<dir>        where a run keeps its temp files (default $HOME/scratch/tmp/check-fast); TMPDIR is set to it.
+#   LUCINA_BQ=<path>              the build queue to run the check through (default $HOME/.local/bin/bq), and only when it is
+#                                 executable and prints our own usage. A `bq` on PATH is never taken: see the queue step below.
 # Verus runs on GitHub; --proofs runs the affected proofs here.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+# A run is not small: the private copy of the binary, the raw log, and every temp file of lucina-ci and its children (reports,
+# coverage, sweep scratch) go to TMPDIR. buildhost's /tmp is a quota'd tmpfs shared by every session, and on 2026-11-12 it filled and
+# every check-fast failed. So the point is to leave /tmp: TMPDIR is set here rather than inherited, which means a caller's own
+# TMPDIR is NOT kept; only an explicitly set LUCINA_CHECK_TMP steers this, and it does not touch anyone else's TMPDIR.
+tmp_root=${LUCINA_CHECK_TMP:-$HOME/scratch/tmp/check-fast}
+mkdir -p "$tmp_root"
+export TMPDIR=$tmp_root
+
+# The one pass over the output of `lucina-ci check-fast`, which changes only how a full disk reads.
+#
+# A failing step is one block: the `FAIL <step>` line and the indented tail of its log under it. The pass holds a block until
+# its tail ends (the first line that is not indented), because only the tail says why the step failed. A step that died on
+# "No space left on device" or "Disk quota exceeded" (os error 28 and 122: the disk or the quota of a tmpfs was full while the
+# step wrote its reports) says nothing about the tree under test, and on 2026-11-12 it cost the box a day of ghosts: 44
+# leftover test folders of 1.1 GiB each filled the quota'd /tmp, and every run then failed on inventory, spec, roles and trust
+# at once, which reads as four unrelated gate failures and is one full tmpfs.
+#
+# So those steps are not counted as failures of their own. Each prints one `oos` line in place of its `FAIL` (which step, and
+# which folder), they are reported ONCE as `out of space in <dir>`, and the summary carries that one class instead of their
+# number. The dir is the folder the message was writing (the parent of the path in it), the one folder the steps share when
+# they name several, or TMPDIR when none names a path. Every other failure, its tail and the counts it adds are left exactly
+# as they were; the exit code is the binary's own, so a full disk still fails the check, and the raw log keeps every tail this
+# pass folded. GNU awk, for fflush() on every line it prints: a live run stays live, and a held tail is capped at 400 lines.
+gate_pass() {
+    awk -v tmpdir="${TMPDIR:-/tmp}" '
+        function tail_punct(w) { sub(/[",;:()\[\]{}]+$/, "", w); return w }
+        # The folder a path token names: its parent for a file, itself for a token that ends in a slash.
+        function parent_of(w,   p, j) {
+            p = w
+            if (p ~ /\/$/) { sub(/\/+$/, "", p); return p }
+            j = length(p)
+            while (j > 0 && substr(p, j, 1) != "/") j--
+            if (j <= 1) return "/"
+            return substr(p, 1, j - 1)
+        }
+        function dir_in(line,   n, i, ws, w) {
+            n = split(line, ws, /[ \t]+/)
+            for (i = 1; i <= n; i++) {
+                w = tail_punct(ws[i])
+                if (substr(w, 1, 1) == "/" && length(w) > 1) return parent_of(w)
+            }
+            return tmpdir
+        }
+        function phrase(line) {
+            if (match(line, /[Nn]o space left on device/)) return substr(line, RSTART, RLENGTH)
+            if (match(line, /[Dd]isk quota exceeded/)) return substr(line, RSTART, RLENGTH)
+            if (match(line, /[Qq]uota exceeded/)) return substr(line, RSTART, RLENGTH)
+            return "out of space"
+        }
+        function scan(line) {
+            if (line !~ /[Nn]o space left on device|[Dd]isk quota exceeded|[Qq]uota exceeded/) return
+            space = 1
+            if (bmsg == "") bmsg = phrase(line)
+            if (bdir == "") bdir = dir_in(line)
+        }
+        function close_block(   d) {
+            if (state != 1) return
+            state = 0
+            if (space) {
+                k++
+                names = names ((k > 1) ? ", " : "") bname
+                d = (bdir == "") ? tmpdir : bdir
+                if (!(d in seen)) { seen[d] = 1; ndir++; dlist[ndir] = d }
+                if (cls == "") cls = bmsg
+                printf "oos   %-28s out of space in %s (%s)\n", bname, d, bmsg
+            } else {
+                printf "%s", blk
+            }
+            fflush()
+            blk = ""; nlines = 0; space = 0; bmsg = ""; bdir = ""
+        }
+        # One class names one folder: what a full disk complains about is usually the same tmpfs seen from a report path and
+        # from a lock path, so the class is the folder they all live in. Only folders that share nothing print as a list.
+        function class_dir(   i, ok, p, w) {
+            if (ndir == 1) return dlist[1]
+            w = dlist[1]
+            while (length(w) > 1) {
+                ok = 1
+                for (i = 2; i <= ndir; i++) {
+                    p = dlist[i]
+                    if (p != w && substr(p, 1, length(w) + 1) != w "/") { ok = 0; break }
+                }
+                if (ok) return w
+                p = w
+                sub(/\/[^\/]*$/, "", p)
+                if (p == w) break
+                w = p
+            }
+            w = ""
+            for (i = 1; i <= ndir; i++) w = w ((i > 1) ? ", " : "") dlist[i]
+            return w
+        }
+        {
+            if (state == 1) {
+                if (substr($0, 1, 4) == "    ") {
+                    blk = blk $0 "\n"; nlines++; scan($0)
+                    if (nlines >= 400) close_block()   # a tail that never ends must not grow without bound
+                    next
+                }
+                close_block()
+            }
+            if (substr($0, 1, 5) == "FAIL ") {
+                state = 1; blk = $0 "\n"; nlines = 1; bname = $2; scan($0); next
+            }
+            if ($0 ~ /^check-fast: [0-9]+s, [0-9]+ failed, [0-9]+ skipped$/) {
+                done = 1
+                if (k == 0) { print; fflush(); next }
+                line = $0; sub(/^check-fast: /, "", line); split(line, f, " ")
+                secs = f[1]; sub(/s,$/, "", secs)
+                other = f[2] - k; if (other < 0) other = 0
+                printf "check-fast: out of space in %s: %s failed on a full disk (%s), which is ONE failure class and not %d gate failure%s. Nothing in those steps says anything about this tree: free the space, then re-run. `bq status` names the largest folders under /tmp and under ~/.cache; the raw log keeps the tails this pass folded.\n", class_dir(), names, cls, k, (k == 1 ? "" : "s")
+                printf "check-fast: %ss, %d failed, %d skipped: out of space in %s (%s)\n", secs, other + 1, f[4], class_dir(), names
+                fflush()
+                next
+            }
+            print
+            fflush()
+        }
+        END {
+            close_block()
+            if (k > 0 && !done) printf "check-fast: out of space in %s (%s failed on it), and the run ended without its summary line\n", class_dir(), names
+        }
+    '
+}
+
+# The gate pass alone, over a log of a finished run: what a full disk looks like to the reader, without a build or a queue.
+if [ -n "${CHECK_FAST_FILTER_ONLY:-}" ]; then
+    gate_pass <"$CHECK_FAST_FILTER_ONLY"
+    exit 0
+fi
+
 # One Cargo target PER WORKTREE, all under one cache root. Cargo gives a workspace member the same artifact hash in every worktree, so a
 # target shared by worktrees on different commits let one overwrite the others' rlibs and test binaries: a check could test code that
 # was not in its worktree (seen twice on 2026-11-11). The first check in a new worktree compiles its dependencies (measured about 40 s
@@ -22,26 +162,79 @@ export CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0}
 export LUCINA_CI_CPU_QUOTA=${LUCINA_CI_CPU_QUOTA:-400%}
 free=$(df --output=avail -BG "$HOME" | tail -1 | tr -dc 0-9)
 floor=${LUCINA_CHECK_FREE_FLOOR_GIB:-20}
-[ "$free" -ge "$floor" ] || { echo "check-fast: only ${free} GiB free on $HOME's disk, the floor is ${floor} GiB: refusing to build rather than fill it. Free space first (stale worktrees: wt prune; the cache $cache_root)." >&2; exit 2; }
-cargo build --quiet --release --locked --manifest-path "$root/tools/ci/lucina-ci/Cargo.toml"
+[ "$free" -ge "$floor" ] || {
+    # What to clean first, named: the three largest folders directly under ~/.cache. du gets 20 s, because walking a few hundred
+    # GiB can take longer than that and a refusal that hangs is worse than one that says nothing about sizes. Only on a refusal,
+    # never on the way through. No -s with --max-depth: on GNU du -s IS --max-depth=0 and refuses to combine with it.
+    cache_home=$HOME/.cache
+    rc=0
+    big=$(timeout 20 du -k --max-depth=1 "$cache_home" 2>/dev/null) || rc=$?
+    if [ "$rc" -eq 124 ]; then
+        note="du on $cache_home timed out after 20 s: the largest folders are not named."
+    elif [ "$rc" -ne 0 ]; then
+        note="du on $cache_home failed (exit $rc): the largest folders are not named."
+    else
+        # The line naming ~/.cache itself is the total, not a folder; awk takes the three first records and still reads to EOF
+        # (head -3 would close the pipe early and pipefail would make this substitution fail).
+        note=$(printf '%s\n' "$big" | awk -F'\t' -v root="$cache_home" '$1 ~ /^[0-9]+$/ && $2 != root' | sort -rn |
+            awk -F'\t' -v root="$cache_home" 'NR <= 3 { printf "%s%s %.1f GiB", (NR > 1 ? ", " : ""), substr($2, length(root) + 2), $1 / 1048576 }') || note=""
+        if [ -n "$note" ]; then
+            note="The three largest folders under $cache_home: $note."
+        else
+            note="No folders to name under $cache_home."
+        fi
+    fi
+    echo "check-fast: only ${free} GiB free on $HOME's disk, the floor is ${floor} GiB: refusing to build rather than fill it. ${note} Free space first (stale worktrees: wt prune; the check cache $cache_root; one target: lucina-ci sweep-target --single)." >&2
+    exit 2
+}
+# The binary to run: the built release, or CHECK_FAST_BIN. scripts/tests/check-fast-oos-test.sh gives a stub of
+# `lucina-ci check-fast`, so the gate pass is tested end to end without a build, a queue or a real disk.
+[ -n "${CHECK_FAST_BIN:-}" ] || cargo build --quiet --release --locked --manifest-path "$root/tools/ci/lucina-ci/Cargo.toml"
 # Run from a private copy of the launcher, so a rebuild of release/lucina-ci under a running check cannot pull it out from under its own
-# sub-steps ("Failed to find executable ... (deleted)", seen 2026-11-11).
-bin=$(mktemp "${TMPDIR:-/tmp}/lucina-ci.XXXXXX")
-log=$(mktemp "${TMPDIR:-/tmp}/check-fast-log.XXXXXX")
-trap 'rm -f "$bin" "$log"' EXIT
-cp "$CARGO_TARGET_DIR/release/lucina-ci" "$bin"
-chmod 700 "$bin"
+# sub-steps ("Failed to find executable ... (deleted)", seen 2026-11-11). CHECK_FAST_BIN is used where it is, and CHECK_FAST_LOG keeps
+# the raw unfiltered output where the caller can read it: neither is deleted. Without them the run is what it always was.
+bin=${CHECK_FAST_BIN:-}
+private_bin=""
+if [ -z "$bin" ]; then
+    bin=$(mktemp "${TMPDIR:-/tmp}/lucina-ci.XXXXXX")
+    private_bin=$bin
+    cp "$CARGO_TARGET_DIR/release/lucina-ci" "$bin"
+    chmod 700 "$bin"
+fi
+log=${CHECK_FAST_LOG:-}
+private_log=""
+if [ -z "$log" ]; then
+    log=$(mktemp "${TMPDIR:-/tmp}/check-fast-log.XXXXXX")
+    private_log=$log
+fi
+cleanup() {
+    [ -z "$private_bin" ] || rm -f "$private_bin"
+    [ -z "$private_log" ] || rm -f "$private_log"
+}
+trap cleanup EXIT
 # A size cap on the whole cache: over the limit the least recently used worktree targets go whole (never this one, never one with a build running).
 "$bin" sweep-target --dir "$cache_root" --keep "$CARGO_TARGET_DIR" --limit-gib "${LUCINA_CHECK_TARGET_LIMIT_GIB:-30}" || true
 # One place in the build queue (docs/ci/BQ.md): a short job, so it never waits behind a long build.
-bqbin=$(command -v bq || true)
-[ -x "$HOME/.local/bin/bq" ] && bqbin=$HOME/.local/bin/bq
+# The queue is named and never looked up on PATH: PATH holds a DIFFERENT `bq` on GitHub's ubuntu-24.04 runners, the Google Cloud
+# SDK's BigQuery CLI (/usr/bin/bq), which answers "ERROR: (bq) You do not currently have an active account selected" and exits 1,
+# so the public proof CI printed nothing and failed (run 43276124239). So it is $HOME/.local/bin/bq, or LUCINA_BQ, and even that
+# only after it proves it is ours: running it with no arguments prints its usage, and our queue's usage offers `--class
+# short|long|proof`. No queue, or one that is not ours: run the check directly and say nothing, which is the normal case on GitHub
+# and on laptops. The probe reads no stdin and dies after 5 s, so a queue that waits for something, or that is not a queue at all,
+# cannot hang a check. Its exit code is not part of the test: our queue is free to exit non-zero on its usage.
+bqbin=${LUCINA_BQ:-$HOME/.local/bin/bq}
 runner=()
-[ -z "$bqbin" ] || runner=("$bqbin" run --class short --who "$(basename "$root")" --)
+if [ -x "$bqbin" ]; then
+    bq_usage=$(timeout 5 "$bqbin" </dev/null 2>&1 || true)
+    case "$bq_usage" in
+        *'--class short|long|proof'*) runner=("$bqbin" run --class short --who "$(basename "$root")" --) ;;
+    esac
+fi
 # A run that ends without its summary line (killed, cut off mid-step, a tool that exited early) is a failure even when the exit code
-# was 0: the output streams through tee, and the last word is the summary line. Stdout only; stderr stays on stderr.
+# was 0: the output streams through tee, and the last word is the summary line. Stdout only; stderr stays on stderr. The raw log
+# keeps what the binary printed, unfiltered, and the pass that collapses a full disk (above) reads the live stream.
 rc=0
-"${runner[@]}" "$bin" check-fast "$@" | tee "$log" || rc=${PIPESTATUS[0]}
+{ "${runner[@]}" "$bin" check-fast "$@" | tee "$log" | gate_pass; } || rc=$?
 if [ "$rc" -ne 0 ]; then
     exit "$rc"
 fi

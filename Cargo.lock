@@ -3588,6 +3588,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lucina-surface-rules"
+version = "0.1.0"
+
+[[package]]
 name = "lucina-taskcpu"
 version = "0.1.0"
 

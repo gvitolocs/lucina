@@ -1,5 +1,7 @@
 # Generated: lucina-ci trust --write. Do not edit. unit<TAB>class<TAB>count (zero is not listed)
+flags/scripts/verify.sh	rlimit	1
 flags/tools/ci/lucina-ci/src/runner.rs	rlimit	1
+flags/verification/juno-surface/mutants.sh	info	2
 shipped/fortuna-look/rules	solver	8
 shipped/fortuna-voice/rules	solver	7
 shipped/gpui-juno/clip	solver	7
@@ -37,6 +39,7 @@ verus/juno-power/rules	solver	4
 verus/juno-rcu/rules	escape	3
 verus/juno-rcu/rules	solver	7
 verus/juno-ring/rules	solver	12
+verus/juno-surface/rules	solver	6
 verus/juno-tcpbuf/rules	solver	6
 verus/juno-wifi-wake/rules	solver	3
 verus/net-installer/rules	solver	3

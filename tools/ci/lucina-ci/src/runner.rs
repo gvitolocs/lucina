@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 /// `--rlimit` site; every other unit gets the Verus default. The value is a number, so no other Verus argument can be
 /// written into this table.
 pub(crate) const VERUS_ARGS: &[(&str, u32)] = &[
-    // `step` in crates/lucina-surface-rules/src/rules.rs: path and case splitting over its 13 arms.
+    // `step` in services/lucina-surface-rules/src/rules.rs: path and case splitting over its 13 arms.
     ("verus/juno-surface/rules", 20),
 ];
 

@@ -149,7 +149,15 @@ impl Hub {
         debug_assert_eq!(st.events.front().unwrap().seq, st.window.head);
     }
 
-    fn lost_event(seq: u64, src: Source, app: Option<&str>, src_seq: u64, t_ms: u64, count: u64, reason: &str) -> Event {
+    fn lost_event(
+        seq: u64,
+        src: Source,
+        app: Option<&str>,
+        src_seq: u64,
+        t_ms: u64,
+        count: u64,
+        reason: &str,
+    ) -> Event {
         let mut fields = Map::new();
         fields.insert("count".to_string(), Value::from(count));
         fields.insert("reason".to_string(), Value::from(reason));
@@ -215,14 +223,10 @@ impl Hub {
         if (src == Source::App || src == Source::Toolkit)
             && let Some(app) = app
         {
-            let bucket = st
-                .buckets
-                .get(app)
-                .copied()
-                .unwrap_or(rules::Bucket {
-                    tokens: self.cfg.burst,
-                    at_ms: now,
-                });
+            let bucket = st.buckets.get(app).copied().unwrap_or(rules::Bucket {
+                tokens: self.cfg.burst,
+                at_ms: now,
+            });
             let adm = rules::admit(bucket, now, self.cfg.every_ms, self.cfg.burst);
             if !adm.ok {
                 st.flooded += 1;
@@ -239,7 +243,8 @@ impl Hub {
                 let count = entry.1;
                 entry.0 = now;
                 entry.1 = 0;
-                let ev = Self::lost_event(st.window.next, src, Some(app), src_seq, now, count, "flood");
+                let ev =
+                    Self::lost_event(st.window.next, src, Some(app), src_seq, now, count, "flood");
                 self.push_event(&mut st, ev);
             }
         }
@@ -286,7 +291,8 @@ impl Hub {
             }
             "media.started" => {
                 if let Some(app) = &e.app {
-                    st.sticky.insert(slot("media", Some(app.clone())), e.clone());
+                    st.sticky
+                        .insert(slot("media", Some(app.clone())), e.clone());
                 }
             }
             "media.ended" | "media.stopped" => {
@@ -295,7 +301,8 @@ impl Hub {
                 }
             }
             "storage.mounted" => {
-                st.sticky.insert(slot("storage", e.subject.clone()), e.clone());
+                st.sticky
+                    .insert(slot("storage", e.subject.clone()), e.clone());
             }
             "storage.unmounted" => {
                 st.sticky.remove(&slot("storage", e.subject.clone()));
@@ -463,10 +470,16 @@ impl Hub {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn peer_cred(fd: RawFd) -> Option<(u32, u32)> {
+    // SAFETY: `ucred` is a struct of plain integers (pid, uid, gid), so all-bits-zero is a valid
+    // value; `getsockopt` overwrites it on success.
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     let r = unsafe {
+        // SAFETY: `fd` is a descriptor the caller owns and keeps open across the call, `cred` is a
+        // writable `ucred`, and `len` is its exact size: the two pointers are valid and aligned for
+        // the whole call, which is what SO_PEERCRED fills in.
         libc::getsockopt(
             fd,
             libc::SOL_SOCKET,
@@ -482,6 +495,47 @@ fn peer_cred(fd: RawFd) -> Option<(u32, u32)> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn peer_cred(fd: RawFd) -> Option<(u32, u32)> {
+    // The macOS pair of SO_PEERCRED: getpeereid for the credentials (SOCK_STREAM only, as here),
+    // LOCAL_PEERPID for the pid, which getpeereid does not give.
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: `uid` and `gid` are writable locals of exactly the `uid_t`/`gid_t` the out-params
+    // take, and `fd` is a descriptor the caller owns and keeps open across the call. getpeereid
+    // writes both only on success (0); on failure it returns -1.
+    if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } != 0 {
+        return None;
+    }
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: as above, and LOCAL_PEERPID wants exactly one `pid_t`: the buffer is writable for
+    // the `len` bytes given, so the kernel never writes past it.
+    let r = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            &mut pid as *mut libc::pid_t as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if r == 0 {
+        Some((uid, pid as u32))
+    } else {
+        None
+    }
+}
+
+/// Peer credentials are unknown here, so `None`: both callers treat it as untrusted and refuse
+/// what needs a credential (handle_read_conn drops the connection unless the uid is 0, and a
+/// Source::Shell hello is refused too); a plain program connection keeps serving, keyed by a
+/// per-connection counter instead of a pid, which costs it only per-process flood accounting.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn peer_cred(_fd: RawFd) -> Option<(u32, u32)> {
+    None
+}
+
 fn set_mode(path: &std::path::Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
@@ -493,7 +547,11 @@ fn read_line(reader: &mut BufReader<UnixStream>, buf: &mut Vec<u8>) -> io::Resul
     loop {
         let n = reader.read_until(b'\n', buf)?;
         if n == 0 {
-            return if buf.is_empty() { Ok(None) } else { Ok(Some(())) };
+            return if buf.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(()))
+            };
         }
         if buf.last() == Some(&b'\n') {
             buf.pop();
@@ -506,8 +564,8 @@ fn read_line(reader: &mut BufReader<UnixStream>, buf: &mut Vec<u8>) -> io::Resul
 }
 
 fn write_line(stream: &mut UnixStream, v: &Value) -> io::Result<()> {
-    let mut line = serde_json::to_string(v)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let mut line =
+        serde_json::to_string(v).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     line.push('\n');
     stream.write_all(line.as_bytes())
 }
@@ -566,9 +624,9 @@ fn handle_program_conn(stream: UnixStream, hub: Arc<Hub>, _cfg: Config) {
         _ => rules::INTROSPECT_ALL,
     };
     static CONN_COUNTER: AtomicU64 = AtomicU64::new(0);
-    let pid = cred.map(|(_, p)| p as u64).unwrap_or_else(|| {
-        1_000_000 + CONN_COUNTER.fetch_add(1, Ordering::Relaxed)
-    });
+    let pid = cred
+        .map(|(_, p)| p as u64)
+        .unwrap_or_else(|| 1_000_000 + CONN_COUNTER.fetch_add(1, Ordering::Relaxed));
     let key: SourceKey = (src, pid);
     loop {
         match read_line(&mut reader, &mut buf) {
@@ -604,13 +662,19 @@ fn handle_program_conn(stream: UnixStream, hub: Arc<Hub>, _cfg: Config) {
 
 /// Whether a reader's filter names tree events (`node.*`, `view.*`): only then do apps pay for a tree after each paint.
 pub fn wants_tree(filter: &Filter) -> bool {
-    filter.kind.iter().any(|k| k.starts_with("node.") || k.starts_with("view."))
+    filter
+        .kind
+        .iter()
+        .any(|k| k.starts_with("node.") || k.starts_with("view."))
 }
 
 /// Tells the apps, through the time of [`wire::TREE_WANTED`], that a reader asked for tree events just now.
 fn mark_tree_wanted(filter: &Filter) {
     if wants_tree(filter)
-        && let Ok(f) = File::options().create(true).append(true).open(wire::TREE_WANTED)
+        && let Ok(f) = File::options()
+            .create(true)
+            .append(true)
+            .open(wire::TREE_WANTED)
     {
         let _ = f.set_modified(std::time::SystemTime::now());
     }
@@ -649,7 +713,11 @@ fn handle_read_conn(stream: UnixStream, hub: Arc<Hub>, _cfg: Config) {
             wire::Ask::Read { since, filter, max } => {
                 let answer = match filter.check() {
                     Ok(()) => serde_json::to_value(hub.read(since, &filter, max)).unwrap(),
-                    Err(e) => serde_json::to_value(Failure { ok: false, error: e }).unwrap(),
+                    Err(e) => serde_json::to_value(Failure {
+                        ok: false,
+                        error: e,
+                    })
+                    .unwrap(),
                 };
                 if write_line(reader.get_mut(), &answer).is_err() {
                     return;
@@ -662,7 +730,11 @@ fn handle_read_conn(stream: UnixStream, hub: Arc<Hub>, _cfg: Config) {
             } => {
                 let answer = match filter.check() {
                     Ok(()) => serde_json::to_value(hub.wait(since, &filter, timeout_ms)).unwrap(),
-                    Err(e) => serde_json::to_value(Failure { ok: false, error: e }).unwrap(),
+                    Err(e) => serde_json::to_value(Failure {
+                        ok: false,
+                        error: e,
+                    })
+                    .unwrap(),
                 };
                 if write_line(reader.get_mut(), &answer).is_err() {
                     return;
@@ -673,7 +745,8 @@ fn handle_read_conn(stream: UnixStream, hub: Arc<Hub>, _cfg: Config) {
                 settle_ms,
                 timeout_ms,
             } => {
-                let answer = serde_json::to_value(hub.settle(since, settle_ms, timeout_ms)).unwrap();
+                let answer =
+                    serde_json::to_value(hub.settle(since, settle_ms, timeout_ms)).unwrap();
                 if write_line(reader.get_mut(), &answer).is_err() {
                     return;
                 }
@@ -751,7 +824,10 @@ fn kernel_loop(hub: Arc<Hub>, path: PathBuf) {
                 eprintln!("lucina-eventd: {} closed, retrying", path.display());
             }
             Err(e) => {
-                eprintln!("lucina-eventd: cannot open {}: {e}, retrying", path.display());
+                eprintln!(
+                    "lucina-eventd: cannot open {}: {e}, retrying",
+                    path.display()
+                );
             }
         }
         thread::sleep(Duration::from_secs(5));
@@ -778,7 +854,10 @@ pub fn serve(hub: Arc<Hub>, cfg: &Config) -> io::Result<()> {
             let k = k.clone();
             thread::spawn(move || kernel_loop(h, k));
         } else {
-            eprintln!("lucina-eventd: no kernel device at {}, skipping", k.display());
+            eprintln!(
+                "lucina-eventd: no kernel device at {}, skipping",
+                k.display()
+            );
         }
     }
     let h = hub.clone();
@@ -786,4 +865,21 @@ pub fn serve(hub: Arc<Hub>, cfg: &Config) -> io::Result<()> {
     thread::spawn(move || accept_loop(rd, h, c, true));
     accept_loop(prog, hub, cfg.clone(), false);
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::io::AsRawFd;
+
+    use super::peer_cred;
+
+    /// Both ends of a socketpair are this process, so the peer cred is our own uid and pid.
+    #[test]
+    fn peer_cred_of_a_socketpair_names_this_process() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        // SAFETY: both take no arguments and touch no memory; they read this process's own ids.
+        // The uid is the effective one, which is what SO_PEERCRED and getpeereid both report.
+        let mine = (unsafe { libc::geteuid() }, unsafe { libc::getpid() } as u32);
+        assert_eq!(peer_cred(a.as_raw_fd()), Some(mine));
+    }
 }

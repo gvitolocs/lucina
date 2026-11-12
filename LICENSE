@@ -33,7 +33,8 @@ licence, and nothing here relicenses it:
 - third_party/ holds other projects, each under the licence in its own folder or files.
 - Code ported from Linux and other GPL projects stays under the GPL with its notices. Today that is files in
   drivers/lucina-adreno, drivers/lucina-venus, drivers/lucina-qrtr, drivers/lucina-qmi, kernel/lucina-cpubw (GPL-2.0-only),
-  kernel/lucina-errseq (GPL-2.0-only, from lib/errseq.c of Linux), drivers/lucina-apple-aic (GPL-2.0-or-later, from irq-apple-aic.c
+  kernel/lucina-errseq (GPL-2.0-only, from lib/errseq.c of Linux), services/lucina-surface-rules (GPL-2.0-only, buffer rules after the Linux dma-buf/GEM semantics),
+  drivers/lucina-apple-aic (GPL-2.0-or-later, from irq-apple-aic.c
   of Asahi Linux), drivers/lucina-apple-uart (GPL-2.0-only, from samsung_tty.c of Linux),
   drivers/lucina-apple-aic-glue (GPL-2.0-only, from irq-apple-aic.c and arm_arch_timer.c of Linux), drivers/lucina-apple-boot
   (GPL-2.0-only, from arm64 smp_spin_table.c and the simple-framebuffer binding of Linux; follows m1n1 behaviour, nothing copied), fortuna/sim and office/engine (AGPL).

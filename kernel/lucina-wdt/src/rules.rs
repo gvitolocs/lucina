@@ -7,7 +7,7 @@
 // stopped the pets and then could not take the bark either, so the bite came with no record. The bark goes instead to
 // another CPU whose watchdog thread ran lately, as Linux's buddy lockup detector watches a CPU from another one.
 
-/// Whether a CPU whose watchdog thread last ran at `touched` (0 for never) ran within `fresh` counter ticks of `now`.
+// Whether a CPU whose watchdog thread last ran at `touched` (0 for never) ran within `fresh` counter ticks of `now`.
 //@ pub open spec fn is_fresh(touched: u64, now: u64, fresh: u64) -> bool {
 //@     touched != 0 && (now < touched || now - touched <= fresh)
 //@ }
@@ -19,7 +19,7 @@ pub fn fresh_at(touched: u64, now: u64, fresh: u64) -> bool //@ret
     touched != 0 && now.saturating_sub(touched) <= fresh
 }
 
-/// Whether CPU `cpu` may take the bark: it exists, it is not the boot CPU `bsp`, and its thread ran lately.
+// Whether CPU `cpu` may take the bark: it exists, it is not the boot CPU `bsp`, and its thread ran lately.
 //@ pub open spec fn usable(cpu: int, bsp: usize, touched: Seq<u64>, now: u64, fresh: u64) -> bool {
 //@     0 <= cpu < touched.len() && cpu != bsp as int && is_fresh(touched[cpu], now, fresh)
 //@ }
@@ -27,7 +27,13 @@ pub fn fresh_at(touched: u64, now: u64, fresh: u64) -> bool //@ret
 /// The CPU the bark goes to, by index: `previous` while it may still take it, so that the GIC is not written each time;
 /// otherwise the CPU other than `bsp` whose thread ran last. `None` when no other CPU ran within `fresh` (one CPU, or all
 /// the others stuck): the bark then stays where it was.
-pub fn bark_target(bsp: usize, previous: usize, touched: &[u64], now: u64, fresh: u64) -> Option<usize> //@ret
+pub fn bark_target(
+    bsp: usize,
+    previous: usize,
+    touched: &[u64],
+    now: u64,
+    fresh: u64,
+) -> Option<usize> //@ret
 //@ ensures
 //@     match ret {
 //@         None => forall|j: int| 0 <= j < touched@.len() ==> !usable(j, bsp, touched@, now, fresh),

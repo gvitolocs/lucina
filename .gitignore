@@ -10,3 +10,5 @@ fortuna/target/
 fortuna/container/build/
 fortuna/container/*.nds
 /minerva/boot/target/
+# Guest-test helpers built for the initramfs (tests/guest/surface-share.sh says how).
+/tests/guest/bin/

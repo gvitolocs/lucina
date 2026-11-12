@@ -11,8 +11,8 @@
 //! First the marker line (`testroot::marker`) goes to the kernel log, which also keeps it in the saved console, to the console and
 //! to `/etc/lucina/test-root` in the test root. Nothing is written to a disk.
 //!
-//! Like patch 0820, it never leaves the machine without a system: on any error it says why, undoes its mounts and runs the
-//! initramfs's init (`rdinit=`, else `/init`) as the rescue system.
+//! Like patch 0820, it never leaves the machine without a system: on any error it says why, leaves its mounts up (the `umount` is what
+//! hangs the rescue boot, not the refusal) and runs the initramfs's init (`rdinit=`, else `/init`) as the rescue system.
 
 // Juno with no C library: Eyra is the libc and the program start, in Rust (docs/research/juno-pure-rust.md).
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))]
@@ -308,8 +308,9 @@ fn set_up(m: &Manifest, args: &RootArgs, marker: &str) -> Result<(), String> {
 }
 
 fn undo() {
-    // Not unmounted: on this kernel the initramfs's init hung after the stage's umount of the lower layer (QEMU, 2026-11-12;
-    // scripts/qemu-stream-root.sh (h)). What stays is read-only (the installed root) or RAM, under /lucina-stream, and is said.
+    // Not unmounted: what hung the rescue boot on this kernel was the stage's `umount` of the lower layer, not the refusal (QEMU,
+    // 2026-11-12; scripts/qemu-stream-root.sh (h)). The initramfs's init reaches its end with the mounts left up. What stays is
+    // read-only (the installed root) or RAM, under /lucina-stream, and is said.
     let mounted = MOUNTED
         .lock()
         .map(|mut m| std::mem::take(&mut *m))
@@ -441,7 +442,8 @@ fn main() {
             write_marker("", &line);
         }
     }
-    // /proc stays: the initramfs's own init mounts its own over it. No umount here at all: in QEMU (2026-11-12) the init hung after
-    // the stage's umounts (of /proc with the lower layer mounted, or of the lower layer), never without.
+    // /proc stays: the initramfs's own init mounts its own over it. No umount here at all: in QEMU (2026-11-12) it was the stage's
+    // umounts (of /proc with the lower layer mounted, or of the lower layer) that hung, never the refusal — the rescue init runs to its
+    // end while those mounts stay.
     run_initramfs_init(&cmdline, &args);
 }

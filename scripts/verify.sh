@@ -29,7 +29,16 @@ mapfile -t proofs < <(cd "$root" && find verification -name '*.rs' | sort)
 status=0
 for p in "${proofs[@]}"; do
     echo "== $p"
-    if "$verus" "$root/$p"; then echo "ok $p"; else echo "FAIL $p"; status=1; fi
+    # One proof needs more solver resources than the Verus default, by file name only; the reason and the ceiling
+    # are in tools/ci/trust-allow.tsv.
+    case "$p" in
+        verification/juno-surface/rules.rs)
+            if "$verus" --rlimit 20 "$root/$p"; then echo "ok $p"; else echo "FAIL $p"; status=1; fi
+            ;;
+        *)
+            if "$verus" "$root/$p"; then echo "ok $p"; else echo "FAIL $p"; status=1; fi
+            ;;
+    esac
 done
 
 # The proofs on shipped files with `//@` lines (D-011), unless VERIFY_SHIPPED=0.

@@ -54,6 +54,7 @@ mutants/juno-sleep	juno-power	mutants	verification/juno-sleep/mutants.sh	kernel/
 mutants/juno-spinwatch	boot-storage	mutants	verification/juno-spinwatch/mutants.sh	kernel/lucina-spinwatch/,verification/juno-spinwatch/
 mutants/juno-standby	juno-power	mutants	verification/juno-standby/mutants.sh	kernel/lucina-standby/,verification/juno-standby/,verification/juno-standby/rules.rs
 mutants/juno-structmap	kernel-memory	mutants	verification/juno-structmap/mutants.sh	kernel/lucina-structmap/,verification/juno-structmap/,verification/juno-structmap/rules.rs
+mutants/juno-surface	juno-gpu-media	mutants	verification/juno-surface/mutants.sh	services/lucina-surface-rules/,verification/juno-surface/,verification/juno-surface/rules.rs
 mutants/juno-taskcpu	kernel-memory	mutants	verification/juno-taskcpu/mutants.sh	kernel/lucina-taskcpu/,verification/juno-taskcpu/,verification/juno-taskcpu/rules.rs
 mutants/juno-tcpbuf	juno-net-security	mutants	verification/juno-tcpbuf/mutants.sh	third_party/smoltcp/src/storage/paged_math.rs,verification/juno-tcpbuf/,verification/juno-tcpbuf/rules.rs
 mutants/juno-touchpad	juno-input-apps	mutants	verification/juno-touchpad/mutants.sh	drivers/lucina-i2c-hid/,verification/juno-touchpad/
@@ -137,6 +138,7 @@ verus/juno-ring/rules	kernel-memory	verus	verification/juno-ring/rules.rs	kernel
 verus/juno-sleep/rules	juno-power	verus	verification/juno-sleep/rules.rs	kernel/lucina-sleep/,verification/juno-sleep/,verification/juno-sleep/rules.rs
 verus/juno-standby/rules	juno-power	verus	verification/juno-standby/rules.rs	kernel/lucina-standby/,verification/juno-standby/,verification/juno-standby/rules.rs
 verus/juno-structmap/rules	kernel-memory	verus	verification/juno-structmap/rules.rs	kernel/lucina-structmap/,verification/juno-structmap/,verification/juno-structmap/rules.rs
+verus/juno-surface/rules	juno-gpu-media	verus	verification/juno-surface/rules.rs	services/lucina-surface-rules/,verification/juno-surface/,verification/juno-surface/rules.rs
 verus/juno-taskcpu/rules	kernel-memory	verus	verification/juno-taskcpu/rules.rs	kernel/lucina-taskcpu/,verification/juno-taskcpu/,verification/juno-taskcpu/rules.rs
 verus/juno-tcpbuf/rules	juno-net-security	verus	verification/juno-tcpbuf/rules.rs	third_party/smoltcp/src/storage/paged_math.rs,verification/juno-tcpbuf/,verification/juno-tcpbuf/rules.rs
 verus/juno-vsync/rules	juno-gpu-media	verus	verification/juno-vsync/rules.rs	drivers/lucina-adreno/,verification/juno-vsync/,verification/juno-vsync/rules.rs

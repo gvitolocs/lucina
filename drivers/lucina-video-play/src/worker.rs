@@ -54,7 +54,12 @@ pub struct Worker {
 
 impl Worker {
     /// Takes over the file. `wake_fd` is written when pictures arrive for a thread that said it was starving.
-    pub fn start(demux: Box<dyn Demuxer>, codec: Codec, reorder: usize, wake_fd: RawFd) -> Result<Worker, String> {
+    pub fn start(
+        demux: Box<dyn Demuxer>,
+        codec: Codec,
+        reorder: usize,
+        wake_fd: RawFd,
+    ) -> Result<Worker, String> {
         Worker::start_with_nice(demux, codec, reorder, wake_fd, VIDEO_APP_NICE)
     }
 
@@ -136,11 +141,29 @@ fn seek(demux: &mut Box<dyn Demuxer>, pts: i64, forward: bool, from: i64) -> Res
     Ok(landed)
 }
 
-fn run(mut demux: Box<dyn Demuxer>, mut decoder: Decoder, codec: Codec, shared: Arc<(Mutex<Inner>, Condvar)>, wake_fd: RawFd, nice: i32) {
+fn run(
+    mut demux: Box<dyn Demuxer>,
+    mut decoder: Decoder,
+    codec: Codec,
+    shared: Arc<(Mutex<Inner>, Condvar)>,
+    wake_fd: RawFd,
+    nice: i32,
+) {
     let (m, cv) = &*shared;
     // At `nice`: the Video app's 10 lets its screen thread go first when both want the CPU, where the kernel honours this.
     // SAFETY: changes this thread's own priority; a failure leaves it as it was.
-    unsafe { libc::setpriority(libc::PRIO_PROCESS, libc::syscall(libc::SYS_gettid) as libc::id_t, nice) };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        libc::setpriority(
+            libc::PRIO_PROCESS,
+            libc::syscall(libc::SYS_gettid) as libc::id_t,
+            nice,
+        )
+    };
+    // Elsewhere niceness belongs to the process, not the thread: setpriority(PRIO_PROCESS, 0, nice) would slow every other thread
+    // along with this one, so this thread keeps the default priority. Follow-up: pthread_set_qos_class_self_np is the per-thread call.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = nice;
     let mut to_key = false;
     let mut out: Vec<Picture> = Vec::with_capacity(2);
     loop {
@@ -242,7 +265,9 @@ fn run(mut demux: Box<dyn Demuxer>, mut decoder: Decoder, codec: Codec, shared: 
             && matches!(decoder, Decoder::Venus(_))
             && let Ok(cpu) = Decoder::new(codec)
         {
-            eprintln!("lucina-app-video: the video block stopped ({e}); the CPU decodes from the last key frame");
+            eprintln!(
+                "lucina-app-video: the video block stopped ({e}); the CPU decodes from the last key frame"
+            );
             decoder = cpu;
             out.clear();
             if demux.seek_to(packet.pts_us).is_err() {
@@ -282,14 +307,54 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    /// A wake pipe with both ends non-blocking and close-on-exec.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn nonblocking_cloexec_pipe() -> std::io::Result<[RawFd; 2]> {
+        let mut pipe = [-1; 2];
+        // SAFETY: pipe2 fills the two-element array with the new descriptors.
+        if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(pipe)
+    }
+
+    /// As above, for the systems without `pipe2`: `pipe`, then the same two flags on both ends.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn nonblocking_cloexec_pipe() -> std::io::Result<[RawFd; 2]> {
+        let mut pipe = [-1; 2];
+        // SAFETY: pipe fills the two-element array with the new descriptors.
+        if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        for fd in pipe {
+            // SAFETY: fcntl takes one of the two descriptors pipe just made; nothing else holds them.
+            let ok = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == 0
+                && unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } == 0;
+            if !ok {
+                let e = std::io::Error::last_os_error();
+                // SAFETY: closes exactly the two descriptors pipe made, which nobody else holds and which are not used again.
+                unsafe {
+                    libc::close(pipe[0]);
+                    libc::close(pipe[1]);
+                }
+                return Err(e);
+            }
+        }
+        Ok(pipe)
+    }
+
     fn start(name: &str, reorder: usize) -> (Worker, Codec) {
-        let path = format!("{}/../../drivers/lucina-video/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+        let path = format!(
+            "{}/../../drivers/lucina-video/tests/fixtures/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
         let demux = lucina_video::open(std::io::Cursor::new(std::fs::read(path).unwrap())).unwrap();
         let codec = demux.track().codec;
-        let mut pipe = [-1; 2];
-        // SAFETY: pipe2 fills the two-element array.
-        assert_eq!(unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) }, 0);
-        (Worker::start(demux, codec, reorder, pipe[1]).unwrap(), codec)
+        let pipe = nonblocking_cloexec_pipe().expect("pipe");
+        (
+            Worker::start(demux, codec, reorder, pipe[1]).unwrap(),
+            codec,
+        )
     }
 
     fn until(w: &Worker, what: impl Fn(&Inner) -> bool) {
@@ -324,7 +389,11 @@ mod tests {
     fn a_seek_forward_lands_on_a_key_frame_past_where_it_was() {
         let (w, _) = start("frag.mp4", 0);
         until(&w, |s| s.queue.len() > 0);
-        w.command(Command::Seek { pts: 700_000, forward: true, from: 0 });
+        w.command(Command::Seek {
+            pts: 700_000,
+            forward: true,
+            from: 0,
+        });
         until(&w, |s| s.landed.is_some());
         let at = w.lock().landed.take().unwrap();
         assert_eq!(at / 100_000, 5);
@@ -336,7 +405,11 @@ mod tests {
     fn a_seek_back_after_the_end_plays_again() {
         let (w, _) = start("vp9.webm", 0);
         assert_eq!(take_all(&w).len(), 12);
-        w.command(Command::Seek { pts: 0, forward: false, from: 1_100_000 });
+        w.command(Command::Seek {
+            pts: 0,
+            forward: false,
+            from: 1_100_000,
+        });
         until(&w, |s| s.landed.is_some());
         assert_eq!(w.lock().landed.take(), Some(0));
         assert_eq!(take_all(&w), (0..12).collect::<Vec<_>>());
@@ -355,14 +428,16 @@ mod tests {
 
     #[test]
     fn what_cannot_be_decoded_is_an_error_not_a_hang() {
-        let mut bad = std::fs::read(format!("{}/../../drivers/lucina-video/tests/fixtures/av1.ivf", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let mut bad = std::fs::read(format!(
+            "{}/../../drivers/lucina-video/tests/fixtures/av1.ivf",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
         for b in bad.iter_mut().skip(60) {
             *b ^= 0x5a;
         }
         let demux = lucina_video::open(std::io::Cursor::new(bad)).unwrap();
-        let mut pipe = [-1; 2];
-        // SAFETY: pipe2 fills the two-element array.
-        assert_eq!(unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) }, 0);
+        let pipe = nonblocking_cloexec_pipe().expect("pipe");
         let w = Worker::start(demux, Codec::Av1, 0, pipe[1]).unwrap();
         until(&w, |s| s.error.is_some() || s.eof);
     }

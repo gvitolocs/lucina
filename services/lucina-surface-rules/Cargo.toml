@@ -1,0 +1,11 @@
+[package]
+name = "lucina-surface-rules"
+version = "0.1.0"
+description = "The rules of a shareable pixel-buffer object (lucina-buf): its lifetime, purge and byte budget as a small state machine over integers, and the size and sync-row arithmetic. no_std; the rules are proved by Verus"
+# Spelled out rather than taken from the workspace: the kernel build copies this crate into the Asterinas tree
+# (kernel/inject.txt), whose workspace has no such keys.
+edition = "2024"
+publish = false
+license = "GPL-2.0-only"
+
+[dependencies]

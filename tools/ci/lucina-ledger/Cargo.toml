@@ -1,0 +1,20 @@
+# The read-only reader of lagent's commit ledger (the writer is agentd's ledger module in SecretaryIOS; the intended caller is
+# the proof-roles gate, docs/ci/PROOF-ROLES.md). Its own workspace, so that it builds in seconds on a clean runner and adds
+# nothing to the root Cargo.lock; the dependencies are the versions the root workspace locks (serde 1.0.229, serde_json 1.0.154,
+# sha2 0.10.9), which is what keeps `--offline` builds working here.
+[package]
+name = "lucina-ledger"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 1
+debug = false

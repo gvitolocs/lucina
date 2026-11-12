@@ -14,7 +14,14 @@
 //! - the header, [`COPIES`] words at 0: the format's magic in the low half, the kernel image's hash in the high half;
 //! - from [`HEADER_LEN`], [`COPIES`] copies of a `[cpu][slot]` array of [`ENTRY_LEN`]-byte entries, one copy after the other;
 //! - the remote processors' slots (patch 1210), [`COPIES`] copies of a `[remote]` array;
-//! - in format 3, the idle stamps ([`Idle`]), [`COPIES`] copies of a `[cpu]` array, then the spin-lock waits ([`Wait`]) the same way.
+//! - in format 3, the idle stamps ([`Idle`]), [`COPIES`] copies of a `[cpu]` array, then the spin-lock waits ([`Wait`]) the same way;
+//! - in format 3 since patch 1311, the idle timer's lock ([`Wake`]), [`COPIES`] copies of one slot. An older format-3 area
+//!   left the bytes there zero, which reads as no slot.
+//! - in format 3 since patch 1313, the frame allocator's stamps ([`Alloc`], [`AllocGlobal`]): [`COPIES`] copies of a
+//!   `[cpu]` array of the per-CPU in-allocator word of patch 1273, then the global pool's holder with the counter of the
+//!   stamp. A kernel of this build stamps them when it writes a crash or bark record and once every few seconds, so a boot
+//!   that vanishes leaves who was inside the allocator, and which CPU held the global pool. An area from before that is
+//!   zero there, which reads as no stamp.
 //!
 //! Format 2 (patch 1189) added the counter's value to each entry, so that the record says how long before the newest access
 //! of all each CPU's own newest one was: all within microseconds means the reset came to a machine at work; one CPU far
@@ -49,12 +56,28 @@ pub const REMOTE_LEN: usize = 16;
 pub const IDLE_LEN: usize = 16;
 /// Bytes per spin-lock wait: the lock, the caller, the time the wait began.
 pub const WAIT_LEN: usize = 24;
+/// The idle timer's lock slot, one for the system (patch 1311).
+pub const WAKE_LEN: usize = 24;
+/// Bytes per in-allocator stamp: the counter of the stamp and the word patch 1273 wrote.
+pub const ALLOC_LEN: usize = 16;
+/// Bytes for the global pool's holder: its word and the counter of the stamp.
+pub const ALLOC_GLOBAL_LEN: usize = 16;
 /// `RP` in the top bits of a remote slot's state word: a slot that was written.
 pub const REMOTE_TAG: u64 = 0x5250 << 48;
 /// `ID` in the top bits of an idle stamp's state word.
 pub const IDLE_TAG: u64 = 0x4944 << 48;
 /// `LW` in the top bits of a spin-lock wait's first word.
 pub const WAIT_TAG: u64 = 0x4c57 << 48;
+/// Marks the idle timer's lock slot ("WK").
+pub const WAKE_TAG: u64 = 0x574b << 48;
+/// Marks the counter word of an in-allocator stamp ("AL").
+pub const ALLOC_TAG: u64 = 0x414c << 48;
+/// Marks the counter word of the global pool's holder ("AG").
+pub const ALLOC_GLOBAL_TAG: u64 = 0x4147 << 48;
+/// The bits a stamp's counter uses: [`TAG_MASK`]'s are for the tag.
+const STAMP_MASK: u64 = !TAG_MASK;
+/// The counter bits patch 1273 keeps in its words: the arch counter's low 40.
+const LOW40: u64 = (1 << 40) - 1;
 const TAG_MASK: u64 = 0xffff << 48;
 const ADDR_MASK: u64 = 0xffff_ffff_ffff;
 
@@ -77,6 +100,12 @@ pub struct Layout {
     /// Where the idle stamps start; 0 in a format without them.
     pub idle_at: usize,
     pub wait_at: usize,
+    /// Where the idle timer's lock slot starts; 0 in a format without it.
+    pub wake_at: usize,
+    /// Where the in-allocator stamps start; 0 in a format without them (patch 1313).
+    pub alloc_at: usize,
+    /// Where the global pool's holder starts; 0 in a format without it.
+    pub alloc_global_at: usize,
     /// The bytes with everything the format has.
     pub full_len: usize,
 }
@@ -84,11 +113,21 @@ pub struct Layout {
 const fn layout(magic: u32, entries: usize, stamps: bool) -> Layout {
     let area_len = HEADER_LEN + COPIES * CPUS * entries * ENTRY_LEN;
     let after_remotes = area_len + COPIES * REMOTES.len() * REMOTE_LEN;
-    let (idle_at, wait_at, full_len) = if stamps {
+    let (idle_at, wait_at, wake_at, alloc_at, alloc_global_at, full_len) = if stamps {
         let wait_at = after_remotes + COPIES * CPUS * IDLE_LEN;
-        (after_remotes, wait_at, wait_at + COPIES * CPUS * WAIT_LEN)
+        let wake_at = wait_at + COPIES * CPUS * WAIT_LEN;
+        let alloc_at = wake_at + COPIES * WAKE_LEN;
+        let alloc_global_at = alloc_at + COPIES * CPUS * ALLOC_LEN;
+        (
+            after_remotes,
+            wait_at,
+            wake_at,
+            alloc_at,
+            alloc_global_at,
+            alloc_global_at + COPIES * ALLOC_GLOBAL_LEN,
+        )
     } else {
-        (0, 0, after_remotes)
+        (0, 0, 0, 0, 0, after_remotes)
     };
     Layout {
         magic,
@@ -97,6 +136,9 @@ const fn layout(magic: u32, entries: usize, stamps: bool) -> Layout {
         remote_at: area_len,
         idle_at,
         wait_at,
+        wake_at,
+        alloc_at,
+        alloc_global_at,
         full_len,
     }
 }
@@ -131,6 +173,21 @@ impl Layout {
         self.wait_at + (copy * CPUS + cpu) * WAIT_LEN
     }
 
+    /// Where copy `copy` of the idle timer's lock slot is (format 3).
+    pub const fn wake_offset(&self, copy: usize) -> usize {
+        self.wake_at + copy * WAKE_LEN
+    }
+
+    /// Where copy `copy` of CPU `cpu`'s in-allocator stamp is (format 3, patch 1313).
+    pub const fn alloc_offset(&self, copy: usize, cpu: usize) -> usize {
+        self.alloc_at + (copy * CPUS + cpu) * ALLOC_LEN
+    }
+
+    /// Where copy `copy` of the global pool's holder is (format 3, patch 1313).
+    pub const fn alloc_global_offset(&self, copy: usize) -> usize {
+        self.alloc_global_at + copy * ALLOC_GLOBAL_LEN
+    }
+
     pub const fn has_stamps(&self) -> bool {
         self.idle_at != 0
     }
@@ -159,6 +216,21 @@ pub const fn idle_offset(copy: usize, cpu: usize) -> usize {
 /// Where copy `copy` of CPU `cpu`'s spin-lock wait is in format 3.
 pub const fn wait_offset(copy: usize, cpu: usize) -> usize {
     V3.wait_offset(copy, cpu)
+}
+
+/// Where copy `copy` of the idle timer's lock slot is in format 3.
+pub const fn wake_offset(copy: usize) -> usize {
+    V3.wake_offset(copy)
+}
+
+/// Where copy `copy` of CPU `cpu`'s in-allocator stamp is in format 3.
+pub const fn alloc_offset(copy: usize, cpu: usize) -> usize {
+    V3.alloc_offset(copy, cpu)
+}
+
+/// Where copy `copy` of the global pool's holder is in format 3.
+pub const fn alloc_global_offset(copy: usize) -> usize {
+    V3.alloc_global_offset(copy)
 }
 
 /// The format-3 header word for a kernel image whose hash is `image_hash`.
@@ -273,6 +345,144 @@ impl Wait {
     }
 }
 
+/// The idle timer's lock (`WAKE_LOCK`, patch 1311), which every CPU takes with interrupts off on its way into WFI: the CPU
+/// that took it last and when, whether it let it go since, and when a CPU waiting for it passed a second.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wake {
+    /// The CPU that took it last.
+    pub cpu: u32,
+    /// It let it go since (the lock was free then).
+    pub released: bool,
+    /// The counter's value when it took it.
+    pub taken: u64,
+    /// The counter's value when a waiter had spun for a second, or 0.
+    pub marked: u64,
+}
+
+impl Wake {
+    pub const fn encode(&self) -> [u64; 3] {
+        [
+            WAKE_TAG | ((self.released as u64) << 32) | self.cpu as u64,
+            self.taken,
+            self.marked,
+        ]
+    }
+
+    pub const fn decode(words: [u64; 3]) -> Option<Self> {
+        if words[0] & TAG_MASK != WAKE_TAG {
+            return None;
+        }
+        Some(Self {
+            cpu: words[0] as u32,
+            released: (words[0] >> 32) & 1 == 1,
+            taken: words[1],
+            marked: words[2],
+        })
+    }
+}
+
+/// One CPU's in-allocator stamp ([`crate::mmio`]'s patch 1273 word) as of the moment it was written: what that CPU was
+/// doing in the frame allocator and for how long, and whether it held the global pool then. A stamp of zero word means the
+/// CPU was outside the allocator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Alloc {
+    /// The word `osdk_frame_allocator::in_allocator` gave, as it was.
+    pub word: u64,
+    /// The counter's value when the stamp was written: what `word`'s own tick counts back from.
+    pub at: u64,
+}
+
+impl Alloc {
+    pub const fn encode(&self) -> [u64; 2] {
+        [ALLOC_TAG | (self.at & STAMP_MASK), self.word]
+    }
+
+    pub const fn decode(words: [u64; 2]) -> Option<Self> {
+        if words[0] & TAG_MASK != ALLOC_TAG {
+            return None;
+        }
+        Some(Self {
+            word: words[1],
+            at: words[0] & STAMP_MASK,
+        })
+    }
+
+    /// The CPU was inside the allocator when the stamp was written.
+    pub const fn inside(&self) -> bool {
+        self.word != 0
+    }
+
+    /// Which of the allocator's doors: `alloc`, `dealloc`, `balance` or `balance_to`.
+    pub const fn place(&self) -> &'static str {
+        ["alloc", "dealloc", "balance", "balance_to"][((self.word >> 46) & 0b11) as usize]
+    }
+
+    /// The buddy order it was working on.
+    pub const fn order(&self) -> u64 {
+        (self.word >> 40) & 0x3f
+    }
+
+    /// It held the global pool's lock when the stamp was written.
+    pub const fn holds_global(&self) -> bool {
+        self.word & (1 << 48) != 0
+    }
+
+    /// How long it had been inside, in counter ticks, as of the stamp.
+    pub const fn since(&self) -> u64 {
+        (self.at & LOW40).wrapping_sub(self.word & LOW40) & LOW40
+    }
+}
+
+/// The global pool's holder ([`crate::mmio`]'s patch 1273 word) as of the moment it was written, with the counter then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllocGlobal {
+    /// The word `osdk_frame_allocator::global_pool_holder` gave: 0 when nobody held it, else the holder's CPU in bits
+    /// 48..56 and the tick it took it in bits 0..40.
+    pub holder: u64,
+    /// The counter's value when the stamp was written.
+    pub at: u64,
+}
+
+impl AllocGlobal {
+    pub const fn encode(&self) -> [u64; 2] {
+        [ALLOC_GLOBAL_TAG | (self.at & STAMP_MASK), self.holder]
+    }
+
+    pub const fn decode(words: [u64; 2]) -> Option<Self> {
+        if words[0] & TAG_MASK != ALLOC_GLOBAL_TAG {
+            return None;
+        }
+        Some(Self {
+            holder: words[1],
+            at: words[0] & STAMP_MASK,
+        })
+    }
+
+    /// A CPU held the global pool when the stamp was written.
+    pub const fn held(&self) -> bool {
+        self.holder != 0
+    }
+
+    /// Which CPU held it.
+    pub const fn cpu(&self) -> u64 {
+        (self.holder >> 48) & 0xff
+    }
+
+    /// How long it had held it, in counter ticks, as of the stamp.
+    pub const fn since(&self) -> u64 {
+        (self.at & LOW40).wrapping_sub(self.holder & LOW40) & LOW40
+    }
+}
+
+/// [`Alloc::since`] or [`AllocGlobal::since`] in milliseconds, or nothing when the trace does not know the counter's
+/// `frequency`. The division is checked, since a stamp of its own says nothing about the rate.
+fn ms_since(since: u64, frequency: u64) -> Option<u64> {
+    let ms = u128::from(since)
+        .checked_mul(1_000)?
+        .checked_div(u128::from(frequency))?;
+    u64::try_from(ms).ok()
+}
+
 /// One access, noted before it was made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -361,6 +571,12 @@ pub struct Trace {
     pub idle: [Option<Idle>; CPUS],
     /// Each CPU's spin-lock wait of a second or more, if it was still waiting (format 3).
     pub waits: [Option<Wait>; CPUS],
+    /// The idle timer's lock, if the area has the slot and a kernel wrote it (patch 1311).
+    pub wake: Option<Wake>,
+    /// Each CPU's in-allocator stamp, if the area has the slots and a kernel wrote them (patch 1313).
+    pub allocs: [Option<Alloc>; CPUS],
+    /// The global pool's holder, likewise.
+    pub alloc_global: Option<AllocGlobal>,
 }
 
 impl Trace {
@@ -394,8 +610,17 @@ impl Trace {
             remotes: [None; 2],
             idle: [None; CPUS],
             waits: [None; CPUS],
+            wake: None,
+            allocs: [None; CPUS],
+            alloc_global: None,
         };
-        if at + l.full_len > mem.size() {
+        // The parts before the idle timer's lock slot, which came later in format 3, as patch 1213 laid them out.
+        let before_wake = if l.has_stamps() {
+            l.wake_at
+        } else {
+            l.full_len
+        };
+        if at + before_wake > mem.size() {
             return Some(trace);
         }
         for (remote, slot) in trace.remotes.iter_mut().enumerate() {
@@ -408,6 +633,23 @@ impl Trace {
                 trace.idle[cpu] = Idle::decode([word(0), word(1)]);
                 let word = |w: usize| vote(mem, |copy| at + l.wait_offset(copy, cpu) + w * 8);
                 trace.waits[cpu] = Wait::decode([word(0), word(1), word(2)]);
+            }
+            if at + l.alloc_at <= mem.size() {
+                let word = |w: usize| vote(mem, |copy| at + l.wake_offset(copy) + w * 8);
+                trace.wake = Wake::decode([word(0), word(1), word(2)]);
+                // The in-allocator stamps, which patch 1313 laid after the idle timer's lock slot.
+                if at + l.alloc_global_at <= mem.size() {
+                    for cpu in 0..CPUS {
+                        let word =
+                            |w: usize| vote(mem, |copy| at + l.alloc_offset(copy, cpu) + w * 8);
+                        trace.allocs[cpu] = Alloc::decode([word(0), word(1)]);
+                    }
+                    if at + l.full_len <= mem.size() {
+                        let word =
+                            |w: usize| vote(mem, |copy| at + l.alloc_global_offset(copy) + w * 8);
+                        trace.alloc_global = AllocGlobal::decode([word(0), word(1)]);
+                    }
+                }
             }
         }
         Some(trace)
@@ -450,10 +692,12 @@ impl Trace {
         let remotes = self.remotes.iter().flatten().map(|r| r.time);
         let idle = self.idle.iter().flatten().map(|i| i.time);
         let waits = self.waits.iter().flatten().map(|w| w.since);
+        let wake = self.wake.iter().flat_map(|k| [k.taken, k.marked]);
         entries
             .chain(remotes)
             .chain(idle)
             .chain(waits)
+            .chain(wake)
             .max()
             .unwrap_or(0)
     }
@@ -585,6 +829,58 @@ impl Trace {
             }
             writeln!(w, "{}", if none { " none traced" } else { "" })?;
         }
+        if let Some(k) = self.wake {
+            if k.released {
+                write!(w, "WAKE_LOCK: free, last held by cpu {}", k.cpu)?;
+                ago(w, ", taken ", k.taken)?;
+            } else {
+                write!(w, "WAKE_LOCK: held by cpu {}", k.cpu)?;
+                ago(w, " since ", k.taken)?;
+            }
+            if k.marked != 0 {
+                if frequency > 0 && latest > 0 {
+                    ago(w, " (marked ", k.marked)?;
+                    write!(w, ")")?;
+                } else {
+                    write!(w, " (marked)")?;
+                }
+            }
+            writeln!(w)?;
+        }
+        if self.allocs.iter().any(Option::is_some) || self.alloc_global.is_some() {
+            writeln!(w, "frame allocator, who was inside it at the last stamp:")?;
+            let mut inside = 0;
+            for (cpu, a) in self.allocs.iter().enumerate() {
+                let Some(a) = a else { continue };
+                if !a.inside() {
+                    continue;
+                }
+                inside += 1;
+                write!(w, "  al cpu {cpu}: {}", a.place())?;
+                if let Some(ms) = ms_since(a.since(), frequency) {
+                    write!(w, " for {ms} ms")?;
+                }
+                write!(w, " order {}", a.order())?;
+                if a.holds_global() {
+                    write!(w, " holds-global")?;
+                }
+                writeln!(w)?;
+            }
+            if inside == 0 {
+                writeln!(w, "  al: nobody inside")?;
+            }
+            match self.alloc_global {
+                None => writeln!(w, "  al global holder: no stamp")?,
+                Some(g) if !g.held() => writeln!(w, "  al global holder: none")?,
+                Some(g) => {
+                    write!(w, "  al global holder: cpu {}", g.cpu())?;
+                    if let Some(ms) = ms_since(g.since(), frequency) {
+                        write!(w, " for {ms} ms")?;
+                    }
+                    writeln!(w)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -706,7 +1002,86 @@ mod tests {
             V3.remote_offset(COPIES - 1, REMOTES.len() - 1) + REMOTE_LEN
         );
         assert_eq!(V3.wait_at, V3.idle_offset(COPIES - 1, CPUS - 1) + IDLE_LEN);
-        assert_eq!(V3.full_len, V3.wait_offset(COPIES - 1, CPUS - 1) + WAIT_LEN);
+        assert_eq!(V3.wake_at, V3.wait_offset(COPIES - 1, CPUS - 1) + WAIT_LEN);
+        assert_eq!(V3.alloc_at, V3.wake_offset(COPIES - 1) + WAKE_LEN);
+        assert_eq!(
+            V3.alloc_global_at,
+            V3.alloc_offset(COPIES - 1, CPUS - 1) + ALLOC_LEN
+        );
+        assert_eq!(
+            V3.full_len,
+            V3.alloc_global_offset(COPIES - 1) + ALLOC_GLOBAL_LEN
+        );
+        assert_eq!(V2.wake_at, 0);
+        assert_eq!((V2.alloc_at, V2.alloc_global_at, V2.full_len), (0, 0, 4064));
+    }
+
+    #[test]
+    fn the_wake_lock_slot_survives_its_encoding_and_an_unwritten_slot_is_none() {
+        let k = Wake {
+            cpu: 7,
+            released: false,
+            taken: 0x1234_5678_9abc,
+            marked: 0x1234_5678_ffff,
+        };
+        assert_eq!(Wake::decode(k.encode()), Some(k));
+        let free = Wake {
+            released: true,
+            marked: 0,
+            ..k
+        };
+        assert_eq!(Wake::decode(free.encode()), Some(free));
+        assert_eq!(k.encode()[0] >> 48, 0x574b, "tagged WK");
+        assert_eq!(Wake::decode([0, 0, 0]), None);
+        assert_eq!(Wake::decode([WAIT_TAG | 7, 1, 2]), None);
+    }
+
+    #[test]
+    fn the_allocator_stamps_survive_their_encoding_and_an_unwritten_slot_is_none() {
+        // cpu 2 balances a order-4 block for the global pool; the tick it entered on is in the low 40 bits.
+        let word = (2u64 << 46) | (4 << 40) | (1 << 48) | 0x5000;
+        let a = Alloc {
+            word,
+            at: 0x1234_5678_9abc,
+        };
+        assert_eq!(Alloc::decode(a.encode()), Some(a));
+        assert_eq!(a.place(), "balance");
+        assert_eq!(a.order(), 4);
+        assert!(a.holds_global() && a.inside());
+        let free = Alloc { word: 0, at: 7 };
+        assert_eq!(Alloc::decode(free.encode()), Some(free));
+        assert!(!free.inside());
+        assert_eq!(a.encode()[0] >> 48, 0x414c, "tagged AL");
+        assert_eq!(Alloc::decode([0, 0]), None);
+        assert_eq!(Alloc::decode([WAKE_TAG | 7, word]), None);
+        // The counter's own high bits stay out of the tag's way: 48 bits of it are kept.
+        let wide = Alloc {
+            word,
+            at: (1 << 48) | 0x5000,
+        };
+        assert_eq!(
+            Alloc::decode(wide.encode()),
+            Some(Alloc { word, at: 0x5000 })
+        );
+        let g = AllocGlobal {
+            holder: (6 << 48) | 0x4000,
+            at: 0x9000,
+        };
+        assert_eq!(AllocGlobal::decode(g.encode()), Some(g));
+        assert_eq!((g.cpu(), g.held()), (6, true));
+        let none = AllocGlobal {
+            holder: 0,
+            at: 0x9000,
+        };
+        assert_eq!(AllocGlobal::decode(none.encode()), Some(none));
+        assert!(!none.held());
+        assert_eq!(g.encode()[0] >> 48, 0x4147, "tagged AG");
+        assert_eq!(AllocGlobal::decode([0, 0]), None);
+        // How long each was in, from the stamp's own counter: 0x9000 - 0x4000 = 0x5000 ticks.
+        assert_eq!(g.since(), 0x5000);
+        // The stamp's counter and the entry tick are both the arch counter's low 40 bits.
+        assert_eq!(a.since(), 0x3456_789abc - 0x5000);
+        assert_eq!(wide.since(), 0);
     }
 
     #[test]
@@ -918,6 +1293,274 @@ mod tests {
                 count: 6,
                 time: 40
             })
+        );
+    }
+
+    #[test]
+    fn the_wake_lock_slot_is_read_back_by_majority_and_absent_where_an_older_area_left_zeros() {
+        let mut mem = ram();
+        start(&mut mem, 0, 1);
+        note(&mut mem, 0, 0, 1, 0x1000);
+        // An older format-3 kernel wiped the tail and wrote no slot: none.
+        assert_eq!(Trace::read(&mem, 0).unwrap().wake, None);
+        let k = Wake {
+            cpu: 6,
+            released: false,
+            taken: 500,
+            marked: 0,
+        };
+        put(&mut mem, wake_offset, &k.encode());
+        // Two copies flipped all over: the vote still has it.
+        for copy in [0, 3] {
+            for w in 0..3 {
+                let at = wake_offset(copy) + w * 8;
+                let mut b = [0u8; 8];
+                mem.read(at, &mut b);
+                mem.write(at, &(!u64::from_le_bytes(b)).to_le_bytes());
+            }
+        }
+        assert_eq!(Trace::read(&mem, 0).unwrap().wake, Some(k));
+        // An area that ends before the slot (a tail sized for patch 1213's format 3) keeps everything else.
+        struct Short<'a>(&'a Ram, usize);
+        impl Mem for Short<'_> {
+            fn size(&self) -> usize {
+                self.1
+            }
+            fn read(&self, offset: usize, out: &mut [u8]) {
+                self.0.read(offset, out)
+            }
+            fn write(&mut self, _: usize, _: &[u8]) {}
+        }
+        let t = Trace::read(&Short(&mem, V3.wake_at), 0).unwrap();
+        assert_eq!(t.wake, None);
+        assert_eq!(t.newest_first(0).0[0], Some(entry(1, 0x1000)));
+        // Format 2 has no slot.
+        assert_eq!(V2.wake_at, 0);
+    }
+
+    #[test]
+    fn the_text_says_who_holds_the_wake_lock_and_when_a_waiter_marked_it() {
+        let f = 19_200_000;
+        let mut mem = ram();
+        start(&mut mem, 0, 1);
+        // CPU 5 took it 2 s before the newest event (an access at 10 s); a waiter marked it 1 s later.
+        note_at(&mut mem, 0, 1, 0, 0x1000, 10 * f);
+        let held = Wake {
+            cpu: 5,
+            released: false,
+            taken: 8 * f,
+            marked: 9 * f,
+        };
+        put(&mut mem, wake_offset, &held.encode());
+        let s = text(&Trace::read(&mem, 0).unwrap(), 1, f);
+        assert!(
+            s.as_str()
+                .contains("WAKE_LOCK: held by cpu 5 since -2000.000 ms (marked -1000.000 ms)\n"),
+            "{}",
+            s.as_str()
+        );
+        let free = Wake {
+            released: true,
+            marked: 0,
+            ..held
+        };
+        put(&mut mem, wake_offset, &free.encode());
+        let s = text(&Trace::read(&mem, 0).unwrap(), 1, f);
+        assert!(
+            s.as_str()
+                .contains("WAKE_LOCK: free, last held by cpu 5, taken -2000.000 ms\n"),
+            "{}",
+            s.as_str()
+        );
+        // Without the counter's frequency, no times.
+        put(&mut mem, wake_offset, &held.encode());
+        let s = text(&Trace::read(&mem, 0).unwrap(), 1, 0);
+        assert!(
+            s.as_str().contains("WAKE_LOCK: held by cpu 5 (marked)\n"),
+            "{}",
+            s.as_str()
+        );
+        // No slot, no line.
+        put(&mut mem, wake_offset, &[0, 0, 0]);
+        let s = text(&Trace::read(&mem, 0).unwrap(), 1, f);
+        assert!(!s.as_str().contains("WAKE_LOCK"), "{}", s.as_str());
+    }
+
+    /// The words patch 1313 stamps every few seconds: cpu 1 deallocates for 1 ms, cpu 3 balances an order-4 block for the
+    /// global pool for 12 ms, cpu 5 holds the global pool for 7 ms, the rest are outside.
+    const STAMP_F: u64 = 19_200_000;
+    const STAMP_AT: u64 = 10 * STAMP_F;
+
+    fn stamped_words() -> [u64; CPUS] {
+        let since = |ms: u64| STAMP_AT - ms * STAMP_F / 1000;
+        [
+            0,
+            since(1) | (1 << 46),
+            0,
+            since(12) | (4 << 40) | (2 << 46) | (1 << 48),
+            0,
+            0,
+            0,
+            0,
+        ]
+    }
+
+    fn stamped_global() -> AllocGlobal {
+        AllocGlobal {
+            holder: (5 << 48) | (STAMP_AT - 7 * STAMP_F / 1000),
+            at: STAMP_AT,
+        }
+    }
+
+    fn stamp_allocator(mem: &mut Ram) {
+        for (cpu, word) in stamped_words().iter().enumerate() {
+            let a = Alloc {
+                word: *word,
+                at: STAMP_AT,
+            };
+            put(mem, |copy| V3.alloc_offset(copy, cpu), &a.encode());
+        }
+        let g = stamped_global();
+        put(mem, |copy| V3.alloc_global_offset(copy), &g.encode());
+    }
+
+    /// An area that ends at `size`.
+    struct Cutoff<'a>(&'a Ram, usize);
+
+    impl Mem for Cutoff<'_> {
+        fn size(&self) -> usize {
+            self.1
+        }
+        fn read(&self, offset: usize, out: &mut [u8]) {
+            self.0.read(offset, out)
+        }
+        fn write(&mut self, _: usize, _: &[u8]) {}
+    }
+
+    #[test]
+    fn the_allocator_stamps_are_read_back_by_majority_and_absent_where_an_older_area_left_zeros() {
+        let mut mem = ram();
+        start(&mut mem, 0, 1);
+        note(&mut mem, 0, 0, 1, 0x1000);
+        // An older format-3 kernel (patch 1311) wiped the tail and wrote no stamps: none.
+        let t = Trace::read(&mem, 0).unwrap();
+        assert_eq!(t.allocs, [None; CPUS]);
+        assert_eq!(t.alloc_global, None);
+        stamp_allocator(&mut mem);
+        let stamped = Alloc {
+            word: stamped_words()[3],
+            at: STAMP_AT,
+        };
+        let t = Trace::read(&mem, 0).unwrap();
+        assert_eq!(t.allocs[3], Some(stamped));
+        // Stamped and outside is a stamp of its own, not a missing one.
+        assert_eq!(
+            t.allocs[0],
+            Some(Alloc {
+                word: 0,
+                at: STAMP_AT
+            })
+        );
+        assert_eq!(t.alloc_global, Some(stamped_global()));
+        // Two copies flipped all over: the vote still has them.
+        for copy in [1, 4] {
+            for cpu in 0..CPUS {
+                for w in 0..2 {
+                    let at = V3.alloc_offset(copy, cpu) + w * 8;
+                    let mut b = [0u8; 8];
+                    mem.read(at, &mut b);
+                    mem.write(at, &(!u64::from_le_bytes(b)).to_le_bytes());
+                }
+            }
+            let at = V3.alloc_global_offset(copy);
+            for w in 0..2 {
+                let mut b = [0u8; 8];
+                mem.read(at + w * 8, &mut b);
+                mem.write(at + w * 8, &(!u64::from_le_bytes(b)).to_le_bytes());
+            }
+        }
+        let t = Trace::read(&mem, 0).unwrap();
+        assert_eq!(t.allocs[3], Some(stamped));
+        assert_eq!(t.alloc_global, Some(stamped_global()));
+        // An area that ends before the stamps (a tail sized for patch 1311) keeps the idle timer's slot.
+        let t = Trace::read(&Cutoff(&mem, V3.alloc_at), 0).unwrap();
+        assert_eq!(t.allocs, [None; CPUS]);
+        assert_eq!(t.newest_first(0).0[0], Some(entry(1, 0x1000)));
+        // One that ends between the stamps and the holder keeps the stamps.
+        let t = Trace::read(&Cutoff(&mem, V3.alloc_global_at), 0).unwrap();
+        assert_eq!(t.allocs[3], Some(stamped));
+        assert_eq!(t.alloc_global, None);
+        // Format 2 has neither.
+        assert_eq!((V2.alloc_at, V2.alloc_global_at), (0, 0));
+    }
+
+    #[test]
+    fn the_text_says_who_was_inside_the_allocator_and_who_held_the_global_pool() {
+        let f = STAMP_F;
+        let mut mem = ram();
+        start(&mut mem, 0, 1);
+        note_at(&mut mem, 0, 1, 0, 0x1000, STAMP_AT);
+        stamp_allocator(&mut mem);
+        let s = text(&Trace::read(&mem, 0).unwrap(), 1, f);
+        let s = s.as_str();
+        assert!(
+            s.contains("  al cpu 3: balance for 12 ms order 4 holds-global\n")
+                && s.contains("  al cpu 1: dealloc for 1 ms order 0\n")
+                && s.contains("  al global holder: cpu 5 for 7 ms\n"),
+            "{s}"
+        );
+        assert!(!s.contains("nobody inside"), "{s}");
+        // Only the CPUs the stamp found inside get a line.
+        assert_eq!(
+            s.lines().filter(|l| l.starts_with("  al cpu")).count(),
+            2,
+            "{s}"
+        );
+        // Nobody inside, and nobody holds the global pool.
+        let mut mem = ram();
+        start(&mut mem, 0, 1);
+        for cpu in 0..CPUS {
+            let a = Alloc {
+                word: 0,
+                at: STAMP_AT,
+            };
+            put(&mut mem, |copy| V3.alloc_offset(copy, cpu), &a.encode());
+        }
+        let none = AllocGlobal {
+            holder: 0,
+            at: STAMP_AT,
+        };
+        put(
+            &mut mem,
+            |copy| V3.alloc_global_offset(copy),
+            &none.encode(),
+        );
+        let s = text(&Trace::read(&mem, 0).unwrap(), 1, f);
+        let s = s.as_str();
+        assert!(
+            s.contains("  al: nobody inside\n") && s.contains("  al global holder: none\n"),
+            "{s}"
+        );
+        // Without the counter's frequency, the stamps say where, not how long.
+        let mut mem = ram();
+        start(&mut mem, 0, 1);
+        stamp_allocator(&mut mem);
+        let s = text(&Trace::read(&mem, 0).unwrap(), 1, 0);
+        let s = s.as_str();
+        assert!(
+            s.contains("  al cpu 3: balance order 4 holds-global\n")
+                && s.contains("  al global holder: cpu 5\n"),
+            "{s}"
+        );
+        // No stamps, no lines.
+        let mut mem = ram();
+        start(&mut mem, 0, 1);
+        note(&mut mem, 0, 0, 1, 0x1000);
+        let s = text(&Trace::read(&mem, 0).unwrap(), 1, f);
+        let s = s.as_str();
+        assert!(
+            !s.contains("al cpu") && !s.contains("frame allocator"),
+            "{s}"
         );
     }
 

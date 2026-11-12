@@ -4,9 +4,11 @@
 //! - [`Lockup`]: when a CPU counts as stuck, behaviour from Linux's `kernel/watchdog.c`.
 //! - [`UserPromise`]: what `/dev/watchdog` promises, behaviour from Linux's `drivers/watchdog/watchdog_dev.c`.
 //! - [`rules::bark_target`]: which CPU takes the bark, never the boot CPU that pets (patch 1185, proved by Verus).
+//! - [`route`]: `lucina.wdt.bark=`, and the target only among CPUs that took an interrupt within the pet period (patch 1312).
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod route;
 pub mod rules;
 
 pub mod qcom {
@@ -146,7 +148,11 @@ impl Lockup {
                 };
             }
         }
-        if own_late { Verdict::ResetOwn } else { Verdict::Fine }
+        if own_late {
+            Verdict::ResetOwn
+        } else {
+            Verdict::Fine
+        }
     }
 }
 
@@ -378,17 +384,38 @@ mod tests {
     fn one_late_timer_does_not_hide_a_stuck_cpu() {
         // CPU 1 checks at 30 s: its last tick 23 s (7 s late), CPU 2 ticked at 29.9 s, CPU 0's thread last ran at 5 s.
         assert_eq!(
-            LOCKUP.check(30_000, 23_000, 29_900, 1, [5_000u64, 23_000, 29_000].into_iter()),
-            Verdict::Stuck { cpu: 0, for_ticks: 25_000 }
+            LOCKUP.check(
+                30_000,
+                23_000,
+                29_900,
+                1,
+                [5_000u64, 23_000, 29_000].into_iter()
+            ),
+            Verdict::Stuck {
+                cpu: 0,
+                for_ticks: 25_000
+            }
         );
         // Nobody else stuck: only this CPU's entry starts over.
         assert_eq!(
-            LOCKUP.check(30_000, 23_000, 29_900, 1, [29_000u64, 23_000, 29_000].into_iter()),
+            LOCKUP.check(
+                30_000,
+                23_000,
+                29_900,
+                1,
+                [29_000u64, 23_000, 29_000].into_iter()
+            ),
             Verdict::ResetOwn
         );
         // Its own stale time is not counted against it then.
         assert_eq!(
-            LOCKUP.check(30_000, 4_000, 29_900, 1, [29_000u64, 4_000, 29_000].into_iter()),
+            LOCKUP.check(
+                30_000,
+                4_000,
+                29_900,
+                1,
+                [29_000u64, 4_000, 29_000].into_iter()
+            ),
             Verdict::ResetOwn
         );
     }
@@ -404,7 +431,10 @@ mod tests {
 
     #[test]
     fn a_counter_that_goes_back_is_no_lockup() {
-        assert_eq!(LOCKUP.check(10, 20, 20, 0, [30u64].into_iter()), Verdict::Fine);
+        assert_eq!(
+            LOCKUP.check(10, 20, 20, 0, [30u64].into_iter()),
+            Verdict::Fine
+        );
     }
 
     #[test]

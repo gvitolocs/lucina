@@ -988,10 +988,23 @@ fn cmd_alert_plan(a: &Args) -> Result<i32, String> {
 }
 
 /// `sweep-target --dir ROOT --limit-gib N [--to-gib M] [--keep TARGET] [--dry-run]`: keeps the fast-check cache under N GiB (sweep.rs).
+/// `--single` caps ONE Cargo target dir instead of a root of them: its least recently used build artifacts go, nothing else, and it
+/// exits 3 when the target is in use and was left alone. `--limit-kib` and `--to-kib` are the same caps in KiB, for a test.
 fn cmd_sweep_target(a: &Args) -> Result<i32, String> {
     let dir = PathBuf::from(a.need("--dir")?);
     let limit = a.num("--limit-gib", 30)?;
     let to = a.num("--to-gib", limit * 4 / 5)?;
+    if a.has("--single") {
+        // The KiB marks are so a test can run the real thing over a folder of a few KiB; the GiB marks are what people and the
+        // timer give.
+        let (lim, to) = if a.has("--limit-kib") {
+            let lim = a.num("--limit-kib", 0)?;
+            (lim, a.num("--to-kib", lim * 4 / 5)?)
+        } else {
+            sweep::caps_kib(limit, to)
+        };
+        return sweep::run_single(&dir, lim, to, a.has("--dry-run"));
+    }
     let keep = a.val("--keep").map(PathBuf::from);
     sweep::run(&dir, limit, to, keep.as_deref(), a.has("--dry-run"))
 }
