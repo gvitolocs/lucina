@@ -627,6 +627,23 @@ fn prepare(
         }
         None => cmdline,
     };
+    // A test root with the stream's own user space is a reload's alone (`/chosen`, kernel patches 1244, 1245): never from BOOT.CFG.
+    let cmdline: &'static str = {
+        let buf = efi
+            .allocate_pages(Place::Anywhere, 1)
+            .map_err(|s| Fail::Config("cmdline", s))?;
+        match uefi::drop_reload_words(cmdline, buf) {
+            Some((line, 0)) => {
+                let _ = line;
+                cmdline
+            }
+            Some((line, n)) => {
+                say!(out, "cmdline: dropped {n} lucina.reload.* words: only a reload sets a test root");
+                line
+            }
+            None => return Err(Fail::Config("cmdline too long", efi::LOAD_ERROR)),
+        }
+    };
     out.verbose = cfg.verbose;
     *stages = 1;
 

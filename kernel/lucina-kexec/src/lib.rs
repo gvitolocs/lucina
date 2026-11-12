@@ -64,7 +64,11 @@ impl Image {
 
     /// As [`Image::parse`], from the start of the file (at least its 64-byte header) and the file's length, so that the
     /// kernel need not hold the whole file in one buffer (patch 1055).
-    pub fn parse_header(header: &[u8], file_len: u64, running_dram_base: u64) -> Result<Image, Error> {
+    pub fn parse_header(
+        header: &[u8],
+        file_len: u64,
+        running_dram_base: u64,
+    ) -> Result<Image, Error> {
         let file = header;
         if file.len() < ARM64_HEADER_LEN
             || &file[ARM64_MAGIC_OFFSET..ARM64_MAGIC_OFFSET + 4] != ARM64_MAGIC
@@ -143,12 +147,133 @@ const RNG_SOURCE: &str = "lucina,rng-source";
 /// Returns `dtb` with `/chosen` describing the new initramfs and, if given, a new command line; everything else, the
 /// framebuffer below `/chosen` and the memory nodes included, stays. `initrd` is `start..end`; `None` removes the
 /// properties. `bootargs` has no terminating NUL; `None` keeps the command line. `rng_seed` is the seed Linux's `kexec` hands
-/// the next kernel; one already in the tree never goes along, since it has been used.
+/// the next kernel; one already in the tree never goes along, since it has been used. The reload properties
+/// ([`RELOAD_ROOT`], [`RELOAD_DATA`]) of the running tree never go along either: see [`edit_chosen_with`].
 pub fn edit_chosen(
     dtb: &[u8],
     initrd: Option<Range<u64>>,
     bootargs: Option<&[u8]>,
     rng_seed: Option<&[u8]>,
+) -> Result<Vec<u8>, Error> {
+    edit_chosen_with(dtb, initrd, bootargs, rng_seed, &ReloadWords::default())
+}
+
+/// `/chosen` property of a reload that boots the stream's own user space: `overlay` or `initramfs`, NUL-terminated.
+pub const RELOAD_ROOT: &str = "lucina,reload-root";
+/// `/chosen` property of such a reload: what becomes of `/data`, `none`, `ro` or `rw`, NUL-terminated.
+pub const RELOAD_DATA: &str = "lucina,reload-data";
+/// The command-line words `lucina-reload --stream-root=<m> --data=<m>` passes to the running kernel's `kexec_file_load`.
+pub const RELOAD_ROOT_WORD: &str = "lucina.reload.root=";
+pub const RELOAD_DATA_WORD: &str = "lucina.reload.data=";
+
+/// The reload words taken out of a kexec command line.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReloadWords {
+    /// `overlay` or `initramfs`; `None` without a valid word.
+    pub root: Option<&'static str>,
+    /// `none`, `ro` or `rw`; `None` without a word. Only set when `root` is.
+    pub data: Option<&'static str>,
+    /// A word was there with a value outside its set (or a data word without a root word): dropped, nothing set.
+    pub refused: bool,
+}
+
+/// Splits the reload words off a kexec command line: returns the line without any `lucina.reload.root=`/`lucina.reload.data=`
+/// word among the kernel's arguments (before ` -- `; the init's arguments stay as they are) and what they asked for. The words never
+/// reach the new kernel's command line: only the `/chosen` properties [`edit_chosen_with`] writes from them do, so that a command
+/// line from anywhere else (BOOT.CFG) cannot start a test root. A data word without a root word, or a value outside its set, sets
+/// nothing (`refused`). A missing data word with a root word means `none`. The last word of a kind counts.
+pub fn reload_words(line: &[u8]) -> (Vec<u8>, ReloadWords) {
+    let (kernel, init) = split_init(line);
+    let mut out: Vec<u8> = Vec::with_capacity(line.len());
+    let (mut root, mut data, mut refused) = (None::<&[u8]>, None::<&[u8]>, false);
+    for word in kernel.split(|b| *b == b' ').filter(|w| !w.is_empty()) {
+        if let Some(v) = word.strip_prefix(RELOAD_ROOT_WORD.as_bytes()) {
+            root = Some(v);
+        } else if let Some(v) = word.strip_prefix(RELOAD_DATA_WORD.as_bytes()) {
+            data = Some(v);
+        } else {
+            if !out.is_empty() {
+                out.push(b' ');
+            }
+            out.extend_from_slice(word);
+        }
+    }
+    if let Some(init) = init {
+        if !out.is_empty() {
+            out.push(b' ');
+        }
+        out.extend_from_slice(b"--");
+        if !init.is_empty() {
+            out.push(b' ');
+            out.extend_from_slice(init);
+        }
+    }
+    let root_value = match root {
+        Some(b"overlay") => Some("overlay"),
+        Some(b"initramfs") => Some("initramfs"),
+        Some(_) => {
+            refused = true;
+            None
+        }
+        None => None,
+    };
+    let data_value = match (root_value, data) {
+        (Some(_), None | Some(b"none")) => Some("none"),
+        (Some(_), Some(b"ro")) => Some("ro"),
+        (Some(_), Some(b"rw")) => Some("rw"),
+        (Some(_), Some(_)) => {
+            refused = true;
+            None
+        }
+        (None, Some(_)) => {
+            refused = true;
+            None
+        }
+        (None, None) => None,
+    };
+    // A bad data value refuses the whole request: a test boot with /data other than asked is worse than none.
+    let words = if root_value.is_some() && data_value.is_some() {
+        ReloadWords {
+            root: root_value,
+            data: data_value,
+            refused,
+        }
+    } else {
+        ReloadWords {
+            root: None,
+            data: None,
+            refused,
+        }
+    };
+    (out, words)
+}
+
+/// The kernel's arguments and, after ` -- ` (or a leading `-- `, or a trailing ` --`), the init's.
+fn split_init(line: &[u8]) -> (&[u8], Option<&[u8]>) {
+    let line = line.strip_suffix(b"\0").unwrap_or(line);
+    if line == b"--" {
+        return (b"", Some(b""));
+    }
+    if let Some(rest) = line.strip_prefix(b"-- ") {
+        return (b"", Some(rest));
+    }
+    if let Some(i) = line.windows(4).position(|w| w == b" -- ") {
+        return (&line[..i], Some(&line[i + 4..]));
+    }
+    if let Some(kernel) = line.strip_suffix(b" --") {
+        return (kernel, Some(b""));
+    }
+    (line, None)
+}
+
+/// [`edit_chosen`], and `/chosen` gets [`RELOAD_ROOT`] and [`RELOAD_DATA`] from `reload` when it asks for a test root. The
+/// running tree's own reload properties are always left out, so that they exist only in the tree of the one reload that asked.
+pub fn edit_chosen_with(
+    dtb: &[u8],
+    initrd: Option<Range<u64>>,
+    bootargs: Option<&[u8]>,
+    rng_seed: Option<&[u8]>,
+    reload: &ReloadWords,
 ) -> Result<Vec<u8>, Error> {
     let bad = Error::BadDeviceTree;
     let be32 = |at: usize| -> Result<u32, Error> {
@@ -211,7 +336,17 @@ pub fn edit_chosen(
     }
     if let Some(seed) = rng_seed {
         props.push((string_offset(&mut new_strings, RNG_SEED), seed.to_vec()));
-        props.push((string_offset(&mut new_strings, RNG_SOURCE), b"the kernel before this reload\0".to_vec()));
+        props.push((
+            string_offset(&mut new_strings, RNG_SOURCE),
+            b"the kernel before this reload\0".to_vec(),
+        ));
+    }
+    if let (Some(root), Some(data)) = (reload.root, reload.data) {
+        for (name, value) in [(RELOAD_ROOT, root), (RELOAD_DATA, data)] {
+            let mut v = value.as_bytes().to_vec();
+            v.push(0);
+            props.push((string_offset(&mut new_strings, name), v));
+        }
     }
     let put_props = |out: &mut Vec<u8>| {
         for (name, value) in &props {
@@ -280,6 +415,8 @@ pub fn edit_chosen(
                         || name == INITRD_END.as_bytes()
                         || name == RNG_SEED.as_bytes()
                         || name == RNG_SOURCE.as_bytes()
+                        || name == RELOAD_ROOT.as_bytes()
+                        || name == RELOAD_DATA.as_bytes()
                         || (bootargs.is_some() && name == BOOTARGS.as_bytes()));
                 if !replaced {
                     put32(&mut out, FDT_PROP);
@@ -351,7 +488,7 @@ fn put32(out: &mut Vec<u8>, value: u32) {
 }
 
 fn pad4(out: &mut Vec<u8>) {
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
 }
@@ -522,7 +659,10 @@ mod tests {
 
     #[test]
     fn bad_trees_are_refused() {
-        assert_eq!(edit_chosen(b"short", None, None, None), Err(Error::BadDeviceTree));
+        assert_eq!(
+            edit_chosen(b"short", None, None, None),
+            Err(Error::BadDeviceTree)
+        );
         let good = small_tree(true);
         let mut wrong_magic = good.clone();
         wrong_magic[0] = 0;
@@ -572,20 +712,40 @@ mod tests {
         assert!(!without["/chosen"].contains_key(RNG_SEED));
         let with = read(&edit_chosen(QEMU_DTB, None, None, Some(&[7; 32])).unwrap());
         assert_eq!(with["/chosen"][RNG_SEED], [7; 32]);
-        let again = read(&edit_chosen(&edit_chosen(QEMU_DTB, None, None, Some(&[7; 32])).unwrap(), None, None, Some(&[8; 32])).unwrap());
+        let again = read(
+            &edit_chosen(
+                &edit_chosen(QEMU_DTB, None, None, Some(&[7; 32])).unwrap(),
+                None,
+                None,
+                Some(&[8; 32]),
+            )
+            .unwrap(),
+        );
         assert_eq!(again["/chosen"][RNG_SEED], [8; 32]);
     }
 
     #[test]
     fn parse_header_agrees_with_parse() {
-        for (text_offset, size, base, len) in [(0x20_0000, 0x100_0000, 0xa000_0000, 0x80_0000), (0, 64, 0xa000_0000, 64)] {
+        for (text_offset, size, base, len) in [
+            (0x20_0000, 0x100_0000, 0xa000_0000, 0x80_0000),
+            (0, 64, 0xa000_0000, 64),
+        ] {
             let mut file = image(text_offset, size, base);
             file.resize(len, 0);
-            assert_eq!(Image::parse(&file, 0xa000_0000), Image::parse_header(&file[..64], len as u64, 0xa000_0000));
+            assert_eq!(
+                Image::parse(&file, 0xa000_0000),
+                Image::parse_header(&file[..64], len as u64, 0xa000_0000)
+            );
         }
         let file = image(0, 100, 0xa000_0000);
-        assert_eq!(Image::parse_header(&file[..64], 101, 0xa000_0000), Err(Error::BadSize));
-        assert_eq!(Image::parse_header(&file[..63], 64, 0xa000_0000), Err(Error::NotArm64Image));
+        assert_eq!(
+            Image::parse_header(&file[..64], 101, 0xa000_0000),
+            Err(Error::BadSize)
+        );
+        assert_eq!(
+            Image::parse_header(&file[..63], 64, 0xa000_0000),
+            Err(Error::NotArm64Image)
+        );
     }
 
     #[test]
@@ -646,5 +806,102 @@ mod tests {
         // Empty or too large.
         assert!(!device_tree_fits(&(0xb000_0000..0xb000_0000), &window));
         assert!(!device_tree_fits(&(0xb000_0000..0xb020_1000), &window));
+    }
+
+    fn words(line: &str) -> (String, ReloadWords) {
+        let (rest, w) = reload_words(line.as_bytes());
+        (String::from_utf8(rest).unwrap(), w)
+    }
+
+    #[test]
+    fn the_reload_words_leave_the_line_and_become_a_request() {
+        let (rest, w) = words(
+            "a=1 lucina.reload.root=overlay b lucina.reload.data=ro -- /etc/x lucina.reload.root=initramfs",
+        );
+        assert_eq!(rest, "a=1 b -- /etc/x lucina.reload.root=initramfs");
+        assert_eq!(
+            w,
+            ReloadWords {
+                root: Some("overlay"),
+                data: Some("ro"),
+                refused: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_root_word_alone_means_data_none() {
+        let (rest, w) = words("lucina.reload.root=initramfs");
+        assert_eq!(rest, "");
+        assert_eq!(
+            w,
+            ReloadWords {
+                root: Some("initramfs"),
+                data: Some("none"),
+                refused: false
+            }
+        );
+    }
+
+    #[test]
+    fn bad_values_and_a_data_word_alone_set_nothing() {
+        for line in [
+            "lucina.reload.root=ram",
+            "lucina.reload.root=overlay lucina.reload.data=yes",
+            "lucina.reload.data=rw",
+        ] {
+            let (rest, w) = words(line);
+            assert_eq!(rest, "", "{line}");
+            assert_eq!(
+                w,
+                ReloadWords {
+                    root: None,
+                    data: None,
+                    refused: true
+                },
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_without_words_is_unchanged() {
+        for line in ["a b -- c d", "-- c", "a --", "a", ""] {
+            let (rest, w) = words(line);
+            assert_eq!(rest, line);
+            assert_eq!(w, ReloadWords::default());
+        }
+    }
+
+    #[test]
+    fn the_request_becomes_chosen_properties() {
+        let reload = ReloadWords {
+            root: Some("overlay"),
+            data: Some("rw"),
+            refused: false,
+        };
+        let tree = edit_chosen_with(QEMU_DTB, None, Some(b"x"), None, &reload).unwrap();
+        let t = read(&tree);
+        assert_eq!(t["/chosen"][RELOAD_ROOT], b"overlay\0");
+        assert_eq!(t["/chosen"][RELOAD_DATA], b"rw\0");
+        assert_eq!(t["/chosen"][BOOTARGS], b"x\0");
+    }
+
+    #[test]
+    fn a_running_trees_reload_properties_never_go_along() {
+        let reload = ReloadWords {
+            root: Some("initramfs"),
+            data: Some("ro"),
+            refused: false,
+        };
+        let test_boot = edit_chosen_with(QEMU_DTB, None, Some(b"x"), None, &reload).unwrap();
+        // The next reload from that boot asks for nothing: no property is left.
+        let next = edit_chosen(&test_boot, None, Some(b"y"), None).unwrap();
+        let t = read(&next);
+        assert!(!t["/chosen"].contains_key(RELOAD_ROOT));
+        assert!(!t["/chosen"].contains_key(RELOAD_DATA));
+        // And one that asks again has each once (`read` refuses a property twice).
+        let again = edit_chosen_with(&test_boot, None, None, None, &reload).unwrap();
+        assert_eq!(read(&again)["/chosen"][RELOAD_ROOT], b"initramfs\0");
     }
 }

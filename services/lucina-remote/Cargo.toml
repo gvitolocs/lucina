@@ -74,6 +74,10 @@ path = "src/bin/lucina-data.rs"
 name = "lucina-rootimg"
 path = "src/bin/lucina-rootimg.rs"
 
+[[bin]]
+name = "lucina-stream-root"
+path = "src/bin/lucina-stream-root.rs"
+
 # Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
 [target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
 eyra = { path = "../../third_party/eyra-stack/eyra" }

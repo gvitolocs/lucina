@@ -52,6 +52,7 @@ pub mod id {
     pub const SLEEP_LEFT: u32 = 107;
     // Juno-Setup
     pub const GENERATION_INSTALLED: u32 = 2;
+    pub const TEST_BOOT: u32 = 3;
     // Juno-Storage
     pub const DATA_CHECKED: u32 = 7;
     // Juno-EventLog
@@ -212,6 +213,15 @@ pub const DEFS: &[Def] = &[
         channel: Channel::Setup,
         windows: "WindowsUpdateClient 19",
         meaning: "a new generation of LucinaOS booted for the first time",
+    },
+    Def {
+        provider: SETUP,
+        id: id::TEST_BOOT,
+        name: "Test boot of a stream",
+        level: Level::Warning,
+        channel: Channel::Setup,
+        windows: "none (a WinPE or VHD test boot leaves no event)",
+        meaning: "a reload ran the stream's own user space (lucina-reload --stream-root) with /data read-write; the installed generation, its trial record and the ESP were not touched",
     },
     Def {
         provider: STORAGE,

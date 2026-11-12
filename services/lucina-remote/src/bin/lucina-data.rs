@@ -26,6 +26,11 @@
 //! /data only comes up after it.
 //!
 //! `/run/lucina/data-ready` appears when /data can be used, and `/run/lucina/data-failed` holds the reason if it cannot.
+//!
+//! On a test boot with the stream's own user space (`lucina,reload-data` in `/chosen`, `lucina_remote::testroot`): `none` leaves
+//! /data unmounted (data-failed says so); `ro` mounts it read-only with no check, no state write, no seed and no sync loop; `rw`
+//! checks and mounts it as usual and writes a test-boot event, but `clean` never writes the clean mark: the state stays 0 (mounted,
+//! not clean), so the next boot of the installed generation checks it. `reopen` is refused unless the mode is `rw`.
 
 // Juno with no C library: Eyra is the libc and the program start, in Rust (docs/research/juno-pure-rust.md).
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))]
@@ -57,6 +62,7 @@ use lucina_remote::{
     image::{self, STATE_ERROR, STATE_VALID, needs_check},
     repair,
     seed::{self, Loaded, SeedFile},
+    testroot::{self, Data, TestBoot},
 };
 
 const DATA: &str = "/data";
@@ -125,6 +131,89 @@ fn mount(device: &str) -> Result<(), String> {
         return Err(errno(&format!("mount {device} on {DATA}")));
     }
     Ok(())
+}
+
+/// /data read-only for a test boot: nothing is written to the device, not even the state.
+fn mount_read_only(device: &str) -> Result<(), String> {
+    let (dev, dir) = (
+        CString::new(device).map_err(|e| e.to_string())?,
+        CString::new(DATA).map_err(|e| e.to_string())?,
+    );
+    // SAFETY: The strings outlive the call; no data.
+    if unsafe {
+        libc::mount(
+            dev.as_ptr(),
+            dir.as_ptr(),
+            c"ext2".as_ptr(),
+            libc::MS_RDONLY | libc::MS_NOATIME,
+            core::ptr::null(),
+        )
+    } != 0
+    {
+        return Err(errno(&format!("mount {device} on {DATA} read-only")));
+    }
+    Ok(())
+}
+
+/// `mount` on a test boot whose /data mode is not `rw`.
+fn test_mount(test: &TestBoot) -> Result<(), String> {
+    fs::create_dir_all(RUN).map_err(|e| format!("{RUN}: {e}"))?;
+    match test.data {
+        Data::None => {
+            let why = "a test boot with the stream's own user space: /data is not mounted (lucina,reload-data none)";
+            say_in_kernel_log(why);
+            fs::write(format!("{RUN}/data-failed"), format!("{why}\n"))
+                .map_err(|e| format!("{RUN}/data-failed: {e}"))
+        }
+        Data::ReadOnly => {
+            let result = device().and_then(|d| mount_read_only(&d));
+            match result {
+                Ok(()) => {
+                    say_in_kernel_log(
+                        "a test boot: /data mounted read-only, not checked, no sync loop",
+                    );
+                    fs::write(format!("{RUN}/data-ready"), "")
+                        .map_err(|e| format!("{RUN}/data-ready: {e}"))
+                }
+                Err(e) => {
+                    let _ = fs::write(format!("{RUN}/data-failed"), format!("{e}\n"));
+                    Err(e)
+                }
+            }
+        }
+        Data::ReadWrite => run_mount(),
+    }
+}
+
+/// With /data read-write on a test boot: one event, with the marker line, so that the event log says which boot this was.
+fn test_boot_event(test: &TestBoot) {
+    let line = fs::read_to_string(testroot::MARKER_FILE).unwrap_or_default();
+    let line = line.trim();
+    let now = unix_seconds();
+    let mut event = Event::new(
+        providers::SETUP,
+        providers::id::TEST_BOOT,
+        Level::Warning,
+        Channel::Setup,
+        if line.is_empty() {
+            format!(
+                "A test boot with the stream's own user space (mode {}, data rw)",
+                test.root
+            )
+        } else {
+            format!("A test boot with the stream's own user space: {line}")
+        },
+    )
+    .field("mode", test.root.to_string())
+    .field("data", test.data.name().to_string());
+    event.next_step = Some("Nothing: any later boot is the installed generation again; /data is checked at the next one.".into());
+    event.time_ms = Some(now as i64 * 1000);
+    let written = Store::open(Path::new(EVENTS), Retention::default())
+        .and_then(|mut s| s.append(event, now as i64 * 1000));
+    say_in_kernel_log(match written {
+        Ok(_) => "a test boot: the event is in the event log",
+        Err(_) => "a test boot: the event could not be written",
+    });
 }
 
 /// What a check found, for after /data is up.
@@ -310,6 +399,9 @@ fn run_mount() -> Result<(), String> {
         }
     };
     fs::write(format!("{RUN}/data-ready"), "").map_err(|e| format!("{RUN}/data-ready: {e}"))?;
+    if let Some(test) = testroot::test_boot() {
+        test_boot_event(&test);
+    }
     // After "ready", so that what reads /data does not wait for the copies.
     if let Some(c) = &checked {
         after_check(c, &mut log);
@@ -478,6 +570,16 @@ fn clean_chain(device: &str) -> Result<(), String> {
 fn clean_inner() -> Result<(), String> {
     // A caller's own working directory in /data would hold it busy.
     let _ = std::env::set_current_dir("/");
+    if let Some(test) = testroot::test_boot() {
+        // Never the clean mark on a test boot: what it wrote is flushed, and the next installed boot checks /data.
+        if test.data == Data::ReadWrite && Path::new(&format!("{RUN}/data-ready")).exists() {
+            syncfs_at(DATA)?;
+        }
+        return Err(format!(
+            "a test boot (data {}): /data is not marked clean, the next boot of the installed generation checks it",
+            test.data.name()
+        ));
+    }
     let device = device()?;
     if !Path::new(&format!("{RUN}/data-ready")).exists() {
         return Err("this boot did not bring /data up: nothing marked".to_string());
@@ -583,12 +685,18 @@ fn status() -> Result<(), String> {
 
 fn main() -> ExitCode {
     let arg = std::env::args().nth(1);
-    let result = match arg.as_deref() {
-        Some("mount") => run_mount(),
-        Some("reopen") => reopen(),
-        Some("clean") => clean(&std::env::args().skip(2).collect::<Vec<_>>()),
-        None | Some("status") => status(),
-        Some(other) => Err(format!(
+    let test = testroot::test_boot();
+    let result = match (arg.as_deref(), &test) {
+        (Some("mount"), Some(t)) => test_mount(t),
+        (Some("mount"), None) => run_mount(),
+        (Some("reopen"), Some(t)) if t.data != Data::ReadWrite => Err(format!(
+            "a test boot (data {}): /data is not reopened read-write",
+            t.data.name()
+        )),
+        (Some("reopen"), _) => reopen(),
+        (Some("clean"), _) => clean(&std::env::args().skip(2).collect::<Vec<_>>()),
+        (None | Some("status"), _) => status(),
+        (Some(other), _) => Err(format!(
             "unknown command {other:?}: lucina-data [mount|clean [--cap SECONDS]|reopen|status]"
         )),
     };

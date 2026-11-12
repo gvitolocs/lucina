@@ -431,6 +431,49 @@ pub fn merge_cmdline<'b>(base: &str, extra: &str, out: &'b mut [u8]) -> Option<&
     core::str::from_utf8(&out[..n]).ok().map(str::trim_start)
 }
 
+/// `line` without the words `lucina.reload.<anything>=` among the kernel's arguments (before ` -- `; the init's stay), into `out`,
+/// and how many there were. Only a reload sets a test root with the stream's own user space, through `/chosen` (kernel patches
+/// 1244, 1245): a BOOT.CFG or a boot manager that has the words gets them dropped and said. None when the result does not fit `out`.
+pub fn drop_reload_words<'b>(line: &str, out: &'b mut [u8]) -> Option<(&'b str, usize)> {
+    let (kernel, init) = if let Some(rest) = line.strip_prefix("-- ") {
+        ("", Some(rest))
+    } else if line == "--" {
+        ("", Some(""))
+    } else {
+        match line.find(" -- ") {
+            Some(i) => (&line[..i], Some(&line[i + 4..])),
+            None if line.ends_with(" --") => (&line[..line.len() - 3], Some("")),
+            None => (line, None),
+        }
+    };
+    let mut n = 0;
+    let mut push = |s: &str| -> Option<()> {
+        out.get_mut(n..n + s.len())?.copy_from_slice(s.as_bytes());
+        n += s.len();
+        Some(())
+    };
+    let (mut dropped, mut first) = (0, true);
+    for word in kernel.split_ascii_whitespace() {
+        if word.starts_with("lucina.reload.") {
+            dropped += 1;
+            continue;
+        }
+        if !first {
+            push(" ")?;
+        }
+        push(word)?;
+        first = false;
+    }
+    if let Some(init) = init {
+        push(if first { "--" } else { " --" })?;
+        if !init.is_empty() {
+            push(" ")?;
+            push(init)?;
+        }
+    }
+    core::str::from_utf8(&out[..n]).ok().map(|s| (s, dropped))
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Memory map
 // ---------------------------------------------------------------------------------------------------------------
@@ -1936,5 +1979,36 @@ mod tests {
             .collect();
         assert_eq!(v.set_firmware_ranges(many.iter().copied()), 3);
         assert_eq!(prop(&v).len(), MAX_FIRMWARE_RANGES * FIRMWARE_RANGE_BYTES);
+    }
+
+    #[test]
+    fn the_reload_words_leave_a_boot_cfg_line() {
+        let mut buf = [0u8; 256];
+        let (line, n) = drop_reload_words(
+            "root=/dev/a lucina.reload.root=overlay ro lucina.reload.data=rw -- /etc/x lucina.reload.root=initramfs",
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(
+            (line, n),
+            ("root=/dev/a ro -- /etc/x lucina.reload.root=initramfs", 2)
+        );
+        let mut buf = [0u8; 256];
+        assert_eq!(
+            drop_reload_words("lucina.reload.root=overlay -- x", &mut buf),
+            Some(("-- x", 1))
+        );
+        let mut buf = [0u8; 256];
+        assert_eq!(
+            drop_reload_words("a b -- c", &mut buf),
+            Some(("a b -- c", 0))
+        );
+        let mut buf = [0u8; 256];
+        assert_eq!(
+            drop_reload_words("a lucina.reloaded=1", &mut buf),
+            Some(("a lucina.reloaded=1", 0))
+        );
+        let mut small = [0u8; 3];
+        assert_eq!(drop_reload_words("abcd", &mut small), None);
     }
 }

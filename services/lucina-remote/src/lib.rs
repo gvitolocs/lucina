@@ -26,3 +26,4 @@ pub mod process;
 pub mod repair;
 pub mod seed;
 pub mod stream;
+pub mod testroot;

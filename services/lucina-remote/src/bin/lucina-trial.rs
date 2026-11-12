@@ -13,6 +13,9 @@
 //!
 //! Every boot: an app the shell had open when the machine crashed gets its line too. It is never reopened.
 //!
+//! On a test boot with the stream's own user space (`lucina,reload-root` in `/chosen`, `lucina_remote::testroot`) it does nothing at
+//! all: no settle, no good mark, no ESP mount, no file on /data. That boot is not a boot of the installed generation.
+//!
 //! `lucina-trial show <file>...` prints records, for tests.
 
 // Juno with no C library: Eyra is the libc and the program start, in Rust (docs/research/juno-pure-rust.md).
@@ -450,6 +453,14 @@ fn main() -> ExitCode {
     }
     if args.first().map(String::as_str) == Some("write") {
         return write_for_a_test(&args[1..]);
+    }
+    if let Some(test) = lucina_remote::testroot::test_boot() {
+        kmsg(&format!(
+            "a test boot with the stream's own user space (mode {}, data {}): no settle, no good mark, no ESP mount, nothing written",
+            test.root,
+            test.data.name()
+        ));
+        return ExitCode::SUCCESS;
     }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
