@@ -37,6 +37,7 @@
 extern crate eyra;
 
 use std::{
+    borrow::Cow,
     ffi::CString,
     fs::{self, File},
     io::{self, BufRead, BufReader, Read, Write},
@@ -216,9 +217,32 @@ fn manifest_installed(first_line: &str) -> Option<&str> {
     is_commit(value).then_some(value)
 }
 
+/// The most a gzip'd initramfs may unpack to for this check. The cpio walk reads an entry's content only to reach the next header,
+/// so the MANIFEST cannot be reached without the archive around it and the whole of it goes into RAM: the same RAM that
+/// `kexec_file_load` is about to ask for. A stream initramfs is a few tens of MiB; 1 GiB stands well above that and keeps a corrupt
+/// or hostile file from filling the machine.
+const MAX_INITRAMFS_UNCOMPRESSED: u64 = 1 << 30;
+
+/// The cpio newc archive a staged initramfs holds: `data` as it is when it already is one, its content when `data` is gzip. `Err`
+/// with the reason when gzip is unreadable or grows past [`MAX_INITRAMFS_UNCOMPRESSED`].
+fn initramfs_newc(data: &[u8]) -> Result<Cow<'_, [u8]>, String> {
+    if !data.starts_with(&[0x1f, 0x8b]) {
+        return Ok(Cow::Borrowed(data));
+    }
+    // `MultiGzDecoder`, because a stream of concatenated gzip members is what the kernel unpacks and what `gzip` writes twice.
+    let mut gz = flate2::read::MultiGzDecoder::new(data).take(MAX_INITRAMFS_UNCOMPRESSED + 1);
+    let mut newc = Vec::new();
+    match gz.read_to_end(&mut newc) {
+        Ok(_) if (newc.len() as u64) <= MAX_INITRAMFS_UNCOMPRESSED => Ok(Cow::Owned(newc)),
+        Ok(_) => Err("unpacks to more than the 1 GiB this reads".to_string()),
+        Err(e) => Err(format!("cannot be read ({e})")),
+    }
+}
+
 /// Why an overlay stream must not be started on this system, or `None` when it may. `running` is the trimmed
 /// [`testroot::COMMIT_FILE`] of the running system (`None` when it is not there), `initramfs` the staged file the kernel would get.
-/// A compressed initramfs has no newc header at its start, so its MANIFEST cannot be read here and it is refused.
+/// The staged file is read as a cpio newc archive, itself or as the content of its gzip (see [`initramfs_newc`]); an archive that
+/// cannot be reached this way is refused.
 fn overlay_refusal(running: Option<&str>, initramfs: &[u8]) -> Option<String> {
     let Some(running) = running.filter(|c| is_commit(c)) else {
         let what = match running {
@@ -230,11 +254,19 @@ fn overlay_refusal(running: Option<&str>, initramfs: &[u8]) -> Option<String> {
             testroot::COMMIT_FILE
         ));
     };
-    let manifest = match cpio_newc_find(initramfs, OVERLAY_MANIFEST) {
+    let archive = match initramfs_newc(initramfs) {
+        Ok(archive) => archive,
+        Err(why) => {
+            return Some(format!(
+                "the gzip of the staged initramfs {why}: its {OVERLAY_MANIFEST} cannot be read here, this system is {running}"
+            ));
+        }
+    };
+    let manifest = match cpio_newc_find(&archive, OVERLAY_MANIFEST) {
         Some(m) => m,
         None => {
             return Some(format!(
-                "the staged initramfs has no {OVERLAY_MANIFEST} to read (an uncompressed cpio newc archive is what is read here): the installed commit its overlay was built for is unknown, this system is {running}"
+                "the staged initramfs has no {OVERLAY_MANIFEST} to read (an uncompressed or a gzip cpio newc archive is what is read here): the installed commit its overlay was built for is unknown, this system is {running}"
             ));
         }
     };
@@ -866,15 +898,53 @@ mod tests {
                 "field at {at}"
             );
         }
-        // Not a cpio archive at all: a compressed initramfs is not walked here.
+        // Not a cpio archive at all: this walker is not what a gzip goes through, `initramfs_newc` opens that first.
         assert_eq!(cpio_newc_find(&gzip_like(), OVERLAY_MANIFEST), None);
     }
 
-    /// What a gzip'd initramfs starts with: no newc header, so nothing is found in it.
+    /// What a gzip'd initramfs starts with, cut short behind its header: no newc header for the walker, and no archive for the
+    /// gzip reader either.
     fn gzip_like() -> Vec<u8> {
         let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0];
         out.extend_from_slice(b"\x8c\x99m\xcbP\x00\x02\xff");
         out
+    }
+
+    /// An initramfs as `scripts/juno-reload-stream.sh:105` writes it: the archive through `gzip`.
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(1));
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn an_overlay_of_a_gzip_initramfs_is_read_and_its_commit_too() {
+        assert_eq!(overlay_refusal(Some(I), &gzip(&three_entries(I))), None);
+        // The mismatch is not lost in the compression: both commits are named.
+        let why = overlay_refusal(Some(I), &gzip(&three_entries(S))).unwrap();
+        assert!(why.contains(S) && why.contains(I), "{why}");
+        assert!(
+            why.contains("the overlay is built for installed commit"),
+            "{why}"
+        );
+        // Two gzip members one after the other, the archive split at an arbitrary byte: that is what the kernel unpacks, and the
+        // MANIFEST is still there whole.
+        let a = three_entries(I);
+        let at = a.len() / 2;
+        let mut members = gzip(&a[..at]);
+        members.extend(gzip(&a[at..]));
+        assert_eq!(overlay_refusal(Some(I), &members), None);
+    }
+
+    #[test]
+    fn an_unreadable_gzip_is_refused_by_name() {
+        let why = overlay_refusal(Some(I), &gzip_like()).unwrap();
+        assert!(why.contains(OVERLAY_MANIFEST), "{why}");
+        assert!(why.contains(I), "{why}: it names the commit it does know");
+        // A readable gzip that simply holds no MANIFEST is refused for the MANIFEST it lacks.
+        let why = overlay_refusal(Some(I), &gzip(&archive(&[("init", b"x")]))).unwrap();
+        assert!(why.contains(OVERLAY_MANIFEST), "{why}");
+        assert!(!why.contains("cannot be read"), "{why}");
     }
 
     #[test]
@@ -940,7 +1010,7 @@ mod tests {
         let why = overlay_refusal(Some(I), &no_field).unwrap();
         assert!(why.contains("installed="), "{why}");
         assert!(why.contains(I), "{why}");
-        // A compressed archive: its MANIFEST cannot be read without a decompressor.
+        // A broken gzip: cut short behind its header, it cannot be read and its MANIFEST is unknown.
         let why = overlay_refusal(Some(I), &gzip_like()).unwrap();
         assert!(why.contains(OVERLAY_MANIFEST), "{why}");
         // The mismatch names both commits.

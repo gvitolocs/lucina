@@ -12,6 +12,8 @@ sunset = { path = "../../third_party/sunset", default-features = false, features
 rustix = { version = "1", features = ["event", "fs", "process", "pty", "stdio", "system", "termios"] }
 libc = "0.2"
 sha2 = "0.10"
+# The gzip of a staged initramfs, unpacked to read its overlay MANIFEST. The pure-Rust backend, as kernel/lucina-initramfs.
+flate2 = "1"
 # BOOT.CFG as the loader reads it, and the GPT, for lucina-install-disk.
 lucina-boot = { path = "../../kernel/lucina-boot", default-features = false }
 lucina-ufs = { path = "../../drivers/lucina-ufs" }
