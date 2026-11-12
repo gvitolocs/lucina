@@ -118,7 +118,10 @@ mod segment_tests {
     #[test]
     fn the_entry_must_be_loaded() {
         let segments = [seg(0x8000_8000, 0x1000, 0x1000)];
-        assert_eq!(check(&segments, 0x8000_9fff), Err(SegmentError::EntryNotLoaded));
+        assert_eq!(
+            check(&segments, 0x8000_9fff),
+            Err(SegmentError::EntryNotLoaded)
+        );
         assert_eq!(check(&segments, 0x8000_8fff), Ok(1));
         assert_eq!(check(&[], 0x8000_8000), Err(SegmentError::EntryNotLoaded));
     }
@@ -126,16 +129,40 @@ mod segment_tests {
     #[test]
     fn nonsense_is_refused() {
         // Longer than its place, not pages, empty, overlapping.
-        assert_eq!(check(&[seg(0x8000_8000, 0x2000, 0x1000)], 0x8000_8000), Err(SegmentError::TooLong(0)));
-        assert_eq!(check(&[seg(0x8000_8100, 0x100, 0x1000)], 0x8000_8100), Err(SegmentError::NotPages(0)));
-        assert_eq!(check(&[seg(0x8000_8000, 0x100, 0x100)], 0x8000_8000), Err(SegmentError::NotPages(0)));
-        assert_eq!(check(&[seg(0x8000_8000, 0, 0)], 0x8000_8000), Err(SegmentError::NotPages(0)));
         assert_eq!(
-            check(&[seg(0x8000_8000, 0x2000, 0x2000), seg(0x8000_9000, 0x1000, 0x1000)], 0x8000_8000),
+            check(&[seg(0x8000_8000, 0x2000, 0x1000)], 0x8000_8000),
+            Err(SegmentError::TooLong(0))
+        );
+        assert_eq!(
+            check(&[seg(0x8000_8100, 0x100, 0x1000)], 0x8000_8100),
+            Err(SegmentError::NotPages(0))
+        );
+        assert_eq!(
+            check(&[seg(0x8000_8000, 0x100, 0x100)], 0x8000_8000),
+            Err(SegmentError::NotPages(0))
+        );
+        assert_eq!(
+            check(&[seg(0x8000_8000, 0, 0)], 0x8000_8000),
+            Err(SegmentError::NotPages(0))
+        );
+        assert_eq!(
+            check(
+                &[
+                    seg(0x8000_8000, 0x2000, 0x2000),
+                    seg(0x8000_9000, 0x1000, 0x1000)
+                ],
+                0x8000_8000
+            ),
             Err(SegmentError::Overlap(0, 1))
         );
         assert_eq!(
-            check(&[seg(0x8000_9000, 0x1000, 0x1000), seg(0x8000_8000, 0x2000, 0x2000)], 0x8000_8000),
+            check(
+                &[
+                    seg(0x8000_9000, 0x1000, 0x1000),
+                    seg(0x8000_8000, 0x2000, 0x2000)
+                ],
+                0x8000_8000
+            ),
             Err(SegmentError::Overlap(0, 1))
         );
         let many = vec![seg(0x8000_8000, 0x1000, 0x1000); MAX_SEGMENTS + 1];
@@ -144,9 +171,18 @@ mod segment_tests {
 
     #[test]
     fn only_ram_can_be_written() {
-        assert_eq!(check(&[seg(0x7fff_f000, 0x1000, 0x1000)], 0x7fff_f000), Err(SegmentError::NotRam(0)));
-        assert_eq!(check(&[seg(0x9fff_f000, 0x1000, 0x2000)], 0x9fff_f000), Err(SegmentError::NotRam(0)));
-        assert_eq!(check(&[seg(0x9fff_f000, 0x1000, 0x1000)], 0x9fff_f000), Ok(1));
+        assert_eq!(
+            check(&[seg(0x7fff_f000, 0x1000, 0x1000)], 0x7fff_f000),
+            Err(SegmentError::NotRam(0))
+        );
+        assert_eq!(
+            check(&[seg(0x9fff_f000, 0x1000, 0x2000)], 0x9fff_f000),
+            Err(SegmentError::NotRam(0))
+        );
+        assert_eq!(
+            check(&[seg(0x9fff_f000, 0x1000, 0x1000)], 0x9fff_f000),
+            Ok(1)
+        );
         // No wrapping past the top of the addresses.
         assert_eq!(
             check(&[seg(0xffff_ffff_ffff_f000, 0x1000, 0x2000)], 0x8000_8000),
