@@ -15,6 +15,7 @@
 pub mod level;
 pub mod quiet;
 pub mod sleep_stats;
+pub mod sleep_test;
 pub mod wake;
 pub mod wake_rules;
 
