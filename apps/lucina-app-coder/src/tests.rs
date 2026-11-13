@@ -1737,9 +1737,12 @@ fn the_local_screen_drives_a_whole_turn_over_acp_allow_then_stop() {
         h.app().note.as_deref(),
         Some("One turn at a time — Stop first.")
     );
-    // Allow: allow_once for that request id, and the turn ends.
+    // Allow: allow_once for that request id, and the turn ends. The pane follows streamed text at its own pace, so
+    // wait for the answer to be drawn too: "not running" alone can arrive a frame before the last chunk is rendered.
     h.app().local_answer(&key, true);
-    pump_until(&mut h, |a| !a.local_chat.as_ref().unwrap().running);
+    pump_until(&mut h, |a| {
+        !a.local_chat.as_ref().unwrap().running && format!("{:?}", a.pane.lines).contains("fixed")
+    });
     let text = format!("{:?}", h.app().pane.lines);
     assert!(text.contains("fixed"), "the assistant's answer: {text}");
     assert!(
@@ -1775,5 +1778,61 @@ fn the_local_screen_drives_a_whole_turn_over_acp_allow_then_stop() {
     assert!(
         sent.contains(r#"{"id":100,"jsonrpc":"2.0","result":{"outcome":{"outcome":"cancelled"}}}"#),
         "the open request answered cancelled: {sent}"
+    );
+}
+
+#[test]
+fn a_finished_turn_draws_its_answer_at_once_not_at_the_stream_pace() {
+    // The pane follows streamed text at STREAM_PACE, but a turn's end is not stream noise: the answer must be on
+    // screen as soon as "running" is false. A huge pace stands in for a stream that is still inside one pace, so
+    // only an explicit redraw at the turn's end can put the last chunk on screen.
+    let log = tempdir("acplog").join("stdin.log");
+    let acp = crate::acp::tests::fake_agent(&log);
+    let (mut h, _s) = sample_app();
+    h.app().fixed_now = Some(NOW);
+    h.app().open_local_agent(
+        PathBuf::from("/data/projects/demo-app"),
+        crate::local::LocalAgent::from_acp(acp),
+    );
+    settle(&mut h);
+    pump_until(&mut h, |a| {
+        a.local_chat
+            .as_ref()
+            .and_then(|c| c.agent.as_ref())
+            .is_some_and(|ag| ag.acp.session_id.is_some())
+    });
+    let id = "local:/data/projects/demo-app";
+    h.app().pane.pace = std::time::Duration::from_secs(3600);
+    h.app().pane.composer.set("fix it");
+    h.app().local_send();
+    let key = format!("{id}/100");
+    pump_until(&mut h, |a| {
+        a.store
+            .permissions
+            .get(&key)
+            .is_some_and(|p| p.status == "pending")
+    });
+    h.app().local_answer(&key, true);
+    // Stand where the frame after Allow leaves the pane: just drawn, so neither flag is set. Nothing is painted from
+    // here until the turn has ended, which keeps the last chunk out of `lines` unless the end itself redraws.
+    h.app().pane.stale = false;
+    h.app().pane.soft = false;
+    h.app().pane.built_at = Some(std::time::Instant::now());
+    for _ in 0..150 {
+        if !h.app().local_chat.as_ref().unwrap().running {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        h.core.input(lucina_app::Input::Wheel(0));
+    }
+    assert!(
+        !h.app().local_chat.as_ref().unwrap().running,
+        "the turn ends"
+    );
+    h.core.paint();
+    let text = format!("{:?}", h.app().pane.lines);
+    assert!(
+        text.contains("fixed"),
+        "the answer drawn when the turn ends: {text}"
     );
 }

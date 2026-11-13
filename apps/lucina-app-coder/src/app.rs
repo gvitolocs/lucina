@@ -152,6 +152,7 @@ pub struct CodeCor {
     queue: Option<mpsc::Sender<Work>>,
     sign_in: Option<SignInView>,
     start_sign_in: Option<Box<dyn FnMut() -> SignInView>>,
+    #[allow(clippy::type_complexity)]
     make_api: Option<Box<dyn FnMut() -> Option<Arc<dyn Api>>>>,
     pub store: Store,
     pub projects: Vec<ProjectRecord>,
@@ -963,9 +964,7 @@ impl CodeCor {
         let ProjectKey::Remote(id) = key else {
             return None;
         };
-        let Some(p) = self.projects.iter().find(|p| &p.project_id == id) else {
-            return None;
-        };
+        let p = self.projects.iter().find(|p| &p.project_id == id)?;
         projects::agents_of_project(self.store.items.values(), model::base_name(&p.root_path))
             .warning
     }
@@ -1094,11 +1093,11 @@ impl CodeCor {
     /// The agent's events that have arrived, onto the store. Called from `message` and `view`.
     pub fn pump_local(&mut self) {
         let mut events = Vec::new();
-        if let Some(chat) = self.local_chat.as_mut() {
-            if let Some(agent) = chat.agent.as_mut() {
-                while let Some(ev) = agent.acp.try_recv() {
-                    events.push(ev);
-                }
+        if let Some(chat) = self.local_chat.as_mut()
+            && let Some(agent) = chat.agent.as_mut()
+        {
+            while let Some(ev) = agent.acp.try_recv() {
+                events.push(ev);
             }
         }
         if events.is_empty() {
@@ -1110,6 +1109,9 @@ impl CodeCor {
             .map(|c| c.id.clone())
             .unwrap_or_default();
         let now = self.now();
+        // A turn's end is a definite state change, not stream noise: draw its last events now rather than at the
+        // stream's pace, so the transcript never shows "not running" with the answer still missing.
+        let mut turn_ended = false;
         for ev in events {
             match ev {
                 AcpEvent::Update(u) => acp::apply_update(&mut self.store, &id, &u, now),
@@ -1148,6 +1150,7 @@ impl CodeCor {
                         if chat.prompt_id == Some(rid) {
                             chat.prompt_id = None;
                             chat.running = false;
+                            turn_ended = true;
                         }
                     }
                     if let Some(n) = note {
@@ -1168,6 +1171,9 @@ impl CodeCor {
             }
         }
         self.pane.mark_soft();
+        if turn_ended {
+            self.pane.mark_stale();
+        }
     }
 
     /// The composer's Send on the local screen: `session/prompt`. One turn at a time.
@@ -1318,7 +1324,7 @@ impl CodeCor {
         let Some(p) = f.provider_info().cloned() else {
             return;
         };
-        if new_agent::codex_blocked(f.lucina, &[p.clone()]).is_some() {
+        if new_agent::codex_blocked(f.lucina, std::slice::from_ref(&p)).is_some() {
             // Codex cannot be chosen on a Lucina project.
             f.problem = Some(new_agent::CODEX_RULE_LINE.to_owned());
             return;
@@ -1365,6 +1371,7 @@ impl CodeCor {
     /// CodeCor labels. A coordinator's prompt is the fixed preamble plus the owner's text. On success the new agent's
     /// row is selected and `reply` (the intent's) is answered; on a refusal the server's message goes under the form,
     /// which keeps what was typed, and to `reply`.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_agent(
         &mut self,
         project: ProjectRecord,
@@ -1769,7 +1776,7 @@ impl CodeCor {
                         Face::Bold,
                         t.pt(16.0),
                         t.text,
-                        &model::base_name(&path.to_string_lossy()),
+                        model::base_name(&path.to_string_lossy()),
                     );
                     let sub = ui.cut_top(t.px(20.0));
                     ui.text_in(sub, Face::Sans, t.pt(12.0), t.dim, &path.to_string_lossy());
@@ -1897,7 +1904,7 @@ impl CodeCor {
                     Face::Bold,
                     t.pt(16.0),
                     t.text,
-                    &model::base_name(&path.to_string_lossy()),
+                    model::base_name(&path.to_string_lossy()),
                 );
                 let sub = ui.cut_top(t.px(20.0));
                 ui.text_in(
@@ -2225,17 +2232,16 @@ impl App for CodeCor {
             Screen::Local(_) => self.local_chat.as_ref().map(|c| c.id.clone()),
             _ => None,
         };
-        if self.pane.stale
+        if (self.pane.stale
             || (self.pane.soft
                 && self
                     .pane
                     .built_at
-                    .is_none_or(|t| t.elapsed() >= self.pane.pace))
+                    .is_none_or(|t| t.elapsed() >= self.pane.pace)))
+            && let Some(id) = pane_id
         {
-            if let Some(id) = pane_id {
-                let now = self.now();
-                self.pane.rebuild(&self.store, &id, now);
-            }
+            let now = self.now();
+            self.pane.rebuild(&self.store, &id, now);
         }
         ui.wake_after(if self.pane.soft {
             self.pane.pace
@@ -2484,13 +2490,12 @@ impl Api for CodecorSample {
             let id = path.strip_prefix(&format!("{B}/")).unwrap_or("");
             let mut v = self.inner.call(method, path, body)?;
             v["labels"] = sample_labels(id);
-            if id == "agt_sample_running" {
-                if let Some(pp) = v
+            if id == "agt_sample_running"
+                && let Some(pp) = v
                     .get_mut("pendingPermissions")
                     .and_then(|p| p.as_array_mut())
-                {
-                    pp.push(perm_diff_request());
-                }
+            {
+                pp.push(perm_diff_request());
             }
             return Ok(v);
         }
