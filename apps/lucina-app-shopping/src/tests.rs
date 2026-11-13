@@ -395,7 +395,7 @@ fn a_catalog_tile_on_the_list_shows_as_to_buy() {
     t.h.app().store.version += 1;
     t.pass();
     let tiles = &t.h.app().tiles;
-    let banana = tiles.iter().filter(|x| x.name == "Bananas").last().unwrap();
+    let banana = tiles.iter().rfind(|x| x.name == "Bananas").unwrap();
     assert_eq!(banana.kind, TileKind::Need);
     assert!(matches!(banana.tap, Tap::Row(_)));
     let other = tiles.iter().find(|x| x.kind == TileKind::Catalog).unwrap();
@@ -477,13 +477,14 @@ fn a_click_on_a_tile_marks_it_and_the_corner_opens_details() {
     let mut t = start(Fake::demo());
     t.pass();
     let before = t.needed().len();
-    // First tile of the list: right of nothing, under the head, the search and the heading.
-    t.h.click(90, 240);
+    // The first tile, at the place the app gave it: the middle of its face.
+    let body = t.h.app().tile_rects[0].expect("the first tile is on screen");
+    t.h.click(body.x + body.w / 2, body.y + body.h / 2);
     assert_eq!(t.needed().len(), before - 1);
     t.settle();
-    // The corner of the first tile. The list starts at the page's padding.
-    let x = 17 + t.h.app().tile_w - 12;
-    t.h.click(x, 236);
+    // Its corner, from the app again: the mark may have moved the list under it.
+    let corner = t.h.app().tile_corners[0].expect("the first tile has a corner");
+    t.h.click(corner.x + corner.w / 2, corner.y + corner.h / 2);
     assert!(matches!(t.h.app().dialog, Some(Dialog::Details(_))));
 }
 

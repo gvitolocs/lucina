@@ -11,6 +11,8 @@ publish = false
 # RegIo, Delay and the command DB. The kernel build copies each crate to
 # kernel/libs/<name>, so this relative path resolves there too.
 lucina-qcom-soc = { path = "../../drivers/lucina-qcom-soc" }
+# The icc aggregate and the BCM vote arithmetic (proved by Verus), for `icc`; also copied to kernel/libs.
+lucina-cpubw = { path = "../../kernel/lucina-cpubw" }
 # The device tree parser the kernel uses (its workspace has the same version), for the tree walk of `tree`.
 fdt = "0.1.5"
 # The lock of the one RSC owner (`rsc::Drv`); the kernel's workspace already has 0.9.

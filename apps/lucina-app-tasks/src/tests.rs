@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use chrono::TimeZone;
 use chrono_tz::Tz;
 use lucina_app::Harness;
+use lucina_app::Rect;
 use lucina_app::keys;
 use secretary_tasks::{Command, ViewQuery};
 
@@ -83,6 +84,18 @@ impl Rig {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The first row that is a task: the place the app hit-tests its round box, and the place it
+    /// hit-tests the row itself.
+    fn first_task_row(&mut self) -> (Rect, Rect) {
+        let a = self.h.app();
+        let i = a
+            .tick_rects
+            .iter()
+            .position(|x| x.is_some())
+            .expect("a task row on screen");
+        (a.tick_rects[i].unwrap(), a.row_rects[i].unwrap())
     }
 
     fn select(&mut self, content: &str) -> String {
@@ -499,13 +512,15 @@ fn drawing_one_key_touches_little_of_the_screen() {
 #[test]
 fn a_click_on_the_round_box_completes_and_on_the_row_opens() {
     let mut r = Rig::new();
-    // The first row at 1920x1080: its box, then its text.
-    r.h.click(367, 293);
+    // The first task row: its box, then the row beside the text.
+    let (tick, _) = r.first_task_row();
+    r.h.click(tick.x + tick.w / 2, tick.y + tick.h / 2);
     assert!(!r.titles().contains(&"Return the library books".to_string()));
     r.pump();
     assert_eq!(r.h.app().shown.as_ref().unwrap().goal.completed_today, 1);
     assert!(r.h.app().toast.is_some());
-    r.h.click(800, 293);
+    let (_, row) = r.first_task_row();
+    r.h.click(row.x + row.w / 2, row.y + row.h / 2);
     assert_eq!(
         r.h.app().detail.as_ref().unwrap().title.text,
         "Send the invoice"

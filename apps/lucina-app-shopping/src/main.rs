@@ -160,8 +160,11 @@ pub struct Shopping {
     images: HashMap<String, Image>,
     asked_art: std::collections::HashSet<String>,
     art_px: u32,
-    /// How wide tiles are now: they share out the width of the list.
-    pub tile_w: i32,
+    /// The face of each tile of the list, by tile index: the rect `draw_tiles_list` hit-tests, so that
+    /// a test clicks from the layout rather than from numbers copied beside it. `None` off screen.
+    pub tile_rects: Vec<Option<Rect>>,
+    /// The details corner of each tile that has one, by tile index.
+    pub tile_corners: Vec<Option<Rect>>,
     quit_saved: bool,
     next_refresh: Instant,
 }
@@ -241,7 +244,8 @@ impl Shopping {
             images: HashMap::new(),
             asked_art: Default::default(),
             art_px: 56,
-            tile_w: 0,
+            tile_rects: Vec::new(),
+            tile_corners: Vec::new(),
             quit_saved: false,
             next_refresh: Instant::now() + REFRESH_EVERY,
         }
@@ -942,13 +946,13 @@ impl Shopping {
         let t = ui.theme();
         let gap = t.px(TILE_GAP);
         let w = (r.w - t.px(8.0) - gap * (cols as i32 - 1)) / cols.max(1) as i32;
-        self.tile_w = w;
         let (band, head, hint) = (t.px(TILE_H) + gap, t.px(32.0), t.px(30.0));
         let lines = std::mem::take(&mut self.lines);
         let tiles = std::mem::take(&mut self.tiles);
         let (tile_art, images) = (&self.tile_art, &self.images);
         let sel = self.sel;
         let (mut tap, mut details, mut toggle) = (None, None, None);
+        let (mut rects, mut corners) = (vec![None; tiles.len()], vec![None; tiles.len()]);
         ui.list_measured(
             "tiles",
             &mut self.list,
@@ -1013,6 +1017,8 @@ impl Shopping {
                         for k in *from..*to {
                             let x = a.x + (k - from) as i32 * (w + gap);
                             let rect = Rect::new(x, a.y, w, a.h - gap);
+                            rects[k] = Some(rect);
+                            corners[k] = tiles[k].details.is_some().then(|| tile_corner(&t, rect));
                             let (tapped, more) = tile(
                                 ui,
                                 &tiles[k],
@@ -1033,6 +1039,8 @@ impl Shopping {
         );
         self.lines = lines;
         self.tiles = tiles;
+        self.tile_rects = rects;
+        self.tile_corners = corners;
         if let Some(id) = toggle {
             let v = self.store.expanded.entry(id).or_insert(false);
             *v = !*v;
@@ -1093,21 +1101,20 @@ impl Shopping {
                     let a = ui.area();
                     ui.fill(a, t.bar);
                     let (from, to) = lines[i];
-                    for k in from..to {
-                        let rect =
-                            Rect::new(a.x + (k - from) as i32 * (w + gap), a.y, w, a.h - gap);
+                    for (col, d) in tiles[from..to].iter().enumerate() {
+                        let rect = Rect::new(a.x + col as i32 * (w + gap), a.y, w, a.h - gap);
                         let (tapped, more) = tile(
                             ui,
-                            &tiles[k],
-                            tile_art.get(&tiles[k].key).and_then(|c| images.get(c)),
+                            d,
+                            tile_art.get(&d.key).and_then(|c| images.get(c)),
                             rect,
                             false,
                         );
                         if tapped {
-                            tap = Some(tiles[k].tap.clone());
+                            tap = Some(d.tap.clone());
                         }
                         if more {
-                            details.clone_from(&tiles[k].details);
+                            details.clone_from(&d.details);
                         }
                     }
                 },
@@ -1725,16 +1732,22 @@ fn monogram(name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// A tile, and whether it (or its corner button) was clicked. The corner button is asked first, so that it gets the click.
-fn tile(ui: &mut Ui, d: &TileData, art: Option<&Image>, r: Rect, selected: bool) -> (bool, bool) {
-    let t = ui.theme();
-    let h = model_hash(&d.key);
-    let corner = Rect::new(
+/// A tile's details corner: the box `tile` draws the " ⋯" in and hit-tests before the tile itself, so
+/// that a click there opens the details instead of tapping the item.
+pub(crate) fn tile_corner(t: &Theme, r: Rect) -> Rect {
+    Rect::new(
         r.right() - t.px(26.0),
         r.y + t.px(3.0),
         t.px(23.0),
         t.px(20.0),
-    );
+    )
+}
+
+/// A tile, and whether it (or its corner button) was clicked. The corner button is asked first, so that it gets the click.
+fn tile(ui: &mut Ui, d: &TileData, art: Option<&Image>, r: Rect, selected: bool) -> (bool, bool) {
+    let t = ui.theme();
+    let h = model_hash(&d.key);
+    let corner = tile_corner(&t, r);
     let more = d.details.is_some() && ui.hit(("more", h), corner).clicked;
     let hit = ui.hit(("tile", h), r);
     // The right button opens the details too, as a right-click does on the web.

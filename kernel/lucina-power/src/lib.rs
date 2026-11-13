@@ -13,6 +13,8 @@
 #![forbid(unsafe_code)]
 
 pub mod level;
+pub mod quiet;
+pub mod sleep_stats;
 pub mod wake;
 pub mod wake_rules;
 
@@ -359,8 +361,22 @@ mod tests {
         // Linux lpg_apply for a disabled, then an enabled channel, with the firmware's values.
         assert_eq!(
             lpg.writes,
-            [(0x43, 0x20), (0x46, 0), (0x47, 1), (0x43, 0),
-             (0x43, 0x20), (0x41, 0x07), (0x42, 0x06), (0x44, 0x00), (0x45, 0x01), (0x46, 0x80), (0x44, 0x00), (0x45, 0x01), (0x47, 1), (0x43, 0)]
+            [
+                (0x43, 0x20),
+                (0x46, 0),
+                (0x47, 1),
+                (0x43, 0),
+                (0x43, 0x20),
+                (0x41, 0x07),
+                (0x42, 0x06),
+                (0x44, 0x00),
+                (0x45, 0x01),
+                (0x46, 0x80),
+                (0x44, 0x00),
+                (0x45, 0x01),
+                (0x47, 1),
+                (0x43, 0)
+            ]
         );
     }
 
@@ -405,7 +421,21 @@ mod tests {
         lpg.fail = false;
         lpg.writes.clear();
         light.on(&mut lpg).unwrap();
-        assert_eq!(lpg.writes, [(0x43, 0x20), (0x41, 0x07), (0x42, 0x06), (0x44, 0x00), (0x45, 0x01), (0x46, 0x80), (0x44, 0x00), (0x45, 0x01), (0x47, 1), (0x43, 0)]);
+        assert_eq!(
+            lpg.writes,
+            [
+                (0x43, 0x20),
+                (0x41, 0x07),
+                (0x42, 0x06),
+                (0x44, 0x00),
+                (0x45, 0x01),
+                (0x46, 0x80),
+                (0x44, 0x00),
+                (0x45, 0x01),
+                (0x47, 1),
+                (0x43, 0)
+            ]
+        );
     }
 
     #[test]
@@ -457,7 +487,12 @@ mod tests {
         assert_eq!(light.value(), (0x100, 511));
         light.set_level(&mut lpg, 40).unwrap();
         // 204 = 0xcc, low byte first, twice (Linux's hardware-bug rewrite), the output on, then the sync.
-        let values: Vec<_> = lpg.writes.iter().filter(|(r, _)| *r == 0x44 || *r == 0x45).copied().collect();
+        let values: Vec<_> = lpg
+            .writes
+            .iter()
+            .filter(|(r, _)| *r == 0x44 || *r == 0x45)
+            .copied()
+            .collect();
         assert_eq!(values, [(0x44, 204), (0x45, 0), (0x44, 204), (0x45, 0)]);
         let sync = lpg.writes.iter().position(|w| *w == (0x47, 1)).unwrap();
         let enable = lpg.writes.iter().position(|w| *w == (0x46, 0x80)).unwrap();

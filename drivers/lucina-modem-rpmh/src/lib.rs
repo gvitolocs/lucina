@@ -15,6 +15,8 @@
 //!   mode / voltage / enable.
 //! * [`xo`]: the `bi_tcxo` ARC clock vote (`clk-rpmh.c`).
 //! * [`bcm`]: bus clock votes for an interconnect path (`icc-rpmh.c`, `bcm-voter.c`), never lower than one already in a TCS.
+//! * [`icc`]: every consumer's interconnect request on the DRV, summed per BCM as `bcm-voter.c` does, with the boot firmware's
+//!   level as a floor client of its own until the interconnect's `sync_state`.
 //! * [`share`]: one table of every ARC and XO vote on the apps DRV, aggregated across drivers as Linux's genpd, `rpmhpd.c` and
 //!   the clock framework do; its rules are [`vote_rules`], which Verus checks.
 //! * [`plan`]: [`plan::modem_plan`] and [`plan::wcn3990_plan`], the complete lists as `(name, command)`, and
@@ -34,6 +36,7 @@ extern crate alloc;
 
 pub mod arc;
 pub mod bcm;
+pub mod icc;
 pub mod plan;
 pub mod rpmh;
 pub mod rsc;

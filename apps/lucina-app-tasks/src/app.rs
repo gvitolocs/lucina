@@ -128,6 +128,12 @@ pub struct Tasks {
     pub section: Section,
     pub shown: Option<View>,
     pub rows: Vec<Row>,
+    /// The rect each row got from the list this pass, by row index: what the row and its widgets are
+    /// hit-tested against, so that a test clicks from the layout rather than from numbers copied
+    /// beside it. `None` for a row the list keeps off screen.
+    pub row_rects: Vec<Option<Rect>>,
+    /// The round tick box of each task row that showed, by the same index.
+    pub tick_rects: Vec<Option<Rect>>,
     pub nav: Vec<Nav>,
     pub list: ListState,
     pub side: ListState,
@@ -281,10 +287,24 @@ fn hit(ui: &mut Ui, id: impl Into<Id>, r: Rect) -> bool {
     ui.hit(id, r).clicked
 }
 
+/// The round box of a task row: where `draw_rows` paints the tick and hit-tests it. `depth` indents
+/// what the list shows under its parent.
+fn tick_box(t: &Theme, a: Rect, depth: usize) -> Rect {
+    let s = t.px(30.0);
+    Rect::new(
+        a.x + t.px(4.0) + depth as i32 * t.px(24.0),
+        a.y + t.px(2.0),
+        s,
+        s,
+    )
+}
+
 impl Tasks {
     pub fn new(store: Store, mode: Mode, link: Option<Link>) -> Tasks {
         let mut app = Tasks {
-            open_on_load: std::env::var("LUCINA_TASKS_OPEN").ok().filter(|v| !v.is_empty()),
+            open_on_load: std::env::var("LUCINA_TASKS_OPEN")
+                .ok()
+                .filter(|v| !v.is_empty()),
             store,
             mode,
             link,
@@ -297,6 +317,8 @@ impl Tasks {
             section: Section::List,
             shown: None,
             rows: Vec::new(),
+            row_rects: Vec::new(),
+            tick_rects: Vec::new(),
             nav: Vec::new(),
             list: ListState::new(),
             side: ListState::new(),
@@ -1199,6 +1221,7 @@ impl Tasks {
         let rows = &self.rows;
         let mut toggled: Option<String> = None;
         let mut reschedule = false;
+        let (mut row_rects, mut tick_rects) = (vec![None; rows.len()], vec![None; rows.len()]);
         let before = self.list.selected;
         let measure = |_: &mut lucina_app::gfx::Text, i: usize, _w: i32| match &rows[i] {
             Row::Head { .. } => t.px(38.0),
@@ -1222,6 +1245,7 @@ impl Tasks {
             measure,
             |ui, i, selected| {
                 let a = ui.area();
+                row_rects[i] = Some(a);
                 match &rows[i] {
                     Row::Head { title, overdue } => {
                         let h = t.px(26.0);
@@ -1269,22 +1293,21 @@ impl Tasks {
                         );
                     }
                     Row::Task { t: x, depth, .. } => {
-                        let left = a.x + t.px(4.0) + *depth as i32 * t.px(24.0);
                         // The round box, in the priority's colour.
-                        let bs = t.px(30.0);
-                        let b = Rect::new(left, a.y + t.px(2.0), bs, bs);
+                        let b = tick_box(&t, a, *depth);
+                        tick_rects[i] = Some(b);
                         if hit(ui, ("tick", i), b) {
                             toggled = Some(x.id.clone());
                         }
                         let glyph = if x.checked { DONE } else { RING };
                         ui.text_in(
-                            Rect::new(b.x + t.px(5.0), b.y, bs, bs),
+                            Rect::new(b.x + t.px(5.0), b.y, b.w, b.h),
                             Face::Sans,
                             t.pt(18.0),
                             priority_color(&t, x.priority),
                             glyph,
                         );
-                        let tx = left + bs + t.px(4.0);
+                        let tx = b.right() + t.px(4.0);
                         let tw = a.right() - tx - t.px(6.0);
                         let mut y = a.y + t.px(4.0);
                         let c = if x.checked {
@@ -1321,6 +1344,8 @@ impl Tasks {
                 }
             },
         );
+        self.row_rects = row_rects;
+        self.tick_rects = tick_rects;
         let mut open: Option<String> = None;
         let mut go: Option<ViewQuery> = None;
         if let Some(i) = res.activated {

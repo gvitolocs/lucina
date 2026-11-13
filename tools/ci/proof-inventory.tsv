@@ -1,6 +1,8 @@
 # Generated: lucina-ci inventory --write. Do not edit. unit<TAB>group<TAB>kind<TAB>target<TAB>inputs
 deep/tla-mc/idle-wake	deep	deep	ONLY=idle-wake VERIFY_HEAVY=1 TLA_MAX_STATES=2000000000 bash specs/juno/run.sh	specs/juno/idle-wake/,specs/juno/run.sh
+deep/tla-mc/timerq-next-deadline	deep	deep	ONLY=timerq-next-deadline VERIFY_HEAVY=1 TLA_MAX_STATES=2000000000 bash specs/juno/run.sh	specs/juno/timerq-next-deadline/,specs/juno/run.sh
 deep/tlc/idle-wake	deep	deep	ONLY=idle-wake VERIFY_HEAVY=1 TLA_MAX_STATES=2000000000 CHECKER=tlc TLC_HEAP=10g JAVA=java TLA_JAR="$HOME/tla2tools.jar" bash specs/juno/run.sh	specs/juno/idle-wake/,specs/juno/run.sh
+deep/tlc/timerq-next-deadline	deep	deep	ONLY=timerq-next-deadline VERIFY_HEAVY=1 TLA_MAX_STATES=2000000000 CHECKER=tlc TLC_HEAP=10g JAVA=java TLA_JAR="$HOME/tla2tools.jar" bash specs/juno/run.sh	specs/juno/timerq-next-deadline/,specs/juno/run.sh
 full/verify-sh	full	full	scripts/verify.sh	verification/
 models/stateright	models	models	scripts/verify-models.sh	Cargo.lock,Cargo.toml,crates/,scripts/verify-models.sh
 mutants/fortuna-library	fortuna	mutants	verification/fortuna-library/mutants.sh	boards/fortuna-library/,verification/fortuna-library/
@@ -24,6 +26,7 @@ mutants/juno-ec	juno-power	mutants	verification/juno-ec/mutants.sh	drivers/lucin
 mutants/juno-events	juno-input-apps	mutants	verification/juno-events/mutants.sh	services/lucina-events/,verification/juno-events/
 mutants/juno-evlog	boot-storage	mutants	verification/juno-evlog/mutants.sh	kernel/lucina-evlog/,verification/juno-evlog/
 mutants/juno-files-keys	juno-input-apps	mutants	verification/juno-files-keys/mutants.sh	services/lucina-nav/,verification/juno-files-keys/,verification/juno-files-keys/rules.rs
+mutants/juno-flight	boot-storage	mutants	verification/juno-flight/mutants.sh	kernel/lucina-flight/,verification/juno-flight/
 mutants/juno-fnkeys	juno-input-apps	mutants	verification/juno-fnkeys/mutants.sh	apps/lucina-shell/,verification/juno-fnkeys/,verification/juno-fnkeys/rules.rs
 mutants/juno-fnrow	juno-input-apps	mutants	verification/juno-fnrow/mutants.sh	drivers/lucina-i2c-hid/,verification/juno-fnrow/,verification/juno-fnrow/rules.rs
 mutants/juno-gesture	juno-input-apps	mutants	verification/juno-gesture/mutants.sh	drivers/lucina-gesture/,verification/juno-gesture/
@@ -39,6 +42,7 @@ mutants/juno-ir3-delay	juno-gpu-media	mutants	verification/juno-ir3-delay/mutant
 mutants/juno-ir3-pack	juno-gpu-media	mutants	verification/juno-ir3-pack/mutants.sh	drivers/lucina-ir3/,verification/juno-ir3-pack/,verification/juno-ir3-pack/rules.rs
 mutants/juno-irqgate	kernel-memory	mutants	verification/juno-irqgate/mutants.sh	kernel/lucina-irqgate/,verification/juno-irqgate/,verification/juno-irqgate/rules.rs
 mutants/juno-kexec	boot-storage	mutants	verification/juno-kexec/mutants.sh	kernel/lucina-fdt/,kernel/lucina-kexec/,verification/fdt/header.rs,verification/juno-kexec/,verification/juno-kexec/rules.rs
+mutants/juno-log	boot-storage	mutants	verification/juno-log/mutants.sh	kernel/lucina-log/,verification/juno-log/
 mutants/juno-modem-witness	juno-net-security	mutants	verification/juno-modem-witness/mutants.sh	kernel/lucina-crash/,verification/juno-modem-witness/,verification/juno-modem-witness/rules.rs
 mutants/juno-netlink	juno-net-security	mutants	verification/juno-netlink/mutants.sh	kernel/lucina-netlink/,verification/juno-netlink/,verification/juno-netlink/rules.rs
 mutants/juno-oom	kernel-memory	mutants	verification/juno-oom/mutants.sh	kernel/lucina-oom/,verification/juno-oom/
@@ -81,6 +85,7 @@ shipped/lucina-crash/layout	boot-storage	shipped	kernel/lucina-crash/src/layout.
 shipped/lucina-crash/waits	boot-storage	shipped	kernel/lucina-crash/src/waits.rs	kernel/lucina-crash/
 shipped/lucina-events/rules	juno-input-apps	shipped	services/lucina-events/src/rules.rs	services/lucina-events/
 shipped/lucina-evlog/rules	boot-storage	shipped	kernel/lucina-evlog/src/rules.rs	kernel/lucina-evlog/
+shipped/lucina-flight/rules	boot-storage	shipped	kernel/lucina-flight/src/rules.rs	kernel/lucina-flight/
 shipped/lucina-gesture/rules	juno-input-apps	shipped	drivers/lucina-gesture/src/rules.rs	drivers/lucina-gesture/
 shipped/lucina-glass/browser_rules	juno-gpu-media	shipped	apps/lucina-glass/src/browser_rules.rs	apps/lucina-glass/
 shipped/lucina-glass/home_rules	juno-gpu-media	shipped	apps/lucina-glass/src/home_rules.rs	apps/lucina-glass/
@@ -88,6 +93,7 @@ shipped/lucina-glass/rules	juno-gpu-media	shipped	apps/lucina-glass/src/rules.rs
 shipped/lucina-hostname/rules	boot-storage	shipped	kernel/lucina-hostname/src/rules.rs	kernel/lucina-hostname/
 shipped/lucina-i2c-hid/tp_rules	juno-input-apps	shipped	drivers/lucina-i2c-hid/src/tp_rules.rs	drivers/lucina-i2c-hid/
 shipped/lucina-intents/rules	juno-input-apps	shipped	services/lucina-intents/src/rules.rs	services/lucina-intents/
+shipped/lucina-log/rules	boot-storage	shipped	kernel/lucina-log/src/rules.rs	kernel/lucina-log/
 shipped/lucina-modem-rpmh/vote_rules	juno-power	shipped	drivers/lucina-modem-rpmh/src/vote_rules.rs	drivers/lucina-modem-rpmh/
 shipped/lucina-oom/rules	kernel-memory	shipped	kernel/lucina-oom/src/rules.rs	kernel/lucina-oom/
 shipped/lucina-pon/rules	boot-storage	shipped	kernel/lucina-pon/src/rules.rs	kernel/lucina-pon/

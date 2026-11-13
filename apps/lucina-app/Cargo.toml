@@ -6,12 +6,15 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The design tokens the palette comes from (src/theme.rs): colours only, no dependency back on this crate.
+lucina-glass = { path = "../../apps/lucina-glass" }
 # Semantic events and the present report (stage D of docs/research/juno-ai-native.md): apps reach them as `lucina_app::events`.
 lucina-events = { path = "../../services/lucina-events" }
 # Which row a key moves to in a list: pure and proved by Verus (verification/juno-files-keys).
 lucina-nav = { path = "../../services/lucina-nav" }
-# Text: skrifa (Google's fontations) reads the DejaVu outlines, from /usr/share/fonts/dejavu (fonts/ here), when a glyph is
-# first drawn; ab_glyph_rasterizer turns them into coverage. (ab_glyph was dropped: its ttf-parser is
+# Text: skrifa (Google's fontations) reads the outlines when a glyph is first drawn — Lato from
+# /usr/share/fonts/lato (the glass kit's fonts/ here) and DejaVu from /usr/share/fonts/dejavu (fonts/ here);
+# ab_glyph_rasterizer turns them into coverage. (ab_glyph was dropped: its ttf-parser is
 # unmaintained, RUSTSEC-2026-0192.)
 ab_glyph_rasterizer = "0.1.10"
 skrifa = { version = "0.49", default-features = false, features = ["libm"] }
@@ -26,6 +29,11 @@ zune-jpeg = "0.5"
 # The tree Lucina reads (docs/research/juno-ai-native.md, Layer 1): the builder, its rules and the socket. serde_json for the replies.
 lucina-ax = { path = "../../services/lucina-ax" }
 serde_json = "1"
+
+[features]
+# Where a frame's time goes (`src/prof.rs`), for `examples/view_bench.rs --parts`. Off by default:
+# every marker then folds away.
+prof = []
 
 # Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
 [target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]

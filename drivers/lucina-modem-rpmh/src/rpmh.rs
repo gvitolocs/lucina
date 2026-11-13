@@ -6,6 +6,7 @@
 //! Linux flushes when the last CPU goes down; this kernel never powers the cluster down, so it flushes once after its votes,
 //! which leaves the same commands in the same registers should a later change start doing that.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use lucina_qcom_soc::io::RegIo;
@@ -52,12 +53,42 @@ impl Cache {
         }
     }
 
+    /// Every resource the cache has seen, in `rpmh_flush`'s order: `(addr, sleep, wake)`, `None` for a value never sent.
+    pub fn entries(&self) -> impl Iterator<Item = (u32, Option<u32>, Option<u32>)> + '_ {
+        let set = |v: u32| (v != UNSET).then_some(v);
+        self.reqs
+            .iter()
+            .map(move |r| (r.addr, set(r.sleep), set(r.wake)))
+    }
+
     /// `is_req_valid` over the cache, in `rpmh_flush`'s order: `(addr, sleep, wake)`.
     pub fn valid(&self) -> impl Iterator<Item = (u32, u32, u32)> + '_ {
         self.reqs
             .iter()
             .filter(|r| r.sleep != UNSET && r.wake != UNSET && r.sleep != r.wake)
             .map(|r| (r.addr, r.sleep, r.wake))
+    }
+
+    /// One line per resource of the cache, `name` naming its address: the SLEEP and WAKE values held, and what [`Cache::flush`]
+    /// would leave in the SLEEP and WAKE TCSes for it (nothing where the two are the same, or one was never sent).
+    pub fn report(&self, name: impl Fn(u32) -> String) -> String {
+        let mut s = String::new();
+        let v = |x: Option<u32>| x.map_or(String::from("-"), |x| alloc::format!("{x:#x}"));
+        for (addr, sleep, wake) in self.entries() {
+            let flush = match (sleep, wake) {
+                (Some(z), Some(w)) if z != w => {
+                    alloc::format!("flush writes sleep {z:#x}, wake {w:#x}")
+                }
+                _ => String::from("flush writes nothing"),
+            };
+            s.push_str(&alloc::format!(
+                "{addr:#x} {}: sleep {} wake {}; {flush}\n",
+                name(addr),
+                v(sleep),
+                v(wake)
+            ));
+        }
+        s
     }
 
     /// `rpmh_flush`. Each `send_single`: wake sets are complete and sleep sets are not.

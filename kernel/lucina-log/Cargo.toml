@@ -1,0 +1,9 @@
+[package]
+name = "lucina-log"
+version = "0.1.0"
+description = "Juno's user-space log library: levels, a source name, boot id, structured fields, one JSON line per record sent to the log socket, with a per-source rate limit and level control from a file (docs/design/juno-logging.md)"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc = "0.2"

@@ -1,5 +1,6 @@
-//! Drawing: an XRGB8888 frame in memory, rectangles with anti-aliased corners, and DejaVu text
-//! (outlines from `skrifa`, coverage from `ab_glyph_rasterizer`) cached per (face, size, character).
+//! Drawing: an XRGB8888 frame in memory, rectangles with anti-aliased corners, and text (Lato with a
+//! DejaVu fallback, outlines from `skrifa`, coverage from `ab_glyph_rasterizer`) cached per
+//! (physical face, size, character).
 //!
 //! Everything is drawn into a [`Frame`] first; the output (`fb.rs`) only copies the changed
 //! rectangles to the screen, so the framebuffer, which is write-combined, is never read.
@@ -177,9 +178,20 @@ impl Frame {
                     Kind::Disc(x, y, rad, c) => self.fill_disc(x, y, rad, c),
                     Kind::Blend(x, y, c, a) => self.blend(x, y, c, a),
                     Kind::Dim(a) => self.dim_area(clip, a),
-                    Kind::Image { x, y, w, ref at } => self.blit_alpha(x, y, w, &rec.pixels[at.clone()]),
-                    Kind::Pixels { x, y, w, ref at } => self.copy_pixels(x, y, w, &rec.pixels[at.clone()]),
-                    Kind::Text { x, y, face, px, color, ref at } => {
+                    Kind::Image { x, y, w, ref at } => {
+                        self.blit_alpha(x, y, w, &rec.pixels[at.clone()])
+                    }
+                    Kind::Pixels { x, y, w, ref at } => {
+                        self.copy_pixels(x, y, w, &rec.pixels[at.clone()])
+                    }
+                    Kind::Text {
+                        x,
+                        y,
+                        face,
+                        px,
+                        color,
+                        ref at,
+                    } => {
                         text.draw_clipped(self, clip, x, y, face, px, color, &rec.text[at.clone()]);
                     }
                 }
@@ -253,6 +265,7 @@ impl Frame {
             return;
         }
         let w = self.w as usize;
+        let _p = crate::prof::region(crate::prof::FILL);
         for y in r.y..r.bottom() {
             let row = y as usize * w;
             self.px[row + r.x as usize..row + r.right() as usize].fill(c.0);
@@ -280,6 +293,7 @@ impl Frame {
             c,
         );
         let rf = rad as f32;
+        let _s = crate::prof::region(crate::prof::SHAPE);
         for dy in 0..rad {
             for dx in 0..rad {
                 // Distance from the pixel's centre to the centre of the top-left corner's arc.
@@ -321,6 +335,7 @@ impl Frame {
             }
             return;
         }
+        let _s = crate::prof::region(crate::prof::SHAPE);
         for y in y0..=y1 {
             for x in x0..=x1 {
                 let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
@@ -345,8 +360,8 @@ impl Frame {
         for y in r.y..r.bottom() {
             let row = y as usize * w;
             for p in &mut self.px[row + r.x as usize..row + r.right() as usize] {
-                let rb = ((*p & 0x00ff_00ff) * k >> 8) & 0x00ff_00ff;
-                let g = ((*p & 0x0000_ff00) * k >> 8) & 0x0000_ff00;
+                let rb = (((*p & 0x00ff_00ff) * k) >> 8) & 0x00ff_00ff;
+                let g = (((*p & 0x0000_ff00) * k) >> 8) & 0x0000_ff00;
                 *p = rb | g;
             }
         }
@@ -456,14 +471,43 @@ enum Kind {
     Disc(f32, f32, f32, Rgb),
     Blend(i32, i32, Rgb, u8),
     Dim(u8),
-    Image { x: i32, y: i32, w: usize, at: std::ops::Range<usize> },
-    Pixels { x: i32, y: i32, w: usize, at: std::ops::Range<usize> },
-    Text { x: i32, y: i32, face: Face, px: u16, color: Rgb, at: std::ops::Range<usize> },
+    Image {
+        x: i32,
+        y: i32,
+        w: usize,
+        at: std::ops::Range<usize>,
+    },
+    Pixels {
+        x: i32,
+        y: i32,
+        w: usize,
+        at: std::ops::Range<usize>,
+    },
+    Text {
+        x: i32,
+        y: i32,
+        face: Face,
+        px: u16,
+        color: Rgb,
+        at: std::ops::Range<usize>,
+    },
 }
 
 fn hash_rect(h: u64, r: Rect) -> u64 {
     let h = mix(h, (r.x as u32 as u64) << 32 | r.y as u32 as u64);
     mix(h, (r.w as u32 as u64) << 32 | r.h as u32 as u64)
+}
+
+/// Which of the [`prof`](crate::prof) counters counts an op of this kind.
+#[inline(always)]
+fn op_counter(kind: &Kind) -> usize {
+    match kind {
+        Kind::Fill(..) => crate::prof::OPS_FILL,
+        Kind::Round(..) | Kind::Disc(..) => crate::prof::OPS_SHAPE,
+        Kind::Blend(..) => crate::prof::OPS_BLEND,
+        Kind::Image { .. } | Kind::Pixels { .. } | Kind::Dim(..) => crate::prof::OPS_PIX,
+        Kind::Text { .. } => crate::prof::OPS_TEXT,
+    }
 }
 
 impl Kind {
@@ -478,12 +522,29 @@ impl Kind {
             }
             Kind::Blend(x, y, c, a) => mix(mix(4, two(x, y)), two(a as i32, c.0 as i32)),
             Kind::Dim(a) => mix(5, a as u64),
-            Kind::Image { x, y, w, ref at } => hash_px(mix(mix(6, two(x, y)), w as u64), &rec.pixels[at.clone()]),
-            Kind::Pixels { x, y, w, ref at } => hash_px(mix(mix(7, two(x, y)), w as u64), &rec.pixels[at.clone()]),
-            Kind::Text { x, y, face, px, color, ref at } => {
-                let h = mix(mix(8, two(x, y)), two(face as i32 | (px as i32) << 8, color.0 as i32));
+            Kind::Image { x, y, w, ref at } => {
+                hash_px(mix(mix(6, two(x, y)), w as u64), &rec.pixels[at.clone()])
+            }
+            Kind::Pixels { x, y, w, ref at } => {
+                hash_px(mix(mix(7, two(x, y)), w as u64), &rec.pixels[at.clone()])
+            }
+            Kind::Text {
+                x,
+                y,
+                face,
+                px,
+                color,
+                ref at,
+            } => {
+                let h = mix(
+                    mix(8, two(x, y)),
+                    two(face as i32 | (px as i32) << 8, color.0 as i32),
+                );
                 rec.text.as_bytes()[at.clone()].chunks(8).fold(h, |h, b| {
-                    mix(h, b.iter().fold(0u64, |v, &c| v << 8 | c as u64) ^ (b.len() as u64) << 56)
+                    mix(
+                        h,
+                        b.iter().fold(0u64, |v, &c| v << 8 | c as u64) ^ (b.len() as u64) << 56,
+                    )
                 })
             }
         }
@@ -492,7 +553,9 @@ impl Kind {
 
 fn hash_px(h: u64, px: &[u32]) -> u64 {
     let (pairs, last) = px.as_chunks::<2>();
-    let h = pairs.iter().fold(h, |h, p| mix(h, (p[0] as u64) << 32 | p[1] as u64));
+    let h = pairs
+        .iter()
+        .fold(h, |h, p| mix(h, (p[0] as u64) << 32 | p[1] as u64));
     last.first().map_or(h, |p| mix(h, *p as u64))
 }
 
@@ -504,9 +567,17 @@ impl Recording {
     }
 
     fn push(&mut self, kind: Kind, bounds: Rect, clip: Rect) {
+        let _r = crate::prof::region(crate::prof::RECORD);
+        crate::prof::count(op_counter(&kind), 1);
+        crate::prof::count(crate::prof::OPS, 1);
         // Where it is clipped is part of what it draws.
         let hash = hash_rect(hash_rect(kind.hash(self), clip), bounds);
-        self.ops.push(Op { bounds, hash, clip, kind });
+        self.ops.push(Op {
+            bounds,
+            hash,
+            clip,
+            kind,
+        });
     }
 
     /// Only what can show is kept: a list of pictures costs what is on the screen, whatever their size.
@@ -526,7 +597,11 @@ impl Recording {
         }
         let at = start..self.pixels.len();
         let (x, y, w) = (r.x, r.y, r.w as usize);
-        let kind = if alpha { Kind::Image { x, y, w, at } } else { Kind::Pixels { x, y, w, at } };
+        let kind = if alpha {
+            Kind::Image { x, y, w, at }
+        } else {
+            Kind::Pixels { x, y, w, at }
+        };
         self.push(kind, r, clip);
     }
 }
@@ -590,22 +665,87 @@ fn edge_coverage(d: f32, rad: f32) -> u8 {
     }
 }
 
-/// The three embedded faces.
+/// The faces an app asks for, named as they have always been. The two sans are Lato, the glass kit's
+/// UI face; DejaVu stands behind them for the glyphs Lato's subsets do not carry, and the mono stays
+/// DejaVu so that a cell of the terminal and a column of figures keep lining up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Face {
+    /// Lato Regular.
     Sans,
+    /// Lato Semibold.
     Bold,
+    /// DejaVu Sans Mono.
     Mono,
 }
 
-const FONT_FILES: [&str; 3] = [
-    "DejaVuSans.ttf",
-    "DejaVuSans-Bold.ttf",
-    "DejaVuSansMono.ttf",
+impl Face {
+    /// The glass kit's name for this face: what `tokens::ty` sizes are drawn in.
+    pub fn glass(self) -> lucina_glass::text::Font {
+        match self {
+            Face::Sans => lucina_glass::text::Font::Regular,
+            Face::Bold => lucina_glass::text::Font::Semibold,
+            Face::Mono => lucina_glass::text::Font::Mono,
+        }
+    }
+
+    /// The file the face's own glyphs come from, before any fallback: what [`Face::glass`] names.
+    pub fn file(self) -> &'static str {
+        self.slot().file()
+    }
+
+    /// The physical faces tried for a glyph of this face, first hit wins.
+    fn chain(self) -> [Slot; 3] {
+        match self {
+            Face::Sans => [Slot::Lato, Slot::Sans, Slot::SansBold],
+            Face::Bold => [Slot::LatoSemibold, Slot::SansBold, Slot::Sans],
+            Face::Mono => [Slot::Mono, Slot::Sans, Slot::SansBold],
+        }
+    }
+
+    /// The face line metrics come from: the chain's first, never a fallback, so a line's height
+    /// does not depend on which scripts the string happens to hold.
+    fn slot(self) -> Slot {
+        self.chain()[0]
+    }
+}
+
+/// A file that is really loaded, one per `FontRef` of [`Text::fonts`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Slot {
+    Lato,
+    LatoSemibold,
+    Sans,
+    SansBold,
+    Mono,
+}
+
+impl Slot {
+    const fn file(self) -> &'static str {
+        match self {
+            Slot::Lato => "Lato-Regular.ttf",
+            Slot::LatoSemibold => "Lato-Semibold.ttf",
+            Slot::Sans => "DejaVuSans.ttf",
+            Slot::SansBold => "DejaVuSans-Bold.ttf",
+            Slot::Mono => "DejaVuSansMono.ttf",
+        }
+    }
+}
+
+/// In the order of [`Slot`]: `fonts[slot as usize]` is that face.
+const ALL_SLOTS: [Slot; 5] = [
+    Slot::Lato,
+    Slot::LatoSemibold,
+    Slot::Sans,
+    Slot::SansBold,
+    Slot::Mono,
 ];
 
-/// Where the faces are on the device: one copy in the initramfs for all programs, mapped read-only,
-/// rather than 1.8 MB inside each of twenty binaries.
+/// Where the Lato faces are on the device, beside [`FONT_DIR`]: the two the toolkit uses, installed by
+/// `scripts/gui-initramfs.sh` from the glass kit's subsets. Mapped like DejaVu, for the same reason.
+pub const LATO_DIR: &str = "/usr/share/fonts/lato";
+
+/// Where the DejaVu faces are on the device: one copy in the initramfs for all programs, mapped
+/// read-only, rather than 1.8 MB inside each of twenty binaries.
 pub const FONT_DIR: &str = "/usr/share/fonts/dejavu";
 
 /// A face, mapped from a file for the rest of the program's life.
@@ -635,15 +775,19 @@ pub(crate) fn load_font(dir: &std::path::Path, name: &str) -> Option<&'static [u
 }
 
 /// The directories to look for fonts in: `LUCINA_FONT_DIR`, the device's, and off the device (tests,
-/// `--render`) the source tree's.
+/// `--render`) the source tree's — Lato's files live in the glass kit.
 fn font_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs: Vec<std::path::PathBuf> = std::env::var_os("LUCINA_FONT_DIR")
         .map(Into::into)
         .into_iter()
         .collect();
+    dirs.push(LATO_DIR.into());
     dirs.push(FONT_DIR.into());
     #[cfg(not(target_env = "musl"))]
-    dirs.push(concat!(env!("CARGO_MANIFEST_DIR"), "/fonts").into());
+    dirs.extend([
+        concat!(env!("CARGO_MANIFEST_DIR"), "/fonts").into(),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../apps/lucina-glass/fonts").into(),
+    ]);
     dirs
 }
 
@@ -721,10 +865,13 @@ impl OutlinePen for Pen {
     }
 }
 
-/// DejaVu Sans, Sans Bold and Sans Mono with a glyph cache. Sizes are em sizes in pixels (what a
-/// CSS or GRUB font size means).
+/// Lato Regular and Semibold, DejaVu Sans, Sans Bold and Sans Mono, with a glyph cache. A [`Face`]
+/// is a chain of these: the glyph is looked for in each until one has it, so a Cyrillic word in a
+/// Lato label comes out of DejaVu and the Latin beside it stays Lato. Sizes are em sizes in pixels
+/// (what a CSS or GRUB font size means).
 pub struct Text {
-    fonts: [FontRef<'static>; 3],
+    fonts: [FontRef<'static>; ALL_SLOTS.len()],
+    /// The glyph of a character in a face at a size, fallback slot resolved included.
     cache: HashMap<(Face, u16, char), Glyph>,
 }
 
@@ -747,24 +894,42 @@ impl Text {
             FontRef::new(bytes).unwrap_or_else(|e| panic!("font {name}: {e}"))
         };
         Text {
-            fonts: FONT_FILES.map(load),
+            fonts: ALL_SLOTS.map(|s| load(s.file())),
             cache: HashMap::new(),
         }
     }
 
     fn font(&self, f: Face) -> &FontRef<'static> {
-        &self.fonts[f as usize]
+        &self.fonts[f.slot() as usize]
     }
 
-    /// Whether the face has a glyph for `c` (not the "missing" box).
+    /// Whether a glyph for `c` will be found: in the face itself or in the one behind it.
     pub fn has(&self, f: Face, c: char) -> bool {
-        self.font(f)
+        let fonts = &self.fonts;
+        !c.is_control() && f.chain().into_iter().any(|s| Self::slot_has(fonts, s, c))
+    }
+
+    fn slot_has(fonts: &[FontRef<'static>], s: Slot, c: char) -> bool {
+        fonts[s as usize]
             .charmap()
             .map(c)
             .is_some_and(|g| g != GlyphId::NOTDEF)
     }
 
-    /// Height above the baseline of tall letters.
+    /// Which face `c` is really drawn in. Control characters keep the primary face: they have no
+    /// glyph anywhere and must not pick up another font's `.notdef` box.
+    fn slot_for(fonts: &[FontRef<'static>], f: Face, c: char) -> Slot {
+        if c.is_control() {
+            return f.slot();
+        }
+        f.chain()
+            .into_iter()
+            .find(|s| Self::slot_has(fonts, *s, c))
+            .unwrap_or(f.slot())
+    }
+
+    /// Height above the baseline of tall letters. Of the face's own font, never of a fallback: a
+    /// line's height is the same whatever scripts its string happens to hold.
     pub fn ascent(&self, f: Face, px: u16) -> i32 {
         let m = self
             .font(f)
@@ -780,61 +945,79 @@ impl Text {
         (-m.descent).round() as i32
     }
 
+    /// What is kept is the whole answer, the fallback with it: a frame that draws known glyphs pays
+    /// one cache lookup each and walks no charmap.
     fn glyph(&mut self, f: Face, px: u16, c: char) -> &Glyph {
-        let font = &self.fonts[f as usize];
+        let fonts = &self.fonts;
         self.cache.entry((f, px, c)).or_insert_with(|| {
-            let size = Size::new(px as f32);
-            let id = font.charmap().map(c).unwrap_or(GlyphId::NOTDEF);
-            // A character this font lacks (an emoji, CJK) is left out rather than drawn as a box.
-            if id == GlyphId::NOTDEF && !c.is_control() {
-                return Glyph { left: 0, top: 0, w: 0, h: 0, advance: 0.0, alpha: Vec::new() };
-            }
-            let advance = font
-                .glyph_metrics(size, LocationRef::default())
-                .advance_width(id)
-                .unwrap_or(0.0);
-            let mut pen = Pen::default();
-            let drawn = font.outline_glyphs().get(id).map(|o| {
-                o.draw(
-                    DrawSettings::unhinted(size, LocationRef::default()),
-                    &mut pen,
-                )
-            });
-            pen.close();
-            if !matches!(drawn, Some(Ok(_))) || pen.segments.is_empty() {
-                // A space (or an outline that cannot be read): nothing to draw.
-                return Glyph {
-                    left: 0,
-                    top: 0,
-                    w: 0,
-                    h: 0,
-                    advance,
-                    alpha: Vec::new(),
-                };
-            }
-            let (left, top) = (pen.min.0.floor(), pen.min.1.floor());
-            let w = (pen.max.0 - left).ceil() as usize + 1;
-            let h = (pen.max.1 - top).ceil() as usize + 1;
-            let o = |p: Point| point(p.x - left, p.y - top);
-            let mut r = Rasterizer::new(w, h);
-            for s in &pen.segments {
-                match *s {
-                    Segment::Line(a, b) => r.draw_line(o(a), o(b)),
-                    Segment::Quad(a, b, c) => r.draw_quad(o(a), o(b), o(c)),
-                    Segment::Cubic(a, b, c, d) => r.draw_cubic(o(a), o(b), o(c), o(d)),
-                }
-            }
-            let mut alpha = vec![0u8; w * h];
-            r.for_each_pixel(|i, cov| alpha[i] = (cov.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
-            Glyph {
-                left: left as i32,
-                top: top as i32,
-                w,
-                h,
-                advance,
-                alpha,
-            }
+            crate::prof::count(crate::prof::MISS, 1);
+            let _r = crate::prof::region(crate::prof::RASTER);
+            let slot = Self::slot_for(fonts, f, c);
+            Self::rasterise(fonts, slot, px, c)
         })
+    }
+
+    fn rasterise(fonts: &[FontRef<'static>], slot: Slot, px: u16, c: char) -> Glyph {
+        let font = &fonts[slot as usize];
+        let size = Size::new(px as f32);
+        let id = font.charmap().map(c).unwrap_or(GlyphId::NOTDEF);
+        // A character no face in the chain has (CJK, an emoji in mono) is left out rather than drawn
+        // as a box.
+        if id == GlyphId::NOTDEF && !c.is_control() {
+            return Glyph {
+                left: 0,
+                top: 0,
+                w: 0,
+                h: 0,
+                advance: 0.0,
+                alpha: Vec::new(),
+            };
+        }
+        let advance = font
+            .glyph_metrics(size, LocationRef::default())
+            .advance_width(id)
+            .unwrap_or(0.0);
+        let mut pen = Pen::default();
+        let drawn = font.outline_glyphs().get(id).map(|o| {
+            o.draw(
+                DrawSettings::unhinted(size, LocationRef::default()),
+                &mut pen,
+            )
+        });
+        pen.close();
+        if !matches!(drawn, Some(Ok(_))) || pen.segments.is_empty() {
+            // A space (or an outline that cannot be read): nothing to draw.
+            return Glyph {
+                left: 0,
+                top: 0,
+                w: 0,
+                h: 0,
+                advance,
+                alpha: Vec::new(),
+            };
+        }
+        let (left, top) = (pen.min.0.floor(), pen.min.1.floor());
+        let w = (pen.max.0 - left).ceil() as usize + 1;
+        let h = (pen.max.1 - top).ceil() as usize + 1;
+        let o = |p: Point| point(p.x - left, p.y - top);
+        let mut r = Rasterizer::new(w, h);
+        for s in &pen.segments {
+            match *s {
+                Segment::Line(a, b) => r.draw_line(o(a), o(b)),
+                Segment::Quad(a, b, c) => r.draw_quad(o(a), o(b), o(c)),
+                Segment::Cubic(a, b, c, d) => r.draw_cubic(o(a), o(b), o(c), o(d)),
+            }
+        }
+        let mut alpha = vec![0u8; w * h];
+        r.for_each_pixel(|i, cov| alpha[i] = (cov.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+        Glyph {
+            left: left as i32,
+            top: top as i32,
+            w,
+            h,
+            advance,
+            alpha,
+        }
     }
 
     /// Horizontal advance of one character.
@@ -865,7 +1048,10 @@ impl Text {
         s: &str,
     ) -> i32 {
         let clip = clip.intersect(&fr.clip);
+        crate::prof::count(crate::prof::STRINGS, 1);
+        crate::prof::count(crate::prof::CHARS, s.chars().count() as u64);
         if fr.rec.is_some() {
+            let _w = crate::prof::region(crate::prof::WALK_REC);
             // Where its glyphs really land: a tile they reach has to know about them.
             let mut pen = x as f32;
             let mut bounds: Option<(i32, i32, i32, i32)> = None;
@@ -874,7 +1060,9 @@ impl Text {
                 if g.w > 0 && g.h > 0 {
                     let (gx, gy) = (pen.round() as i32 + g.left, y + g.top);
                     let (r, b) = (gx + g.w as i32, gy + g.h as i32);
-                    bounds = Some(bounds.map_or((gx, gy, r, b), |o| (o.0.min(gx), o.1.min(gy), o.2.max(r), o.3.max(b))));
+                    bounds = Some(bounds.map_or((gx, gy, r, b), |o| {
+                        (o.0.min(gx), o.1.min(gy), o.2.max(r), o.3.max(b))
+                    }));
                 }
                 pen += g.advance;
             }
@@ -884,12 +1072,24 @@ impl Text {
                     let start = rec.text.len();
                     rec.text.push_str(s);
                     let at = start..rec.text.len();
-                    rec.push(Kind::Text { x, y, face: f, px, color, at }, bounds, clip);
+                    rec.push(
+                        Kind::Text {
+                            x,
+                            y,
+                            face: f,
+                            px,
+                            color,
+                            at,
+                        },
+                        bounds,
+                        clip,
+                    );
                 }
             }
             return (pen - x as f32).round() as i32;
         }
         let stride = fr.w as usize;
+        let _w = crate::prof::region(crate::prof::WALK_DRAW);
         let mut pen = x as f32;
         for c in s.chars() {
             let g = self.glyph(f, px, c);
@@ -1122,6 +1322,71 @@ mod tests {
         for c in ['─', '│', '█', '▒'] {
             assert!(t.has(Face::Mono, c), "{c}");
         }
+    }
+
+    /// Which file a glyph really comes from: Lato for the Latin the subset carries, DejaVu for
+    /// everything else, the mono file first for the mono face.
+    #[test]
+    fn lato_is_the_ui_face_with_dejavu_behind_it() {
+        let t = Text::new();
+        let slot = |f: Face, c: char| Text::slot_for(&t.fonts, f, c);
+        // The array behind `fonts[slot as usize]`, so a reordered enum shows up here.
+        assert_eq!(ALL_SLOTS.map(|s| s as usize), [0, 1, 2, 3, 4]);
+        assert_eq!(Face::Sans.glass(), lucina_glass::text::Font::Regular);
+        assert_eq!(Face::Bold.glass(), lucina_glass::text::Font::Semibold);
+        assert_eq!(Face::Mono.glass(), lucina_glass::text::Font::Mono);
+        for c in ['a', 'É', 'é', 'æ', '—', '•', '…', '·', '↑'] {
+            assert_eq!(slot(Face::Sans, c), Slot::Lato, "{c} is in Lato");
+        }
+        assert_eq!(slot(Face::Bold, 'a'), Slot::LatoSemibold);
+        // Per glyph, not per string: the Latin of a title stays Lato beside its Cyrillic.
+        assert_eq!(slot(Face::Sans, 'Я'), Slot::Sans);
+        assert_eq!(slot(Face::Sans, 'β'), Slot::Sans);
+        assert_eq!(slot(Face::Sans, '★'), Slot::Sans);
+        assert_eq!(slot(Face::Bold, '★'), Slot::SansBold);
+        assert_eq!(slot(Face::Mono, '─'), Slot::Mono);
+        assert_eq!(slot(Face::Mono, 'Я'), Slot::Mono);
+        assert_eq!(slot(Face::Mono, '😀'), Slot::Sans);
+        // A control character stays in the face asked for: it has no glyph in any of them.
+        assert_eq!(slot(Face::Sans, '\n'), Slot::Lato);
+        // What no face in the chain has is still left out, and still has no width.
+        assert!(!t.has(Face::Sans, '一'));
+        assert_eq!(slot(Face::Sans, '一'), Slot::Lato);
+    }
+
+    /// Latin, Cyrillic and a star in one string: every character has a width, the mixed word draws,
+    /// and `fit` and `wrap` still work across the switch of face.
+    #[test]
+    fn mixed_scripts_measure_and_draw() {
+        let mut t = Text::new();
+        let s = "Idéer ★ Лекция — 2026";
+        let mut sum = 0.0;
+        for c in s.chars() {
+            let a = t.advance(Face::Sans, 21, c);
+            assert!(a > 0.0, "{c} has no width");
+            sum += a;
+        }
+        assert_eq!(t.measure(Face::Sans, 21, s), sum.round() as i32);
+        assert!(t.measure(Face::Sans, 21, "Лекция") > 40);
+        // Every non-space character of the mixed string puts pixels somewhere.
+        for c in s.chars().filter(|c| !c.is_whitespace()) {
+            let mut f = Frame::new(60, 40);
+            let one = c.to_string();
+            t.draw(&mut f, 4, 28, Face::Sans, 21, Rgb::hex(0xffffff), &one);
+            assert!(f.px.iter().any(|&p| p != 0), "{c} drew nothing");
+        }
+        // The same in a heading and in the mono face of the terminal.
+        let mut f = Frame::new(400, 40);
+        let w = t.draw(&mut f, 2, 28, Face::Bold, 21, Rgb::hex(0xffffff), s);
+        assert!(w > 0 && f.px.iter().any(|&p| p != 0));
+        let mut f = Frame::new(400, 40);
+        t.draw(&mut f, 2, 28, Face::Mono, 21, Rgb::hex(0xffffff), s);
+        // Cut and wrapped: the ellipsis itself is a glyph of the face.
+        let cut = t.fit(Face::Sans, 21, s, 120);
+        let cut_w = t.measure(Face::Sans, 21, &cut);
+        assert!(cut.ends_with('…') && cut_w <= 120, "{cut}");
+        let lines = t.wrap(Face::Sans, 21, s, 90);
+        assert!(lines.len() >= 2 && !lines.is_empty());
     }
 
     #[test]

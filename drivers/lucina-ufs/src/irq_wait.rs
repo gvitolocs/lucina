@@ -42,6 +42,19 @@ pub fn sleep_us(elapsed_us: u64, timeout_us: u64) -> u64 {
     timeout_us.saturating_sub(elapsed_us).clamp(1, SLEEP_CAP_US)
 }
 
+/// The length of the next sleep while the machine sleeps: what is left of the request's timeout, [`SLEEP_CAP_US`]
+/// lifted, at least 1 us (patch 1342).
+///
+/// The cap exists to find a completion whose interrupt was lost; a sleeping machine takes no periodic look at
+/// anything, and Linux needs none here because the host is suspended for the sleep (`ufshcd_system_suspend`,
+/// `drivers/ufs/core/ufshcd.c:10091`) with no request waiting on it. So a request that is in flight across a sleep is
+/// waited out on its interrupt or on its own timeout, which is the bound the wait had before patch 1243: a completion
+/// whose interrupt is lost during a sleep costs the rest of the timeout, not 20 ms, and the CPU is not woken
+/// [`SLEEP_CAP_US`] at a time through the sleep.
+pub fn sleep_us_asleep(elapsed_us: u64, timeout_us: u64) -> u64 {
+    timeout_us.saturating_sub(elapsed_us).max(1)
+}
+
 /// Rate limit of the log lines about missed interrupts: [`MISS_NOTES_PER_WINDOW`] lines per [`MISS_NOTE_WINDOW_US`], then
 /// one "N more" line when the next window starts. The count of misses itself is never limited (it lives in the host).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -149,6 +162,21 @@ mod tests {
         assert_eq!(sleep_us(30_000_000, 30_000_000), 1);
         assert_eq!(sleep_us(u64::MAX, 30_000_000), 1);
         assert_eq!(sleep_us(0, 0), 1);
+    }
+
+    #[test]
+    fn a_sleeping_machine_is_waited_out_past_the_cap() {
+        // The 30 s timeout still bounds the wait; only the 20 ms look-again is lifted.
+        assert_eq!(sleep_us_asleep(0, 30_000_000), 30_000_000);
+        assert_eq!(sleep_us_asleep(29_000_000, 30_000_000), 1_000_000);
+        assert_eq!(sleep_us_asleep(29_995_000, 30_000_000), 5_000);
+    }
+
+    #[test]
+    fn an_asleep_sleep_is_never_zero() {
+        assert_eq!(sleep_us_asleep(30_000_000, 30_000_000), 1);
+        assert_eq!(sleep_us_asleep(u64::MAX, 30_000_000), 1);
+        assert_eq!(sleep_us_asleep(0, 0), 1);
     }
 
     #[test]

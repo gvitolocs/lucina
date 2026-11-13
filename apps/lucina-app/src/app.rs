@@ -373,10 +373,13 @@ impl<A: App> Core<A> {
                 .start_recording(self.recording.take().unwrap_or_default());
         }
         // A pass can move the focus (its widget went away): draw until that has settled.
-        for _ in 0..3 {
-            self.frame.restart_recording();
-            if !self.pass(None, true) {
-                break;
+        {
+            let _v = crate::prof::region(crate::prof::VIEW);
+            for _ in 0..3 {
+                self.frame.restart_recording();
+                if !self.pass(None, true) {
+                    break;
+                }
             }
         }
         self.st.want_paint = false;
@@ -387,7 +390,10 @@ impl<A: App> Core<A> {
         let dirty = self
             .tiles
             .diff_ops(self.frame.w as usize, self.frame.h as usize, &rec);
-        self.frame.replay(&rec, &mut self.text, &dirty);
+        {
+            let _r = crate::prof::region(crate::prof::REPLAY);
+            self.frame.replay(&rec, &mut self.text, &dirty);
+        }
         self.recording = Some(rec);
         dirty
     }

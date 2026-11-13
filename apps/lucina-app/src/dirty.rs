@@ -5,7 +5,7 @@
 //! An app's tiles hash what it asked for ([`Tiles::diff_ops`]), which is cheap, and only what changed is then drawn. The shell
 //! draws straight into its frame, so its tiles hash the pixels ([`Tiles::diff`]).
 
-use crate::gfx::{Frame, Rect, Recording};
+use crate::gfx::{Frame, Recording, Rect};
 
 const TILE_W: usize = 64;
 const TILE_H: usize = 32;
@@ -39,6 +39,7 @@ impl Tiles {
         }
         self.now.clear();
         self.now.resize(cols * rows, 0);
+        let _t = crate::prof::region(crate::prof::TILE);
         for y in 0..h {
             let row_hashes = &mut self.now[(y / TILE_H) * cols..][..cols];
             let line = &frame.px[y * w..(y + 1) * w];
@@ -71,6 +72,7 @@ impl Tiles {
         }
         self.now.clear();
         self.now.resize(cols * rows, 0);
+        let _t = crate::prof::region(crate::prof::TILE);
         for op in &rec.ops {
             let b = op.bounds;
             // `bounds` is inside the frame: it was clipped to it.

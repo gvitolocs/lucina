@@ -13,6 +13,7 @@
 //! - [`manifest`]: the description of an app that the home screen reads.
 //! - [`screen`]: the framebuffer, with the GPU showing large changes where the kernel offers one.
 //! - [`dirty`], [`fb`], [`gfx`], [`gpu`], [`input`], [`keys`]: the layers below.
+//! - [`prof`]: where a frame's time goes, for `view_bench --parts`; inert without the `prof` feature.
 
 pub mod app;
 pub mod camera_mark;
@@ -29,6 +30,7 @@ pub mod input_watch;
 pub mod intent;
 pub mod keys;
 pub mod manifest;
+pub mod prof;
 pub mod program;
 pub mod screen;
 pub mod theme;
@@ -39,7 +41,7 @@ pub use app::{App, Harness, Load, Sender, run};
 pub use edit::TextEdit;
 pub use gfx::{Face, Rect, Rgb};
 pub use image::Image;
-pub use manifest::Manifest;
 /// What an app tells Lucina happened (`events::emit("download.done")...send()`), and the present report.
 pub use lucina_events as events;
+pub use manifest::Manifest;
 pub use ui::{Hit, Id, Input, ListResponse, ListState, TextResponse, Theme, Ui};

@@ -35,8 +35,9 @@ pub const EVIDENCE: &[&str] = &[
     "original-differs",
 ];
 pub const VERDICTS: &[&str] = &["accepted", "rejected", "escalated"];
-/// `gpt` is a known family (a record may name a GPT reviewer), but the owner bans Codex and GPT models on Lucina work: it is never a
-/// lane there. `qoder` is a family of its own: its default model (`efficient`) is Qoder's, not one of the others.
+/// `gpt` is a known family. Codex is not used as a work lane on Lucina. A GPT-family model may be the reviewer of record only through the
+/// Copilot lane, read-only, and only where the usual reviewer family (Qoder) wrote part of the unit; source: the owner's rule of
+/// 2026-11-11 in CLAUDE.md. `qoder` is a family of its own: its default model (`efficient`) is Qoder's, not one of the others.
 pub const FAMILIES: &[&str] = &[
     "claude", "gemini", "gpt", "qwen", "mistral", "deepseek", "glm", "qoder", "other",
 ];

@@ -43,7 +43,7 @@ licence, and nothing here relicenses it:
   drivers/lucina-audio-ledger, drivers/lucina-audio-wake, drivers/lucina-charge, kernel/lucina-cpufreq, kernel/lucina-crash,
   drivers/lucina-gesture, drivers/lucina-i2c-hid, kernel/lucina-idle, kernel/lucina-irqgate, kernel/lucina-kexec, kernel/lucina-ksyms,
   kernel/lucina-ksyms-build, services/lucina-nav, kernel/lucina-power, kernel/lucina-rcu, kernel/lucina-ring, apps/lucina-shell,
-  kernel/lucina-sleep, kernel/lucina-spmi, kernel/lucina-standby, kernel/lucina-structmap, kernel/lucina-taskcpu and
+  kernel/lucina-sleep, kernel/lucina-spmi, kernel/lucina-standby, crates/lucina-suspend, kernel/lucina-structmap, kernel/lucina-taskcpu and
   drivers/lucina-wifi-wake.
 - drivers/lucina-qcom-services is under the BSD 3-Clause licence.
 - apps/lucina-app-desk links lucinadesk-core (gvitolocs/lucinadesk-core), which is under the AGPL-3.0-only. The desk app as built is

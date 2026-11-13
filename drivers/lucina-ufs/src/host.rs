@@ -45,10 +45,18 @@ pub trait Clock {
     fn delay_us(&self, us: u64);
 
     /// Sleeps until the controller interrupts for a request (`IS.UTRCS`, `IS.UE` or a fatal bit; Linux `ufshcd_intr`), for
-    /// at most `timeout_us` (the host asks for at most [`crate::irq_wait::SLEEP_CAP_US`]). [`IrqWait::Unavailable`]: there is
-    /// no interrupt to sleep on here (no line, or a caller that may not sleep), and the caller polls.
+    /// at most `timeout_us` (the host asks for at most [`crate::irq_wait::SLEEP_CAP_US`], or the rest of the request's
+    /// timeout while [`Clock::sleeping`]). [`IrqWait::Unavailable`]: there is no interrupt to sleep on here (no line, or a
+    /// caller that may not sleep), and the caller polls.
     fn wait_interrupt(&self, _timeout_us: u64) -> IrqWait {
         IrqWait::Unavailable
+    }
+    /// Whether the machine as a whole is asleep (patch 1342): while it is, the host lets a request wait out its own
+    /// timeout instead of asking for the [`crate::irq_wait::SLEEP_CAP_US`] re-look, as Linux's host never looks again
+    /// through a sleep (`ufshcd_system_suspend`, `drivers/ufs/core/ufshcd.c:10091`, suspends the host for it). Default:
+    /// never asleep, which is how a machine with no sleep works.
+    fn sleeping(&self) -> bool {
+        false
     }
     /// A request finished although no interrupt woke its thread: found `late_us` at most after it finished. For the
     /// platform's own count (the kernel's `/proc/lucina-irq`); the host counts and logs it too.
@@ -1473,7 +1481,14 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
             spins += 1;
             if spins > 64 {
                 let at = self.clock.now_us();
-                let sleep = irq_wait::sleep_us(at.wrapping_sub(start), timeout_us);
+                let elapsed = at.wrapping_sub(start);
+                // Patch 1342: while the machine sleeps nothing looks at the slot on a timer, so the sleep is not cut at
+                // 20 ms; the request is waited out on its interrupt or its own timeout (`irq_wait::sleep_us_asleep`).
+                let sleep = if self.clock.sleeping() {
+                    irq_wait::sleep_us_asleep(elapsed, timeout_us)
+                } else {
+                    irq_wait::sleep_us(elapsed, timeout_us)
+                };
                 match self.clock.wait_interrupt(sleep) {
                     IrqWait::Unavailable => {
                         self.clock.delay_us(if spins > 1024 { 1000 } else { 10 })

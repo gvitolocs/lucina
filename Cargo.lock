@@ -2616,6 +2616,7 @@ dependencies = [
  "libc",
  "lucina-ax",
  "lucina-events",
+ "lucina-glass",
  "lucina-intents",
  "lucina-nav",
  "png 0.18.1",
@@ -3194,6 +3195,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lucina-flight"
+version = "0.1.0"
+dependencies = [
+ "eyra",
+ "libc",
+]
+
+[[package]]
 name = "lucina-geni"
 version = "0.1.0"
 
@@ -3324,6 +3333,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lucina-log"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "lucina-memfrag"
 version = "0.1.0"
 dependencies = [
@@ -3348,6 +3364,7 @@ name = "lucina-modem-rpmh"
 version = "0.1.0"
 dependencies = [
  "fdt",
+ "lucina-cpubw",
  "lucina-qcom-soc",
  "spin",
 ]

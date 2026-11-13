@@ -14,6 +14,7 @@
 
 pub mod ab;
 pub mod fs;
+pub mod kmsg_wake;
 pub mod rcu;
 
 use stateright::{Checker, Model};

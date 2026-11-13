@@ -36,16 +36,14 @@
 //! corner rises above the domain's current active corner, which the first vote always does; WAKE_ONLY and SLEEP never
 //! wait (`rpmh_write_async`).
 //!
-//! # Sleep and wake sets: a known gap
+//! # Sleep and wake sets
 //!
-//! This crate is active-only. Linux also sends, for every domain that has a peer, the same corner as WAKE_ONLY (what
-//! RPMh applies when the application processor wakes up again) and the SLEEP corner (the larger of the domain's own
-//! and its enabled peer's, with the active-only peer's sleep corner being 0), through `rpmhpd_send_corner` with
-//! `rpmh_write_async`. [`Pds`] computes all three ([`Send::state`]); [`Pds::active_cmds`] drops the other two. Without
-//! them the RPMh firmware has no sleep or wake level for these resources from us, so after the application processor
-//! first suspends, RPMh may fall back to whatever its own sleep set says, and the domains could drop below the level
-//! the modem needs. That is not a problem for a first cold start, and it is a gap before the modem is expected to
-//! survive a suspend. Linux's `rpmh.c` also caches every active vote as the wake value; that cache does not exist here.
+//! Linux also sends, for every domain that has a peer, the same corner as WAKE_ONLY (what RPMh applies when the
+//! application processor wakes up again) and the SLEEP corner (the larger of the domain's own and its enabled peer's,
+//! with the active-only peer's sleep corner being 0), through `rpmhpd_send_corner` with `rpmh_write_async`. [`Pds`]
+//! computes all three ([`Send::state`]); [`Pds::active_cmds`] keeps the ACTIVE_ONLY ones for an active-only caller. The
+//! kernel's votes go through [`crate::share::Votes`], which sends all three with [`to_active_sleep`]'s corners and keeps
+//! them in the `rpmh.c` cache ([`crate::rpmh::Cache`]), so a flush has the sleep and wake values Linux would write.
 //!
 //! Before `sync_state` Linux clamps every aggregate to the top corner (`state_synced` false), so the votes above
 //! would be the same corner whatever the request. [`Pds::set_state_synced`] sets the flag; it starts false, as in
@@ -206,6 +204,17 @@ pub fn parse_levels(aux: &[u8], data_len: usize, skip_retention: bool) -> Result
     })
 }
 
+/// `to_active_sleep` (Linux v6.12 `drivers/pmdomain/qcom/rpmhpd.c:672-681`): the `(active, sleep)` corners a vote of `corner` on
+/// domain `idx` asks for. The active corner is the vote; the sleep corner is the vote too, except on an active-only domain
+/// (`cx_ao`, `mx_ao`), which asks for nothing while the application processor sleeps.
+pub fn to_active_sleep(idx: usize, corner: u32) -> (u32, u32) {
+    if SC7180[idx].active_only {
+        (corner, 0)
+    } else {
+        (corner, corner)
+    }
+}
+
 /// One `rpmhpd_send_corner`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Send {
@@ -347,11 +356,7 @@ impl Pds {
 
     /// `to_active_sleep`.
     fn to_active_sleep(idx: usize, corner: u32) -> (u32, u32) {
-        if SC7180[idx].active_only {
-            (corner, 0)
-        } else {
-            (corner, corner)
-        }
+        to_active_sleep(idx, corner)
     }
 
     /// `rpmhpd_aggregate_corner`: send the aggregated corner as ACTIVE_ONLY and, for a domain with a peer, also as

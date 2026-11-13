@@ -1,0 +1,21 @@
+[package]
+name = "lucina-flight"
+version = "0.1.0"
+description = "Juno's flight recorder: follows /dev/kmsg and sends each line, as it is produced, to a collector on the owner's network, so the last lines before a stall are already off the machine; the collector keeps one folder per boot (docs/design/juno-logging.md)"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "lucina-flight"
+path = "src/bin/lucina-flight.rs"
+
+[[bin]]
+name = "lucina-flight-collector"
+path = "src/bin/lucina-flight-collector.rs"
+
+# Juno with no C library: Eyra (third_party/eyra-stack) is the libc and the program start, in Rust; docs/research/juno-pure-rust.md.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64"))'.dependencies]
+eyra = { path = "../../third_party/eyra-stack/eyra" }

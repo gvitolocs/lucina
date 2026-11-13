@@ -2713,6 +2713,21 @@ fn render_previews(dir: &str, w: u32, h: u32) -> std::io::Result<()> {
         size: (w, h),
     };
     let mut app = App::new(opts, None, w, h, display);
+    // One state for the bar and for the Network rows. The live shell reads `net::Network::read()` once
+    // a tick and gives the same value to `status_with` and to `settings::page` (main.rs, the status
+    // pass), so a preview that wrote the bar's line by hand could say something the panel denied. The
+    // address is TEST-NET-1 (RFC 5737): a preview must not carry this host's network into a picture.
+    let network = net::Network {
+        interfaces: vec![net::Interface {
+            name: "eth0".into(),
+            up: true,
+            mac: Some("02:00:00:00:00:01".into()),
+            ipv4: vec!["192.0.2.101/24".into()],
+        }],
+        routes: vec![("eth0".into(), "192.0.2.1".into())],
+        wifi: None,
+    };
+    app.network = network.clone();
     app.status = Status {
         clock: "14:05 CET".into(),
         battery: Some(system::Battery {
@@ -2720,11 +2735,12 @@ fn render_previews(dir: &str, w: u32, h: u32) -> std::io::Result<()> {
             status: "Charging".into(),
             details: Vec::new(),
         }),
-        network: "eth0 192.168.1.47".into(),
-        online: true,
+        network: network.summary(),
+        online: network.primary().is_some(),
         camera: None,
     };
     app.model = "Samsung Galaxy Book Go".into();
+    app.settings = app.build_settings();
     std::fs::create_dir_all(dir)?;
     let mut term = Terminal::new(app.layout.cols, app.layout.rows);
     term.feed(
@@ -2824,6 +2840,75 @@ fn render_previews(dir: &str, w: u32, h: u32) -> std::io::Result<()> {
         );
         std::fs::write(format!("{dir}/{name}.ppm"), app.frame.to_ppm())?;
     }
+    // The two answers to Home's power buttons: the question over the launcher, and the screen on the way out.
+    for (name, action, sel) in [
+        ("confirm", ui::Power::Restart, ui::CONFIRM_DO),
+        ("confirm-cancel", ui::Power::ShutDown, ui::CONFIRM_CANCEL),
+    ] {
+        app.view = View::Home;
+        app.full = true;
+        ui::draw_all(
+            &mut app.frame,
+            &mut app.text,
+            &app.layout,
+            View::Home,
+            &app.status,
+            &app.model,
+            &app.home,
+            Some(&ended),
+            &app.settings,
+            app.settings_sel,
+            app.settings_row,
+            None,
+            None,
+        );
+        ui::draw_confirm(&mut app.frame, &mut app.text, &app.layout, action, sel);
+        std::fs::write(format!("{dir}/{name}.ppm"), app.frame.to_ppm())?;
+    }
+    ui::draw_leaving(
+        &mut app.frame,
+        &mut app.text,
+        &app.layout,
+        ui::Power::Restart,
+    );
+    std::fs::write(format!("{dir}/leaving.ppm"), app.frame.to_ppm())?;
+    // Settings' section with the rows that can be changed. The host has no backlight, so the preview
+    // lends one that is attached to nothing: the Power page then has its −/+ rows, as on a laptop.
+    let preview_light = backlight::Backlight::unattached(10, 7, 5, 15);
+    app.settings = settings::page(
+        &app.display,
+        app.layout.k,
+        &[],
+        &app.zone_name,
+        &app.network,
+        app.crashes.as_deref(),
+        Some(&preview_light),
+    );
+    app.settings_sel = app
+        .settings
+        .sections
+        .iter()
+        .position(|(n, _)| *n == settings::SCREEN_SECTION)
+        .unwrap_or(0);
+    app.settings_row = Some(0);
+    app.view = View::Settings;
+    app.full = true;
+    ui::draw_all(
+        &mut app.frame,
+        &mut app.text,
+        &app.layout,
+        View::Settings,
+        &app.status,
+        &app.model,
+        &app.home,
+        Some(&ended),
+        &app.settings,
+        app.settings_sel,
+        app.settings_row,
+        None,
+        None,
+    );
+    std::fs::write(format!("{dir}/settings-power.ppm"), app.frame.to_ppm())?;
     // Home with the level a volume key shows (17 of 20).
     app.view = View::Home;
     ui::draw_all(

@@ -346,8 +346,7 @@ impl Backlight {
         }
     }
 
-    /// A device that is not there, for the tests of what the rows show.
-    #[cfg(test)]
+    /// A device that is not there: for the tests of what the rows show, and for the headless preview, whose host has no light.
     pub fn unattached(max: u32, level: u32, battery_min: u32, charger_min: u32) -> Backlight {
         let gone = PathBuf::from("/nonexistent/lucina-shell-test");
         Backlight {

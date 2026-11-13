@@ -2,8 +2,12 @@
 //! window and Settings. Drawing only: state changes happen in `main.rs`.
 //!
 //! The system is called Juno on PCs (the LucinaOS for laptops; its kernel build is LucinaJuno).
-//! The colours are the LucinaOS boot menu's (navy background, gold accents, white title), so the
-//! shell continues the boot screens without a visible jump.
+//! Since the glass restyle these screens are the kit's: every colour, radius, space and type step is
+//! a `lucina_glass` token, a number the glass widgets published, or one of the toolkit's composites
+//! (`lucina_app::theme`, `lucina_app::ui`) — no colour literal and no size of our own in the paint
+//! code, which `the_paint_code_names_no_colour_of_its_own` and
+//! `the_paint_code_scales_no_length_of_its_own` enforce. The terminal's ANSI table is
+//! the exception: those colours are the shell's *content*, not its chrome (`ANSI`, `palette`).
 
 use crate::app_groups;
 use crate::apps::Ended;
@@ -11,10 +15,79 @@ use crate::system::Status;
 use crate::term::{Color, Screen};
 use lucina_app::Image;
 use lucina_app::gfx::{Face, Frame, Rect, Rgb, Text};
+use lucina_app::theme;
+use lucina_app::ui::{CONTROLS, MEASURED, TextRole, quiet, rim, row_selected};
+use lucina_glass::tokens::{color, radius, space, ty};
+use lucina_glass::widgets::dialog_card;
 
-pub use lucina_app::theme::{
-    BAR, DANGER, DIM, GOLD, GREEN, ITEM, NAVY, PANEL, PANEL_HI, TERM_BG, TERM_FG, WHITE,
-};
+/// The accent under its historical name: only the preview test reaches for it, to find one pixel of it.
+#[cfg(test)]
+pub use lucina_app::theme::GOLD;
+/// The colours the other modules of the shell name, and the surfaces and the terminal's ink this file
+/// still paints with. The screens take their ink from the kit's roles and their composites
+/// (`GROUND`, `CARD`, `theme::ACCENT`, `rim`, `quiet`, `row_selected`); the four old aliases that no
+/// longer buy anything (`ITEM`, `DIM`, `WHITE`, `PANEL_HI`) are gone with them.
+pub use lucina_app::theme::{BAR, DANGER, GREEN, NAVY, TERM_BG, TERM_FG};
+
+/// The page's ground, the kit's black (`color::VOID`, through `theme::GROUND`). `NAVY` above is the
+/// same colour under its historical name.
+const GROUND: Rgb = theme::GROUND;
+/// The card the shell paints where there is no backdrop to show through (`color::CARBON`).
+const CARD: Rgb = theme::PANEL;
+
+/// A length the glass kit published: `CONTROLS` first, then `MEASURED` (both tables are read against
+/// the kit by `lucina_app`'s own test). The shell takes its numbers from them so a change in the kit
+/// moves these screens with it; `the_shell_only_asks_the_kit_for_what_it_publishes` checks every pair
+/// used here really is in a table.
+fn control(which: &str, what: &str) -> f32 {
+    CONTROLS
+        .iter()
+        .chain(MEASURED.iter())
+        .find(|c| c.control == which && c.what == what)
+        .map(|c| c.dp)
+        .expect("the shell asks for a control the kit does not publish")
+}
+
+/// The ink a role carries over `surface`: the colour token the kit's `SCALE` names for it, composited
+/// the way the kit composites a translucent token where it has no alpha. `SCALE` gives the size and
+/// the face; only the surface is the shell's, since these screens sit on the page or on a card of it.
+fn role_ink(name: &str, surface: Rgb) -> Rgb {
+    match name {
+        "INK_2" => theme::over(color::INK_2, surface),
+        "ACCENT" => theme::over(color::ACCENT, surface),
+        // `"INK"`, `"WHITE"`, and `"caller"` where the app picks: content is the primary ink.
+        _ => theme::over(color::INK, surface),
+    }
+}
+
+/// A type step of the kit: its face, its size on this screen, and its ink over `surface`. The steps
+/// come from `lucina_app::ui::SCALE`, and `Layout::pt` scales them exactly as the kit's `Theme::pt`
+/// does (`the_shell_scales_type_as_the_kit_does`).
+fn role(l: &Layout, r: TextRole, surface: Rgb) -> (Face, u16, Rgb) {
+    let s = r.spec();
+    (s.face, l.pt(s.size), role_ink(s.colour, surface))
+}
+
+/// The least there is to draw: the kit's hairline is one device pixel wide (`ui::Paint::glass` strokes
+/// `separator` at 1 dp, and 1 dp is what an opaque canvas has).
+fn hair(l: &Layout) -> i32 {
+    l.px(1.0).max(1)
+}
+
+/// The card of the kit: its material, and the `separator` hairline around it (`Paint::glass` with no
+/// backdrop is exactly this: the tint and a hairline stroke). The hairline is one device pixel, the
+/// least there is to draw.
+fn card(fr: &mut Frame, l: &Layout, r: Rect, rad: i32, fill: Rgb) {
+    fr.bordered_round_rect(r, rad, hair(l), rim(fill), fill);
+}
+
+/// The kit's focus ring: the published offset outside the control, the published stroke thick, in the
+/// accent, over the surface behind.
+fn focus_ring(fr: &mut Frame, l: &Layout, r: Rect, rad: i32, surface: Rgb) {
+    let off = l.px(control("focus ring", "offset"));
+    let w = l.px(control("focus ring", "stroke")).max(1);
+    fr.bordered_round_rect(r.inset(-off), rad + off, w, theme::ACCENT, surface);
+}
 
 /// The system's name in the interface: Diana on the POCO X3, Juno everywhere else.
 pub fn system_name() -> &'static str {
@@ -117,7 +190,18 @@ impl Home {
             counts[app_groups::group_of(&t.id) as usize] += 1;
         }
         let area = l.apps_area();
-        let p = app_groups::place(&counts, area, l.gap, l.px(22.0), l.px(72.0), l.tile_h, 10);
+        // A header band is the dim caption's own line with the kit's small gap under it; the tiles
+        // flow on `space::XL`, and never shrink below the plate and one line of name.
+        let head = l.px(ty::BODY.0) + l.px(space::S);
+        let p = app_groups::place(
+            &counts,
+            area,
+            l.gap,
+            head,
+            l.px(TILE_MIN_H_DP),
+            l.tile_h,
+            10,
+        );
         self.area = area;
         self.tile_h = p.height;
         self.header_groups = p.header_groups;
@@ -277,31 +361,78 @@ pub struct Layout {
     pub dialog_buttons: [Rect; 2],
 }
 
+// The reference layout's own numbers: the page geometry the kit does not publish, because it is not a
+// control. Every one is a dp of the 1024 x 768 reference screen, scaled by `k`.
+/// The status band's height: the glass kit lays its bar in a band of 40 dp (`widgets/home/mod.rs:187`,
+/// `chrome::status_bar`). The kit keeps the number to itself, so it is copied here with the reason;
+/// the report lists `StatusBar` as the control the toolkit still lacks.
+const BAR_H_DP: f32 = 40.0;
+/// The launcher's tile: the reference grid's 176 x 136.
+const TILE_W_DP: f32 = 176.0;
+const TILE_H_DP: f32 = 136.0;
+/// The smallest the apps page may make a tile: the plate and one line of name.
+const TILE_MIN_H_DP: f32 = 72.0;
+/// The power buttons' width: long enough for "Shut down" with the kit's padding at its sides.
+const POWER_W_DP: f32 = 130.0;
+/// The band under the bar a screen's title stands in. The toolkit has no `Header` control yet, so the
+/// shell keeps the reference layout's band.
+const TITLE_BAND_DP: f32 = 64.0;
+/// Where Settings begins under that band, and how wide its section column is.
+const SETTINGS_TOP_DP: f32 = 110.0;
+const LIST_W_DP: f32 = 220.0;
+/// The foot of the page, below the list and the panel.
+const PAGE_FOOT_DP: f32 = 60.0;
+/// The dialog card's width; its height is the kit's (`dialog_card::HEIGHT`).
+const DIALOG_W_DP: f32 = 460.0;
+/// The value column between a stepper's discs: the widest value a row shows, "1920 x 1080", in the
+/// kit's control face.
+const STEPPER_VALUE_W_DP: f32 = 150.0;
+/// The bar's brand block: the block at its left that goes home when tapped.
+const BRAND_W_DP: f32 = 200.0;
+/// The status band's marks, in dp: what glass `chrome::status_bar` keeps inside itself (its battery is
+/// 23 x 12 dp with a 3.5 dp wall, its items stand 26 dp apart, its camera mark is a 10 dp disc) rather
+/// than publishing. The shell's glyphs are the reference bar's; they move to the kit when it has a
+/// `StatusBar`, which the report of this step asks for.
+const BAR_BATTERY_W_DP: f32 = 22.0;
+const BAR_BATTERY_H_DP: f32 = 11.0;
+const BAR_STROKE_DP: f32 = 1.5;
+const BAR_ITEM_GAP_DP: f32 = 26.0;
+/// The online mark's diameter, and the camera mark's, which the kit's header takes as 10 dp.
+const BAR_DOT_DP: f32 = 8.0;
+const BAR_MARK_DP: f32 = 10.0;
+/// The terminal's cell height in dp. This is content, not chrome: `cols` and `rows` off it are the
+/// size the shell tells the pty, so it stays the reference layout's own.
+const TERM_PX_DP: f32 = 15.0;
+
 impl Layout {
     pub fn new(w: u32, h: u32, text: &mut Text) -> Layout {
         let (w, h) = (w as i32, h as i32);
         let k = (w as f32 / 1024.0).min(h as f32 / 768.0).clamp(0.6, 3.0);
-        let px = |v: i32| (v as f32 * k).round() as i32;
-        let bar = Rect::new(0, 0, w, px(36).max(24));
-        let margin = (w * 6 / 100).max(px(24));
+        let px = |v: f32| (v * k).round() as i32;
+        // The status band, and the page's gutter: the kit's `space::EDGE` (rule 13), not the boot
+        // menu's six percent.
+        let bar = Rect::new(0, 0, w, px(BAR_H_DP).max(px(space::TAP) / 2));
+        let margin = px(space::EDGE);
 
-        let (bw, bh) = (px(130), px(38).max(24));
-        let by = h - px(104);
-        // The old tile size: 176 x 136 reference pixels. The apps page sizes its tiles from the
-        // space left instead, never above this height.
-        let gap = px(20);
-        let tile_w = px(176).min((w - 2 * margin - 2 * gap) / 3);
-        let tile_h = (tile_w as f32 * 136.0 / 176.0).round() as i32;
+        // A control is a tap target tall (`CONTROLS`: button, height).
+        let (bw, bh) = (px(POWER_W_DP), px(space::TAP));
+        // The tiles flow on the kit's card gap, `space::XL`.
+        let gap = px(space::XL);
+        let tile_w = px(TILE_W_DP).min((w - 2 * margin - 2 * gap) / 3);
+        let tile_h = (tile_w as f32 * TILE_H_DP / TILE_W_DP).round() as i32;
 
+        // The terminal window is a card on the page: the gutter at its sides, `space::L` above and below.
+        let inset = px(space::L);
         let window = Rect::new(
-            px(14),
-            bar.bottom() + px(14),
-            w - 2 * px(14),
-            h - bar.bottom() - 2 * px(14),
+            inset,
+            bar.bottom() + inset,
+            w - 2 * inset,
+            h - bar.bottom() - 2 * inset,
         );
-        let title_h = px(30).max(20);
-        let pad = px(10).max(6);
-        let term_px = ((15.0 * k).round() as i32).clamp(12, 20) as u16;
+        // Its title strip is the kit's app bar: a row of tap-sized controls.
+        let title_h = px(space::TAP);
+        let pad = px(space::M);
+        let term_px = ((TERM_PX_DP * k).round() as i32).clamp(12, 20) as u16;
         let cell_w = (text.advance(Face::Mono, term_px, 'M').round() as i32).max(1);
         let term_ascent = text.ascent(Face::Mono, term_px);
         let cell_h = term_ascent + text.descent(Face::Mono, term_px) + (term_px as i32 / 8).max(1);
@@ -315,27 +446,37 @@ impl Layout {
         let rows = (inner.h / cell_h).max(1) as usize;
         let grid = Rect::new(inner.x, inner.y, cols as i32 * cell_w, rows as i32 * cell_h);
 
-        let list_top = bar.bottom() + px(110);
-        let list = Rect::new(margin, list_top, px(220), h - list_top - px(60));
-        let panel_x = list.right() + px(24);
+        let list_top = bar.bottom() + px(SETTINGS_TOP_DP);
+        let list = Rect::new(
+            margin,
+            list_top,
+            px(LIST_W_DP),
+            h - list_top - px(PAGE_FOOT_DP),
+        );
+        let panel_x = list.right() + px(space::L);
         let panel = Rect::new(panel_x, list_top, w - margin - panel_x, list.h);
 
-        // At the right of the page's title: the whole height below is the apps'.
-        let _ = by;
+        // The power buttons at the right of the title band, above the tiles.
         let power = [0, 1].map(|i| {
             Rect::new(
                 w - margin - 2 * bw - gap / 2 + i * (bw + gap / 2),
-                bar.bottom() + px(10),
+                bar.bottom() + px(space::S),
                 bw,
                 bh,
             )
         });
-        let (dw, dh) = (px(460).min(w - 2 * px(16)), px(180));
+        // The dialog card: the kit's height, the page's gutter at its sides, its buttons a flow of two
+        // with the kit's gap on the card's own padding.
+        let (dw, dh) = (
+            px(DIALOG_W_DP).min(w - 2 * px(space::L)),
+            px(dialog_card::HEIGHT),
+        );
         let dialog = Rect::new((w - dw) / 2, (h - dh) / 2, dw, dh);
+        let (dpad, dgap) = (px(space::L), px(control("flow", "gap")));
         let dialog_buttons = [0, 1].map(|i| {
             Rect::new(
-                dialog.right() - (2 - i) * (bw + px(16)),
-                dialog.bottom() - bh - px(18),
+                dialog.right() - dpad - (2 - i) * bw - (1 - i) * dgap,
+                dialog.bottom() - dpad - bh,
                 bw,
                 bh,
             )
@@ -345,7 +486,7 @@ impl Layout {
             h,
             k,
             bar,
-            bar_home: Rect::new(0, 0, px(200), bar.h),
+            bar_home: Rect::new(0, 0, px(BRAND_W_DP), bar.h),
             margin,
             gap,
             tile_h,
@@ -358,7 +499,8 @@ impl Layout {
             cols,
             rows,
             list,
-            list_row: px(44).max(28),
+            // A section is a row of the kit's list: a tap target tall.
+            list_row: px(space::TAP),
             panel,
             power,
             dialog,
@@ -370,14 +512,16 @@ impl Layout {
         (v * self.k).round() as i32
     }
 
+    /// A type step in pixels. The shell has no `Theme` — it is not an app — so this scales the kit's
+    /// `k` itself; `the_shell_scales_type_as_the_kit_does` keeps the two agree at every size.
     pub fn pt(&self, v: f32) -> u16 {
         ((v * self.k).round() as i32).clamp(9, 300) as u16
     }
 
     /// The area of the apps page: under its title, to the foot of the screen.
     pub fn apps_area(&self) -> Rect {
-        let top = self.bar.bottom() + self.px(64.0);
-        let bottom = self.h - self.px(16.0);
+        let top = self.bar.bottom() + self.px(TITLE_BAND_DP);
+        let bottom = self.h - self.px(space::L);
         Rect::new(
             self.margin,
             top,
@@ -415,34 +559,50 @@ impl Layout {
         )
     }
 
-    /// The baseline of row `i` of the Settings panel.
-    pub fn panel_baseline(&self, i: usize) -> i32 {
-        let pad = self.px(24.0);
-        self.panel.y + pad + self.px(24.0) + self.px(16.0) + (i as i32 + 1) * self.px(34.0)
+    /// The panel's content padding: `space::L`, the kit's content padding for a card.
+    pub fn panel_pad(&self) -> i32 {
+        self.px(space::L)
     }
 
-    /// The band row `i` of the panel is drawn in.
+    /// The pitch of the panel's rows: the kit's list row, a tap target tall.
+    pub fn panel_pitch(&self) -> i32 {
+        self.px(space::TAP)
+    }
+
+    /// The room the section's own title takes above the rows: its line and the gap under it.
+    pub fn panel_title_h(&self) -> i32 {
+        self.px(space::XXL) + self.px(space::M)
+    }
+
+    /// The row `i` of the Settings panel, as the toolkit's `list` lays one.
     pub fn panel_row(&self, i: usize) -> Rect {
-        let pad = self.px(24.0);
+        let pad = self.panel_pad();
         Rect::new(
             self.panel.x + pad,
-            self.panel_baseline(i) - self.px(24.0),
+            self.panel.y + pad + self.panel_title_h() + i as i32 * self.panel_pitch(),
             self.panel.w - 2 * pad,
-            self.px(34.0),
+            self.panel_pitch(),
         )
     }
 
-    /// The −, the value and the + of an adjustable row `i`, at the right of the panel.
+    /// The band row `i` is drawn in: the kit's band, inset from the row and cut at its radius.
+    pub fn panel_band(&self, i: usize) -> Rect {
+        self.panel_row(i).inset(self.px(space::XS))
+    }
+
+    /// The −, the value and the + of an adjustable row `i`, at the right of the panel: the kit's
+    /// stepper, discs as tall as the band leaves, the value centred between them, the row's own inset
+    /// at the right.
     pub fn steppers(&self, i: usize) -> (Rect, Rect, Rect) {
         let r = self.panel_row(i);
-        let b = self.px(30.0);
-        let vw = self.px(150.0);
-        let gap = self.px(6.0);
-        let h = r.h - self.px(6.0);
-        let y = r.y + (r.h - h) / 2;
-        let plus = Rect::new(r.right() - self.px(8.0) - b, y, b, h);
-        let value = Rect::new(plus.x - gap - vw, y, vw, h);
-        let minus = Rect::new(value.x - gap - b, y, b, h);
+        let d = (r.h - self.px(space::XS)).max(1);
+        let vw = self.px(STEPPER_VALUE_W_DP);
+        let gap = self.px(space::S);
+        let inset = self.px(space::M);
+        let y = r.y + (r.h - d) / 2;
+        let plus = Rect::new(r.right() - inset - d, y, d, d);
+        let value = Rect::new(plus.x - gap - vw, y, vw, d);
+        let minus = Rect::new(value.x - gap - d, y, d, d);
         (minus, value, plus)
     }
 
@@ -485,7 +645,7 @@ pub fn draw_all(
     term: Option<&Screen>,
     shell_note: Option<&str>,
 ) -> Rect {
-    fr.fill_rect(fr.bounds(), NAVY);
+    fr.fill_rect(fr.bounds(), GROUND);
     draw_bar(fr, t, l, view, status);
     match view {
         View::Home => draw_home(fr, t, l, model, home),
@@ -506,272 +666,358 @@ pub fn draw_all(
     fr.bounds()
 }
 
-/// The status bar. Returns its rectangle.
+/// The status bar of the pages that are not the glass dashboard: the kit's header — its surface, the
+/// `separator` hairline under it, its two roles for the words — so the bar of every page is the same
+/// bar. The marks keep the shell's own geometry: glass `chrome::status_bar` builds its battery and
+/// wifi glyphs from numbers it keeps inside itself, and hardcodes its clock to "9:41", so there is
+/// nothing published to copy yet. `StatusBar` is the control the toolkit still lacks; the report
+/// lists it and what it would have to publish.
 pub fn draw_bar(fr: &mut Frame, t: &mut Text, l: &Layout, view: View, status: &Status) -> Rect {
     let b = l.bar;
+    let hair = hair(l);
     fr.fill_rect(b, BAR);
-    let line = l.px(2.0).max(1);
-    fr.fill_rect(Rect::new(0, b.bottom() - line, b.w, line), GOLD);
-    let base = b.y + (b.h - line) / 2 + t.ascent(Face::Sans, l.pt(15.0)) / 2 - 1;
-    let x = l.px(16.0);
-    let w = t.draw(fr, x, base, Face::Bold, l.pt(16.0), WHITE, system_name());
+    fr.fill_rect(
+        Rect::new(b.x, b.bottom() - hair, b.w, hair),
+        theme::HAIRLINE,
+    );
+    let pad = l.px(control("app bar", "side padding"));
+    let band = Rect::new(b.x, b.y, b.w, (b.h - hair).max(1));
+    let (tf, tp, tink) = role(l, TextRole::HeaderTitle, BAR);
+    let (hf, hp, hink) = role(l, TextRole::HeaderHint, BAR);
+    let (tb, hb) = (centre_base(t, tf, tp, band), centre_base(t, hf, hp, band));
+    let cy = band.y + band.h / 2;
+
+    // Which page is up is what is active: the accent is the one colour of the bar that is not ink.
+    let w = t.draw(fr, pad, tb, tf, tp, tink, system_name());
     t.draw(
         fr,
-        x + w + l.px(10.0),
-        base,
-        Face::Sans,
-        l.pt(15.0),
-        GOLD,
+        pad + w + l.px(control("app bar", "gap after mark")),
+        hb,
+        hf,
+        hp,
+        theme::ACCENT,
         &format!("·  {}", view.name()),
     );
 
     // Right side, right to left: clock, battery, network, camera.
-    let size = l.pt(15.0);
-    let mut right = b.w - l.px(16.0);
+    let mut right = b.w - pad;
     if !status.clock.is_empty() {
-        let cw = t.measure(Face::Bold, size, &status.clock);
-        right -= cw;
-        t.draw(fr, right, base, Face::Bold, size, WHITE, &status.clock);
-        right -= l.px(26.0);
+        right -= t.measure(tf, tp, &status.clock);
+        t.draw(fr, right, tb, tf, tp, tink, &status.clock);
+        right -= l.px(BAR_ITEM_GAP_DP);
     }
 
-    let (iw, ih) = (l.px(22.0).max(12), l.px(11.0).max(7));
+    let (iw, ih) = (
+        l.px(BAR_BATTERY_W_DP).max(l.px(space::M)),
+        l.px(BAR_BATTERY_H_DP).max(l.px(space::S)),
+    );
     if let Some(battery) = &status.battery {
         let text = battery.text();
-        let bw = t.measure(Face::Sans, size, &text);
-        right -= bw;
-        t.draw(fr, right, base, Face::Sans, size, ITEM, &text);
+        right -= t.measure(hf, hp, &text);
+        t.draw(fr, right, hb, hf, hp, hink, &text);
         // A battery: body, nub, and as much filled as there is charge.
-        right -= l.px(8.0) + iw;
-        let icon = Rect::new(right, base - ih + l.px(1.0), iw, ih);
-        let th = l.px(1.5).max(1);
-        fr.fill_rect(icon, ITEM);
+        let gap = l.px(control("app bar", "gap after mark"));
+        right -= gap + iw;
+        let icon = Rect::new(right, cy - ih / 2, iw, ih);
+        let th = l.px(BAR_STROKE_DP).max(1);
+        fr.fill_rect(icon, tink);
         let inner = icon.inset(th);
         fr.fill_rect(inner, BAR);
         let filled = inner.w * i32::from(battery.percent.min(100)) / 100;
-        fr.fill_rect(Rect::new(inner.x, inner.y, filled, inner.h), ITEM);
+        fr.fill_rect(Rect::new(inner.x, inner.y, filled, inner.h), tink);
         fr.fill_rect(
-            Rect::new(icon.right(), icon.y + ih / 3, th + 1, ih / 3),
-            ITEM,
+            Rect::new(icon.right(), icon.y + ih / 3, th + hair, ih / 3),
+            tink,
         );
-        right -= l.px(26.0);
+        right -= l.px(BAR_ITEM_GAP_DP);
     }
 
     if !status.network.is_empty() {
-        let nw = t.measure(Face::Sans, size, &status.network);
-        right -= nw;
-        t.draw(fr, right, base, Face::Sans, size, ITEM, &status.network);
-        let dot = l.px(4.0).max(3) as f32;
-        let online = status.online;
-        fr.fill_disc(
-            (right - l.px(10.0)) as f32,
-            (base - ih / 2) as f32,
-            dot,
-            if online { GREEN } else { DIM },
+        right -= t.measure(hf, hp, &status.network);
+        t.draw(fr, right, hb, hf, hp, hink, &status.network);
+        let d = l.px(BAR_DOT_DP).max(l.px(space::XS));
+        right = bar_mark(
+            fr,
+            right,
+            d,
+            l.px(space::S),
+            cy,
+            if status.online { GREEN } else { hink },
         );
-        right -= l.px(26.0);
+        right -= l.px(BAR_ITEM_GAP_DP);
     }
 
     // The camera mark, when something captures: a red disc and "Camera on", left of the rest, drawn
-    // the same right-to-left way (text first, then the disc to its left). The 26 px before it come
-    // from the item placed before, as for the battery and the network.
+    // the same right-to-left way (text first, then the disc to its left). The gap before it comes from
+    // the item placed before, as for the battery and the network.
     if status.camera.is_some() {
         let mark = "Camera on";
-        let mw = t.measure(Face::Bold, l.pt(15.0), mark);
-        right -= mw;
-        t.draw(fr, right, base, Face::Bold, l.pt(15.0), WHITE, mark);
-        right -= l.px(8.0);
-        let rad = l.px(5.0) as f32;
-        right -= l.px(10.0);
-        fr.fill_disc(right as f32 + rad, (base - ih / 2) as f32, rad, DANGER);
+        right -= t.measure(tf, tp, mark);
+        t.draw(fr, right, tb, tf, tp, tink, mark);
+        let gap = l.px(control("app bar", "gap after mark"));
+        let d = l.px(BAR_MARK_DP).max(l.px(space::M));
+        bar_mark(fr, right - gap, d, l.px(space::S), cy, DANGER);
     }
     b
 }
 
+/// A round mark of the bar `d` across, standing `gap` left of `right` and centred on `cy`: the kit's
+/// header draws its camera mark this way. Returns the mark's left edge, which is where the next item
+/// to its left ends.
+fn bar_mark(fr: &mut Frame, right: i32, d: i32, gap: i32, cy: i32, ink: Rgb) -> i32 {
+    let x = right - gap - d;
+    fr.fill_disc(x as f32 + d as f32 / 2.0, cy as f32, d as f32 / 2.0, ink);
+    x
+}
+
+/// The icon plate on a launcher tile: the box the reference grid gave it. The kit has no app tile, so
+/// the shell keeps this one of its own; the report lists `AppTile` as the control that is missing.
+const TILE_ICON_DP: f32 = 46.0;
+
+/// A page's title, on every page the shell shows: the kit's display step (`ty::TITLE`) in the primary
+/// ink, standing `space::L` below the bar. The kit's dashboard sets this step in its Thin face, which
+/// `gfx::Face` has not got, so the shell takes Semibold; the report lists it. Returns the baseline, so
+/// a page can put its next line under the title's own.
+fn page_title(fr: &mut Frame, t: &mut Text, l: &Layout, s: &str) -> i32 {
+    let (face, px, ink) = (Face::Bold, l.pt(ty::TITLE.0), theme::WHITE);
+    let base = l.bar.bottom() + l.px(space::L) + t.ascent(face, px);
+    t.draw(fr, l.margin, base, face, px, ink, s);
+    base
+}
+
 fn draw_home(fr: &mut Frame, t: &mut Text, l: &Layout, _model: &str, home: &Home) {
-    let margin = l.margin;
-    let title_px = l.pt(30.0);
-    let title_base = l.bar.bottom() + l.px(38.0);
-    t.draw(fr, margin, title_base, Face::Bold, title_px, WHITE, "Apps");
+    page_title(fr, t, l, "Apps");
 
     let area = l.apps_area();
     fr.set_clip(area);
 
-    let head_px = l.pt(14.0);
+    // The group headers: the kit's dim caption, centred in the band `reflow` gave them.
+    let (head_face, head_px, head_ink) = role(l, TextRole::Dim, GROUND);
     for (&g, r) in home.header_groups.iter().zip(&home.headers) {
         if r.bottom() <= area.y || r.y >= area.bottom() {
             continue;
         }
         let name = app_groups::Group::ALL[g].name();
-        let name = t.fit(Face::Sans, head_px, name, r.w);
-        let base = r.y + (r.h + t.ascent(Face::Sans, head_px) - t.descent(Face::Sans, head_px)) / 2;
-        t.draw_clipped(fr, area, r.x, base, Face::Sans, head_px, DIM, &name);
+        let name = t.fit(head_face, head_px, name, r.w);
+        t.draw_clipped(
+            fr,
+            area,
+            r.x,
+            centre_base(t, head_face, head_px, *r),
+            head_face,
+            head_px,
+            head_ink,
+            &name,
+        );
     }
 
-    let name_px = l.pt(13.0);
-    let pad = l.px(10.0);
-    let rad = l.px(10.0).max(4);
+    // A tile is the dashboard's card: `radius::LG`, the card material under the `separator` hairline,
+    // its name on the last line. The one under the keyboard is the raised card with the kit's ring.
+    let rad = l.px(radius::LG);
+    let (name_face, name_px) = (Face::Sans, l.pt(ty::CAPTION.0));
+    let name_ink = role_ink("INK", CARD);
+    let line = t.ascent(name_face, name_px) + t.descent(name_face, name_px);
     for (i, (r, tile)) in home.placed.iter().zip(home.tiles.iter()).enumerate() {
         if r.bottom() <= area.y || r.y >= area.bottom() {
             continue;
         }
-        if i == home.sel {
-            fr.bordered_round_rect(*r, rad, l.px(3.0).max(2), GOLD, PANEL_HI);
-        } else {
-            fr.fill_round_rect(*r, rad, PANEL);
+        let selected = i == home.sel;
+        let fill = if selected { theme::PANEL_HI } else { CARD };
+        if selected {
+            focus_ring(fr, l, *r, rad, GROUND);
         }
-        let pad = pad.min((r.h - l.px(10.0)) / 2).max(l.px(4.0));
-        let icon_side = l
-            .px(46.0)
-            .min((r.h - 2 * pad - l.px(18.0)).max(l.px(16.0)))
+        card(fr, l, *r, rad, fill);
+        let pad = l
+            .px(space::L)
+            .min((r.h - line) / 2)
+            .max(l.px(space::XS))
+            .min((r.w / 2).max(1));
+        let plate = l
+            .px(TILE_ICON_DP)
+            .min((r.h - 2 * pad - line).max(l.px(space::M)))
             .min(r.w - 2 * pad);
-        let icon = Rect::new(r.x + pad, r.y + pad, icon_side, icon_side);
-        draw_icon(fr, t, icon, &tile.icon);
-        let inner = r.w - 2 * pad;
-        let name = t.fit(Face::Bold, name_px, &tile.title, inner);
-        let name_base = r.bottom() - pad - t.descent(Face::Bold, name_px);
+        draw_icon(
+            fr,
+            t,
+            Rect::new(r.x + pad, r.y + pad, plate, plate),
+            &tile.icon,
+        );
+        let name = t.fit(name_face, name_px, &tile.title, r.w - 2 * pad);
         t.draw_clipped(
             fr,
             area,
             r.x + pad,
-            name_base,
-            Face::Bold,
+            r.bottom() - pad - t.descent(name_face, name_px),
+            name_face,
             name_px,
-            WHITE,
+            name_ink,
             &name,
         );
     }
     fr.set_clip(fr.bounds());
 
     for (i, (r, p)) in l.power.iter().zip(POWER_BUTTONS).enumerate() {
-        draw_button(fr, t, l, *r, p.name(), home.tiles.len() + i == home.sel);
+        draw_button(
+            fr,
+            t,
+            l,
+            *r,
+            p.name(),
+            home.tiles.len() + i == home.sel,
+            GROUND,
+        );
     }
 
+    // What just happened, in the foot band the page keeps for it.
     if let Some(note) = &home.note {
-        let size = l.pt(14.0);
-        let note = t.fit(Face::Sans, size, note, l.w - 2 * margin);
-        t.draw(fr, margin, l.h - l.px(50.0), Face::Sans, size, ITEM, &note);
+        let (face, px, ink) = role(l, TextRole::Paragraph, GROUND);
+        let note = t.fit(face, px, note, l.w - 2 * l.margin);
+        let foot = Rect::new(0, l.h - l.px(PAGE_FOOT_DP), l.w, l.px(PAGE_FOOT_DP));
+        t.draw(
+            fr,
+            l.margin,
+            centre_base(t, face, px, foot),
+            face,
+            px,
+            ink,
+            &note,
+        );
     }
 }
 
-/// Where the two answers on the "app stopped" screen are.
+/// The baseline the line of `s` sits on when the line is centred in `r`, as the kit centres the text
+/// of a row: its ascent above the middle, its descent below.
+fn centre_base(t: &Text, f: Face, px: u16, r: Rect) -> i32 {
+    r.y + (r.h + t.ascent(f, px) - t.descent(f, px)) / 2
+}
+
+/// Where the two answers on the "app stopped" screen are: the kit's buttons, a flow of two standing in
+/// the foot band the page keeps below its content.
 pub fn ended_buttons(l: &Layout) -> (Rect, Rect) {
-    let (x, w, h) = (l.margin, l.px(190.0), l.px(40.0));
-    let y = l.h - l.px(110.0);
+    let (w, h) = (l.px(POWER_W_DP), l.px(space::TAP));
+    let y = l.h - l.px(PAGE_FOOT_DP) - h;
+    let gap = l.px(control("flow", "gap"));
     (
-        Rect::new(x, y, w, h),
-        Rect::new(x + w + l.px(16.0), y, w, h),
+        Rect::new(l.margin, y, w, h),
+        Rect::new(l.margin + w + gap, y, w, h),
     )
 }
 
 /// An app stopped: which, why, what it last said, and the way on.
 fn draw_ended(fr: &mut Frame, t: &mut Text, l: &Layout, e: &Ended) {
-    let margin = l.margin;
-    let width = l.w - 2 * margin;
-    let mut y = l.bar.bottom() + l.px(80.0);
+    let width = l.w - 2 * l.margin;
     let heading = format!("{} stopped", e.title);
-    let heading = t.fit(Face::Bold, l.pt(34.0), &heading, width);
-    t.draw(fr, margin, y, Face::Bold, l.pt(34.0), WHITE, &heading);
-    y += l.px(36.0);
-    let what = t.fit(Face::Sans, l.pt(18.0), &e.what, width);
-    t.draw(fr, margin, y, Face::Sans, l.pt(18.0), GOLD, &what);
-    y += l.px(30.0);
+    let heading = t.fit(Face::Bold, l.pt(ty::TITLE.0), &heading, width);
+    let title_base = page_title(fr, t, l, &heading);
+    let (face, px, ink) = role(l, TextRole::Paragraph, GROUND);
+    let what = t.fit(face, px, &e.what, width);
+    let y =
+        title_base + t.descent(Face::Bold, l.pt(ty::TITLE.0)) + l.px(space::L) + t.ascent(face, px);
+    t.draw(fr, l.margin, y, face, px, ink, &what);
+
     let (b1, b2) = ended_buttons(l);
     if !e.tail.is_empty() {
-        let px = l.pt(13.0);
-        let lh = t.ascent(Face::Mono, px) + t.descent(Face::Mono, px) + 2;
-        let bx = Rect::new(margin, y, width, (b1.y - l.px(20.0) - y).max(lh));
-        fr.fill_round_rect(bx, l.px(8.0), TERM_BG);
-        let inner = bx.inset(l.px(12.0));
+        // What the app last said: its own ink on a field of the kit's quiet glass.
+        let (mf, mp) = (Face::Mono, l.pt(ty::BODY.0));
+        let lh = t.ascent(mf, mp) + t.descent(mf, mp) + l.px(space::XS);
+        let top = y + t.descent(mf, mp) + l.px(space::L);
+        let bx = Rect::new(l.margin, top, width, (b1.y - l.px(space::L) - top).max(lh));
+        card(fr, l, bx, l.px(radius::MD), quiet(GROUND));
+        let inner = bx.inset(l.px(space::M));
         let fits = (inner.h / lh).max(1) as usize;
         let lines = &e.tail[e.tail.len().saturating_sub(fits)..];
-        let mut base = inner.y + t.ascent(Face::Mono, px);
+        let mut base = inner.y + t.ascent(mf, mp);
         for line in lines {
-            let line = t.fit(Face::Mono, px, line, inner.w);
-            t.draw(fr, inner.x, base, Face::Mono, px, TERM_FG, &line);
+            let line = t.fit(mf, mp, line, inner.w);
+            t.draw(fr, inner.x, base, mf, mp, TERM_FG, &line);
             base += lh;
         }
     }
-    let rad = l.px(8.0);
-    let size = l.pt(16.0);
-    fr.fill_round_rect(b1, rad, GOLD);
-    fr.fill_round_rect(b2, rad, PANEL_HI);
-    let base = b1.y + (b1.h + t.ascent(Face::Sans, size) - t.descent(Face::Sans, size)) / 2;
-    t.draw(
-        fr,
-        b1.x + l.px(14.0),
-        base,
-        Face::Sans,
-        size,
-        NAVY,
-        "Enter: reopen",
-    );
-    t.draw(
-        fr,
-        b2.x + l.px(14.0),
-        base,
-        Face::Sans,
-        size,
-        WHITE,
-        "Esc: home",
-    );
+    // This screen has no cursor: Enter always answers the first of the two, so the ring is on it.
+    draw_primary_button(fr, t, l, b1, "Enter: reopen", true);
+    draw_button(fr, t, l, b2, "Esc: home", false, GROUND);
 }
 
-fn draw_button(fr: &mut Frame, t: &mut Text, l: &Layout, r: Rect, name: &str, focused: bool) {
-    let rad = l.px(8.0);
-    if focused {
-        fr.bordered_round_rect(r, rad, l.px(2.0).max(2), GOLD, PANEL_HI);
+/// A secondary button of the kit (`widgets/button.rs`, through `lucina_app::ui`): the control's own
+/// corners, the quiet glass and its hairline at rest, the selected band and the ring when it carries
+/// the keyboard. `surface` is the colour the button sits on.
+fn draw_button(
+    fr: &mut Frame,
+    t: &mut Text,
+    l: &Layout,
+    r: Rect,
+    name: &str,
+    selected: bool,
+    surface: Rgb,
+) {
+    let rad = l.px(control("button", "radius"));
+    let fill = if selected {
+        row_selected(surface)
     } else {
-        fr.fill_round_rect(r, rad, PANEL);
+        quiet(surface)
+    };
+    if selected {
+        focus_ring(fr, l, r, rad, fill);
     }
-    let size = l.pt(15.0);
-    let w = t.measure(Face::Sans, size, name);
-    let base = r.y + r.h / 2 + t.ascent(Face::Sans, size) / 2 - 1;
-    t.draw(
-        fr,
-        r.x + (r.w - w) / 2,
-        base,
-        Face::Sans,
-        size,
-        if focused { WHITE } else { ITEM },
-        name,
-    );
+    card(fr, l, r, rad, fill);
+    draw_button_label(fr, t, l, r, name, role_ink("INK", surface));
+}
+
+/// The kit's paper button: the one action of a dialog (`Look::Primary` in `lucina_app::ui`).
+fn draw_primary_button(
+    fr: &mut Frame,
+    t: &mut Text,
+    l: &Layout,
+    r: Rect,
+    name: &str,
+    selected: bool,
+) {
+    let rad = l.px(control("button", "radius"));
+    if selected {
+        focus_ring(fr, l, r, rad, theme::PAPER);
+    }
+    fr.fill_round_rect(r, rad, theme::PAPER);
+    draw_button_label(fr, t, l, r, name, theme::PAPER_INK);
+}
+
+/// A button's label, in the kit's control role and centred in its band: the text never has less room
+/// at its sides than a flow gap.
+fn draw_button_label(fr: &mut Frame, t: &mut Text, l: &Layout, r: Rect, name: &str, ink: Rgb) {
+    let s = TextRole::Control.spec();
+    let (face, px) = (s.face, l.pt(s.size));
+    let w = t.measure(face, px, name);
+    let x = r.x + (r.w - w).max(l.px(control("flow", "gap"))) / 2;
+    t.draw(fr, x, centre_base(t, face, px, r), face, px, ink, name);
 }
 
 /// The one question before the machine goes away. Returns its area.
+///
+/// The kit's `modal` dims the page under the card and `dialog_card` lifts it on a soft shadow; the
+/// shell paints its screens one damage rect at a time, so a scrim here would darken the page as many
+/// times as it is repainted. The card therefore comes without either, which is the `DialogCard` the
+/// toolkit still lacks (the report).
 pub fn draw_confirm(fr: &mut Frame, t: &mut Text, l: &Layout, action: Power, sel: usize) -> Rect {
     let d = l.dialog;
-    fr.bordered_round_rect(d, l.px(14.0), l.px(2.0).max(2), GOLD, BAR);
-    let pad = l.px(24.0);
+    let rad = l.px(control("dialog", "radius"));
+    let pad = l.px(control("dialog", "content padding"));
+    card(fr, l, d, rad, CARD);
     let question = match action {
         Power::Restart => format!("Restart {}?", system_name()),
         Power::ShutDown => format!("Shut down {}?", system_name()),
     };
-    let question = question.as_str();
-    t.draw(
-        fr,
-        d.x + pad,
-        d.y + pad + l.px(20.0),
-        Face::Bold,
-        l.pt(22.0),
-        WHITE,
-        question,
-    );
+    let (qf, qp, qink) = role(l, TextRole::Heading, CARD);
+    let question = t.fit(qf, qp, &question, d.w - 2 * pad);
+    let qb = d.y + pad + t.ascent(qf, qp);
+    t.draw(fr, d.x + pad, qb, qf, qp, qink, &question);
+    let (nf, np, nink) = role(l, TextRole::Dim, CARD);
+    let nb = qb + t.descent(qf, qp) + l.px(space::M) + t.ascent(nf, np);
     let note = t.fit(
-        Face::Sans,
-        l.pt(14.0),
+        nf,
+        np,
         "This session is lost: the system runs from RAM.",
         d.w - 2 * pad,
     );
-    t.draw(
-        fr,
-        d.x + pad,
-        d.y + pad + l.px(50.0),
-        Face::Sans,
-        l.pt(14.0),
-        ITEM,
-        &note,
-    );
+    t.draw(fr, d.x + pad, nb, nf, np, nink, &note);
     draw_button(
         fr,
         t,
@@ -779,8 +1025,9 @@ pub fn draw_confirm(fr: &mut Frame, t: &mut Text, l: &Layout, action: Power, sel
         l.dialog_buttons[CONFIRM_CANCEL],
         "Cancel",
         sel == CONFIRM_CANCEL,
+        CARD,
     );
-    draw_button(
+    draw_primary_button(
         fr,
         t,
         l,
@@ -836,16 +1083,26 @@ impl Osd {
     }
 }
 
-/// What the screen says while the machine goes away, in case that takes a moment.
+/// What the screen says while the machine goes away, in case that takes a moment: the page's ground,
+/// and the kit's display step centred on it.
 pub fn draw_leaving(fr: &mut Frame, t: &mut Text, l: &Layout, action: Power) -> Rect {
-    fr.fill_rect(fr.bounds(), NAVY);
+    fr.fill_rect(fr.bounds(), GROUND);
     let text = match action {
         Power::Restart => "Restarting…",
         Power::ShutDown => "Shutting down…",
     };
-    let size = l.pt(26.0);
-    let w = t.measure(Face::Bold, size, text);
-    t.draw(fr, (l.w - w) / 2, l.h / 2, Face::Bold, size, WHITE, text);
+    let (face, px, ink) = (Face::Bold, l.pt(ty::TITLE.0), theme::WHITE);
+    let w = t.measure(face, px, text);
+    let band = Rect::new(0, 0, l.w, l.h);
+    t.draw(
+        fr,
+        (l.w - w) / 2,
+        centre_base(t, face, px, band),
+        face,
+        px,
+        ink,
+        text,
+    );
     fr.bounds()
 }
 
@@ -872,67 +1129,65 @@ fn draw_settings(
     sel: usize,
     focus: Option<usize>,
 ) {
-    let margin = l.list.x;
-    t.draw(
-        fr,
-        margin,
-        l.bar.bottom() + l.px(64.0),
-        Face::Bold,
-        l.pt(30.0),
-        WHITE,
-        "Settings",
-    );
-    let size = l.pt(17.0);
+    page_title(fr, t, l, "Settings");
+
+    // The sections are the kit's list: a band of `radius::MD` standing in from the column's edges,
+    // the selected one `accentSoft`, its name content and so the primary ink either way. The accent
+    // ring is on whichever of the two columns the keyboard is in (rule 10).
+    let inset = l.px(control("list row", "band inset"));
+    let rad = l.px(control("list row", "band radius"));
+    let (face, px, ink) = role(l, TextRole::Label, GROUND);
     for (i, (name, _)) in page.sections.iter().enumerate() {
         let row = Rect::new(
             l.list.x,
             l.list.y + i as i32 * l.list_row,
             l.list.w,
-            l.list_row - l.px(6.0),
+            l.list_row,
         );
         if i == sel {
-            fr.fill_round_rect(row, l.px(8.0), PANEL_HI);
-            fr.fill_rect(
-                Rect::new(
-                    row.x,
-                    row.y + l.px(8.0),
-                    l.px(4.0).max(2),
-                    row.h - l.px(16.0),
-                ),
-                GOLD,
-            );
+            let band = Rect::new(row.x + inset, row.y, (row.w - 2 * inset).max(1), row.h);
+            if focus.is_none() {
+                focus_ring(fr, l, band, rad, GROUND);
+            }
+            fr.fill_round_rect(band, rad, row_selected(GROUND));
         }
-        let base = row.y + row.h / 2 + t.ascent(Face::Sans, size) / 2 - 1;
-        t.draw(
+        t.draw_clipped(
             fr,
-            row.x + l.px(18.0),
-            base,
-            if i == sel { Face::Bold } else { Face::Sans },
-            size,
-            if i == sel { WHITE } else { ITEM },
+            l.list,
+            row.x + l.px(control("button", "side padding")) + inset,
+            centre_base(t, face, px, row),
+            face,
+            px,
+            ink,
             name,
         );
     }
 
+    // The panel is the kit's card.
     let p = l.panel;
-    fr.fill_round_rect(p, l.px(14.0), PANEL);
+    let pad = l.panel_pad();
+    let card_rad = l.px(radius::LG);
+    card(fr, l, p, card_rad, CARD);
     let Some((name, rows)) = page.sections.get(sel) else {
         return;
     };
-    let pad = l.px(24.0);
+    let (title_face, title_px, title_ink) = role(l, TextRole::Heading, CARD);
     t.draw(
         fr,
         p.x + pad,
-        p.y + pad + l.px(24.0),
-        Face::Bold,
-        l.pt(22.0),
-        GOLD,
+        p.y + pad + t.ascent(title_face, title_px),
+        title_face,
+        title_px,
+        title_ink,
         name,
     );
-    let size = l.pt(15.0);
+
+    // What a row says is a key and a value: the key is metadata, the value content.
+    let (key_face, key_px, key_ink) = role(l, TextRole::Dim, CARD);
+    let (val_face, val_px, val_ink) = role(l, TextRole::Label, CARD);
     let label_w = rows
         .iter()
-        .map(|(k, _)| t.measure(Face::Sans, size, k))
+        .map(|(k, _)| t.measure(key_face, key_px, k))
         .max()
         .unwrap_or(0)
         .min(p.w / 3);
@@ -942,118 +1197,165 @@ fn draw_settings(
         .filter(|&(s, _)| s == sel)
         .map_or(0, |(_, n)| n);
     // The hint for the rows that can be changed takes the panel's last line.
-    let last = if adjustable > 0 {
-        p.bottom() - pad - l.px(30.0)
+    let hint_h = if adjustable > 0 {
+        t.ascent(key_face, key_px) + l.px(space::L)
     } else {
-        p.bottom() - pad
+        0
     };
+    let last = p.bottom() - pad - hint_h;
+    let rule = rim(CARD);
     for (i, (k, v)) in rows.iter().enumerate() {
-        let y = l.panel_baseline(i);
-        if y > last {
+        let row = l.panel_row(i);
+        if row.bottom() > last {
             break;
         }
-        fr.fill_rect(
-            Rect::new(p.x + pad, y - l.px(24.0), p.w - 2 * pad, 1),
-            PANEL_HI,
-        );
+        // The kit's `separator` hairline between two rows of a card.
+        if i > 0 {
+            fr.fill_rect(Rect::new(p.x + pad, row.y, p.w - 2 * pad, hair(l)), rule);
+        }
         if i >= adjustable {
-            t.draw_clipped(fr, clip, p.x + pad, y, Face::Sans, size, DIM, k);
-            let vx = p.x + pad + label_w + l.px(24.0);
-            let v = t.fit(Face::Sans, size, v, p.right() - pad - vx);
-            t.draw_clipped(fr, clip, vx, y, Face::Sans, size, WHITE, &v);
+            t.draw_clipped(
+                fr,
+                clip,
+                p.x + pad,
+                centre_base(t, key_face, key_px, row),
+                key_face,
+                key_px,
+                key_ink,
+                k,
+            );
+            let vx = p.x + pad + label_w + l.px(space::M);
+            let v = t.fit(val_face, val_px, v, p.right() - pad - vx);
+            t.draw_clipped(
+                fr,
+                clip,
+                vx,
+                centre_base(t, val_face, val_px, row),
+                val_face,
+                val_px,
+                val_ink,
+                &v,
+            );
             continue;
         }
         let focused = focus == Some(i);
-        let mut label_x = p.x + pad;
         if focused {
-            let row = l.panel_row(i);
-            fr.fill_round_rect(row, l.px(8.0), PANEL_HI);
-            fr.fill_rect(
-                Rect::new(
-                    row.x,
-                    row.y + l.px(8.0),
-                    l.px(4.0).max(2),
-                    row.h - l.px(16.0),
-                ),
-                GOLD,
-            );
-            label_x += l.px(12.0);
+            let band = l.panel_band(i);
+            focus_ring(fr, l, band, rad, CARD);
+            fr.fill_round_rect(band, rad, row_selected(CARD));
         }
+        let label_x = row.x + inset;
         let (minus, value, plus) = l.steppers(i);
         // A long label stops before the −.
         let label_clip = clip.intersect(&Rect::new(clip.x, clip.y, minus.x - clip.x, clip.h));
-        t.draw_clipped(fr, label_clip, label_x, y, Face::Sans, size, DIM, k);
-        let glyph = if focused { GOLD } else { WHITE };
+        t.draw_clipped(
+            fr,
+            label_clip,
+            label_x,
+            centre_base(t, key_face, key_px, row),
+            key_face,
+            key_px,
+            key_ink,
+            k,
+        );
+        // The kit's stepper: a disc of the quiet glass at each end, its glyph in the content ink.
         for (r, g) in [(minus, "−"), (plus, "+")] {
-            fr.fill_round_rect(r, l.px(6.0), if focused { PANEL } else { PANEL_HI });
-            let base = r.y + r.h / 2 + t.ascent(Face::Sans, size) / 2 - 1;
-            let gx = r.x + (r.w - t.measure(Face::Sans, size, g)) / 2;
-            t.draw(fr, gx, base, Face::Sans, size, glyph, g);
+            fr.fill_disc(
+                (r.x + r.w / 2) as f32,
+                (r.y + r.h / 2) as f32,
+                (r.w.min(r.h) / 2) as f32,
+                quiet(CARD),
+            );
+            let (glyph_face, glyph_px, _) = role(l, TextRole::Control, CARD);
+            let gw = t.measure(glyph_face, glyph_px, g);
+            t.draw(
+                fr,
+                r.x + (r.w - gw) / 2,
+                centre_base(t, glyph_face, glyph_px, r),
+                glyph_face,
+                glyph_px,
+                role_ink("INK", CARD),
+                g,
+            );
         }
-        let face = if focused { Face::Bold } else { Face::Sans };
-        let v = t.fit(face, size, v, value.w);
-        let vx = value.x + (value.w - t.measure(face, size, &v)) / 2;
-        t.draw_clipped(fr, clip, vx, y, face, size, WHITE, &v);
+        let v = t.fit(val_face, val_px, v, value.w);
+        let vx = value.x + (value.w - t.measure(val_face, val_px, &v)) / 2;
+        t.draw_clipped(
+            fr,
+            clip,
+            vx,
+            centre_base(t, val_face, val_px, row),
+            val_face,
+            val_px,
+            val_ink,
+            &v,
+        );
     }
     if adjustable > 0 {
+        let (hint_face, hint_px, hint_ink) = role(l, TextRole::Dim, CARD);
         let hint = t.fit(
-            Face::Sans,
-            l.pt(13.0),
+            hint_face,
+            hint_px,
             "Enter or Right to change    Up and Down choose    Left and Right change    Esc goes back",
             p.w - 2 * pad,
         );
         t.draw(
             fr,
             p.x + pad,
-            p.bottom() - pad,
-            Face::Sans,
-            l.pt(13.0),
-            DIM,
+            p.bottom() - pad - t.descent(hint_face, hint_px),
+            hint_face,
+            hint_px,
+            hint_ink,
             &hint,
         );
     }
 }
 
-/// The terminal window's frame and title strip.
+/// The terminal window's frame and title strip: the kit's card, and the header its `app bar` lays —
+/// the title in the header role, the hint beside it in the dim one. The grid inside is content and
+/// keeps its own palette.
 pub fn draw_window(fr: &mut Frame, t: &mut Text, l: &Layout, note: Option<&str>) -> Rect {
     let w = l.window;
-    fr.bordered_round_rect(w, l.px(10.0), 1, PANEL_HI, TERM_BG);
-    let title_h = l.grid.y - w.y - l.px(5.0);
-    let strip = Rect::new(w.x + 1, w.y + 1, w.w - 2, title_h);
+    let hair = hair(l);
+    let rad = l.px(radius::LG);
+    fr.bordered_round_rect(w, rad, hair, theme::HAIRLINE, TERM_BG);
+    // The strip is the kit's app bar: its height, its side padding, a hairline under it.
+    let strip = Rect::new(
+        w.x + hair,
+        w.y + hair,
+        w.w - 2 * hair,
+        l.px(control("app bar", "height")),
+    );
+    let pad = l.px(control("app bar", "side padding"));
     fr.fill_rect(
         Rect::new(
-            strip.x + l.px(10.0),
+            strip.x + pad,
             strip.bottom(),
-            strip.w - 2 * l.px(10.0),
-            1,
+            (strip.w - 2 * pad).max(1),
+            hair,
         ),
-        PANEL_HI,
+        theme::HAIRLINE,
     );
-    let size = l.pt(15.0);
-    let base = strip.y + strip.h / 2 + t.ascent(Face::Sans, size) / 2;
-    let x = w.x + l.px(14.0);
-    let tw = t.draw(fr, x, base, Face::Bold, size, WHITE, "Terminal");
+    let (tf, tp, tink) = role(l, TextRole::HeaderTitle, TERM_BG);
+    let (hf, hp, hink) = role(l, TextRole::HeaderHint, TERM_BG);
+    let base = centre_base(t, tf, tp, strip);
+    let x = w.x + pad;
+    let tw = t.draw(fr, x, base, tf, tp, tink, "Terminal");
     let sub = note.unwrap_or("sh");
+    // The shell's own word on the strip is what is active, so it is the one thing here in the accent.
+    let sub_ink = if note.is_some() { theme::ACCENT } else { hink };
     t.draw(
         fr,
-        x + tw + l.px(10.0),
+        x + tw + l.px(control("app bar", "gap after mark")),
         base,
-        Face::Sans,
-        size,
-        if note.is_some() { GOLD } else { DIM },
+        hf,
+        hp,
+        sub_ink,
         &format!("·  {sub}"),
     );
     let hint = format!("{}×{}   Shift+PgUp history   Super+1 Home", l.cols, l.rows);
-    let hw = t.measure(Face::Sans, l.pt(13.0), &hint);
-    t.draw(
-        fr,
-        w.right() - l.px(14.0) - hw,
-        base,
-        Face::Sans,
-        l.pt(13.0),
-        DIM,
-        &hint,
-    );
+    let hw = t.measure(hf, hp, &hint);
+    t.draw(fr, w.right() - pad - hw, base, hf, hp, hink, &hint);
     w
 }
 
@@ -1113,7 +1415,8 @@ pub fn draw_term_rows(
             let cursor =
                 focused && s.cursor_visible && s.view_back() == 0 && r == s.row && c == s.col;
             if cursor {
-                bg = GOLD;
+                // Where the owner types is what is active: the accent, not the grid's palette.
+                bg = theme::ACCENT;
                 fg = TERM_BG;
             }
             let x = rr.x + c as i32 * l.cell_w;
@@ -1146,6 +1449,8 @@ pub fn draw_term_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the checks that compare the shell against the kit read the table itself.
+    use lucina_app::ui::SCALE;
 
     #[test]
     fn layouts_fit_the_screens() {
@@ -1237,5 +1542,324 @@ mod tests {
         assert!(
             m.intersect(&v).is_empty() && m.intersect(&p).is_empty() && v.intersect(&p).is_empty()
         );
+    }
+
+    /// The shell's own source, the way the toolkit reads its own (`no_lengths_of_its_own`).
+    fn paint_source() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui.rs"))
+            .expect("the shell's own source")
+    }
+
+    /// The lines that are the terminal's *content* rather than its chrome: the ANSI table. Its sixteen
+    /// colours are what a program on the other end of the pty asks for, and no token of the interface
+    /// stands for them; `palette` is the same argument in code.
+    fn ansi_span(src: &str) -> (usize, usize) {
+        let lines: Vec<&str> = src.lines().collect();
+        let from = lines
+            .iter()
+            .position(|l| l.contains("const ANSI: [u32; 16]"))
+            .expect("the ANSI table is where the comment says");
+        let to = from
+            + lines[from..]
+                .iter()
+                .position(|l| l.trim_end() == "];")
+                .expect("the ANSI table is closed");
+        (from, to)
+    }
+
+    /// The paint code of these screens takes every colour from the kit: no `0x` literal anywhere
+    /// except the terminal's content table. Comments are free to say hex, and the tests below name
+    /// colours to check them, so this reads the code lines only, up to where `mod tests` begins.
+    #[test]
+    fn the_paint_code_names_no_colour_of_its_own() {
+        let src = paint_source();
+        let (ansi_from, ansi_to) = ansi_span(&src);
+        let paint_lines = paint_lines(&src);
+        let mut bad: Vec<String> = Vec::new();
+        for (n, line) in src.lines().enumerate() {
+            if n >= paint_lines {
+                break;
+            }
+            let t = line.trim();
+            if t.starts_with("//") || (ansi_from..=ansi_to).contains(&n) {
+                continue;
+            }
+            for i in t.match_indices("0x").map(|(i, _)| i) {
+                let hex: String = t[i + 2..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .collect();
+                if hex.len() == 6 {
+                    bad.push(format!("{}: {}", n + 1, t));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "the shell paints a colour the kit does not name:\n{}",
+            bad.join("\n")
+        );
+        // The table is still the only excuse, and still holds the sixteen colours it stands for.
+        let in_table = src
+            .lines()
+            .skip(ansi_from)
+            .take(ansi_to - ansi_from + 1)
+            .filter(|l| !l.trim().starts_with("//"))
+            .flat_map(|l| l.match_indices("0x").map(|_| ()))
+            .count();
+        assert_eq!(
+            in_table, 16,
+            "the ANSI table is where the content colours live"
+        );
+    }
+
+    /// How far up the file the paint code goes, as text: everything before the tests at the bottom.
+    /// The tests name colours and lengths to check them, so they are not evidence about the screens.
+    /// The marker is the module, not the attribute: a `#[cfg(test)]` re-export near the top is not the
+    /// bottom of the file.
+    fn paint_text(src: &str) -> &str {
+        let end = src
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("the shell's tests are at the bottom of the file");
+        let t = &src[..end];
+        // A marker that matched too early would leave these tests nothing to read, and pass.
+        assert!(
+            t.contains("fn draw_home") && t.contains("fn draw_settings"),
+            "the scan stops before the screens it is meant to read"
+        );
+        t
+    }
+
+    fn paint_lines(src: &str) -> usize {
+        paint_text(src).lines().count()
+    }
+
+    /// The same for sizes: the paint code scales a length that is a glass token, a number the kit
+    /// published, or one of the named dp of the reference layout — never a number written into the
+    /// middle of a screen. What it is allowed to keep is listed here with why, and every entry has to
+    /// still be in use: an excuse that outlives the length it excuses fails.
+    #[test]
+    fn the_paint_code_scales_no_length_of_its_own() {
+        let src = paint_source();
+        let allowed = [(
+            "1.0",
+            "the hairline: one device pixel is the least there is to draw",
+        )];
+        let paint_lines = paint_lines(&src);
+        let mut bad: Vec<String> = Vec::new();
+        for (n, line) in src.lines().enumerate() {
+            if n >= paint_lines {
+                break;
+            }
+            let t = line.trim();
+            if t.starts_with("//") {
+                continue;
+            }
+            for p in t
+                .match_indices("px(")
+                .chain(t.match_indices("pt("))
+                .map(|(i, _)| i)
+            {
+                let rest = &t[p + 3..];
+                let num: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                if !num.is_empty() && !allowed.iter().any(|(a, _)| *a == num) {
+                    bad.push(format!("{}: {}", n + 1, t));
+                }
+            }
+        }
+        for (a, why) in allowed {
+            assert!(
+                src.contains(&format!("px({a}")),
+                "px({a}) has no use left: {why}"
+            );
+        }
+        assert!(
+            bad.is_empty(),
+            "the shell scales a length that is not the kit's:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// Every `control` the shell reads really is published. The pairs are read out of the source, not
+    /// out of a list kept beside it, so an entry that stops being used stops being excused too.
+    #[test]
+    fn the_shell_only_asks_the_kit_for_what_it_publishes() {
+        let src = paint_source();
+        let asked = control_pairs(paint_text(&src));
+        assert!(asked.len() >= 12, "the shell hardly reads the tables");
+        for (which, what) in &asked {
+            assert!(
+                CONTROLS
+                    .iter()
+                    .chain(MEASURED.iter())
+                    .any(|c| c.control == *which && c.what == *what),
+                "the kit does not publish {which} / {what}"
+            );
+        }
+    }
+
+    /// The `control("…", "…")` pairs in `src`, in the order they are written. The whole text is walked
+    /// rather than the lines, because a call rustfmt has wrapped is the same request to the kit;
+    /// arguments that are not string literals belong to the helper's own signature.
+    fn control_pairs(src: &str) -> Vec<(String, String)> {
+        const OPEN: &str = "control(";
+        let mut out = Vec::new();
+        let mut rest = src;
+        while let Some(i) = rest.find(OPEN) {
+            rest = &rest[i + OPEN.len()..];
+            let end = match rest.find(')') {
+                Some(end) => end,
+                None => break,
+            };
+            let names: Vec<&str> = rest[..end]
+                .split(',')
+                .map(|a| a.trim())
+                .filter(|a| a.starts_with('"') && a.ends_with('"') && a.len() > 1)
+                .collect();
+            if names.len() == 2 {
+                out.push((
+                    names[0][1..names[0].len() - 1].into(),
+                    names[1][1..names[1].len() - 1].into(),
+                ));
+            }
+            rest = &rest[end..];
+        }
+        out
+    }
+
+    /// The ink of a role over the page's own ground is the colour the toolkit published for it: the
+    /// shell composites the same tokens the same way, it only has different surfaces to put them on.
+    #[test]
+    fn the_roles_over_the_page_are_the_kits_own() {
+        for s in SCALE.iter() {
+            assert_eq!(
+                role_ink(s.colour, GROUND),
+                s.rgb,
+                "{} over the page is not the kit's ink for it",
+                s.name
+            );
+        }
+    }
+
+    /// A role is scaled on the shell exactly as it is scaled in an app: the same `k`, the same
+    /// rounding, the same floor and ceiling.
+    #[test]
+    fn the_shell_scales_type_as_the_kit_does() {
+        for (w, h) in [(800u32, 600), (1024, 768), (1366, 768), (1920, 1080)] {
+            let mut text = Text::new();
+            let l = Layout::new(w, h, &mut text);
+            let t = lucina_app::ui::Theme::new(w, h);
+            for s in SCALE.iter() {
+                assert_eq!(l.pt(s.size), t.pt(s.size), "{} at {w}x{h}", s.name);
+            }
+        }
+    }
+
+    /// CPU time of this process, on the clock `view_bench` measures against.
+    fn cpu_us() -> i64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: a valid clock id and a timespec on the stack.
+        unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+        ts.tv_sec * 1_000_000 + ts.tv_nsec / 1_000
+    }
+
+    /// The launcher as the shell has it with forty apps on the four groups.
+    fn bench_home(l: &Layout) -> Home {
+        let ids = [
+            "terminal", "gallery", "desk", "camera", "notes", "player", "secrets", "viewer",
+            "codecor", "recorder",
+        ];
+        let mut home = Home::default();
+        for (i, id) in ids.iter().cycle().take(40).enumerate() {
+            home.tiles.push(Tile {
+                id: (*id).to_string(),
+                title: format!("App {i}"),
+                subtitle: String::new(),
+                icon: Icon::Text("A".into()),
+                action: TileAction::App(i),
+            });
+        }
+        home.sel = 0;
+        home.note = Some("Hello closed".into());
+        home.reflow(l);
+        home
+    }
+
+    /// What the launcher page costs to paint, before and after a change to it: the whole page and the tile
+    /// grid alone, on the CPU clock, the best and the mean of the rounds. A release run measures what the
+    /// device does (`cargo test -p lucina-shell --release -- --nocapture launcher_paint`); a debug run
+    /// keeps to one short round so the suite stays quick.
+    #[test]
+    fn launcher_paint_is_measured() {
+        // 300 frames x 5 rounds when optimised, as step 3b measured the toolkit; a short pass in debug.
+        let (frames, rounds) = if cfg!(debug_assertions) {
+            (20, 1)
+        } else {
+            (300, 5)
+        };
+        let mut text = Text::new();
+        let l = Layout::new(1024, 768, &mut text);
+        let mut fr = Frame::new(1024, 768);
+        let home = bench_home(&l);
+        let settings = SettingsPage {
+            sections: vec![("Network", vec![("Host".into(), "eth0".into())])],
+            adjustable: None,
+        };
+        let status = Status {
+            clock: "14:05 CET".into(),
+            battery: Some(crate::system::Battery {
+                percent: 83,
+                status: "Charging".into(),
+                details: Vec::new(),
+            }),
+            network: "eth0 192.0.2.101".into(),
+            online: true,
+            camera: None,
+        };
+        let model = "Samsung Galaxy Book Go";
+        let mut all = Vec::new();
+        let mut grid = Vec::new();
+        for _ in 0..rounds {
+            let t0 = cpu_us();
+            for _ in 0..frames {
+                draw_all(
+                    &mut fr,
+                    &mut text,
+                    &l,
+                    View::Home,
+                    &status,
+                    model,
+                    &home,
+                    None,
+                    &settings,
+                    0,
+                    None,
+                    None,
+                    None,
+                );
+            }
+            all.push((cpu_us() - t0) as f64 / frames as f64);
+            let t0 = cpu_us();
+            for _ in 0..frames {
+                draw_home(&mut fr, &mut text, &l, model, &home);
+            }
+            grid.push((cpu_us() - t0) as f64 / frames as f64);
+        }
+        let best = |v: &Vec<f64>| format!("{:.1}", v.iter().cloned().fold(f64::MAX, f64::min));
+        let mean = |v: &Vec<f64>| format!("{:.1}", v.iter().sum::<f64>() / v.len() as f64);
+        println!(
+            "launcher paint, {frames} frames x{rounds} rounds, CPU us/frame: whole page best {} mean {}; tile grid best {} mean {}",
+            best(&all),
+            mean(&all),
+            best(&grid),
+            mean(&grid)
+        );
+        println!("rounds: whole {:?} grid {:?}", all, grid);
     }
 }
