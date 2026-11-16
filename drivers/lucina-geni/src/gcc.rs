@@ -253,3 +253,39 @@ pub fn enable_branch(r: &mut impl Regs, branch: &Branch) -> (BranchState, u32, u
     };
     (state, r.read32(branch.cbcr), r.read32(branch.vote))
 }
+
+/// What [`disable_branch`] did, and what it leaves for the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BranchOff {
+    /// The bit was set and is clear now. `wait_us`: what Linux waits after it - 10 µs for a voted branch
+    /// (`clk_branch_wait`'s `!enabling && voted`, `clk-branch.c:74-75`), 0 when the branch is hardware gated or its
+    /// halt check is skipped (`clk_branch_in_hwcg_mode` and `BRANCH_HALT_SKIP` come first, `:68-72`).
+    Cleared { wait_us: u64 },
+    /// The bit was already clear: nothing was written, as the clock's own refcount never reached this caller.
+    WasOff,
+}
+
+/// `clk_branch2_disable` for one voted branch, as `clk_branch_toggle(hw, false)` does it: `clk_disable_regmap` clears
+/// only this clock's bits of the vote register, which every other QUP clock shares (`clk-branch.c:126-129`,
+/// `:95-101`, `clk_disable_regmap` of `drivers/clk/qcom/clk-regmap.c`). The wait it earns is reported, not slept: the
+/// caller has the clock.
+///
+/// The caller's bookkeeping is the clock framework's: this writes for a clock whose last user is going, so the vote
+/// bit is cleared once, not once per user (Linux's `clk core` counts enables, `drivers/clk/clk.c:1046-1060`).
+pub fn disable_branch(r: &mut impl Regs, branch: &Branch) -> (BranchOff, u32, u32) {
+    let vote = r.read32(branch.vote);
+    if vote & (1 << branch.vote_bit) == 0 {
+        return (BranchOff::WasOff, r.read32(branch.cbcr), vote);
+    }
+    r.write32(branch.vote, vote & !(1 << branch.vote_bit));
+    let cbcr = r.read32(branch.cbcr);
+    let gated = branch
+        .hwcg_bit
+        .is_some_and(|bit| cbcr != u32::MAX && cbcr & (1 << bit) != 0);
+    let wait_us = if branch.halt == Halt::Skip || gated {
+        0
+    } else {
+        10
+    };
+    (BranchOff::Cleared { wait_us }, cbcr, r.read32(branch.vote))
+}

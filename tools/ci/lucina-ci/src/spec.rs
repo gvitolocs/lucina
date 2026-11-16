@@ -166,6 +166,16 @@ pub(crate) fn shipped_transform(src: &str) -> (String, Vec<bool>, Vec<bool>) {
     (out, tag, carry)
 }
 
+/// The tokens of one `//@omit` line as rustc reads it (the tag removed), all on source line `line`.
+pub(crate) fn lex_omit_line(l: &str, line: usize) -> Vec<Tok> {
+    let body = l.trim_end().strip_suffix("//@omit").unwrap_or(l);
+    let mut v = lex(body, &[], &[]);
+    for x in &mut v {
+        x.line = line;
+    }
+    v
+}
+
 fn lex(src: &str, tag: &[bool], carry: &[bool]) -> Vec<Tok> {
     let c: Vec<char> = src.chars().collect();
     let n = c.len();
@@ -413,6 +423,11 @@ pub(crate) fn attr_end(t: &[Tok], i: usize) -> Option<usize> {
 
 /// The formatting-free text of tokens: comments gone, one space between tokens except around `,;(){}[]`, trailing commas
 /// dropped, attributes that cannot change what is proved dropped.
+/// Is this attribute one the lexer drops from the normalised stream (`doc`, `allow`, `inline`, ...)?
+pub(crate) fn is_ignored_attr(name: &str) -> bool {
+    IGNORED_ATTRS.contains(&name)
+}
+
 pub(crate) fn norm_tokens(toks: &[Tok]) -> String {
     let mut v: Vec<&str> = Vec::new();
     let mut i = 0;

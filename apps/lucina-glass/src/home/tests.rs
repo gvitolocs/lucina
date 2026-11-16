@@ -354,3 +354,82 @@ fn a_tall_stat_card_lists_its_tasks_and_opens_one() {
             .any(|(it, _)| matches!(it, Item::StatLine(..)))
     );
 }
+
+/// The slide compose before it took its spans from `slide_rules` (main 22e968aa6), kept to show the new one is byte-identical.
+fn slide_compose_before(
+    out: &mut [u32],
+    back: &[u32],
+    front: &[u32],
+    w: usize,
+    h: usize,
+    t: f32,
+    dir: i32,
+) {
+    let k = Ease::EMPHASIZED.at(t.clamp(0.0, 1.0));
+    let unit = (k * 65536.0).round().clamp(0.0, 65536.0) as u32;
+    let off = crate::home_rules::slide(w as u32, unit) as usize;
+    let drift = (w as u32 / 4 - crate::home_rules::slide(w as u32 / 4, unit)) as usize;
+    let dim = 256 - (141.0 * k) as u32;
+    for y in 0..h {
+        let row = y * w;
+        let (o, b, f) = (
+            &mut out[row..row + w],
+            &back[row..row + w],
+            &front[row..row + w],
+        );
+        let drift = drift.min(w);
+        if dir >= 0 {
+            let edge = off.min(w);
+            let shown = edge.min(w - drift);
+            for (o, v) in o[..shown].iter_mut().zip(&b[drift..drift + shown]) {
+                *o = darken(*v, dim);
+            }
+            o[shown..edge].fill(0);
+            o[edge..w].copy_from_slice(&f[..w - edge]);
+        } else {
+            let edge = w - off.min(w);
+            o[..edge].copy_from_slice(&f[off.min(w)..w]);
+            let start = edge.max(drift);
+            o[edge..start].fill(0);
+            for (o, v) in o[start..w].iter_mut().zip(&b[start - drift..w - drift]) {
+                *o = darken(*v, dim);
+            }
+        }
+    }
+}
+
+#[test]
+fn the_slide_compose_from_proved_spans_is_byte_identical() {
+    for &(w, h) in &[(37usize, 3usize), (1920, 2), (5, 1), (1, 1)] {
+        let back: Vec<u32> = (0..w * h)
+            .map(|i| (i as u32).wrapping_mul(2654435761))
+            .collect();
+        let front: Vec<u32> = (0..w * h)
+            .map(|i| (i as u32).wrapping_mul(40503) ^ 0x00ab_cdef)
+            .collect();
+        for dir in [1, -1] {
+            for step in 0..=64 {
+                let t = step as f32 / 64.0;
+                let (mut a, mut b) = (vec![7u32; w * h], vec![7u32; w * h]);
+                slide_compose(&mut a, &back, &front, w, h, t, dir);
+                slide_compose_before(&mut b, &back, &front, w, h, t, dir);
+                assert_eq!(a, b, "w {w} dir {dir} t {t}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_slide_spans_tile_every_row() {
+    for w in [0u32, 1, 2, 7, 640, 1920] {
+        for off in [0, 1, w / 3, w, w + 5] {
+            for drift in [0, 1, w / 4, w] {
+                for fwd in [true, false] {
+                    let s = crate::slide_rules::slide_spans(w, off, drift, fwd);
+                    assert_eq!(s.back_len + s.gap_len + s.front_len, w);
+                    assert!(s.back_src + s.back_len <= w && s.front_src + s.front_len <= w);
+                }
+            }
+        }
+    }
+}

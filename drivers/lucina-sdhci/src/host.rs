@@ -836,6 +836,24 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
     pub fn write(&mut self, lba: u64, sectors: u32, segments: &[DataSegment]) -> Result<(), Error> {
         self.transfer(true, lba, sectors, segments)
     }
+
+    /// `_mmc_sd_suspend`'s way to leave the card standing by: CMD7 with a zero argument and no response, which
+    /// deselects it (`drivers/mmc/core/sd.c:1704-1705`, `mmc_deselect_cards` at
+    /// `drivers/mmc/core/mmc_ops.c:122-125`, whose command is `_mmc_select_card(host, NULL)` with `cmd.arg = 0` and
+    /// `MMC_RSP_NONE`, `mmc_ops.c:103-110`). Linux takes this branch when the card cannot do a power-off notify
+    /// (`sd.c:1702-1705`); this driver never turns that feature on, so this is always the one that runs.
+    pub fn deselect_card(&mut self) -> Result<(), Error> {
+        self.command(7, 0, Rsp::None, None)?;
+        Ok(())
+    }
+
+    /// The card's way back, `mmc_sd_init_card` of `_mmc_sd_resume` (`sd.c:1737-1753`): the same idle, OCR, CID, CSD
+    /// and select sequence the card came up with. Linux's `mmc_power_up` before it is not ours to do - a rail write,
+    /// which patch 1356 leaves to the resource manager - and the card was never powered off, so this re-initialises
+    /// it where it stands.
+    pub fn resume_card(&mut self) -> Result<(), Error> {
+        self.init_card()
+    }
 }
 
 /// Before a jump to another kernel: resets the command and data lines, which stops the ADMA engine, and masks the

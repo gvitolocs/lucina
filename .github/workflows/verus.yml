@@ -134,8 +134,15 @@ jobs:
         if: matrix.phase == 'deep'
         run: |
           curl -fsSL --retry 5 -o "$HOME/tla2tools.jar" https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
-          echo "e1f11b75c4b5bc4478ba0ac5cb6ae28e40a01b0016bc33e0aa97da22dfdbcd7f  $HOME/tla2tools.jar" | sha256sum -c --status
-          java -version
+          sha256sum "$HOME/tla2tools.jar"
+          expected=7e53aa636dac8a3cb0533f343115c0548e03fc0ce5edc7739becf58d3d0fb84f
+          if echo "$expected  $HOME/tla2tools.jar" | sha256sum -c --status; then
+            java -version
+          else
+            actual=$(sha256sum "$HOME/tla2tools.jar" | cut -d' ' -f1)
+            echo "upstream rebuilt the pre-release jar; re-pin (expected $expected, got $actual)"
+            exit 1
+          fi
       - name: Run
         env:
           GROUP: ${{ matrix.group }}

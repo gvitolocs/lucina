@@ -486,6 +486,14 @@ fn uic(s: &mut State, cmd: u8) {
                 0
             }
         }
+        regs::UIC_DME_HIBER_ENTER => {
+            // The link goes to hibern8 with the host as the one who asked, which is what the driver checks for.
+            s.hibernated = true;
+            s.is |= regs::IS_UHES;
+            s.hcs = (s.hcs & !(regs::HCS_UPMCRS_MASK << regs::HCS_UPMCRS_SHIFT))
+                | (regs::HCS_UPMCRS_PWR_LOCAL << regs::HCS_UPMCRS_SHIFT);
+            0
+        }
         regs::UIC_DME_HIBER_EXIT if s.hibernated => {
             s.hibernated = false;
             s.is |= regs::IS_UHXS;
@@ -556,9 +564,15 @@ fn run_slot(s: &mut State, slot: u32) {
             0
         }
         upiu::TT_COMMAND => {
-            out[0] = upiu::TT_RESPONSE;
-            out[2] = req[2];
-            scsi(s, &req, dd, &segs, &mut out)
+            if s.hibernated {
+                // A link in hibern8 carries no command: the controller says so with the peer failure, as it does for
+                // a NOP OUT above and for a DME_PEER_GET.
+                upiu::OCS_PEER_COMM_FAILURE
+            } else {
+                out[0] = upiu::TT_RESPONSE;
+                out[2] = req[2];
+                scsi(s, &req, dd, &segs, &mut out)
+            }
         }
         _ => upiu::OCS_INVALID_CMD_TABLE_ATTR,
     };

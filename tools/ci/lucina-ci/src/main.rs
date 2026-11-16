@@ -11,12 +11,16 @@
 //!   lucina-ci spec --check [--base REF] [--allow WHY] [--merge-gate] | --list [--json]   freeze proof specifications against the base commit (src/spec.rs)
 //!   lucina-ci spec amend --list | --template   the amendment log a spec change needs (src/amend.rs, docs/ci/SPEC-AMENDMENTS.md)
 //!   lucina-ci roles --check [--base REF] [--merge-gate] | --list [--json|--summary] | --template KIND | --seed   who wrote the code, who proved it, who judged it (src/roles.rs, docs/ci/PROOF-ROLES.md)
+//!   lucina-ci mutants-precheck [--base REF] [--unit NAME] [--all] [--root DIR] [--merge-gate] [--quiet] [--verbose]   the text half of the mutants scripts without Verus (src/mutants_pre.rs)
+//!   lucina-ci roles --audit | --authors UNIT [--base REF]   the authorship walk alone: both sets per unit, or for one unit (report only)
 //!   lucina-ci green-commit|sync-plan|sync-gate the automatic public sync and the install gate (docs/ci/PUBLIC-SYNC.md)
 
 mod amend;
+mod authorship;
 mod coverage;
 mod fast;
 mod inventory;
+mod mutants_pre;
 mod roles;
 mod runner;
 mod snapshot;
@@ -202,6 +206,51 @@ fn merge_base(root: &Path, a: &str, b: &str) -> Option<String> {
     o.status
         .success()
         .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// `mutants-precheck [--base REF] [--unit NAME] [--all] [--root DIR] [--merge-gate] [--quiet] [--verbose]`: see src/mutants_pre.rs.
+/// Without `--unit` and `--all` the units are those a file changed against the merge base with REF (and the working tree) reaches.
+/// `--verbose` is what lists the twice-matching regions; without them the run says one line and no more.
+fn cmd_mutants_precheck(a: &Args) -> Result<i32, String> {
+    let root = match a.val("--root") {
+        Some(r) => PathBuf::from(r),
+        None => repo_root()?,
+    };
+    let units = mutants_pre::units_of(&root)?;
+    let only = a.val("--unit");
+    let all = a.has("--all");
+    let mut changed: Vec<String> = Vec::new();
+    if only.is_none() && !all {
+        let base_ref = a
+            .val("--base")
+            .ok_or("give --base REF, --unit NAME or --all")?;
+        let base = merge_base(&root, &base_ref, "HEAD")
+            .ok_or_else(|| format!("no merge base with {base_ref}"))?;
+        let mut set: BTreeSet<String> =
+            changed_between(&root, &base, "HEAD")?.into_iter().collect();
+        for args in [
+            &["diff", "--name-only", "HEAD"][..],
+            &["ls-files", "-o", "--exclude-standard"][..],
+        ] {
+            if let Ok(o) = Command::new("git").args(args).current_dir(&root).output() {
+                set.extend(
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .map(str::to_string),
+                );
+            }
+        }
+        changed = set.into_iter().collect();
+    }
+    let picked = mutants_pre::select(&units, &changed, only.as_deref(), all)?;
+    mutants_pre::run(
+        &root,
+        &picked,
+        only.is_some() || all || !a.has("--quiet"),
+        a.has("--merge-gate"),
+        mutants_pre::total_budget(picked.len()),
+        a.has("--verbose"),
+    )
 }
 
 /// `--event --ref --before --sha --output --plan`. Pull requests and main get everything; another branch gets what its changes
@@ -1283,6 +1332,7 @@ fn main() -> ExitCode {
         "snapshot" => cmd_snapshot(&a),
         "spec" => spec::cmd(&a.0),
         "roles" => roles::cmd(&a.0),
+        "mutants-precheck" => cmd_mutants_precheck(&a),
         "check-fast" => cmd_check_fast(&a),
         "perf" => cmd_perf(&a),
         "__alloc" => cmd_alloc(&a),
@@ -1361,6 +1411,49 @@ fn tool_exists(t: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// The most a non-required step may run at the merge gate, in seconds. The default is 180; `LUCINA_CHECK_FAST_MERGE_CAP_S` lets a
+/// test inject a small one (never a real 180 s sleep in the suite). The clock is the step's OWN run time: `scripts/check-fast` takes
+/// its queue slot (`bq run --class short --max-wait ...`) before this binary starts, so a step's limit starts after the wait.
+fn merge_step_cap() -> u64 {
+    std::env::var("LUCINA_CHECK_FAST_MERGE_CAP_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(180)
+}
+
+/// One step of `check-fast`, with the merge-gate limit applied. `Some(entry)` is a failure. At the merge gate a step past its limit
+/// is a failure that says so (`past its N s limit at merge`), never a skip: `spec`, `roles`, `trust`, `inventory` and `mutants-text`
+/// (FAST_STEPS_REQUIRED) keep their full limit, the others are capped at `cap`.
+#[allow(clippy::too_many_arguments)]
+fn gated_step(
+    name: &str,
+    cmd: &str,
+    kind: &str,
+    t: u64,
+    merge_gate: bool,
+    cap: u64,
+    b: &runner::Budget,
+    tc: &runner::Toolchain,
+    out: &str,
+) -> Result<Option<String>, String> {
+    let strict = FAST_STEPS_REQUIRED.contains(&name);
+    let t = if merge_gate && !strict { t.min(cap) } else { t };
+    if fast_step(name, cmd, kind, t, b, tc, out)?.0 {
+        return Ok(None);
+    }
+    let json =
+        fs::read_to_string(Path::new(out).join(format!("fast__{}.json", name.replace('/', "__"))))
+            .unwrap_or_default();
+    if merge_gate && runner::report_field(&json, "outcome").as_deref() == Some("timeout") {
+        let m = format!(
+            "{name}: past its {t} s limit at merge: the machine is loaded; retry when it is quieter, or run scripts/check-fast in the worktree"
+        );
+        println!("    {m}");
+        return Ok(Some(m));
+    }
+    Ok(Some(name.to_string()))
+}
+
 /// The steps this binary can run, in order. `check-fast` prints them first, and refuses to run when a required one is not here.
 const FAST_STEPS: &[&str] = &[
     "diffgate",
@@ -1372,10 +1465,11 @@ const FAST_STEPS: &[&str] = &[
     "spec",
     "roles",
     "trust",
+    "mutants-text",
     "proofs",
 ];
 /// Steps that must be registered in the binary, and that are refusals (not skips) when they run out of time at the merge gate.
-const FAST_STEPS_REQUIRED: &[&str] = &["inventory", "spec", "roles", "trust"];
+const FAST_STEPS_REQUIRED: &[&str] = &["inventory", "spec", "roles", "trust", "mutants-text"];
 
 /// The required steps that `registered` lacks: a `check-fast` built from a tree that predates a step must not pass for the full gate.
 fn missing_required_steps(registered: &[&str]) -> Vec<&'static str> {
@@ -1492,8 +1586,10 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
     };
     let mut failed: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
-    // In `lagent merge` the queue is shared: a step that runs long is skipped and says so, it does not hold up every other merge.
+    // At `lagent merge` a step that runs past its limit FAILS the merge: a gate that reports "0 failed" for tests it did not run is
+    // not a gate (2026-11-12: unit-tests skipped at the merge gate under load on SecretaryIOS). docs/ci/SHIFT-LEFT.md.
     let merge_gate = a.has("--merge-gate");
+    let cap = merge_step_cap();
     let step = |name: &str,
                 cmd: &str,
                 kind: &str,
@@ -1501,24 +1597,8 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
                 tc: &runner::Toolchain,
                 failed: &mut Vec<String>|
      -> Result<(), String> {
-        // `spec`, `roles`, `trust` and `inventory` are refusals when they run out of time at the merge gate, never skips.
-        let strict = FAST_STEPS_REQUIRED.contains(&name);
-        let t = if merge_gate && !strict { t.min(180) } else { t };
-        if !fast_step(name, cmd, kind, t, &b, tc, &out)?.0 {
-            let json = fs::read_to_string(
-                Path::new(&out).join(format!("fast__{}.json", name.replace('/', "__"))),
-            )
-            .unwrap_or_default();
-            let late = merge_gate
-                && !strict
-                && runner::report_field(&json, "outcome").as_deref() == Some("timeout");
-            failed.push(if late {
-                format!(
-                    "~{name}: past its {t} s limit at merge; run scripts/check-fast in the worktree"
-                )
-            } else {
-                name.to_string()
-            });
+        if let Some(f) = gated_step(name, cmd, kind, t, merge_gate, cap, &b, tc, &out)? {
+            failed.push(f);
         }
         Ok(())
     };
@@ -1665,6 +1745,26 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
             trust::BASELINE
         ));
     }
+    // The text half of the mutants scripts, without Verus (src/mutants_pre.rs): a formatter that re-wraps a shipped file must not turn a
+    // unit red on GitHub. Only the units the change reaches; nothing reached is silent.
+    if root.join(inventory::INVENTORY).exists() {
+        step(
+            "mutants-text",
+            &format!(
+                "{exe} mutants-precheck --quiet --base {base}{}",
+                if merge_gate { " --merge-gate" } else { "" }
+            ),
+            "script",
+            mutants_pre::STEP_TIMEOUT_S,
+            &none,
+            &mut failed,
+        )?;
+    } else if merge_gate {
+        failed.push(format!(
+            "mutants-text: skipped at the merge gate because {} is missing",
+            inventory::INVENTORY
+        ));
+    }
     let units = inventory::load(&root).unwrap_or_default();
     let list: Vec<String> = changed.iter().cloned().collect();
     let hits: Vec<&Unit> = units
@@ -1735,12 +1835,6 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
             }
         }
     }
-    let (late, failed): (Vec<String>, Vec<String>) =
-        failed.into_iter().partition(|f| f.starts_with('~'));
-    skipped.extend(
-        late.into_iter()
-            .map(|l| l.trim_start_matches('~').to_string()),
-    );
     let _ = fs::remove_dir_all(&out);
     for s in &skipped {
         println!("skipped  {s}");
@@ -1851,6 +1945,13 @@ mod tests {
     }
 
     #[test]
+    fn merge_step_cap_defaults_to_180_seconds() {
+        if std::env::var_os("LUCINA_CHECK_FAST_MERGE_CAP_S").is_none() {
+            assert_eq!(merge_step_cap(), 180);
+        }
+    }
+
+    #[test]
     fn check_fast_refuses_a_binary_without_a_required_step() {
         assert!(missing_required_steps(FAST_STEPS).is_empty());
         for gone in FAST_STEPS_REQUIRED {
@@ -1859,7 +1960,7 @@ mod tests {
         }
         assert_eq!(
             missing_required_steps(&["diffgate"]),
-            vec!["inventory", "spec", "roles", "trust"]
+            vec!["inventory", "spec", "roles", "trust", "mutants-text"]
         );
     }
 

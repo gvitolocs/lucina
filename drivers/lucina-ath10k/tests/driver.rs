@@ -231,7 +231,11 @@ fn memory_is_what_the_docs_say_and_stop_gives_it_all_back() {
         cfg.dma_bytes()
     );
     assert!(cfg.dma_bytes() < 11 * 1024 * 1024, "{}", cfg.dma_bytes());
-    assert!(D::arena_bytes(&cfg) < 128 * 1024, "{}", D::arena_bytes(&cfg));
+    assert!(
+        D::arena_bytes(&cfg) < 128 * 1024,
+        "{}",
+        D::arena_bytes(&cfg)
+    );
     r.d.stop();
     let (_, _, dma) = r.d.platform_mut().parts();
     assert_eq!(dma.live_bytes, 0);
@@ -338,7 +342,11 @@ fn a_whole_station_session() {
         ]
     );
     let vs = r.m.cmds(id::VDEV_START)[0].tlv();
-    assert_eq!(word(&vs[0].1, 2), 0, "first join: bcn_intval 0, as arvif has it");
+    assert_eq!(
+        word(&vs[0].1, 2),
+        0,
+        "first join: bcn_intval 0, as arvif has it"
+    );
     assert_eq!(word(&vs[0].1, 3), 0, "first join: dtim_period 0");
     assert_eq!(
         (r.m.wmi_log[start + 1].w(1), r.m.wmi_log[start + 1].w(2)),
@@ -359,7 +367,11 @@ fn a_whole_station_session() {
         .iter()
         .map(|c| (c.w(1), c.w(2)))
         .collect();
-    assert_eq!(limits, vec![(3, 40), (4, 40)], "TXPOWER_LIMIT2G, TXPOWER_LIMIT5G");
+    assert_eq!(
+        limits,
+        vec![(3, 40), (4, 40)],
+        "TXPOWER_LIMIT2G, TXPOWER_LIMIT5G"
+    );
 
     // auth and assoc over WMI by reference
     let mut auth = vec![0xb0, 0x00, 0, 0];
@@ -591,7 +603,11 @@ fn a_whole_station_session() {
         .iter()
         .map(|c| (c.w(1), c.w(2)))
         .collect();
-    assert_eq!(erp, vec![(7, 1), (8, 1)], "reset_erp_info: long slot and preamble before vdev_down");
+    assert_eq!(
+        erp,
+        vec![(7, 1), (8, 1)],
+        "reset_erp_info: long slot and preamble before vdev_down"
+    );
     // and a new join works; arvif keeps the timing it was told, so this vdev_start carries it
     let before = r.m.wmi_log.len();
     r.d.join(&join_params()).unwrap();
@@ -1480,7 +1496,7 @@ fn peer_assoc_vht_and_phymodes_match_the_c_branches() {
             // the larger of HT's and VHT's: exponent 3 gives 2^16 - 1, HT factor 0 gives 2^13 - 1
             assert_eq!(word(&t[0].1, 9), (1 << 16) - 1);
             // nss 2 from the map (two streams, then not supported), under our two chains
-            assert_eq!(word(&t[0].1, 12), 2);            // ath10k_peer_assoc_h_vht: vht on both bands; the vht_2g flag is 0 in the TLV map, so a 2.4 GHz peer
+            assert_eq!(word(&t[0].1, 12), 2); // ath10k_peer_assoc_h_vht: vht on both bands; the vht_2g flag is 0 in the TLV map, so a 2.4 GHz peer
             // gets no extra bit (0x0800_0000, WMI_PEER_VHT_2G elsewhere, is PMF here)
             let flags = word(&t[0].1, 5);
             assert_ne!(flags & wmi::peer_flags::VHT, 0, "case {i}");
@@ -1732,7 +1748,11 @@ fn a_command_and_its_completion_need_only_the_doorbell() {
     let reads = r.d.platform().regs.reads;
     r.d.start_scan(&ScanParams::default()).unwrap();
     r.d.poll(r.now);
-    assert_eq!(r.d.platform().regs.reads, reads, "no register is read to send");
+    assert_eq!(
+        r.d.platform().regs.reads,
+        reads,
+        "no register is read to send"
+    );
 }
 
 #[test]
@@ -1750,12 +1770,7 @@ fn power_save_is_enabled_after_pairwise_key_installation() {
         .iter()
         .filter(|e| matches!(e, Event::KeyInstalled { .. }))
         .collect();
-    assert_eq!(
-        keys,
-        vec![
-            &Event::KeyInstalled { pairwise: true }
-        ]
-    );
+    assert_eq!(keys, vec![&Event::KeyInstalled { pairwise: true }]);
     let inst = r.m.cmds(id::INSTALL_KEY);
     assert_eq!(inst.len(), 1);
     let t0 = inst[0].tlv();
@@ -1778,15 +1793,26 @@ fn power_save_is_enabled_after_pairwise_key_installation() {
             .collect();
     assert!(ps_cmds.contains(&(3, 100)), "{ps_cmds:?}");
     // Disabled at join, enabled once authorized: in that order, as mac80211 then ath10k_mac_vif_setup_ps.
-    let modes: Vec<u32> = r.m.cmds(id::STA_PS_MODE).iter().map(|c| word(&c.tlv()[0].1, 1)).collect();
+    let modes: Vec<u32> =
+        r.m.cmds(id::STA_PS_MODE)
+            .iter()
+            .map(|c| word(&c.tlv()[0].1, 1))
+            .collect();
     assert_eq!(modes, vec![0, 1], "disabled at join, then enabled");
-    let log: Vec<(u32, Vec<u8>)> = r.m.wmi_log.iter().map(|c| (c.id, c.tlv()[0].1.clone())).collect();
+    let log: Vec<(u32, Vec<u8>)> =
+        r.m.wmi_log
+            .iter()
+            .map(|c| (c.id, c.tlv()[0].1.clone()))
+            .collect();
     type Pred<'a> = &'a dyn Fn(&(u32, Vec<u8>)) -> bool;
     let at = |pred: Pred| log.iter().position(pred).unwrap();
     let authorize = at(&|c| c.0 == id::PEER_SET_PARAM && word(&c.1, 3) == 3 && word(&c.1, 4) == 1);
     let inactivity = at(&|c| c.0 == id::STA_PS_PARAM && word(&c.1, 1) == 3 && word(&c.1, 2) == 100);
     let enable = at(&|c| c.0 == id::STA_PS_MODE && word(&c.1, 1) == 1);
-    assert!(authorize < inactivity && inactivity < enable, "{authorize} {inactivity} {enable}");
+    assert!(
+        authorize < inactivity && inactivity < enable,
+        "{authorize} {inactivity} {enable}"
+    );
 }
 
 #[test]
@@ -1796,7 +1822,7 @@ fn power_save_is_disabled_when_power_save_is_false() {
             power_save: false,
             ..Config::default()
         },
-        ModelCfg::default()
+        ModelCfg::default(),
     );
     let ev = r.run(200);
     let _caps = ev
@@ -1815,7 +1841,11 @@ fn power_save_is_disabled_when_power_save_is_false() {
     let ev = r.run(20);
     assert!(ev.contains(&Event::VdevStarted), "{ev:?}");
     // Power save off at join, as with the default config.
-    let modes: Vec<u32> = r.m.wmi_log[start..].iter().filter(|c| c.id == id::STA_PS_MODE).map(|c| word(&c.tlv()[0].1, 1)).collect();
+    let modes: Vec<u32> = r.m.wmi_log[start..]
+        .iter()
+        .filter(|c| c.id == id::STA_PS_MODE)
+        .map(|c| word(&c.tlv()[0].1, 1))
+        .collect();
     assert_eq!(modes, vec![0]);
     let vs = r.m.cmds(id::VDEV_START)[0].tlv();
     assert_eq!(word(&vs[1].1, 0), 2437);
@@ -1973,7 +2003,11 @@ fn power_save_is_disabled_when_power_save_is_false() {
             .map(|c| (word(&c.tlv()[0].1, 1), word(&c.tlv()[0].1, 2)))
             .collect();
     assert!(!ps_cmds.contains(&(3, 100)), "{ps_cmds:?}");
-    let modes: Vec<u32> = r.m.cmds(id::STA_PS_MODE).iter().map(|c| word(&c.tlv()[0].1, 1)).collect();
+    let modes: Vec<u32> =
+        r.m.cmds(id::STA_PS_MODE)
+            .iter()
+            .map(|c| word(&c.tlv()[0].1, 1))
+            .collect();
     assert_eq!(modes, vec![0], "only the join's disabled");
 }
 
@@ -2027,7 +2061,11 @@ fn conf_tx_goes_per_ac_in_mac80211_order_with_the_uapsd_calls() {
     assert_eq!(sets[1], vec![zero, zero, to(acs[2]), to(acs[3])]);
     assert_eq!(sets[2], vec![to(acs[0]), zero, to(acs[2]), to(acs[3])]);
     assert_eq!(sets[3], acs.map(to).to_vec());
-    for (n, (chunk, (wmm_ac, prio))) in log.chunks(6).zip([(3, 7), (2, 5), (1, 2), (0, 0)]).enumerate() {
+    for (n, (chunk, (wmm_ac, prio))) in log
+        .chunks(6)
+        .zip([(3, 7), (2, 5), (1, 2), (0, 0)])
+        .enumerate()
+    {
         assert_eq!(chunk[0].id, wmi::cmd::VDEV_SET_WMM_PARAMS, "ac {n}");
         let ps: Vec<(u32, u32, u32)> = chunk[1..5].iter().map(|c| (c.id, c.w(1), c.w(2))).collect();
         assert_eq!(
@@ -2047,7 +2085,10 @@ fn conf_tx_goes_per_ac_in_mac80211_order_with_the_uapsd_calls() {
         assert_eq!(word(&t[0].1, 3), 1, "num_ac");
         let p = model::walk(&t[1].1);
         let w = |k: usize| word(&p[0].1, k);
-        assert_eq!((w(0), w(1), w(2), w(3), w(4)), (wmm_ac, prio, 0, u32::MAX, u32::MAX));
+        assert_eq!(
+            (w(0), w(1), w(2), w(3), w(4)),
+            (wmm_ac, prio, 0, u32::MAX, u32::MAX)
+        );
     }
 }
 
@@ -2060,7 +2101,12 @@ fn conf_tx_without_the_auto_trigger_services_sends_no_trigger_command() {
     let ids: Vec<u32> = r.m.wmi_log[before..].iter().map(|c| c.id).collect();
     assert_eq!(ids.len(), 4 * 5);
     assert!(!ids.contains(&wmi::cmd::STA_UAPSD_AUTO_TRIG));
-    assert_eq!(ids.iter().filter(|&&i| i == wmi::cmd::VDEV_SET_WMM_PARAMS).count(), 4);
+    assert_eq!(
+        ids.iter()
+            .filter(|&&i| i == wmi::cmd::VDEV_SET_WMM_PARAMS)
+            .count(),
+        4
+    );
 }
 
 #[test]
@@ -2081,11 +2127,16 @@ fn defaults_set_during_a_leave_go_after_vdev_down() {
     r.d.leave().unwrap();
     r.d.set_wmm(&wmm_acs()).unwrap();
     let ev = r.run(80);
-    assert!(ev.contains(&Event::Disconnected(Disconnect::Left)), "{ev:?}");
+    assert!(
+        ev.contains(&Event::Disconnected(Disconnect::Left)),
+        "{ev:?}"
+    );
     let ids: Vec<u32> = r.m.wmi_log[before..].iter().map(|c| c.id).collect();
     let down = ids.iter().position(|&i| i == id::VDEV_DOWN).unwrap();
     let stop = ids.iter().position(|&i| i == id::VDEV_STOP).unwrap();
-    let wmm: Vec<usize> = (0..ids.len()).filter(|&i| ids[i] == wmi::cmd::VDEV_SET_WMM_PARAMS).collect();
+    let wmm: Vec<usize> = (0..ids.len())
+        .filter(|&i| ids[i] == wmi::cmd::VDEV_SET_WMM_PARAMS)
+        .collect();
     assert_eq!(wmm.len(), 4);
     assert!(wmm.iter().all(|&i| i > down && i < stop), "{ids:x?}");
 }
@@ -2167,4 +2218,87 @@ fn linux_coherent_structures_come_from_the_coherent_allocator() {
         .collect();
     assert!(cached.len() > 1000, "{}", cached.len());
     assert!(!cached.contains(&ring));
+}
+
+// ---- the sleep (patch 1352) ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_sleep_is_a_pdev_suspend_the_target_answers_and_its_reverse_wakes_it() {
+    let mut r = joined();
+    r.d.leave().unwrap();
+    let ev = r.run(40);
+    assert!(
+        ev.contains(&Event::Disconnected(Disconnect::Left)),
+        "{ev:?}"
+    );
+    assert_eq!(
+        r.d.resume_target(),
+        Err(DriverError::WrongState),
+        "nothing has been put to sleep"
+    );
+    // `ath10k_core_stop` tries to suspend the target before the engines are stopped (`core.c:3291-3294`), which
+    // mac80211's suspend without WoWLAN reaches through `ieee80211_stop_device(local, true)` (`pm.c:174`), and asks for
+    // the interrupts to go with it (`WMI_PDEV_SUSPEND_AND_DISABLE_INTR`, `mac.c:5388-5389`).
+    r.d.suspend_target().unwrap();
+    assert!(!r.d.suspended(), "the wait for the answer has not ended");
+    r.run(8);
+    assert!(
+        r.d.suspended(),
+        "the target's suspend-complete message ends the wait (`htc.c:556-558`)"
+    );
+    assert_eq!(
+        r.d.start_scan(&ScanParams::default()),
+        Err(DriverError::NotReady),
+        "asleep: no command is taken"
+    );
+    assert!(!r.d.can_tx(), "asleep: nothing goes out");
+    let (rd, wr) = (r.d.platform().regs.reads, r.d.platform().regs.writes);
+    assert!(r.d.poll(r.now).is_empty(), "asleep: no event");
+    assert_eq!(
+        (r.d.platform().regs.reads, r.d.platform().regs.writes),
+        (rd, wr),
+        "asleep: nothing is read or written, as after `ath10k_snoc_irq_disable` (`snoc.c:829-836`)"
+    );
+    let susp = r.m.cmds(id::PDEV_SUSPEND);
+    assert_eq!(susp.len(), 1);
+    let t = susp[0].tlv();
+    assert_eq!((t[0].0, t[0].1.len()), (115, 8), "one suspend TLV");
+    assert_eq!(
+        (word(&t[0].1, 0), word(&t[0].1, 1)),
+        (0, 1),
+        "pdev_id, and opt 1: SUSPEND_AND_DISABLE_INTR (`wmi.h:4636-4643`)"
+    );
+    // The way back is the reverse: pdev-resume, then the link as after a cold start.
+    r.d.resume_target().unwrap();
+    assert!(!r.d.suspended());
+    r.run(8);
+    assert_eq!(r.m.cmds(id::PDEV_RESUME).len(), 1);
+    r.d.join(&join_params()).unwrap();
+    let ev = r.run(30);
+    assert!(ev.contains(&Event::VdevStarted), "{ev:?}");
+}
+
+#[test]
+fn a_target_that_never_answers_the_suspend_is_put_to_sleep_all_the_same() {
+    let mut mc = ModelCfg::default();
+    mc.silent.no_suspend_complete = true;
+    let (mut r, _) = up_with(mc);
+    r.d.suspend_target().unwrap();
+    // The wait is one second (`core.c:3276`), and its running out only prints (`core.c:3279`).
+    r.skip(900);
+    assert!(
+        !r.d.suspended(),
+        "the answer has not come, and is not yet given up on"
+    );
+    // `ath10k_core_stop` ignores the result and stops the interface (`core.c:3294`), so the sleep goes ahead.
+    r.skip(200);
+    assert!(
+        r.d.suspended(),
+        "the wait ended on its own, not on an answer"
+    );
+    r.d.resume_target().unwrap();
+    r.skip(20);
+    r.d.join(&join_params()).unwrap();
+    let ev = r.run(30);
+    assert!(ev.contains(&Event::VdevStarted), "{ev:?}");
 }

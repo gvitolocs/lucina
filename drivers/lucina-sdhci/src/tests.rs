@@ -677,3 +677,168 @@ fn a_slow_response_is_waited_on_the_interrupt() {
     );
     assert_eq!(m.0.borrow().mem[&0x9000_0000], 0xa5);
 }
+
+// ---------------------------------------------------------- patch 1356: the slot's way down and the card's way back
+
+/// One page of the GCC. The two branch registers answer a cleared enable bit with `CLK_OFF`, which is how
+/// `clk_branch2_check_halt` reads them (`drivers/clk/qcom/clk-branch.c:44-56`).
+#[derive(Clone)]
+struct GccPage {
+    regs: alloc::rc::Rc<core::cell::RefCell<[u32; 8]>>,
+}
+
+impl GccPage {
+    /// GPLL0's page: only `GPLL0_MODE` at offset 0, with the lock bit telling whether the PLL runs.
+    fn gpll0(locked: bool) -> Self {
+        Self {
+            regs: alloc::rc::Rc::new(core::cell::RefCell::new([
+                if locked { 1 << 31 } else { 0 },
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ])),
+        }
+    }
+
+    fn with(apps: u32, ahb: u32) -> Self {
+        Self {
+            regs: alloc::rc::Rc::new(core::cell::RefCell::new([0, apps, ahb, 0, 0, 0, 0, 0])),
+        }
+    }
+
+    fn raw(&self, off: usize) -> u32 {
+        self.regs.borrow()[off / 4]
+    }
+}
+
+impl Regs for GccPage {
+    fn read32(&self, offset: usize) -> u32 {
+        let v = self.regs.borrow()[offset / 4];
+        match offset / 4 {
+            // `APPS_CBCR` at index 1, `AHB_CBCR` at index 2: enabled reads running, gated reads off.
+            1 | 2 => {
+                if v & 1 == 0 {
+                    v | (1 << 31)
+                } else {
+                    v & !(1 << 31)
+                }
+            }
+            // `RCG_CMD` (index 3): hardware takes the update and clears `CMD_UPDATE` itself.
+            3 => 0,
+            _ => v,
+        }
+    }
+
+    fn write32(&self, offset: usize, value: u32) {
+        self.regs.borrow_mut()[offset / 4] = value;
+    }
+
+    fn read16(&self, offset: usize) -> u16 {
+        (self.read32(offset) & 0xffff) as u16
+    }
+
+    fn read8(&self, offset: usize) -> u8 {
+        (self.read32(offset) & 0xff) as u8
+    }
+
+    fn write16(&self, offset: usize, value: u16) {
+        self.write32(offset, value as u32);
+    }
+
+    fn write8(&self, offset: usize, value: u8) {
+        self.write32(offset, value as u32);
+    }
+}
+
+/// A clock that does not pass: the two helpers count their own looks, and this one says the update is done at once.
+struct NoWait;
+
+impl Clock for NoWait {
+    fn now_us(&self) -> u64 {
+        0
+    }
+
+    fn delay_us(&self, _us: u64) {}
+}
+
+#[test]
+fn a_sleep_gates_both_sdcc2_branches_and_leaves_the_rcg_alone() {
+    let gcc = GccPage::with(1, 1);
+    let after = soc::disable_clocks(&gcc);
+    assert!(!after.running(), "both branches read gated");
+    assert_eq!(gcc.raw(0x004) & 1, 0, "core (apps) gated");
+    assert_eq!(gcc.raw(0x008) & 1, 0, "iface (ahb) gated");
+    // The RCG is not touched: Linux's suspend gates the branches, and the rate comes back with the OPP on resume.
+    assert_eq!(
+        gcc.raw(0x010),
+        0,
+        "the RCG configuration is left as bring-up put it"
+    );
+}
+
+#[test]
+fn the_wake_votes_the_branches_back_before_it_reports_running() {
+    let gcc = GccPage::with(1, 1);
+    soc::disable_clocks(&gcc);
+    let gpll0 = GccPage::gpll0(true);
+    soc::restore_clocks(&gcc, &gpll0, &NoWait).expect("the branches come back");
+    assert!(soc::Clocks::read(&gcc).running());
+    assert_eq!(
+        gcc.raw(0x010),
+        (6 << 8) | 5,
+        "the 100 MHz configuration is set again"
+    );
+    // A GPLL0 that is not locked is refused without touching the branches, as bring-up's helper does.
+    let gcc = GccPage::with(0, 0);
+    assert!(soc::restore_clocks(&gcc, &GccPage::gpll0(false), &NoWait).is_err());
+    assert_eq!(gcc.raw(0x004), 0);
+}
+
+#[test]
+fn deselecting_the_card_is_cmd7_with_no_argument_and_no_response() {
+    let m = Model::new(true, SDHC_SECTORS, true);
+    let mut host = start(&m, QCOM_RO).unwrap();
+    let before = m.commands().len();
+    host.deselect_card().unwrap();
+    let cmds = m.commands();
+    assert_eq!(cmds.len(), before + 1, "one command, nothing else");
+    assert_eq!(
+        cmds.last(),
+        Some(&7),
+        "MMC_SELECT_CARD with a zero argument"
+    );
+    assert!(!m.0.borrow().selected, "and the card is no longer selected");
+}
+
+#[test]
+fn the_card_is_initialised_again_after_the_sleep() {
+    // Linux's `_mmc_sd_resume` is `mmc_power_up` and `mmc_sd_init_card` (`sd.c:1737-1753`); the rail write of the
+    // power-up is not ours, so the re-init is what this driver can do, and it is the whole sequence again.
+    let m = Model::new(true, SDHC_SECTORS, true);
+    let mut host = start(&m, QCOM_RO).unwrap();
+    let before = m.commands();
+    host.resume_card().unwrap();
+    let after = m.commands();
+    let sectors = host.card().sectors;
+    let fresh = &after[before.len()..];
+    assert_eq!(
+        fresh.first(),
+        Some(&0),
+        "the fresh sequence starts at idle state"
+    );
+    assert!(fresh.contains(&7), "and selects the card again on its way");
+    assert_eq!(
+        host.card().sectors,
+        sectors,
+        "the same card as before the sleep"
+    );
+    assert_eq!(
+        host.card().sectors,
+        sectors,
+        "the same card as before the sleep"
+    );
+}

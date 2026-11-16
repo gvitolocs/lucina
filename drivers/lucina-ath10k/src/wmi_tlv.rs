@@ -23,8 +23,9 @@
 //!   [`gen_pdev_set_regdomain`], [`gen_vdev_create`], [`gen_vdev_start`], [`gen_vdev_up`], [`gen_vdev_down`],
 //!   [`gen_vdev_delete`], [`gen_peer_create`], [`gen_peer_delete`] and [`gen_mgmt_tx_send`].
 //!
-//! * For a station ([`crate::driver`]): [`gen_pdev_set_param`], [`gen_vdev_stop`], [`gen_vdev_set_param`],
-//!   [`gen_vdev_install_key`], [`gen_peer_set_param`], [`gen_peer_assoc`], [`gen_scan_chan_list`], [`gen_set_psmode`],
+//! * For a station ([`crate::driver`]): [`gen_pdev_set_param`], [`gen_pdev_suspend`] and [`gen_pdev_resume`] for the
+//!   sleep, [`gen_vdev_stop`], [`gen_vdev_set_param`], [`gen_vdev_install_key`], [`gen_peer_set_param`],
+//!   [`gen_peer_assoc`], [`gen_scan_chan_list`], [`gen_set_psmode`],
 //!   [`gen_set_sta_ps`], [`gen_sta_keepalive_disable`], [`gen_scan_prob_req_oui`], [`gen_adaptive_qcs`] and the events
 //!   [`parse_mgmt_rx`], [`parse_mgmt_tx_compl`], [`parse_mgmt_tx_bundle_compl`], [`parse_peer_kickout`],
 //!   [`parse_roam`]. Service numbers are [`svc`]; [`svc_is_enabled`] is the bitmap test, four bits per word.
@@ -113,6 +114,10 @@ pub mod tag {
     pub const VHT_RATE_SET: u16 = 102;
     pub const STA_POWERSAVE_MODE_CMD: u16 = 108;
     pub const STA_POWERSAVE_PARAM_CMD: u16 = 109;
+    /// `WMI_TLV_TAG_STRUCT_PDEV_SUSPEND_CMD` (`wmi-tlv.h:678`).
+    pub const PDEV_SUSPEND_CMD: u16 = 115;
+    /// `WMI_TLV_TAG_STRUCT_PDEV_RESUME_CMD` (`wmi-tlv.h:679`).
+    pub const PDEV_RESUME_CMD: u16 = 116;
     pub const STA_KEEPALIVE_CMD: u16 = 127;
     pub const STA_KEEPALVE_ARP_RESPONSE: u16 = 128;
     pub const STA_UAPSD_AUTO_TRIG_CMD: u16 = 0x79;
@@ -175,6 +180,18 @@ pub mod cmd {
     pub const STA_UAPSD_AUTO_TRIG: u32 = 0x1c004;
     pub const STA_KEEPALIVE: u32 = 0x1c005;
     pub const RESMGR_ADAPTIVE_OCS: u32 = 0x21001;
+    /// `WMI_TLV_PDEV_SUSPEND_CMDID`: `WMI_TLV_CMD(WMI_TLV_GRP_SUSPEND)` with group 17 (`wmi-tlv.h:38,175`).
+    pub const PDEV_SUSPEND: u32 = 0x11001;
+    /// `WMI_TLV_PDEV_RESUME_CMDID` (`wmi-tlv.h:176`).
+    pub const PDEV_RESUME: u32 = 0x11002;
+}
+
+/// The `opt` of `ath10k_wmi_pdev_suspend_target` (`wmi-ops.h:552`): the anonymous enum of `wmi.h:4636-4643`, counted from 0.
+pub mod suspend_opt {
+    /// `WMI_PDEV_SUSPEND`.
+    pub const SUSPEND: u32 = 0;
+    /// `WMI_PDEV_SUSPEND_AND_DISABLE_INTR`, what `ath10k_core_stop` sends (`core.c:3294`).
+    pub const SUSPEND_AND_DISABLE_INTR: u32 = 1;
 }
 
 /// `enum wmi_tlv_service` values the driver looks at. Numbers from 128 up live in the extended map of the service
@@ -1538,6 +1555,26 @@ pub fn gen_vdev_stop(vdev_id: u32) -> Vec<u8> {
     one_vdev_cmd(tag::VDEV_STOP_CMD, vdev_id)
 }
 
+/// `ath10k_wmi_tlv_op_gen_pdev_suspend` (`wmi-tlv.c:1714-1733`): `struct wmi_tlv_pdev_suspend` (`wmi-tlv.h:1919-1922`),
+/// the pdev id word staying 0 ("not used yet") as in [`gen_pdev_set_param`]. `opt` is one of [`suspend_opt`];
+/// `ath10k_core_stop` uses `WMI_PDEV_SUSPEND_AND_DISABLE_INTR` (`core.c:3294`).
+pub fn gen_pdev_suspend(opt: u32) -> Vec<u8> {
+    let mut o = Out::new();
+    o.tlv(tag::PDEV_SUSPEND_CMD, 8);
+    o.u32(0);
+    o.u32(opt);
+    o.finish()
+}
+
+/// `ath10k_wmi_tlv_op_gen_pdev_resume` (`wmi-tlv.c:1735-1754`): `struct wmi_tlv_resume_cmd` (`wmi-tlv.h:1976-1978`),
+/// whose one word the C leaves 0.
+pub fn gen_pdev_resume() -> Vec<u8> {
+    let mut o = Out::new();
+    o.tlv(tag::PDEV_RESUME_CMD, 4);
+    o.u32(0);
+    o.finish()
+}
+
 /// `ath10k_wmi_tlv_op_gen_vdev_set_param`.
 pub fn gen_vdev_set_param(vdev_id: u32, param_id: u32, value: u32) -> Vec<u8> {
     let mut o = Out::new();
@@ -1578,7 +1615,12 @@ pub fn gen_vdev_wmm_conf(vdev_id: u32, acs: &[WmmAc; 4]) -> Vec<u8> {
 /// `ath10k_wmi_tlv_op_gen_vdev_sta_uapsd` for one access category: `ath10k_conf_tx_uapsd` calls it per AC when the
 /// firmware has an auto-trigger service, to switch the firmware's own U-APSD trigger off. `wmm_ac` is the AC's index
 /// (BE 1, BK 0, VI 2, VO 3) and `user_priority` its TID.
-pub fn gen_vdev_sta_uapsd(vdev_id: u32, peer: &[u8; 6], wmm_ac: u32, user_priority: u32) -> Vec<u8> {
+pub fn gen_vdev_sta_uapsd(
+    vdev_id: u32,
+    peer: &[u8; 6],
+    wmm_ac: u32,
+    user_priority: u32,
+) -> Vec<u8> {
     let mut o = Out::new();
     o.tlv(tag::STA_UAPSD_AUTO_TRIG_CMD, 16);
     o.u32(vdev_id);
@@ -1939,18 +1981,92 @@ mod wmm_conf_tests {
     /// The bytes of `ath10k_wmi_tlv_op_gen_vdev_wmm_conf`: `struct wmi_tlv_vdev_set_wmm_cmd`, a dummy word before each category.
     #[test]
     fn each_category_is_a_dummy_word_and_six_fields() {
-        let be = WmmAc { cwmin: 15, cwmax: 1023, aifs: 3, txop: 0 };
-        let vo = WmmAc { cwmin: 3, cwmax: 7, aifs: 2, txop: 1504 };
+        let be = WmmAc {
+            cwmin: 15,
+            cwmax: 1023,
+            aifs: 3,
+            txop: 0,
+        };
+        let vo = WmmAc {
+            cwmin: 3,
+            cwmax: 7,
+            aifs: 2,
+            txop: 1504,
+        };
         let bytes = gen_vdev_wmm_conf(5, &[be, WmmAc::default(), WmmAc::default(), vo]);
         assert_eq!(bytes.len(), 4 + 4 + 4 * 28);
-        let word = |i: usize| u32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]);
+        let word = |i: usize| {
+            u32::from_le_bytes([
+                bytes[i * 4],
+                bytes[i * 4 + 1],
+                bytes[i * 4 + 2],
+                bytes[i * 4 + 3],
+            ])
+        };
         // `struct wmi_tlv`: the length, then the tag.
         assert_eq!(word(0) & 0xffff, 116);
         assert_eq!(word(0) >> 16, 199);
         assert_eq!(word(1), 5);
         // BE: dummy, cwmin, cwmax, aifs, txop, acm, no_ack.
-        assert_eq!((word(2), word(3), word(4), word(5), word(6), word(7), word(8)), (0, 15, 1023, 3, 0, 0, 0));
+        assert_eq!(
+            (
+                word(2),
+                word(3),
+                word(4),
+                word(5),
+                word(6),
+                word(7),
+                word(8)
+            ),
+            (0, 15, 1023, 3, 0, 0, 0)
+        );
         // VO is the last category.
-        assert_eq!((word(23), word(24), word(25), word(26), word(27), word(28), word(29)), (0, 3, 7, 2, 1504, 0, 0));
+        assert_eq!(
+            (
+                word(23),
+                word(24),
+                word(25),
+                word(26),
+                word(27),
+                word(28),
+                word(29)
+            ),
+            (0, 3, 7, 2, 1504, 0, 0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod suspend_tests {
+    use super::*;
+
+    fn word(bytes: &[u8], i: usize) -> u32 {
+        let b = i * 4;
+        u32::from_le_bytes([bytes[b], bytes[b + 1], bytes[b + 2], bytes[b + 3]])
+    }
+
+    /// The bytes of `ath10k_wmi_tlv_op_gen_pdev_suspend` and `ath10k_wmi_tlv_op_gen_pdev_resume` (`wmi-tlv.c:1714-1754`).
+    #[test]
+    fn pdev_suspend_and_resume_are_one_tag_and_its_words() {
+        // `struct wmi_tlv_pdev_suspend` (`wmi-tlv.h:1919-1922`): the length 8, then the tag 115, then pdev_id and opt.
+        let susp = gen_pdev_suspend(suspend_opt::SUSPEND_AND_DISABLE_INTR);
+        assert_eq!(susp.len(), 12);
+        assert_eq!(word(&susp, 0) & 0xffff, 8);
+        assert_eq!(word(&susp, 0) >> 16, tag::PDEV_SUSPEND_CMD as u32);
+        assert_eq!(word(&susp, 1), 0, "pdev_id, not used yet");
+        assert_eq!(
+            word(&susp, 2),
+            1,
+            "WMI_PDEV_SUSPEND_AND_DISABLE_INTR (wmi.h:4642)"
+        );
+        // `struct wmi_tlv_resume_cmd` (`wmi-tlv.h:1976-1978`): the length 4, then the tag 116, then its reserved word.
+        let res = gen_pdev_resume();
+        assert_eq!(res.len(), 8);
+        assert_eq!(word(&res, 0) & 0xffff, 4);
+        assert_eq!(word(&res, 0) >> 16, tag::PDEV_RESUME_CMD as u32);
+        assert_eq!(word(&res, 1), 0, "the reserved word");
+        // `WMI_TLV_PDEV_SUSPEND_CMDID` and `WMI_TLV_PDEV_RESUME_CMDID` (`wmi-tlv.h:175-176`).
+        assert_eq!(cmd::PDEV_SUSPEND, 0x11001);
+        assert_eq!(cmd::PDEV_RESUME, 0x11002);
     }
 }

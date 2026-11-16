@@ -23,6 +23,7 @@ pub mod home_rules;
 pub mod icons;
 pub mod imagery;
 pub mod layouts;
+pub mod slide_rules;
 // rules.rs is what Verus reads, so it keeps to the arithmetic Verus models (`%`, `/`), not the std helpers clippy suggests.
 #[allow(clippy::manual_is_multiple_of, clippy::manual_div_ceil)]
 pub mod rules;

@@ -31,12 +31,15 @@
 //!   and ACTIVE only (`clk-rpmh.c:81-83`, `:100-101`). The resource's state is the union of the two (`:195-197`), and each state
 //!   whose bit changed is sent, SLEEP then WAKE then ACTIVE, the ACTIVE one waiting when anything is on (`:152-185`). On this SoC
 //!   GCC holds `bi_tcxo` for good: GPLL0's parent is `bi_tcxo`, and every running QUP, UFS and USB clock comes from GPLL0. So a
-//!   remote processor's handover lets go of its own reference and XO stays on.
+//!   remote processor's handover lets go of its own reference and XO stays on. With `lucina.suspend.xo=ao` ([`Votes::gcc_xo`],
+//!   patch 1354) GCC's hold is cast as Linux's GCC casts it: `bi_tcxo_ao` for GCC itself, `bi_tcxo` for [`Client::Gpll0`].
 //!
 //! The device tree's consumers that have no driver voting here (GCC, the serial engines, UFS, USB, the display, SD) are one client,
 //! [`Client::Tree`], whose level is the highest of the consumers that hold a domain ([`Votes::vote_consumer`]), as genpd takes the
 //! highest of its devices' performance states (`_genpd_reeval_performance_state`, `drivers/pmdomain/core.c:313`). Each consumer
-//! is kept on its own, so it can be lowered or let go without touching the others.
+//! is kept on its own, so it can be lowered or let go without touching the others, and powered off and on again
+//! ([`Votes::power_consumer`], patch 1354): genpd's runtime power-off of one device, whose performance state leaves the
+//! aggregate while it is off and comes back with its power-on (`rpmhpd_power_off`, `rpmhpd_power_on`, `rpmhpd.c:741-773`).
 
 use alloc::format;
 use alloc::string::String;
@@ -62,12 +65,15 @@ pub enum Client {
     Venus = 2,
     /// The device tree's consumers that no driver here votes for ([`Votes::vote_consumer`]).
     Tree = 3,
-    /// GCC, which holds XO as the parent of its PLLs.
+    /// GCC, which holds XO as the parent of its PLLs (with `lucina.suspend.xo=ao`, `bi_tcxo_ao` as the critical CPUSS AHB clock's).
     Gcc = 4,
+    /// GPLL0's users, which hold `bi_tcxo` as GPLL0's parent (`gcc-sc7180.c:43-46`) with `lucina.suspend.xo=ao`.
+    Gpll0 = 5,
 }
 
 /// Names for the report, by client number.
-pub const CLIENT_NAMES: [&str; CLIENTS] = ["modem", "adsp", "venus", "tree", "gcc", "-", "-", "-"];
+pub const CLIENT_NAMES: [&str; CLIENTS] =
+    ["modem", "adsp", "venus", "tree", "gcc", "gpll0", "-", "-"];
 
 /// The domains that take votes: the full ones of `sc7180_rpmhpds`.
 pub const DOMAINS: [usize; 6] = [
@@ -171,6 +177,8 @@ pub struct Votes {
     xo_called: bool,
     /// The device tree's consumers that hold a domain, each as [`Votes::vote_consumer`] last gave it.
     tree: Vec<Consumer>,
+    /// The ones powered off ([`Votes::power_consumer`]), with the state they get back at their power-on.
+    tree_off: Vec<Consumer>,
     /// Every WAKE and SLEEP value sent, for `rpmh_flush`.
     pub cache: Cache,
 }
@@ -209,6 +217,7 @@ impl Votes {
             xo_last: 0,
             xo_called: false,
             tree: Vec::new(),
+            tree_off: Vec::new(),
             cache: Cache::new(),
         }
     }
@@ -397,7 +406,22 @@ impl Votes {
     /// device (`genpd_set_performance_state`, `drivers/pmdomain/core.c:470`), the domain taking the highest of its devices'
     /// (`_genpd_reeval_performance_state`, `:313`). The consumers are cast together as [`Client::Tree`]: at the highest state of
     /// those that hold `d`, and on while any does.
+    ///
+    /// A consumer that is powered off ([`Votes::power_consumer`]) keeps a new state for its power-on and sends nothing, as
+    /// genpd keeps a suspended device's state in `rpm_pstate` (`genpd_dev_pm_set_performance_state`); one let go is gone.
     pub fn vote_consumer(&mut self, node: &str, d: usize, on: bool, state: u32) -> Vec<Cmd> {
+        if let Some(i) = self
+            .tree_off
+            .iter()
+            .position(|c| c.node == node && c.domain == d)
+        {
+            if on {
+                self.tree_off[i].state = state;
+            } else {
+                self.tree_off.remove(i);
+            }
+            return Vec::new();
+        }
         let at = self
             .tree
             .iter()
@@ -414,18 +438,57 @@ impl Votes {
             }),
             (None, false) => {}
         }
-        let held = self
-            .tree
-            .iter()
-            .filter(|c| c.domain == d)
-            .map(|c| c.state)
-            .max();
+        self.vote_tree(d)
+    }
+
+    /// [`Client::Tree`]'s vote on `d` from the consumers that are on.
+    fn vote_tree(&mut self, d: usize) -> Vec<Cmd> {
+        let held = tree_level(&self.tree, d);
         self.vote(Client::Tree, d, held.is_some(), held.unwrap_or(0))
+    }
+
+    /// genpd's runtime power-off (`on` false) or power-on of the device tree consumer `node` (its path, or its last
+    /// component: [`crate::sleep_votes::node_is`]), on every domain it holds. Off, its state leaves [`Client::Tree`]'s
+    /// aggregate, so the domain is what the consumers still on ask for, and off (`rpmhpd_power_off`, `rpmhpd.c:759-773`,
+    /// corner 0 into `rpmhpd_aggregate_corner`, `:692-739`) when none is; ACTIVE, WAKE and SLEEP of the domain and its
+    /// active-only peer are worked out again. On, the state it had comes back (`rpmhpd_power_on`, `:741-757`). Turning off
+    /// a consumer that is off, or on one that is on, sends nothing. Returns how many (consumer, domain) entries changed
+    /// and the commands, in order.
+    pub fn power_consumer(&mut self, node: &str, on: bool) -> (usize, Vec<Cmd>) {
+        let (from, to) = if on {
+            (&mut self.tree_off, &mut self.tree)
+        } else {
+            (&mut self.tree, &mut self.tree_off)
+        };
+        let mut domains: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i < from.len() {
+            if crate::sleep_votes::node_is(&from[i].node, node) {
+                let c = from.remove(i);
+                if !domains.contains(&c.domain) {
+                    domains.push(c.domain);
+                }
+                to.push(c);
+            } else {
+                i += 1;
+            }
+        }
+        let changed = domains.len();
+        let mut out = Vec::new();
+        for d in domains {
+            out.extend(self.vote_tree(d));
+        }
+        (changed, out)
     }
 
     /// The device tree consumers that hold a domain now.
     pub fn consumers(&self) -> &[Consumer] {
         &self.tree
+    }
+
+    /// The device tree consumers that are powered off ([`Votes::power_consumer`]), each with the state of its power-on.
+    pub fn consumers_off(&self) -> &[Consumer] {
+        &self.tree_off
     }
 
     /// `client` takes (`on`) or lets go of `bi_tcxo`, the XO clock valid in all three states: a consumer's `clk_prepare` or
@@ -481,6 +544,19 @@ impl Votes {
         }
         self.xo_last = aggr;
         self.xo_called = true;
+        out
+    }
+
+    /// GCC takes XO at its start. Today's cast (`ao` false): GCC holds `bi_tcxo`. With `ao` (`lucina.suspend.xo=ao`), as
+    /// Linux's GCC: `bi_tcxo_ao` for the critical `gcc_cpuss_ahb_clk` (`gcc-sc7180.c:979`, its source on
+    /// `gcc_parent_data_0_ao`, `:172-176`, `:262-275`), then `bi_tcxo` for GPLL0 (`:43-46`), held by [`Client::Gpll0`] for
+    /// as long as GPLL0's users run. Nothing here counts them, so nothing lets that hold go: XO stays on in all three states.
+    pub fn gcc_xo(&mut self, ao: bool) -> Vec<Cmd> {
+        if !ao {
+            return self.xo(Client::Gcc, true);
+        }
+        let mut out = self.xo_ao(Client::Gcc, true);
+        out.extend(self.xo(Client::Gpll0, true));
         out
     }
 
@@ -569,6 +645,12 @@ impl Votes {
                         k.node, SC7180[y].name, k.state
                     ));
                 }
+                for k in self.tree_off.iter().filter(|k| k.domain == y) {
+                    s.push_str(&format!(
+                        "    tree: {} is off: holds nothing on {}, level {} at its power-on\n",
+                        k.node, SC7180[y].name, k.state
+                    ));
+                }
             }
         }
         let holders = |h: &[bool; CLIENTS]| -> Vec<&str> {
@@ -612,6 +694,13 @@ pub struct Consumer {
     pub node: String,
     pub domain: usize,
     pub state: u32,
+}
+
+/// The [`Client::Tree`] level of domain `d` from the consumers that are on: the highest of their states, `None` when no
+/// consumer holds it (genpd's `_genpd_reeval_performance_state`, `drivers/pmdomain/core.c:313`, over the devices that are
+/// on; with none on, the domain is powered off).
+pub fn tree_level(on: &[Consumer], d: usize) -> Option<u32> {
+    on.iter().filter(|c| c.domain == d).map(|c| c.state).max()
 }
 
 /// The [`Client::Tree`] level of each domain: `Some(highest state)` where any consumer holds it. Linux would vote each consumer's
@@ -1263,6 +1352,441 @@ mod tests {
         assert!(
             c.contains("0x30050 gfx.lvl: sleep - wake 0x0; flush writes nothing\n"),
             "{c}"
+        );
+    }
+
+    /// The laptop's boot as patch 1354 runs it: [`laptop_boot`]'s per-consumer sequence, GCC's XO taken by
+    /// [`Votes::gcc_xo`] (`ao` is `lucina.suspend.xo=ao`).
+    fn laptop_boot_1354(ao: bool) -> (Votes, Vec<Cmd>) {
+        let mut v = laptop();
+        let mut cmds = v.gcc_xo(ao);
+        cmds.extend(v.proxy(Client::Modem, &[sc7180::CX, sc7180::MSS], true));
+        cmds.extend(v.xo(Client::Modem, true));
+        cmds.extend(v.proxy(Client::Adsp, &[sc7180::LCX, sc7180::LMX], true));
+        cmds.extend(v.xo(Client::Adsp, true));
+        cmds.extend(v.vote(Client::Venus, sc7180::CX, true, 384));
+        cmds.extend(v.xo(Client::Modem, false));
+        cmds.extend(v.proxy(Client::Modem, &[sc7180::CX, sc7180::MSS], false));
+        cmds.extend(v.xo(Client::Adsp, false));
+        cmds.extend(v.proxy(Client::Adsp, &[sc7180::LCX, sc7180::LMX], false));
+        cmds.extend(v.vote(Client::Venus, sc7180::CX, false, 0));
+        for (node, level) in LAPTOP_TREE {
+            cmds.extend(v.vote_consumer(node, sc7180::CX, true, level));
+        }
+        cmds.extend(v.sync());
+        (v, cmds)
+    }
+
+    /// What the hooks of a sleep send through this table, as the kernel runs them: the scanout's way down (its engine
+    /// stopped), Venus's power-down after its `cx`, then the scanout's way back. Venus's paths are the interconnect
+    /// table's, not this one's.
+    fn sleep_cycle(v: &mut Votes, scanout: bool, media: bool) -> Vec<Cmd> {
+        use crate::sleep_votes::{self, Release};
+        let mut cmds = Vec::new();
+        let mut apply = |v: &mut Votes, rs: &[Release], on: bool| {
+            for r in rs {
+                if let Release::Consumer(node) = r {
+                    cmds.extend(v.power_consumer(node, on).1);
+                }
+            }
+        };
+        // The MDP clock runs through a sleep here (no display clock is gated), so the DPU keeps its vote.
+        apply(v, sleep_votes::scanout_down(scanout, true, true), false);
+        apply(v, sleep_votes::venus_down(media), false);
+        apply(v, sleep_votes::scanout_up(scanout), true);
+        cmds
+    }
+
+    /// The disk's and USB's hooks through this table (patch 1355), as the kernel runs them: on the way down the USB host
+    /// before the disk (USB registers after it, and the list goes down in reverse), each after its device is down; on
+    /// the way back the disk first, each before its device comes up. `storage` and `usb` are the two switches,
+    /// `glue_clocks_on` whether the USB glue's clocks still run (they do: nothing here gates them).
+    fn disk_and_usb_down(
+        v: &mut Votes,
+        storage: bool,
+        usb: bool,
+        glue_clocks_on: bool,
+    ) -> Vec<Cmd> {
+        use crate::sleep_votes;
+        let mut cmds = Vec::new();
+        let rs = sleep_votes::usb_down(usb, glue_clocks_on)
+            .iter()
+            .chain(sleep_votes::ufs_down(storage));
+        for r in rs {
+            if let sleep_votes::Release::Consumer(node) = r {
+                cmds.extend(v.power_consumer(node, false).1);
+            }
+        }
+        cmds
+    }
+
+    /// The way back of [`disk_and_usb_down`].
+    fn disk_and_usb_up(v: &mut Votes, storage: bool, usb: bool) -> Vec<Cmd> {
+        use crate::sleep_votes;
+        let mut cmds = Vec::new();
+        for r in sleep_votes::ufs_up(storage)
+            .iter()
+            .chain(sleep_votes::usb_up(usb))
+        {
+            if let sleep_votes::Release::Consumer(node) = r {
+                cmds.extend(v.power_consumer(node, true).1);
+            }
+        }
+        cmds
+    }
+
+    /// Patch 1355 on the laptop's consumers, with both switches: the disk's host and PHY power off, which lowers no
+    /// level (they ask for 0, and the others for more), and the USB glue keeps its `nom` because its clocks run; so the
+    /// sleep sends nothing, and the way back puts every consumer on and the report as it was.
+    #[test]
+    fn the_disk_and_usb_sleep_on_the_laptop() {
+        let (mut v, _) = laptop_boot_1354(false);
+        let before = v.report();
+        let cache: Vec<_> = v.cache.entries().collect();
+        assert!(disk_and_usb_down(&mut v, true, true, true).is_empty());
+        let off: Vec<&str> = v.consumers_off().iter().map(|c| c.node.as_str()).collect();
+        assert_eq!(off, ["/soc@0/ufshc@1d84000", "/soc@0/phy@1d87000"]);
+        assert_eq!(v.consumers().len(), LAPTOP_TREE.len() - 2);
+        let r = v.report();
+        assert!(
+            r.contains("    tree: /soc@0/ufshc@1d84000 is off: holds nothing on cx, level 0 at its power-on\n"),
+            "{r}"
+        );
+        assert!(
+            r.contains("    tree: /soc@0/usb@a6f8800 holds cx at level 256\n"),
+            "{r}"
+        );
+        assert_eq!(v.sent(sc7180::CX), Some(5));
+        assert!(disk_and_usb_up(&mut v, true, true).is_empty());
+        assert!(v.consumers_off().is_empty());
+        // A consumer powered on again is listed after the others (`power_consumer` appends it), so the lines are the
+        // same but not in the same order.
+        let lines = |r: &str| {
+            let mut l: Vec<String> = r.lines().map(String::from).collect();
+            l.sort();
+            l
+        };
+        assert_eq!(lines(&v.report()), lines(&before));
+        assert_eq!(v.cache.entries().collect::<Vec<_>>(), cache);
+    }
+
+    /// The same three consumers when they are the last ones up but GCC's: the disk's power-off still lowers nothing
+    /// (GCC's level-0 consumer keeps `cx` at its first corner either way), while the USB glue's `nom` is all that holds
+    /// `cx` at corner 5 and `mx` at 2, and goes only with the glue's clocks off. Back on, both corners return.
+    #[test]
+    fn the_disk_and_usb_consumers_with_the_others_off() {
+        let (mut v, _) = laptop_boot_1354(false);
+        for (node, _) in LAPTOP_TREE {
+            if ![
+                "/soc@0/clock-controller@100000",
+                "/soc@0/ufshc@1d84000",
+                "/soc@0/phy@1d87000",
+                "/soc@0/usb@a6f8800",
+            ]
+            .contains(&node)
+            {
+                v.power_consumer(node, false);
+            }
+        }
+        let at = |v: &Votes| (v.sent(sc7180::CX).unwrap(), v.sent(sc7180::MX).unwrap());
+        assert_eq!(at(&v), (5, 2));
+        // (storage, usb, glue clocks on) -> (cx, mx) after the way down, and whether anything was sent.
+        type Row = ((bool, bool, bool), (usize, usize), bool);
+        let table: [Row; 5] = [
+            ((false, false, true), (5, 2), false),
+            ((false, true, true), (5, 2), false),
+            ((true, false, true), (5, 2), false),
+            ((true, true, true), (5, 2), false),
+            ((true, true, false), (1, 1), true),
+        ];
+        for ((storage, usb, clocks), corners, sends) in table {
+            let down = disk_and_usb_down(&mut v, storage, usb, clocks);
+            assert_eq!(at(&v), corners, "{storage} {usb} {clocks}");
+            assert_eq!(!down.is_empty(), sends, "{storage} {usb} {clocks}");
+            assert!(down.iter().all(|c| !c.cmd.wait), "going down never waits");
+            let up = disk_and_usb_up(&mut v, storage, usb);
+            assert_eq!(at(&v), (5, 2), "{storage} {usb} {clocks}");
+            assert_eq!(!up.is_empty(), sends, "{storage} {usb} {clocks}");
+            if sends {
+                // mx before cx on the way up, both waiting (`rpmhpd_power_on`).
+                assert_eq!(active(&up), [("mx.lvl", 2), ("cx.lvl", 5)]);
+                assert!(
+                    up.iter()
+                        .filter(|c| c.state == State::Active)
+                        .all(|c| c.cmd.wait)
+                );
+            }
+        }
+    }
+
+    /// Patch 1354 with no switch: the boot and a sleep send exactly what they sent before it, in all three states, and
+    /// the report is the same.
+    #[test]
+    fn with_no_switch_the_laptop_sends_todays_commands() {
+        let (mut today, today_cmds) = laptop_boot(true);
+        let (mut v, mut cmds) = laptop_boot_1354(false);
+        assert_eq!(all(&cmds), all(&today_cmds));
+        // Before 1354 a sleep sent nothing through this table (Venus's `cx` goes in its power-down either way).
+        cmds.extend(sleep_cycle(&mut v, false, false));
+        // Nor the disk's and USB's hooks of patch 1355 without their switches, whatever the glue's clocks do.
+        for clocks in [true, false] {
+            cmds.extend(disk_and_usb_down(&mut v, false, false, clocks));
+            cmds.extend(disk_and_usb_up(&mut v, false, false));
+        }
+        assert_eq!(all(&cmds), all(&today_cmds));
+        assert_eq!(v.report(), today.report());
+        assert_eq!(
+            v.cache.entries().collect::<Vec<_>>(),
+            today.cache.entries().collect::<Vec<_>>()
+        );
+        // Venus's idle power-down, the same call before and after.
+        assert_eq!(
+            all(&v.vote(Client::Venus, sc7180::CX, false, 0)),
+            all(&today.vote(Client::Venus, sc7180::CX, false, 0))
+        );
+        // With the switches: the DPU keeps its vote (its MDP clock runs), so the sleep sends nothing either and every
+        // consumer stays on.
+        let (mut v, _) = laptop_boot_1354(false);
+        assert!(sleep_cycle(&mut v, true, true).is_empty());
+        assert!(disk_and_usb_down(&mut v, true, true, true).is_empty());
+        assert!(disk_and_usb_up(&mut v, true, true).is_empty());
+        assert!(v.consumers_off().is_empty());
+        assert_eq!(v.consumers().len(), LAPTOP_TREE.len());
+    }
+
+    /// genpd and rpmhpd with the laptop's consumers powering off one by one, the highest first: cx is what the consumers
+    /// still on ask for (the first corner whose level is not below the highest state, at least `enable_corner`,
+    /// `rpmhpd_power_on`), and with none on it is off (`rpmhpd_power_off`: corner 0). mx follows its child cx. A full
+    /// domain's SLEEP is its ACTIVE (`to_active_sleep`, `rpmhpd.c:672-681`). Powering them on again restores every corner.
+    #[test]
+    fn consumers_powering_off_lower_cx_as_rpmhpd_computes() {
+        let (mut v, _) = laptop_boot_1354(false);
+        let at = |v: &Votes| {
+            (
+                v.sent(sc7180::CX).unwrap(),
+                v.sent_sleep(sc7180::CX).unwrap(),
+                v.sent(sc7180::MX).unwrap(),
+                v.sent_sleep(sc7180::MX).unwrap(),
+            )
+        };
+        assert_eq!(at(&v), (5, 5, 2, 2));
+        // (consumer, cx, mx) after it is off: cx levels [0, 16, 64, 128, 192, 256, 384], mx [0, 16, 256, 384].
+        let steps: [(&str, usize, usize); 16] = [
+            ("serial@88c000", 5, 2),
+            ("mmc@8804000", 5, 2),
+            ("usb@a6f8800", 5, 2),
+            // The last 256 gone: the DSI's 192 is corner 4; mx's first level not below 192 is 256, corner 2.
+            ("display-controller@ae01000", 4, 2),
+            // The serial engines' 64: corner 2 on both.
+            ("dsi@ae94000", 2, 2),
+            ("i2c@880000", 2, 2),
+            ("i2c@888000", 2, 2),
+            ("i2c@890000", 2, 2),
+            ("i2c@894000", 2, 2),
+            ("i2c@a80000", 2, 2),
+            ("i2c@a84000", 2, 2),
+            ("i2c@a8c000", 2, 2),
+            // GCC, UFS and its PHY at state 0: the first non-zero corner of each.
+            ("i2c@a90000", 1, 1),
+            ("clock-controller@100000", 1, 1),
+            ("ufshc@1d84000", 1, 1),
+            // All off: corner 0, cx first and mx last.
+            ("phy@1d87000", 0, 0),
+        ];
+        for (node, cx, mx) in steps {
+            let (n, cmds) = v.power_consumer(node, false);
+            assert_eq!(n, 1, "{node}");
+            assert!(
+                cmds.iter().all(|c| !c.cmd.wait),
+                "{node}: going down never waits"
+            );
+            assert_eq!(at(&v), (cx, cx, mx, mx), "{node}");
+        }
+        assert!(v.consumers().is_empty());
+        assert_eq!(v.consumers_off().len(), LAPTOP_TREE.len());
+        let r = v.report();
+        assert!(
+            r.contains("    tree: /soc@0/usb@a6f8800 is off: holds nothing on cx, level 256 at its power-on\n"),
+            "{r}"
+        );
+        assert!(!r.contains("  tree holds cx"), "{r}");
+        // The first back on: mx before cx on the way up, both waiting.
+        let (_, up) = v.power_consumer("clock-controller@100000", true);
+        assert_eq!(active(&up), [("mx.lvl", 1), ("cx.lvl", 1)]);
+        assert!(
+            up.iter()
+                .filter(|c| c.state == State::Active)
+                .all(|c| c.cmd.wait)
+        );
+        for (node, _) in LAPTOP_TREE {
+            v.power_consumer(node, true);
+        }
+        assert_eq!(at(&v), (5, 5, 2, 2));
+        assert!(v.consumers_off().is_empty());
+        // Twice is nothing.
+        assert!(v.power_consumer("usb@a6f8800", true).1.is_empty());
+        assert_eq!(v.power_consumer("no-such-node@0", false), (0, Vec::new()));
+    }
+
+    /// A consumer of the active-only peer `cx_ao` and one of `cx`: ACTIVE and WAKE are the larger corner, SLEEP the full
+    /// domain's alone (`rpmhpd_aggregate_corner`, `rpmhpd.c:692-739`); either powering off leaves the other's.
+    #[test]
+    fn the_active_only_peer_powers_off_on_its_own() {
+        let mut v = laptop();
+        v.sync();
+        v.vote_consumer("/soc@0/full@1", sc7180::CX, true, 64);
+        v.vote_consumer("/soc@0/awake@2", sc7180::CX_AO, true, 256);
+        let at = |v: &Votes| {
+            (
+                v.sent(sc7180::CX),
+                v.sent_sleep(sc7180::CX),
+                v.sent(sc7180::MX),
+                v.sent_sleep(sc7180::MX),
+            )
+        };
+        assert_eq!(at(&v), (Some(5), Some(2), Some(2), Some(2)));
+        // The peer's consumer off: the full domain's 64 in all three.
+        v.power_consumer("awake@2", false);
+        assert_eq!(at(&v), (Some(2), Some(2), Some(2), Some(2)));
+        v.power_consumer("awake@2", true);
+        assert_eq!(at(&v), (Some(5), Some(2), Some(2), Some(2)));
+        // The full domain's consumer off: awake at the peer's corner, asleep 0, which rpmh_flush writes.
+        let down = v.power_consumer("full@1", false).1;
+        assert_eq!(
+            all(&down),
+            [
+                ("cx.lvl", State::Active, 5),
+                ("cx.lvl", State::Wake, 5),
+                ("cx.lvl", State::Sleep, 0),
+                ("mx.lvl", State::Active, 2),
+                ("mx.lvl", State::Wake, 2),
+                ("mx.lvl", State::Sleep, 0),
+            ]
+        );
+        assert_eq!(
+            v.cache.valid().collect::<Vec<_>>(),
+            [(0x30000, 0, 5), (0x30010, 0, 2)]
+        );
+        v.power_consumer("awake@2", false);
+        assert_eq!(at(&v), (Some(0), Some(0), Some(0), Some(0)));
+    }
+
+    /// A consumer powered off keeps a new state for its power-on and sends nothing (genpd's `rpm_pstate`); one let go is
+    /// gone from both lists. Before `sync_state` a power-off changes nothing that is sent: every domain is at its top.
+    #[test]
+    fn a_consumer_that_is_off_keeps_its_state_for_its_power_on() {
+        let mut v = laptop();
+        v.vote_consumer("/soc@0/a@1", sc7180::CX, true, 64);
+        v.vote_consumer("/soc@0/b@2", sc7180::CX, true, 16);
+        assert!(
+            v.power_consumer("a@1", false).1.is_empty(),
+            "before the sync, the top stays"
+        );
+        v.sync();
+        assert_eq!(v.sent(sc7180::CX), Some(1));
+        assert!(
+            v.vote_consumer("/soc@0/a@1", sc7180::CX, true, 256)
+                .is_empty()
+        );
+        assert_eq!(v.consumers_off()[0].state, 256);
+        // 256 on cx is corner 5, and mx (from 16, corner 1) its first level not below 256, corner 2: parent first.
+        assert_eq!(
+            active(&v.power_consumer("a@1", true).1),
+            [("mx.lvl", 2), ("cx.lvl", 5)]
+        );
+        v.power_consumer("a@1", false);
+        assert!(
+            v.vote_consumer("/soc@0/a@1", sc7180::CX, false, 0)
+                .is_empty()
+        );
+        assert!(v.consumers_off().is_empty());
+        assert_eq!(v.power_consumer("a@1", true), (0, Vec::new()));
+        assert_eq!(v.sent(sc7180::CX), Some(1));
+    }
+
+    #[test]
+    fn the_tree_level_is_over_the_consumers_that_are_on() {
+        let c = |node: &str, domain, state| Consumer {
+            node: node.into(),
+            domain,
+            state,
+        };
+        let on = [
+            c("gcc", sc7180::CX, 0),
+            c("qup", sc7180::CX, 64),
+            c("ao", sc7180::CX_AO, 256),
+        ];
+        assert_eq!(tree_level(&on, sc7180::CX), Some(64));
+        assert_eq!(tree_level(&on, sc7180::CX_AO), Some(256));
+        assert_eq!(tree_level(&on[..1], sc7180::CX), Some(0));
+        assert_eq!(tree_level(&on, sc7180::MX), None);
+        assert_eq!(tree_level(&[], sc7180::CX), None);
+    }
+
+    /// GCC's XO hold (clk-rpmh.c:152-211). Today's: `bi_tcxo`, all three states on at once. Moved (`lucina.suspend.xo=ao`):
+    /// `bi_tcxo_ao` for GCC (WAKE and ACTIVE on, ACTIVE waiting), then `bi_tcxo` for GPLL0 (SLEEP on): the same resource
+    /// state, so nothing for rpmh_flush. GPLL0's hold let go is what Linux sends once GPLL0's users stop: SLEEP off alone.
+    #[test]
+    fn gccs_xo_hold_with_and_without_the_move() {
+        let s = |cmds: &[Cmd]| {
+            cmds.iter()
+                .map(|c| (c.state, c.cmd.data, c.cmd.wait))
+                .collect::<Vec<_>>()
+        };
+        let mut today = Votes::new(0x30090);
+        let mut v = Votes::new(0x30090);
+        assert_eq!(s(&v.gcc_xo(false)), s(&today.xo(Client::Gcc, true)));
+        assert_eq!(v.report(), today.report());
+        let mut v = Votes::new(0x30090);
+        assert_eq!(
+            s(&v.gcc_xo(true)),
+            [
+                (State::Wake, 3, false),
+                (State::Active, 3, true),
+                (State::Sleep, 3, false)
+            ]
+        );
+        assert_eq!(v.xo_sent(), Some(true));
+        assert_eq!(v.cache.valid().count(), 0);
+        assert!(
+            v.report()
+                .contains("sent sleep on wake on active on; bi_tcxo held by [\"gpll0\"], bi_tcxo_ao held by [\"gcc\"]"),
+            "{}",
+            v.report()
+        );
+        // A remote processor's hold and release change nothing either way.
+        assert!(v.xo(Client::Modem, true).is_empty());
+        assert!(v.xo(Client::Modem, false).is_empty());
+        assert_eq!(s(&v.xo(Client::Gpll0, false)), [(State::Sleep, 0, false)]);
+        assert_eq!(v.cache.valid().collect::<Vec<_>>(), [(0x30090, 0, 3)]);
+        // Without the move GCC's one hold is everything: its release would take XO off awake too.
+        assert_eq!(
+            s(&today.xo(Client::Gcc, false)),
+            [
+                (State::Sleep, 0, false),
+                (State::Wake, 0, false),
+                (State::Active, 0, false)
+            ]
+        );
+    }
+
+    /// With the XO move the boot's ACTIVE values are today's (XO on, then the domains), and only the order of XO's three
+    /// states differs.
+    #[test]
+    fn the_boot_with_the_xo_move() {
+        let (v, cmds) = laptop_boot_1354(true);
+        let (today, today_cmds) = laptop_boot(true);
+        let not_xo = |c: &[Cmd]| {
+            all(c)
+                .into_iter()
+                .filter(|x| x.0 != xo::RES_NAME)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(not_xo(&cmds), not_xo(&today_cmds));
+        assert_eq!(v.xo_sent(), today.xo_sent());
+        assert_eq!(
+            v.cache.entries().collect::<Vec<_>>(),
+            today.cache.entries().collect::<Vec<_>>()
         );
     }
 }

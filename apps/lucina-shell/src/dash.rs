@@ -17,6 +17,7 @@
 use std::sync::mpsc::Receiver;
 use std::time::{Instant, SystemTime};
 
+use lucina_app::compose::{self, Compositor, Op, Shown};
 use lucina_app::gfx::{Frame, Rect};
 use lucina_app::manifest::Manifest;
 use lucina_glass::home::{
@@ -40,9 +41,16 @@ struct Slide {
     start: f64,
     /// 1: to the apps (they come from the right); -1: back.
     dir: i32,
+    /// When the last frame of the move began.
+    last_frame: Option<Instant>,
+    /// The pages, when no compositor holds them (`comp` is `None`).
     back: Vec<u32>,
     front: Vec<u32>,
 }
+
+/// The compositor's surfaces for a page move: the leaving page and the arriving one.
+const BACK: usize = 0;
+const FRONT: usize = 1;
 
 /// How long a page move takes, seconds (the concept's screen transition).
 const SLIDE: f64 = 0.62;
@@ -87,6 +95,12 @@ pub struct Dash {
     bg_job: Option<Receiver<(Canvas, Canvas)>>,
     t0: Instant,
     slide: Option<Slide>,
+    /// The last GPU slide frame's split, in ms: building the ops, and the compositor's `show`. For traces.
+    pub slide_split: (f64, f64),
+    /// Shows page moves as two layers and a fill (`lucina_app::compose`): on the GPU the CPU writes no pixel per frame. Made at
+    /// the first move; `None` with `LUCINA_GPU_COMPOSE=0`, or no GPU, or after it failed (then the CPU composes, as before).
+    comp: Option<Box<dyn Compositor>>,
+    comp_tried: bool,
     pub feed: Option<Feed>,
     parts: Parts,
     /// Pixels per dp, and where the 1280 x 720 dp screen starts on the frame (a panel of another shape is letterboxed).
@@ -155,6 +169,9 @@ impl Dash {
             bg_job,
             t0,
             slide: None,
+            slide_split: (0.0, 0.0),
+            comp: None,
+            comp_tried: false,
             feed: None,
             parts: Parts::default(),
             k,
@@ -409,8 +426,13 @@ impl Dash {
 
     /// When the next frame is due, if ever.
     pub fn next_frame(&self, now: Instant, period: f64) -> Option<Instant> {
-        if self.slide.is_some() {
-            return Some(now + std::time::Duration::from_secs_f64(period));
+        if let Some(s) = &self.slide {
+            // One period after the last frame began, not after it ended: the frame's own present waits for the vertical blank,
+            // and waiting a period after that made every slide frame take two (about 28 fps, measured on the laptop).
+            let due = s
+                .last_frame
+                .map_or(now, |t| t + std::time::Duration::from_secs_f64(period));
+            return Some(due.max(now));
         }
         if self.page != Page::Dash {
             return None;
@@ -545,8 +567,17 @@ impl Dash {
         out
     }
 
-    /// The whole dashboard as it is now, for a page move. The canvas already holds it: only what is still due is drawn first.
-    fn snapshot(&mut self, t: f64) -> Vec<u32> {
+    /// Makes the page slide's compositor now, if it is not made yet (`go` makes it otherwise).
+    pub fn open_compositor(&mut self) {
+        if !self.comp_tried {
+            self.comp_tried = true;
+            // Only the GPU's backend gains anything: the CPU keeps its own compose (slide_compose), which vectorises.
+            self.comp = Some(compose::best(self.cv.w, self.cv.h, 2)).filter(|c| c.name() == "gpu");
+        }
+    }
+
+    /// Brings the canvas up to date for a page move: only what is still due is drawn.
+    fn bring_up_to_date(&mut self, t: f64) {
         let black;
         let (img, blurred) = match &self.bg {
             Some((a, b)) => (a, b),
@@ -560,23 +591,43 @@ impl Dash {
             self.home.draw(&mut self.cv, &mut self.ty, t, img, blurred);
             self.cv.pop_clip();
         }
-        self.cv.px.clone()
     }
 
-    /// Start moving to `to`: `other` is the apps page drawn whole into a frame-sized buffer.
-    pub fn go(&mut self, now: Instant, to: Page, other: Vec<u32>) {
+    /// Start moving to `to`: `other` is the apps page drawn whole, frame-sized. With the GPU compositor both pages are copied once
+    /// into its surfaces; without it, into the slide's own buffers.
+    pub fn go(&mut self, now: Instant, to: Page, other: &[u32]) {
         if to == self.page {
             return;
         }
         let t = self.secs(now);
-        let dash = self.snapshot(t);
-        let (dir, back, front) = if to == Page::Apps {
-            (1, dash, other)
+        self.bring_up_to_date(t);
+        self.open_compositor();
+        let forward = to == Page::Apps;
+        let dir = if forward { 1 } else { -1 };
+        let n = (self.cv.w * self.cv.h) as usize;
+        let (mut back, mut front) = (Vec::new(), Vec::new());
+        let dash = &self.cv.px[..];
+        let (b, f) = if forward {
+            (dash, other)
         } else {
-            (-1, other, dash)
+            (other, dash)
         };
+        match self.comp.as_mut() {
+            Some(c) if b.len() == n && f.len() == n => {
+                c.surface_mut(BACK)[..n].copy_from_slice(b);
+                c.surface_mut(FRONT)[..n].copy_from_slice(f);
+                let all = Rect::new(0, 0, self.cv.w as i32, self.cv.h as i32);
+                c.changed(BACK, all);
+                c.changed(FRONT, all);
+            }
+            _ => {
+                back = b.to_vec();
+                front = f.to_vec();
+            }
+        }
         self.slide = Some(Slide {
             start: t,
+            last_frame: None,
             dir,
             back,
             front,
@@ -589,23 +640,82 @@ impl Dash {
         }
     }
 
-    /// One frame of a page move into `frame`; true while it goes on.
-    pub fn draw_slide(&mut self, frame: &mut Frame, now: Instant) -> bool {
-        let Some(s) = self.slide.as_ref() else {
-            return false;
-        };
+    /// One frame of a page move. Returns what of `frame` to present (`None`: it is on the screen already, or nothing moved), and
+    /// whether the move goes on. With `vblank` the GPU's frame waits for the panel's scan.
+    pub fn draw_slide(
+        &mut self,
+        frame: &mut Frame,
+        now: Instant,
+        vblank: bool,
+    ) -> (Option<Rect>, bool) {
         let t = self.secs(now);
+        let Some(s) = self.slide.as_mut() else {
+            return (None, false);
+        };
+        s.last_frame = Some(now);
+        let s = &*s;
         let k = ((t - s.start) / SLIDE).clamp(0.0, 1.0) as f32;
         let (w, h) = (frame.w as usize, frame.h as usize);
-        if s.back.len() == w * h && s.front.len() == w * h {
-            home::slide_compose(&mut frame.px[..], &s.back, &s.front, w, h, k, s.dir);
+        let dir = s.dir;
+        let mut shown = Some(frame.bounds());
+        let on_cpu = !s.back.is_empty();
+        if on_cpu {
+            if s.back.len() == w * h && s.front.len() == w * h {
+                home::slide_compose(&mut frame.px[..], &s.back, &s.front, w, h, k, dir);
+            }
+        } else if let Some(c) = self.comp.as_mut() {
+            if k >= 1.0 {
+                // The last frame goes through the frame as usual, so that the frame holds what the screen shows again.
+                frame.px.copy_from_slice(&c.surface_mut(FRONT)[..w * h]);
+            } else {
+                let t_ops = Instant::now();
+                let ops = slide_ops(w as u32, h as u32, k, dir);
+                let t_show = Instant::now();
+                let shown_res = c.show(&ops, vblank, frame);
+                self.slide_split = (
+                    (t_show - t_ops).as_secs_f64() * 1000.0,
+                    t_show.elapsed().as_secs_f64() * 1000.0,
+                );
+                match shown_res {
+                    Ok(Shown::Screen) => shown = None,
+                    Ok(Shown::Frame(r)) => shown = Some(r),
+                    Err(e) => {
+                        eprintln!(
+                            "lucina-shell: the GPU compose failed, the CPU composes from now on: {e}"
+                        );
+                        let back = c.surface_mut(BACK)[..w * h].to_vec();
+                        let front = c.surface_mut(FRONT)[..w * h].to_vec();
+                        home::slide_compose(&mut frame.px[..], &back, &front, w, h, k, dir);
+                        self.comp = None;
+                        if let Some(s) = self.slide.as_mut() {
+                            (s.back, s.front) = (back, front);
+                        }
+                    }
+                }
+            }
         }
         if k >= 1.0 {
             self.slide = None;
-            self.home.invalidate();
-            return false;
+            // The canvas still holds the dashboard after a slide to the apps: `Home::damage` reports what changed since.
+            if self.page == Page::Dash {
+                self.home.invalidate();
+            }
+            return (shown, false);
         }
-        true
+        (shown, true)
+    }
+
+    /// The GPU's clock/frequency status line, for traces; `None` without a GPU compositor.
+    pub fn gpu_status(&mut self) -> Option<String> {
+        self.comp.as_mut()?.status_line()
+    }
+
+    /// Which backend shows page moves, for traces.
+    pub fn slide_backend(&self) -> &'static str {
+        match (&self.slide, &self.comp) {
+            (Some(s), Some(c)) if s.back.is_empty() => c.name(),
+            _ => "cpu",
+        }
     }
 
     pub fn sliding(&self) -> bool {
@@ -823,5 +933,78 @@ impl GlassOsd {
             frame.px[dst..dst + cw].copy_from_slice(&self.cv.px[y * cw..(y + 1) * cw]);
         }
         r
+    }
+}
+
+/// One frame of a page move as compositor ops, from the same proved spans as `home::slide_compose`: the leaving page dimmed, the
+/// black gap, the arriving page. The GPU's tint is in 255ths where the CPU darkens in 256ths: at most one step apart.
+pub fn slide_ops(w: u32, h: u32, t: f32, dir: i32) -> [Op; 3] {
+    let (sp, dim) = home::slide_frame(w, t, dir);
+    let grey = (dim * 255 / 256).min(255);
+    let tint = 0xff00_0000 | grey << 16 | grey << 8 | grey;
+    let r = |x: u32, len: u32| Rect::new(x as i32, 0, len as i32, h as i32);
+    [
+        Op::Layer {
+            surface: BACK,
+            from: r(sp.back_src, sp.back_len),
+            to: r(sp.back_dst, sp.back_len),
+            tint,
+            blend: false,
+            filter: false,
+        },
+        Op::Fill {
+            to: r(sp.gap_dst, sp.gap_len),
+            colour: 0,
+        },
+        Op::copy(
+            FRONT,
+            r(sp.front_src, sp.front_len),
+            r(sp.front_dst, sp.front_len),
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod slide_tests {
+    use super::*;
+
+    /// The ops, drawn by the CPU's reference compositor, give the slide's picture within one step of 255 per channel.
+    #[test]
+    fn the_gpu_slide_ops_draw_what_the_cpu_slide_draws() {
+        let (w, h) = (97usize, 3usize);
+        let back: Vec<u32> = (0..w * h)
+            .map(|i| 0xff00_0000 | (i as u32).wrapping_mul(2654435761) & 0xff_ffff)
+            .collect();
+        let front: Vec<u32> = (0..w * h)
+            .map(|i| 0xff00_0000 | ((i as u32).wrapping_mul(40503) ^ 0xabcdef) & 0xff_ffff)
+            .collect();
+        for dir in [1, -1] {
+            for step in 0..=20 {
+                let t = step as f32 / 20.0;
+                let mut cpu = vec![0u32; w * h];
+                home::slide_compose(&mut cpu, &back, &front, w, h, t, dir);
+                let mut ops = vec![0u32; w * h];
+                let views = [
+                    Some(compose::View {
+                        px: &back,
+                        w: w as u32,
+                    }),
+                    Some(compose::View {
+                        px: &front,
+                        w: w as u32,
+                    }),
+                ];
+                compose::compose_cpu(&mut ops, w, &views, &slide_ops(w as u32, h as u32, t, dir));
+                for (i, (a, b)) in cpu.iter().zip(&ops).enumerate() {
+                    for sh in [0, 8, 16] {
+                        let (x, y) = ((a >> sh) & 0xff, (b >> sh) & 0xff);
+                        assert!(
+                            x.abs_diff(y) <= 1,
+                            "dir {dir} t {t} px {i}: {a:08x} vs {b:08x}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -4,6 +4,10 @@
 //!
 //! `cargo run --release -p lucina-glass --features fixture --example frame_bench -- [--cpu <n>] [--reps <n>]`
 //!
+//! `--bw`: memory bandwidth instead, one line per routine and size: `cpuN bw <copy|copy-neon|fill|fill-neon> <bytes> <GB/s>`
+//! (median of `--reps`), at 64 KiB (L2), 1 MiB (L3), 8 MiB and 64 MiB (DDR). `copy` is the program's own memcpy (musl's, as
+//! every Juno program has it); `copy-neon` is a plain 64-byte ldp/stp loop of q registers, to tell the routine from the memory.
+//!
 //! One `name value unit` line per result, prefixed with the CPU it ran on, so that runs on a Silver and a Gold core compare with
 //! `diff`. With `--cpu` the thread is pinned there first (`sched_setaffinity`); without it, it runs wherever the kernel puts it.
 use std::time::Instant;
@@ -38,15 +42,96 @@ fn time(reps: usize, mut f: impl FnMut()) -> (f64, f64) {
     (v[v.len() / 2], v[v.len() - 1])
 }
 
+/// Copies `src` into `dst` 64 bytes at a time with q-register pairs (lengths a multiple of 64).
+fn copy_neon(dst: &mut [u8], src: &[u8]) {
+    let n = dst.len().min(src.len()) / 64 * 64;
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: both pointers are valid for `n` bytes and do not overlap (two separate allocations); the loop reads and writes
+    // exactly `n` bytes, 64 at a time, and touches only the named registers.
+    unsafe {
+        core::arch::asm!(
+            "cbz {n}, 2f",
+            "1:",
+            "ldp q0, q1, [{s}]",
+            "ldp q2, q3, [{s}, #32]",
+            "add {s}, {s}, #64",
+            "stp q0, q1, [{d}]",
+            "stp q2, q3, [{d}, #32]",
+            "add {d}, {d}, #64",
+            "subs {n}, {n}, #64",
+            "b.ne 1b",
+            "2:",
+            s = inout(reg) src.as_ptr() => _,
+            d = inout(reg) dst.as_mut_ptr() => _,
+            n = inout(reg) n => _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            options(nostack),
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    dst[..n].copy_from_slice(&src[..n]);
+}
+
+/// Fills `dst` with zero 64 bytes at a time with q-register pairs.
+fn fill_neon(dst: &mut [u8]) {
+    let n = dst.len() / 64 * 64;
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: the pointer is valid for `n` bytes; the loop writes exactly `n` bytes, 64 at a time.
+    unsafe {
+        core::arch::asm!(
+            "movi v0.16b, #0",
+            "movi v1.16b, #0",
+            "cbz {n}, 2f",
+            "1:",
+            "stp q0, q1, [{d}]",
+            "stp q0, q1, [{d}, #32]",
+            "add {d}, {d}, #64",
+            "subs {n}, {n}, #64",
+            "b.ne 1b",
+            "2:",
+            d = inout(reg) dst.as_mut_ptr() => _,
+            n = inout(reg) n => _,
+            out("v0") _, out("v1") _,
+            options(nostack),
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    dst[..n].fill(0);
+}
+
+/// The `--bw` sweep: each routine at each size, median GB/s of `reps` runs (each run moves at least 64 MiB, so small sizes repeat).
+fn bandwidth(reps: usize) {
+    for size in [64usize << 10, 1 << 20, 8 << 20, 64 << 20] {
+        let src = vec![0x5au8; size];
+        let mut dst = vec![0u8; size];
+        let rounds = ((64usize << 20) / size).max(1);
+        let gbs = |ms: f64| (size * rounds) as f64 / (ms / 1000.0) / 1e9;
+        let mut run = |name: &str, f: &mut dyn FnMut(&mut [u8], &[u8])| {
+            f(&mut dst, &src);
+            let (med, _) = time(reps, || {
+                for _ in 0..rounds {
+                    f(std::hint::black_box(&mut dst), std::hint::black_box(&src));
+                }
+            });
+            println!("cpu{} bw {name} {size} {:.2}", cpu_now(), gbs(med));
+        };
+        run("copy", &mut |d, s| d.copy_from_slice(s));
+        run("copy-neon", &mut |d, s| copy_neon(d, s));
+        run("fill", &mut |d, _| d.fill(0));
+        run("fill-neon", &mut |d, _| fill_neon(d));
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
-    let (mut cpu, mut reps) = (None, 15usize);
+    let (mut cpu, mut reps, mut bw) = (None, 15usize, false);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--cpu" => cpu = args.next().and_then(|v| v.parse().ok()),
             "--reps" => reps = args.next().and_then(|v| v.parse().ok()).unwrap_or(15),
+            "--bw" => bw = true,
             _ => {
-                eprintln!("usage: frame_bench [--cpu <n>] [--reps <n>]");
+                eprintln!("usage: frame_bench [--cpu <n>] [--reps <n>] [--bw]");
                 std::process::exit(2);
             }
         }
@@ -59,6 +144,10 @@ fn main() {
             std::io::Error::last_os_error()
         );
         std::process::exit(1);
+    }
+    if bw {
+        bandwidth(reps);
+        return;
     }
     let (w, h) = (1920usize, 1080usize);
     let n = w * h;

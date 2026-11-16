@@ -270,6 +270,10 @@ pub mod id {
     pub const SCAN_CHAN_LIST: u32 = 0x3003;
     pub const REGDOMAIN: u32 = 0x4001;
     pub const PDEV_SET_PARAM: u32 = 0x4003;
+    /// `WMI_TLV_PDEV_SUSPEND_CMDID`, `WMI_TLV_CMD(WMI_TLV_GRP_SUSPEND)` with group 17 (`wmi-tlv.h:38,175`).
+    pub const PDEV_SUSPEND: u32 = 0x11001;
+    /// `WMI_TLV_PDEV_RESUME_CMDID` (`wmi-tlv.h:176`).
+    pub const PDEV_RESUME: u32 = 0x11002;
     pub const VDEV_CREATE: u32 = 0x5001;
     pub const VDEV_START: u32 = 0x5003;
     pub const VDEV_UP: u32 = 0x5005;
@@ -315,6 +319,9 @@ pub struct Silent {
     pub no_sec_ind: bool,
     pub no_peer_map: bool,
     pub no_scan_events: bool,
+    /// Never answer a pdev-suspend with `HTC_MSG_SEND_SUSPEND_COMPLETE` (`htc.c:556-558`), as a target that is already
+    /// asleep or wedged would not.
+    pub no_suspend_complete: bool,
 }
 
 impl Default for ModelCfg {
@@ -791,6 +798,32 @@ impl Model {
                 }
             }
             id::MGMT_TX_SEND => self.on_mgmt_send(p, &c),
+            id::PDEV_SUSPEND => {
+                // `ath10k_wmi_tlv_op_pdev_suspend_target` (`wmi-tlv.c:1714-1733`): one TLV, `pdev_id` then `opt`.
+                let t = c.tlv();
+                assert_eq!(t.len(), 1, "pdev suspend is one TLV");
+                assert_eq!(t[0].0, 115, "WMI_TLV_TAG_STRUCT_PDEV_SUSPEND_CMD");
+                assert_eq!(t[0].1.len(), 8, "pdev_id and opt");
+                assert_eq!(word(&t[0].1, 0), 0, "pdev_id");
+                assert_eq!(
+                    word(&t[0].1, 1),
+                    1,
+                    "opt: WMI_PDEV_SUSPEND_AND_DISABLE_INTR"
+                );
+                // What the host answers with is the completion of `ar->target_suspend` (`core.c:812-817`): control
+                // message 6, `HTC_MSG_SEND_SUSPEND_COMPLETE` (`htc.h`), with no endpoint in front of it (`htc.c:411`).
+                if !self.cfg.silent.no_suspend_complete {
+                    self.pending
+                        .push_back((PIPE_CTRL_DL, Self::htc_frame(0, 0, 0, &6u16.to_le_bytes())));
+                }
+            }
+            id::PDEV_RESUME => {
+                // `ath10k_wmi_tlv_op_pdev_resume_target` (`wmi-tlv.c:1735-1754`): one TLV, its reserved word.
+                let t = c.tlv();
+                assert_eq!(t.len(), 1, "pdev resume is one TLV");
+                assert_eq!(t[0].0, 116, "WMI_TLV_TAG_STRUCT_WMI_RESUME_CMD");
+                assert_eq!(t[0].1.len(), 4, "the reserved word");
+            }
             _ => {}
         }
     }

@@ -12,6 +12,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod display;
 pub mod level;
 pub mod quiet;
 pub mod scanout;

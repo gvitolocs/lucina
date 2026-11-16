@@ -434,12 +434,20 @@ pub fn discover(root: &Path) -> Result<Vec<Unit>, String> {
         inputs: vec!["userspace/formal/".into()],
     });
 
-    units.retain(|u| u.kind != "tla" || root.join(&u.target).exists());
+    units.retain(|u| unit_present(&u.kind, root.join(&u.target).exists()));
     units.sort_by(|a, b| a.name.cmp(&b.name));
     if let Some(w) = units.windows(2).find(|w| w[0].name == w[1].name) {
         return Err(format!("two proof units are both named {}", w[0].name));
     }
     Ok(units)
+}
+
+/// Whether a discovered unit belongs in the inventory of a repository. A `tla`, `models` or `full` unit names a file
+/// this repository may simply not carry; emitting it anyway gives a unit with no files, which `spec --check` and
+/// `roles --check` refuse to classify. The other kinds are never judged on their target: a `deep` target is a command
+/// line, not a path.
+fn unit_present(kind: &str, target_exists: bool) -> bool {
+    !matches!(kind, "tla" | "models" | "full") || target_exists
 }
 
 /// The paths in the `files=(a b c)` line.
@@ -544,6 +552,27 @@ mod tests {
             model_dir("specs/juno/idle-wake/JunoIdleWake3.heavy.cfg").as_deref(),
             Some("idle-wake")
         );
+    }
+
+    #[test]
+    fn a_unit_whose_target_this_repo_lacks_is_not_discovered() {
+        for kind in ["tla", "models", "full"] {
+            assert!(
+                !unit_present(kind, false),
+                "{kind}: kept although its target is gone"
+            );
+            assert!(
+                unit_present(kind, true),
+                "{kind}: dropped although its target is there"
+            );
+        }
+        // The other kinds name directories, command lines or lists of files: never judged by their target.
+        for kind in ["verus", "shipped", "mutants", "mutations", "deep"] {
+            assert!(
+                unit_present(kind, false),
+                "{kind}: dropped for a target this check does not look at"
+            );
+        }
     }
 
     fn unit(inputs: &[&str]) -> Unit {

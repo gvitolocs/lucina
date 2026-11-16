@@ -47,6 +47,7 @@ mutants/juno-modem-witness	juno-net-security	mutants	verification/juno-modem-wit
 mutants/juno-netlink	juno-net-security	mutants	verification/juno-netlink/mutants.sh	kernel/lucina-netlink/,verification/juno-netlink/,verification/juno-netlink/rules.rs
 mutants/juno-oom	kernel-memory	mutants	verification/juno-oom/mutants.sh	kernel/lucina-oom/,verification/juno-oom/
 mutants/juno-parse-caps	juno-input-apps	mutants	verification/juno-parse-caps/mutants.sh	kernel/lucina-parse-caps/,verification/juno-parse-caps/,verification/juno-parse-caps/rules.rs
+mutants/juno-perf-slide	juno-gpu-media	mutants	verification/juno-perf-slide/mutants.sh	apps/lucina-glass/,verification/juno-perf-slide/
 mutants/juno-pon	boot-storage	mutants	verification/juno-pon/mutants.sh	kernel/lucina-pon/,verification/juno-pon/
 mutants/juno-power	juno-power	mutants	verification/juno-power/mutants.sh	kernel/lucina-power/,kernel/lucina-spmi/,verification/juno-power/,verification/juno-power/rules.rs
 mutants/juno-random	juno-net-security	mutants	verification/juno-random/mutants.sh	boot/gbgo/boot.toml,kernel/lucina-boot/,kernel/lucina-fdt/,kernel/lucina-random/,verification/fdt/header.rs,verification/juno-random/,verification/juno-random/rules.rs
@@ -90,6 +91,7 @@ shipped/lucina-gesture/rules	juno-input-apps	shipped	drivers/lucina-gesture/src/
 shipped/lucina-glass/browser_rules	juno-gpu-media	shipped	apps/lucina-glass/src/browser_rules.rs	apps/lucina-glass/
 shipped/lucina-glass/home_rules	juno-gpu-media	shipped	apps/lucina-glass/src/home_rules.rs	apps/lucina-glass/
 shipped/lucina-glass/rules	juno-gpu-media	shipped	apps/lucina-glass/src/rules.rs	apps/lucina-glass/
+shipped/lucina-glass/slide_rules	juno-gpu-media	shipped	apps/lucina-glass/src/slide_rules.rs	apps/lucina-glass/
 shipped/lucina-hostname/rules	boot-storage	shipped	kernel/lucina-hostname/src/rules.rs	kernel/lucina-hostname/
 shipped/lucina-i2c-hid/tp_rules	juno-input-apps	shipped	drivers/lucina-i2c-hid/src/tp_rules.rs	drivers/lucina-i2c-hid/
 shipped/lucina-intents/rules	juno-input-apps	shipped	services/lucina-intents/src/rules.rs	services/lucina-intents/

@@ -200,7 +200,8 @@ impl Rig {
         );
         assert!(
             // ath10k_add_interface's three sta ps params, then four per conf_tx
-            self.run_until(200, |r| r.count(WMM_CONF) == 4 && r.count(id::STA_PS_PARAM) == 3 + 4 * 4),
+            self.run_until(200, |r| r.count(WMM_CONF) == 4
+                && r.count(id::STA_PS_PARAM) == 3 + 4 * 4),
             "interface-up WMM defaults: {}",
             self.count(WMM_CONF)
         );
@@ -1579,6 +1580,56 @@ fn disconnect_says_goodbye_tears_down_in_order_and_connects_again() {
     r.reconnect_works(13);
 }
 
+/// Patch 1352: the sleep of the block is mac80211's path with no WoWLAN configured, quiesce and the driver's pdev
+/// suspend; the way back is the pdev resume, and the link rejoins as a supplicant's does afterwards.
+#[test]
+fn a_sleep_quiesces_then_suspends_the_target_and_the_resume_lets_the_link_rejoin() {
+    let mut r = Rig::up(ApCfg::default());
+    r.connected();
+    r.run(20);
+    // The front of `__ieee80211_suspend`: the scan cancelled (`pm.c:34`), the interface gone (`pm.c:156,164`), nothing of
+    // ours left in the air (`pm.c:57,61,63`).
+    r.wifi.suspend_quiesce();
+    assert!(r.wifi.quiet(), "{}", r.wifi.status());
+    assert!(!r.wifi.link_up());
+    r.run(100);
+    assert!(r.wifi.quiet(), "nothing starts again");
+    let send = r.last(id::MGMT_TX_SEND).unwrap();
+    let delete = r.last(id::PEER_DELETE).unwrap();
+    let stop = r.last(id::VDEV_STOP).unwrap();
+    // `ath10k_core_stop`'s try (`core.c:3291-3294`), queued after the teardown it follows.
+    r.wifi.suspend_target().unwrap();
+    assert!(!r.wifi.suspended(), "the target has not answered");
+    assert!(
+        r.run_until(200, |r| r.wifi.suspended()),
+        "no suspend complete: {:?}",
+        r.logs
+    );
+    let suspend = r.last(id::PDEV_SUSPEND).unwrap();
+    assert!(
+        send < delete && delete < stop && stop < suspend,
+        "{send} {delete} {stop} {suspend}"
+    );
+    let t = r.fw.cmds(id::PDEV_SUSPEND)[0].tlv();
+    assert_eq!(t[0].0, 115, "WMI_TLV_TAG_STRUCT_PDEV_SUSPEND_CMD");
+    assert_eq!(
+        word(&t[0].1, 1),
+        1,
+        "WMI_PDEV_SUSPEND_AND_DISABLE_INTR (`wmi.h:4642`)"
+    );
+    // Asleep: nothing goes out, and nothing of ours is asked of the block.
+    let out = r.mgmt_seen.len();
+    r.run(100);
+    assert_eq!(r.mgmt_seen.len(), out, "asleep: no frame leaves");
+    assert_eq!(r.state(), "idle");
+    // The reverse, then the link the way user space brings it back.
+    r.wifi.resume_target().unwrap();
+    assert!(!r.wifi.suspended());
+    r.run(100);
+    assert_eq!(r.count(id::PDEV_RESUME), 1);
+    r.reconnect_works(14);
+}
+
 #[test]
 fn connecting_while_connected_leaves_first() {
     let mut r = Rig::up(ApCfg::default());
@@ -2253,20 +2304,14 @@ fn interface_up_programs_mac80211s_default_edca_one_conf_tx_per_ac() {
     let z = (0, 0, 0, 0);
     assert_eq!(
         sets,
-        vec![
-            vec![z, z, z, d],
-            vec![z, z, d, d],
-            vec![d, z, d, d],
-            all(d)
-        ]
+        vec![vec![z, z, z, d], vec![z, z, d, d], vec![d, z, d, d], all(d)]
     );
     // and per AC the U-APSD parameters (none asked for)
-    let ps: Vec<(u32, u32)> = r
-        .fw
-        .cmds(id::STA_PS_PARAM)
-        .iter()
-        .map(|c| (c.w(1), c.w(2)))
-        .collect();
+    let ps: Vec<(u32, u32)> =
+        r.fw.cmds(id::STA_PS_PARAM)
+            .iter()
+            .map(|c| (c.w(1), c.w(2)))
+            .collect();
     assert_eq!(
         ps.iter().filter(|p| **p == (4, 0)).count(),
         4,
@@ -2321,17 +2366,20 @@ fn the_aps_set_goes_out_at_association_and_defaults_after_disassociation() {
     assert!(r.run_until(200, |r| r.count(id::VDEV_STOP) == 1));
     let sets = r.wmm_sets();
     assert_eq!(sets.len(), 12);
-    assert_eq!(sets[11], all((15, 1023, 2, 0)), "ieee80211_set_disassoc's defaults");
+    assert_eq!(
+        sets[11],
+        all((15, 1023, 2, 0)),
+        "ieee80211_set_disassoc's defaults"
+    );
     // after vdev_down, before the vdev stops (the channel context is released after)
-    let first = r
-        .fw
-        .wmi_log
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.id == WMM_CONF)
-        .map(|(i, _)| i)
-        .nth(8)
-        .unwrap();
+    let first =
+        r.fw.wmi_log
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.id == WMM_CONF)
+            .map(|(i, _)| i)
+            .nth(8)
+            .unwrap();
     assert!(r.last(id::VDEV_DOWN).unwrap() < first);
     assert!(r.last(WMM_CONF).unwrap() < r.last(id::VDEV_STOP).unwrap());
 }

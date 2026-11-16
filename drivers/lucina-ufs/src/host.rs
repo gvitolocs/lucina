@@ -61,12 +61,36 @@ pub trait Clock {
     /// A request finished although no interrupt woke its thread: found `late_us` at most after it finished. For the
     /// platform's own count (the kernel's `/proc/lucina-irq`); the host counts and logs it too.
     fn missed_interrupt(&self, _late_us: u64) {}
+    /// The reset of the attached device that the error handler asks its vendor for (`ufshcd_device_reset`,
+    /// `ufshcd.c:699-716` through `ufshcd_vops_device_reset`, called first in every reset of the host:
+    /// `ufshcd_reset_and_restore` `:7744`, `ufshcd_link_recovery` `:4393`). On a Qualcomm controller that is
+    /// `ufs_qcom_device_reset` (`ufs-qcom.c:1524-1543`), which pulses the controller node's `reset` GPIO - the line
+    /// `devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH)` took (`:1088-1089`), driven by
+    /// `gpiod_set_value_cansleep` with a 10 µs wait each way (`ufs_qcom_device_reset_ctrl`, `:547-556`) - and answers
+    /// `-EOPNOTSUPP` when the device tree gives no such line, as SC7180's does: its `ufs_mem_hc` node has
+    /// `resets = <&gcc GCC_UFS_PHY_BCR>` for the host block and no `reset-gpios`
+    /// (`arch/arm64/boot/dts/qcom/sc7180.dtsi:1535`). [`DeviceReset::Unsupported`] is that
+    /// answer, and Linux's consequence is what [`Host::error_recovery`] does with it: nothing is assumed about the
+    /// device's state (after `-EOPNOTSUPP` it does not even mark the device active, `ufshcd.c:705-714`).
+    /// The default is `Unsupported`: a platform with no reset line of its own.
+    fn device_reset(&self) -> DeviceReset {
+        DeviceReset::Unsupported
+    }
     /// One line of the bring-up log, at most about 75 columns: on the laptop it is read on a screen or from
     /// `/dev/kmsg` at 100 columns, after the kernel's timestamp and prefix.
     fn note(&self, _line: fmt::Arguments<'_>) {}
     /// A request failed: logs what only the platform can see, while the request is still pending if it is
     /// (clocks, the IOMMU).
     fn platform_report(&self) {}
+}
+
+/// What [`Clock::device_reset`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceReset {
+    /// The reset line was pulsed: the device forgot everything, as Linux assumes.
+    Done,
+    /// This platform has no device reset (Linux's `-EOPNOTSUPP`): the device keeps its state.
+    Unsupported,
 }
 
 /// How [`Clock::wait_interrupt`] ended.
@@ -132,6 +156,12 @@ const TUR_RETRIES: u32 = 3;
 const READ_CAPACITY_RETRIES_ON_RESET: u32 = 10;
 /// Failed requests described in the log per attempt at the device, so ten NOP OUTs do not fill the screen.
 const REQUEST_NOTES: u32 = 3;
+/// [`Host::error_recovery`] tries per failure burst. Linux gives `ufshcd_reset_and_restore` five
+/// (`MAX_HOST_RESET_RETRIES` `ufshcd.c:81`, the `retries` of `:7727-7757`), and a pass that ends with no error and
+/// an operational state leaves the loop. One here: on this laptop a pass is a full reset of the controller through
+/// the firmware's link, and a second one of a device that did not answer the first is the same bet again. What
+/// Linux's last failure is - `UFSHCD_STATE_ERROR`, the commands reported `FAILED` - is what the caller gets.
+const RECOVER_ATTEMPTS: u32 = 1;
 /// Most units a UFS 2.x/3.x device has (bMaxNumberLU = 0); 32 with bMaxNumberLU = 1.
 const DEFAULT_MAX_LU: u8 = 8;
 
@@ -245,12 +275,18 @@ pub struct Options {
     /// Clear run-stop before moving the request lists, and set it again. Without it the bases are written with the
     /// lists left running. Neither is what Linux does (it resets first), so the laptop decides.
     pub restart_lists: bool,
+    /// Whether a request that cannot be completed may reset the host and the link ([`Host::error_recovery`]), the
+    /// way Linux's `ufshcd_err_handler` does. The kernel component sets it from `ufs.recover`: on where a reset is
+    /// enough to bring the controller back (a PCI/QEMU one), off on a Qualcomm one, whose HCE enable also needs the
+    /// PHY and clock re-power (`ufs_qcom_power_up_sequence`) that this driver does not have.
+    pub recover: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             restart_lists: true,
+            recover: true,
         }
     }
 }
@@ -305,6 +341,9 @@ pub struct Host<R: Regs, D: DmaArea, C: Clock> {
     held: usize,
     /// How many more failed requests get a line in the log.
     request_notes: u32,
+    /// [`Self::error_recovery`] attempts since the last request that completed, so a second failure in a row is
+    /// reported instead of resetting the controller again.
+    recoveries: u32,
     options: Options,
     /// The controller's lists point at this host's DMA area.
     lists_ours: bool,
@@ -374,6 +413,7 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
             dead: false,
             held: 0,
             request_notes: REQUEST_NOTES,
+            recoveries: 0,
             options,
             lists_ours: false,
             timing: Timing::default(),
@@ -626,10 +666,54 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
         )
     }
 
+    /// DME_HIBER_ENTER, as Linux's `ufshcd_uic_hibern8_enter` (`ufshcd.c:4411-4433`) through `ufshcd_uic_pwr_ctrl`
+    /// (`:4249-4330`): the command's completion in `IS.UHES`, and the host still the local power-mode change
+    /// requester afterwards (`HCS.UPMCRS == PWR_LOCAL`, `:4315-4322`), which is what says the link really went to
+    /// hibern8 rather than the device refusing it. A `UHES` that never arrives is only an error when UPMCRS did not
+    /// come back local too: Linux takes the same route through `check_upmcrs` when the command itself completed
+    /// (`:4306-4313`). `ufshcd_uic_pwr_ctrl` also masks `IS.UCCS` (`:4281-4289`) so the interrupt handler does not
+    /// take the completion: our mask (`comps/ufs/src/irq.rs:28`) never enables it. There is no vendor step around the
+    /// command: `ufshcd_vops_hibern8_notify` (`:4417`, `:4426`) has no callback in ufs-qcom, whose variant ops
+    /// (`ufs-qcom.c:1794-1815`) set `.suspend` and `.resume` but no `.hibern8_notify`, and Linux's 1000 µs wait
+    /// between DME commands (`ufshcd_add_delay_before_dme_cmd`, `:4095-4102`) is gated on
+    /// `UFSHCD_QUIRK_DELAY_BEFORE_DME_CMDS`, a quirk ufs-qcom never sets.
+    pub fn hibernate_enter(&mut self) -> Result<(), Error> {
+        self.regs
+            .write32(regs::IS, regs::IS_UHXS | regs::IS_UHES | regs::IS_UPMS);
+        self.uic(regs::UIC_DME_HIBER_ENTER, 0, 0, 0)?;
+        let done = self.wait_reg(
+            regs::IS,
+            regs::IS_UHES,
+            regs::IS_UHES,
+            UIC_TIMEOUT_US,
+            "UHES",
+        );
+        self.regs.write32(regs::IS, regs::IS_UHES);
+        let hcs = self.regs.read32(regs::HCS);
+        let upmcrs = (hcs >> regs::HCS_UPMCRS_SHIFT) & regs::HCS_UPMCRS_MASK;
+        self.clock.note(format_args!(
+            "hibernate enter: sent, UHES {}, {}",
+            if done.is_ok() { "set" } else { "never set" },
+            regs::upmcrs_name(hcs),
+        ));
+        if upmcrs != regs::HCS_UPMCRS_PWR_LOCAL {
+            return Err(if done.is_err() {
+                Error::Timeout("UHES")
+            } else {
+                self.clock.note(format_args!(
+                    "hibernate enter: link not hibernating: the device asked for the change"
+                ));
+                Error::NoDevice
+            });
+        }
+        Ok(())
+    }
+
     /// DME_HIBER_EXIT, as Linux `ufshcd_uic_pwr_ctrl`: the result, then IS.UHXS and HCS.UPMCRS. Linux requires
     /// UPMCRS == PWR_LOCAL afterwards and marks the link broken otherwise; here that fails the bring-up, as a
-    /// failed hibernate exit does.
-    fn hibernate_exit(&mut self) -> Result<(), Error> {
+    /// failed hibernate exit does. Called on the way back from a sleep too (`__ufshcd_wl_resume`, `ufshcd.c:9832`),
+    /// where the caller checks the link with a command of its own afterwards.
+    pub fn hibernate_exit(&mut self) -> Result<(), Error> {
         self.regs
             .write32(regs::IS, regs::IS_UHXS | regs::IS_UHES | regs::IS_UPMS);
         match self.uic(regs::UIC_DME_HIBER_EXIT, 0, 0, 0) {
@@ -761,6 +845,89 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
         self.verify_device()?;
         self.query_flag(upiu::Query::set_flag(desc::FLAG_DEVICE_INIT))?;
         self.wait_device_init()
+    }
+
+    /// The error handler's reset: host and link brought back from nothing, the way Linux does it when a request will
+    /// not end. `ufshcd_err_handler` (`ufshcd.c:6511`) calls `ufshcd_reset_and_restore` (`:7721-7766`) for its
+    /// `needs_reset`, and `ufshcd_eh_timed_out` (`:8924-8940`) and `ufshcd_link_recovery` (`:4382-4409`) are the same
+    /// body for a timed-out command; both are `ufshcd_host_reset_and_restore` (`:7684-7712`): the device reset first
+    /// (`:7744`, the vendor op), `ufshcd_hba_stop` (`:4792`, HCE 1 => 0), the requests the hardware dropped completed
+    /// and their buffers freed (`ufshcd_complete_requests(hba, true)`, `:7694`), `ufshcd_hba_enable` (`:7700`) and
+    /// `ufshcd_probe_hba(hba, false)` (`:7704`) - link startup and device initialization, the descriptors not read
+    /// again because the driver still holds them. Here that is [`Self::full_init`], so every register sequence is
+    /// the one the bring-up already has and no value is written down twice.
+    ///
+    /// Once, not five times: Linux loops `MAX_HOST_RESET_RETRIES` (`:81`, used at `:7727`), but a second reset of a
+    /// controller that did not answer the first is the same bet again, and here the caller is a file system on the
+    /// machine's only disk. A reset that is tried and fails answers as Linux's last failure does
+    /// (`UFSHCD_STATE_ERROR`, `:7763-7768`): the host is dead, the error goes up, nothing hangs. With
+    /// `Options::recover` off there is no error handler at all, as before this existed: the call declines, touches
+    /// nothing of the controller and leaves the host exactly as the caller found it.
+    ///
+    /// Not here: `ufshcd_scale_clks` (`:7698`), the clock vote around the reset, and the writes of
+    /// `ufshcd_probe_hba` past the initialization - `ufshcd_set_active_icc_lvl`, `ufshcd_configure_wb`,
+    /// `ufshcd_configure_auto_hibern8` (`:8874-8884`). The first is a resource-manager vote (patch 1354, `// 1354:`
+    /// below); the others are descriptor and attribute writes this driver never sends, bring-up included, so a
+    /// recovered link is left exactly as a brought-up one is: the device's own power-on values.
+    pub fn error_recovery(&mut self) -> Result<(), Error> {
+        if !self.options.recover {
+            self.clock.note(format_args!(
+                "recovery: off (ufs.recover=off): nothing reset"
+            ));
+            return Err(Error::Dead);
+        }
+        if self.recoveries >= RECOVER_ATTEMPTS {
+            self.dead = true;
+            self.clock.note(format_args!(
+                "recovery: already reset once since a request worked: not again"
+            ));
+            return Err(Error::Dead);
+        }
+        self.recoveries += 1;
+        let began = self.clock.now_us();
+        // The request in slot 0 is what Linux completes here (`ufshcd_complete_requests`, `:7694`). `abort` has
+        // already rung UTRLCLR for a timeout, so this only gives the slot a moment before the controller goes down;
+        // the HCE below is what actually takes it back.
+        let _ = self.wait_reg(regs::UTRLDBR, SLOT0, 0, CLEAR_TIMEOUT_US, "slot 0 to drain");
+        // The device reset first, as Linux (`:7744`). A platform whose tree gives no reset line answers what
+        // `ufs_qcom_device_reset` does on SC7180 (`-EOPNOTSUPP`), and then nothing is assumed about the device -
+        // which is why the proof of the link afterwards is the NOP OUT inside `full_init`, not a trust in its state.
+        let dev_reset = self.clock.device_reset();
+        self.clock.note(format_args!(
+            "recovery: device reset {dev_reset:?}, host and link reset"
+        ));
+        // The bring-up sends requests, and `exec` refuses them of a dead host; `dead` comes back on a failure below.
+        self.dead = false;
+        // 1354: Linux drops and takes the clock scaling vote around the reset (`ufshcd_scale_clks`, `:7698`, and
+        // `ufshcd_clk_scaling_start_busy` in `ufshcd_hba_enable`); this driver keeps no vote of its own.
+        match self.full_init() {
+            Ok(()) => {
+                // The controller was stopped and its lists restarted, so nothing of the request that failed can
+                // reach its buffers any more: what Linux frees there, it frees here too.
+                self.held = 0;
+                self.request_notes = REQUEST_NOTES;
+                self.started = Started::Reset;
+                self.clock.note(format_args!(
+                    "recovery: link up, {} ({} µs)",
+                    if dev_reset == DeviceReset::Done {
+                        "device reset"
+                    } else {
+                        "no device reset"
+                    },
+                    self.clock.now_us().saturating_sub(began)
+                ));
+                Ok(())
+            }
+            Err(e) => {
+                self.post_mortem();
+                self.dead = true;
+                self.clock.note(format_args!(
+                    "recovery: reset failed: {e} ({} µs): no more requests",
+                    self.clock.now_us().saturating_sub(began)
+                ));
+                Err(e)
+            }
+        }
     }
 
     /// DME_LINKSTARTUP as Linux `ufshcd_link_startup`: a startup that answers but finds no device fails at once
@@ -1195,16 +1362,30 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
         } else {
             SCSI_TIMEOUT_US
         };
-        if let Err(e) = self.exec(&upiu, dir, data, timeout) {
+        let mut result = self.exec(&upiu, dir, data, timeout);
+        if let Err(e) = result {
             self.note_request(&e);
-            // The device may still hold task tag 0, and there is no task management to abort it.
-            if matches!(e, Error::Timeout(_)) {
+            if self.options.recover && needs_recovery(&e) {
+                // The error handler, once: host and link reset, then this command sent again - Linux's requeue of
+                // the requests a host reset dropped (`ufshcd_complete_requests`, `ufshcd.c:7694`, and the SCSI layer
+                // starting them over). A recovery that is refused or fails leaves the host dead, and the caller
+                // gets the request's own error: an I/O error, never a wait.
+                result = match self.error_recovery() {
+                    Ok(()) => self.exec(&upiu, dir, data, timeout),
+                    Err(_) => Err(e),
+                };
+            } else if matches!(e, Error::Timeout(_)) {
+                // `ufs.recover=off`, and a request that did not end: the device may still hold task tag 0, and
+                // there is no task management to abort it.
                 self.dead = true;
                 self.clock
                     .note(format_args!("a SCSI command timed out: no more requests"));
+                result = Err(e);
             }
-            return Err(e);
         }
+        result?;
+        // A request that ended, however it got there, ends the failure burst: the next one may be reset once again.
+        self.recoveries = 0;
         let rsp = upiu::parse_command_response(&self.read_response())?;
         if rsp.response != 0 {
             return Err(Error::Response(rsp.response));
@@ -1447,13 +1628,22 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
                 self.regs
                     .write32(regs::IS, is & (regs::IS_FATAL | regs::IS_UE));
                 self.abort();
-                // Linux's error handler resets the host on these bits; this driver cannot reset (no PHY/GCC/RPMh
-                // reset), so the host is dead: Linux's "reset failed" outcome.
+                // These are the bits Linux's interrupt handler saves and hands to the error handler, which answers
+                // them with a reset and nothing else (`ufshcd_check_errors`, `ufshcd.c:6795-6801` and `:6825-6827`;
+                // `ufshcd_is_saved_err_fatal`, `:6303-6306`; `ufshcd_err_handler`'s `needs_reset`, `:6588-6594`).
+                // Nothing may reach the controller until [`Host::command`] has asked for that reset below and seen
+                // whether it worked, so the host is dead meanwhile and the caller's bytes stay quarantined either way.
                 self.dead = true;
                 self.held = caller_bytes;
-                self.clock.note(format_args!(
-                    "fatal controller error IS {is:#x}: no more requests"
-                ));
+                if self.options.recover {
+                    self.clock.note(format_args!(
+                        "fatal controller error IS {is:#x}: host and link reset"
+                    ));
+                } else {
+                    self.clock.note(format_args!(
+                        "fatal controller error IS {is:#x}: no more requests"
+                    ));
+                }
                 return Err(Error::Fatal(is));
             }
             if self.clock.now_us().wrapping_sub(start) > timeout_us {
@@ -1594,6 +1784,19 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
             self.clock.delay_us(100);
         }
     }
+}
+
+/// Whether a failed request is one the error handler answers with a reset: a request that did not end or ended with
+/// the controller saying something was wrong with itself (`Host::error_recovery`). A SCSI status the device answered
+/// is not: that is [`retryable`] and the layers above. `OCS_INVALID_COMMAND_STATUS` is here because the slot came
+/// back with a descriptor the controller never touched, which is a controller that lost its list base, not a device
+/// that refused a command. Whether the handler exists at all is [`Options::recover`], checked by the caller: without
+/// it these are the errors this driver answered by giving up, as before.
+fn needs_recovery(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Timeout(_) | Error::Fatal(_) | Error::Ocs(upiu::OCS_INVALID_COMMAND_STATUS)
+    )
 }
 
 /// Whether a failed request is sent again, as Linux takes these: UNIT ATTENTION, BUSY, TASK SET FULL and TASK

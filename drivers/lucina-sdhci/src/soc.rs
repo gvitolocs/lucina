@@ -80,6 +80,44 @@ pub fn enable_clocks(gcc: &impl Regs, gpll0: &impl Regs, clock: &impl Clock) -> 
     Err(Error::Timeout("the SDCC2 clocks"))
 }
 
+/// The two halves of a sleep that touch the GCC (patch 1356).
+///
+/// Linux's list is the bulk array, `core` at index 0 (`drivers/mmc/host/sdhci-msm.c:2473-2479`) and `iface` at index
+/// 1 (`:2464-2470`); `cal` and `sleep` are optional and sc7180's device tree names neither
+/// (`arch/arm64/boot/dts/qcom/sc7180.dtsi:2815-2818`, three clocks: iface, core, xo), and the `"bus"` voter
+/// (`sdhci-msm.c:2452-2461`) and `"xo"` (`:2520-2526`) are not in the bulk list and stay on - which is why these two
+/// functions know only the two branches. Both are `BRANCH_HALT`, not voted (`gcc-sc7180.c:1765-1794`), so a disable
+/// writes the bit and waits for nothing (`clk_branch_wait`'s two branches both need `enabling` or `voted`,
+/// `drivers/clk/qcom/clk-branch.c:65-87`).
+pub fn disable_clocks(gcc: &impl Regs) -> Clocks {
+    // `clk_bulk_disable` walks the array backwards (`drivers/clk/clk-bulk.c:211-216`), so `iface` first.
+    gcc.write32(AHB_CBCR, gcc.read32(AHB_CBCR) & !CBCR_ENABLE);
+    gcc.write32(APPS_CBCR, gcc.read32(APPS_CBCR) & !CBCR_ENABLE);
+    Clocks::read(gcc)
+}
+
+/// The way back: `clk_bulk_prepare_enable` in the array's own order (`clk-bulk.c:87-90` and
+/// `include/linux/clk.h:1162-1172`), which is `core` before `iface` - the opposite of what this driver's bring-up
+/// writes (`enable_clocks` below, `soc.rs:72-73`) - and then the rate set again, which is what Linux's
+/// `dev_pm_opp_set_rate(dev, msm_host->clk_rate)` does for the core clock (`sdhci-msm.c:2733`). The RCG is left
+/// where bring-up put it, as in [`enable_clocks`], because only the two branches were gated.
+pub fn restore_clocks(gcc: &impl Regs, gpll0: &impl Regs, clock: &impl Clock) -> Result<(), Error> {
+    if gpll0.read32(GPLL0_MODE) & PLL_LOCK_DET == 0 {
+        return Err(Error::Unusable("GPLL0 is not running"));
+    }
+    gcc.write32(APPS_CBCR, gcc.read32(APPS_CBCR) | CBCR_ENABLE);
+    gcc.write32(AHB_CBCR, gcc.read32(AHB_CBCR) | CBCR_ENABLE);
+    gcc.write32(RCG_CFG, RCG_CFG_100MHZ);
+    gcc.write32(RCG_CMD, gcc.read32(RCG_CMD) | RCG_UPDATE);
+    for _ in 0..1000 {
+        if Clocks::read(gcc).running() && gcc.read32(RCG_CMD) & RCG_UPDATE == 0 {
+            return Ok(());
+        }
+        clock.delay_us(10);
+    }
+    Err(Error::Timeout("the SDCC2 clocks"))
+}
+
 /// `sdc2-on` from the device tree: clock no pull, 16 mA; command and data pull-up, 10 mA.
 pub fn configure_pins(sdc2: &impl Regs) {
     const PULL_UP: u32 = 3;

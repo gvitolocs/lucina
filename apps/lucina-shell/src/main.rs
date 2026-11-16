@@ -263,6 +263,8 @@ struct App {
     pub(crate) damage: Vec<Rect>,
     bar_dirty: bool,
     drawn_view: Option<View>,
+    /// When the last slide frame ended: the gap to the next one is the main loop between frames. For traces.
+    slide_frame_end: Option<Instant>,
     /// The screen is off: the power button asked for it. Only the power button counts then.
     asleep: bool,
     /// The backlight class device, when the kernel has one: brightness, and the screen going dark after idling.
@@ -287,6 +289,14 @@ struct App {
     /// With `--trace`: the input still waiting to reach the screen, and when the kernel took it.
     input_waiting: Option<(String, i64)>,
     pointer_waiting: Option<i64>,
+    /// With `--trace`: this burst's frames (`lucina_app::perf`), what kind they are, when the last one was shown, and what kind
+    /// the frame being drawn now is. A `perf <kind> ...` line ends each burst (docs/research/juno-perf.md).
+    perf: lucina_app::perf::Recorder,
+    /// The apps page drawn for the last slide: what it showed (`apps_page_key`), its pixels, and the status its bar shows.
+    apps_page: Option<(String, Frame, system::Status)>,
+    perf_kind: &'static str,
+    perf_last_at: i64,
+    frame_kind: &'static str,
     /// `/run/lucina/shell.sock`, for `lucina-devd` (`control.rs`). Bound after the first frame.
     control: Option<control::Control>,
     /// An app asked for through the socket while another had the screen: it starts once that one has closed.
@@ -450,6 +460,7 @@ impl App {
             damage: Vec::new(),
             bar_dirty: false,
             drawn_view: None,
+            slide_frame_end: None,
             asleep: false,
             backlight,
             last_input_us: monotonic_us(),
@@ -462,6 +473,11 @@ impl App {
             status_stale: false,
             input_waiting: None,
             pointer_waiting: None,
+            perf: lucina_app::perf::Recorder::new(512),
+            apps_page: None,
+            perf_kind: "",
+            perf_last_at: 0,
+            frame_kind: "",
             control: None,
             pending_open: None,
             ax: None,
@@ -474,6 +490,8 @@ impl App {
 
     /// What the first frame did not wait for: the sky (drawn at the next frame) and the backlight.
     fn after_first_frame(&mut self) {
+        // The page slide's compositor and its GPU surfaces, now rather than on the first PgDn (that slide's frames took 30 ms).
+        self.dash.open_compositor();
         if let Some(ms) = self.dash.finish_backdrop() {
             self.log(&format!(
                 "home: sky made in {ms:.0} ms, after the first frame"
@@ -533,26 +551,51 @@ impl App {
         self.dash.compose(Instant::now(), &ctx);
     }
 
-    /// The apps page drawn whole into a buffer, for the slide between the pages.
-    fn apps_page_pixels(&mut self) -> Vec<u32> {
-        let mut f = Frame::new(self.frame.w, self.frame.h);
-        let term = self.session.as_ref().map(|s| &s.term.screen);
-        ui::draw_all(
-            &mut f,
-            &mut self.text,
-            &self.layout,
-            View::Home,
-            &self.status,
-            &self.model,
-            &self.home,
-            self.ended.as_ref(),
-            &self.settings,
-            self.settings_sel,
-            self.settings_row,
-            term,
-            None,
-        );
-        f.px.to_vec()
+    /// What the apps page shows apart from the status bar: when it is the same as the cached page's, only the bar is drawn again.
+    fn apps_page_key(&self) -> String {
+        let h = &self.home;
+        let tiles: Vec<(&str, &str, &str)> = h
+            .tiles
+            .iter()
+            .map(|t| (t.id.as_str(), t.title.as_str(), t.subtitle.as_str()))
+            .collect();
+        format!(
+            "{:?}|{}|{}|{}|{:?}|{:?}|{:?}",
+            self.layout.k, self.model, h.sel, h.scroll, h.note, h.placed, tiles
+        )
+    }
+
+    /// The apps page drawn whole, for the slide between the pages. Kept between slides: drawing it took 53-69 ms on the laptop,
+    /// most of a slide's start. When only the status changed (the clock, each minute) the bar alone is drawn again.
+    fn apps_page(&mut self) -> &Frame {
+        let key = self.apps_page_key();
+        let fresh = matches!(&self.apps_page, Some((k, _, _)) if *k == key);
+        if !fresh {
+            let mut f = Frame::new(self.frame.w, self.frame.h);
+            let term = self.session.as_ref().map(|s| &s.term.screen);
+            ui::draw_all(
+                &mut f,
+                &mut self.text,
+                &self.layout,
+                View::Home,
+                &self.status,
+                &self.model,
+                &self.home,
+                self.ended.as_ref(),
+                &self.settings,
+                self.settings_sel,
+                self.settings_row,
+                term,
+                None,
+            );
+            self.apps_page = Some((key, f, self.status.clone()));
+        } else if let Some((_, f, st)) = self.apps_page.as_mut()
+            && *st != self.status
+        {
+            ui::draw_bar(f, &mut self.text, &self.layout, View::Home, &self.status);
+            *st = self.status.clone();
+        }
+        &self.apps_page.as_ref().expect("made above").1
     }
 
     /// Slide to the other page of Home.
@@ -560,8 +603,29 @@ impl App {
         if self.view != View::Home || self.dash.page == to {
             return;
         }
-        let other = self.apps_page_pixels();
+        let t0 = Instant::now();
+        self.apps_page();
+        let t1 = Instant::now();
+        let other = &self.apps_page.as_ref().expect("made above").1.px[..];
         self.dash.go(Instant::now(), to, other);
+        self.slide_frame_end = None;
+        if self.opts.trace {
+            let gpu = self.dash.gpu_status();
+            self.log(&format!(
+                "slide direction {}, gpu: {}",
+                if to == dash::Page::Apps {
+                    "to apps"
+                } else {
+                    "back"
+                },
+                gpu.as_deref().unwrap_or("no status")
+            ));
+            self.log(&format!(
+                "slide start: apps page {:.1} ms, dashboard and pages {:.1} ms",
+                (t1 - t0).as_secs_f64() * 1000.0,
+                t1.elapsed().as_secs_f64() * 1000.0
+            ));
+        }
         self.log(&format!(
             "home page {}",
             if to == dash::Page::Dash {
@@ -2172,14 +2236,27 @@ impl App {
             let now = Instant::now();
             if self.dash.sliding() {
                 let t = Instant::now();
-                self.dash.draw_slide(&mut self.frame, now);
+                let outside = self
+                    .slide_frame_end
+                    .map_or(0.0, |e| (t - e).as_secs_f64() * 1000.0);
+                let vblank = self.fb.as_mut().is_some_and(|f| f.vsync());
+                let backend = self.dash.slide_backend();
+                let (show, _) = self.dash.draw_slide(&mut self.frame, now, vblank);
+                self.slide_frame_end = Some(Instant::now());
                 if self.opts.trace {
+                    let (ops, shown_ms) = self.dash.slide_split;
                     self.log(&format!(
-                        "slide frame {:.1} ms",
+                        "slide frame {:.1} ms ({backend}): ops {ops:.1} ms, show {shown_ms:.1} ms, outside {outside:.1} ms",
                         t.elapsed().as_secs_f64() * 1000.0
                     ));
                 }
-                rects.push(self.frame.bounds());
+                // A GPU slide frame is on the screen already: it counts as a frame though nothing is left to present.
+                self.frame_kind = if show.is_some() {
+                    "slide-cpu"
+                } else {
+                    "slide-gpu"
+                };
+                rects.extend(show);
                 self.full = false;
                 self.damage.clear();
             } else {
@@ -2192,6 +2269,7 @@ impl App {
                     self.dash_damage(self.osd_glass.rect(self.frame.w, self.frame.h));
                 }
                 rects = self.dash.draw(&mut self.frame, now);
+                self.frame_kind = "dash";
                 if self.osd.is_some() {
                     let osd = self.osd_glass.rect(self.frame.w, self.frame.h);
                     if rects.iter().any(|r| !r.intersect(&osd).is_empty()) {
@@ -2211,6 +2289,7 @@ impl App {
             }
         } else {
             self.render_views(&mut rects, &mut dirty);
+            self.frame_kind = "views";
         }
         self.present_frame(started, rects, dirty);
     }
@@ -2323,6 +2402,7 @@ impl App {
         }
         let drew = !rects.is_empty();
         let drawn_px: i64 = rects.iter().map(|r| r.w as i64 * r.h as i64).sum();
+        let input_at = self.input_waiting.as_ref().map(|(_, t)| *t);
         if let Some(fb) = self.fb.as_mut() {
             fb.present_all(&self.frame, &rects);
             // The pointer goes straight to the screen over the frame; where it was, the frame is
@@ -2353,7 +2433,10 @@ impl App {
             }
             // What the input changed is on the screen once something was drawn. In the terminal that may be a little
             // later than the key, when the program's echo comes back through the pty.
-            if drew && let Some((what, t)) = self.input_waiting.take() {
+            let slid = self.frame_kind == "slide-gpu";
+            if (drew || slid)
+                && let Some((what, t)) = self.input_waiting.take()
+            {
                 self.log(&format!(
                     "latency {what}: {} us to the screen (compose {} us, copy {} us, {} rects, {} by the GPU, {drawn_px} pixels)",
                     now - t,
@@ -2364,11 +2447,57 @@ impl App {
                 ));
             }
         }
+        let kind = std::mem::take(&mut self.frame_kind);
+        if self.opts.trace && (drew || kind == "slide-gpu") {
+            self.perf_frame(
+                kind,
+                started,
+                composed,
+                input_at.filter(|_| drew || kind == "slide-gpu"),
+                drawn_px,
+            );
+        }
         self.pointer_moved = false;
         if self.drawn_view != Some(self.view) {
             self.drawn_view = Some(self.view);
             self.log(&format!("view {} drawn", self.view.name()));
         }
+    }
+
+    /// One frame for the burst's `perf` line. A burst ends after a quarter second with no frame, or when the kind of frame changes:
+    /// its line is printed then.
+    fn perf_frame(
+        &mut self,
+        kind: &'static str,
+        started: i64,
+        composed: i64,
+        input_at: Option<i64>,
+        px: i64,
+    ) {
+        use lucina_app::perf::{FrameRecord, current_cpu};
+        let now = monotonic_us();
+        if kind != self.perf_kind || now - self.perf_last_at > 250_000 {
+            self.perf_flush();
+            self.perf_kind = kind;
+        }
+        self.perf_last_at = now;
+        let us = |a: i64| a.clamp(0, u32::MAX as i64) as u32;
+        self.perf.push(FrameRecord {
+            at_us: now,
+            input_us: input_at.map_or(0, |t| us(now - t)),
+            compose_us: us(composed - started),
+            present_us: us(now - composed),
+            pixels: us(px),
+            cpu: current_cpu(),
+        });
+    }
+
+    /// Print the burst's `perf` line, if it had frames.
+    fn perf_flush(&mut self) {
+        if let Some(s) = self.perf.summary() {
+            self.log(&s.line(self.perf_kind));
+        }
+        self.perf.clear();
     }
 
     fn run(&mut self) -> ! {
@@ -2986,8 +3115,9 @@ fn main() {
         log_to(path);
     }
     eprintln!(
-        "lucina-shell: started {} ms after the kernel",
-        monotonic_us() / 1000
+        "lucina-shell: started {} ms after the kernel (build {})",
+        monotonic_us() / 1000,
+        option_env!("LUCINA_BUILD_ID").unwrap_or("unknown")
     );
     events::init();
     if let Some(dir) = opts.render.clone() {

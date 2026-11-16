@@ -1,0 +1,60 @@
+// The page slide's geometry (screen-forward and screen-back): which columns of a screen row come from the leaving page, which are
+// black and which come from the arriving page, for a slide offset and a drift. The CPU compose (`home::slide_compose`) and the GPU
+// compose (lucina-app `compose`) both take their spans from here, so the two backends show the same picture. The proof of this
+// file is added separately.
+
+/// The widest screen the rule takes, in pixels.
+pub const MAX_W: u32 = 65_536;
+
+/// One row of a slide frame, left to right in screen columns: `back_len` columns of the leaving page from its column `back_src`
+/// starting at `back_dst`, `gap_len` black columns at `gap_dst`, and `front_len` columns of the arriving page from its column
+/// `front_src` starting at `front_dst`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spans {
+    pub back_src: u32,
+    pub back_dst: u32,
+    pub back_len: u32,
+    pub gap_dst: u32,
+    pub gap_len: u32,
+    pub front_src: u32,
+    pub front_dst: u32,
+    pub front_len: u32,
+}
+
+/// The spans of a `w` pixels wide row when the arriving page's edge has moved `off` columns in and the leaving page has drifted
+/// `drift` columns. `forward` (screen-forward): the new page comes from the right over the old one, which drifts left. Otherwise
+/// (screen-back) the new page is on top and slides in from the left, its right edge at `w - off`, read from its column `off`;
+/// the old one drifts right by `drift`, dimmed, to the right of it, and black fills between them once the old page has run out.
+/// The three spans cover the row exactly once, each in its order, and no span reads outside its page: the spans tile the screen.
+pub fn slide_spans(w: u32, off: u32, drift: u32, forward: bool) -> Spans {
+    let off = if off < w { off } else { w };
+    let drift = if drift < w { drift } else { w };
+    if forward {
+        // The front page's left edge is at `off`; the back page has moved `drift` to the left.
+        let edge = off;
+        let shown = if edge < w - drift { edge } else { w - drift };
+        Spans {
+            back_src: drift,
+            back_dst: 0,
+            back_len: shown,
+            gap_dst: shown,
+            gap_len: edge - shown,
+            front_src: 0,
+            front_dst: edge,
+            front_len: w - edge,
+        }
+    } else {
+        let edge = w - off;
+        let start = if edge > drift { edge } else { drift };
+        Spans {
+            back_src: start - drift,
+            back_dst: start,
+            back_len: w - start,
+            gap_dst: edge,
+            gap_len: start - edge,
+            front_src: off,
+            front_dst: 0,
+            front_len: edge,
+        }
+    }
+}

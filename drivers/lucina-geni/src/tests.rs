@@ -151,7 +151,9 @@ impl Model {
                     w[..chunk.len()].copy_from_slice(chunk);
                     self.rx.push_back(u32::from_le_bytes(w));
                 }
-                self.status |= self.read_status.unwrap_or(irq::RX_FIFO_LAST | irq::CMD_DONE);
+                self.status |= self
+                    .read_status
+                    .unwrap_or(irq::RX_FIFO_LAST | irq::CMD_DONE);
                 self.cmd = None;
             }
             _ => self.status |= irq::ILLEGAL_CMD,
@@ -342,7 +344,10 @@ fn the_rx_fifo_is_drained_only_on_a_watermark_or_the_last_word() {
         i2c.transfer(&mut m, &mut Ticks(0), 0x05, &mut [Msg::Read(&mut buf)]),
         Err(Error::ShortRead { got: 0 })
     );
-    assert!(!m.rx.is_empty(), "CMD_DONE alone does not drain the RX FIFO");
+    assert!(
+        !m.rx.is_empty(),
+        "CMD_DONE alone does not drain the RX FIFO"
+    );
 }
 
 #[test]
@@ -950,7 +955,10 @@ fn clk_off_clear_or_the_noc_fsm_on_mean_running_and_the_vote_is_still_set() {
             gcc::enable_branch(&mut r, &S_AHB).0,
             gcc::BranchState::Running
         );
-        assert_eq!(r.writes, 0, "the vote bit is already set, nothing is rewritten");
+        assert_eq!(
+            r.writes, 0,
+            "the vote bit is already set, nothing is rewritten"
+        );
     }
     // After a vote the FSM counts too.
     let mut no_hwcg = S_AHB;
@@ -981,5 +989,136 @@ fn a_failed_read_never_looks_like_a_gated_or_running_clock() {
     assert_eq!(
         gcc::enable_branch(&mut r, &S_AHB).0,
         gcc::BranchState::StaysOff
+    );
+}
+
+// ---------------------------------------------------------------- patch 1356: the bus gate and the vote off
+
+#[test]
+fn a_down_bus_refuses_the_transfer_and_touches_nothing() {
+    let mut m = Model::new(vec![keyboard()]);
+    let mut i2c = ready(&mut m);
+    let gate = i2c.gate();
+    assert!(gate.down(), "an idle engine goes down");
+    let mut buf = [0u8; 4];
+    assert_eq!(
+        i2c.transfer(&mut m, &mut Ticks(0), 0x05, &mut [Msg::Read(&mut buf)]),
+        Err(Error::Suspended),
+        "Linux's answer over a suspended adapter is an error, not an access"
+    );
+    assert!(m.cmds.is_empty(), "no command was started");
+    // A bus clear is refused the same way, and is not counted.
+    assert!(!i2c.clear_bus(&mut m, &mut Ticks(0)));
+    assert_eq!(i2c.bus_clears(), 0);
+    // Up again: the very same transfer works, pointer set and descriptor read as the HID bring-up does.
+    gate.up();
+    i2c.transfer(
+        &mut m,
+        &mut Ticks(0),
+        0x05,
+        &mut [Msg::Write(&[0x20, 0x00]), Msg::Read(&mut buf)],
+    )
+    .unwrap();
+    assert_eq!(buf, [0x1e, 0x00, 0x00, 0x01]);
+}
+
+#[test]
+fn a_transfer_holds_the_bus_and_a_recovery_let_it_go() {
+    let mut m = Model::new(vec![keyboard()]);
+    let i2c = ready(&mut m);
+    let gate = i2c.gate();
+    let _use = gate.try_use().expect("the bus runs");
+    assert_eq!(gate.inflight(), 1);
+    assert!(!gate.down(), "a transfer in flight keeps the engine up");
+    drop(_use);
+    assert!(gate.is_idle());
+    assert!(gate.down());
+}
+
+#[test]
+fn the_gate_counts_several_users_and_the_park_is_the_owner_s_word() {
+    let gate = sleep::Gate::new();
+    let a = gate.try_use().unwrap();
+    let b = gate.try_use().unwrap();
+    assert_eq!(gate.inflight(), 2);
+    assert!(!gate.down());
+    drop(a);
+    drop(b);
+    assert!(gate.down());
+    // The owner's word survives the down and is owed again only after the bus runs.
+    gate.up();
+    assert!(!gate.is_parked());
+    gate.park();
+    assert!(gate.is_parked() && !gate.is_down());
+    // An owner that starts a transfer has taken its word back, so a sleep that is beginning waits for the round to
+    // end rather than finding a bus parked and busy at the same time.
+    let _use = gate.try_use().expect("the bus runs");
+    assert!(!gate.is_parked(), "transferring is not parked");
+    assert!(!gate.down(), "and not idle either");
+    drop(_use);
+    gate.park();
+    assert!(gate.down());
+    assert!(gate.is_parked(), "going down does not unpark the owner");
+    gate.up();
+    assert!(!gate.is_parked(), "the sleep this was parked for is over");
+}
+
+#[test]
+fn the_gate_never_invents_the_owner_s_ack() {
+    // The hook is what waits for the park; the gate only says what the owner left. A bus can be idle and unacked at
+    // the same time, which is the case the hook refuses a sleep for.
+    let gate = sleep::Gate::new();
+    assert!(gate.is_idle() && !gate.is_parked());
+    assert!(
+        gate.down(),
+        "down is about the transfers, not about the ack"
+    );
+}
+
+fn se_branch() -> gcc::Branch {
+    gcc::Branch {
+        cbcr: 0,
+        vote: 4,
+        vote_bit: 22,
+        halt: gcc::Halt::Voted,
+        hwcg_bit: None,
+    }
+}
+
+#[test]
+fn the_last_user_clears_only_its_own_vote_bit() {
+    // Keyboard SE (bit 22) with the touchpad SE (bit 26) and a wrapper clock (bit 19) still voted on the same register.
+    let mut r = branch(1 << 31, (1 << 22) | (1 << 26) | (1 << 19), None);
+    let (off, cbcr, vote) = gcc::disable_branch(&mut r, &se_branch());
+    assert_eq!(off, gcc::BranchOff::Cleared { wait_us: 10 });
+    assert_eq!(vote, (1 << 26) | (1 << 19), "the others keep their vote");
+    assert_eq!(cbcr, 1 << 31);
+    assert_eq!(r.writes, 1);
+    // clk-branch.c:74-75: a voted disable is answered with udelay(10), not with a poll of CLK_OFF.
+    assert_eq!(
+        gcc::disable_branch(&mut r, &se_branch()).0,
+        gcc::BranchOff::WasOff,
+        "a bit already clear writes nothing again"
+    );
+    assert_eq!(r.writes, 1);
+}
+
+#[test]
+fn a_gated_or_skipped_branch_earns_no_wait() {
+    // The slave AHB of a wrapper can sit in hardware gated mode: CLK_OFF says nothing, so Linux does not look
+    // (clk_branch_in_hwcg_mode comes first in clk_branch_wait, clk-branch.c:68-72).
+    let mut gated = se_branch();
+    gated.hwcg_bit = Some(1);
+    let mut r = branch(2, 1 << 22, None);
+    assert_eq!(
+        gcc::disable_branch(&mut r, &gated).0,
+        gcc::BranchOff::Cleared { wait_us: 0 }
+    );
+    let mut skip = se_branch();
+    skip.halt = gcc::Halt::Skip;
+    let mut r = branch(1 << 31, 1 << 22, None);
+    assert_eq!(
+        gcc::disable_branch(&mut r, &skip).0,
+        gcc::BranchOff::Cleared { wait_us: 0 }
     );
 }

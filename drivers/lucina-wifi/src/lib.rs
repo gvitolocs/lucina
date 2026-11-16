@@ -7,6 +7,10 @@
 //! back until the driver has answered: a join (nothing may be sent before the vdev runs and the peer exists) and a key
 //! (the port must not open before the key is in, `HTT_T2H_MSG_TYPE_SEC_IND`).
 //!
+//! A system sleep with no WoWLAN configured is mac80211's own path, in its order: [`Wifi::suspend_quiesce`] until
+//! [`Wifi::quiet`], then [`Wifi::suspend_target`] until [`Wifi::suspended`], and on the way back
+//! [`Wifi::resume_target`] after the copy engine lines are unmasked; the link rejoins from user space (patch 1352).
+//!
 //! `tests/session.rs` runs a whole session against the two crates' models. They are models: nothing here has met a modem,
 //! a real access point or the WCN3990's firmware.
 
@@ -369,6 +373,56 @@ impl<P: Platform> Wifi<P> {
         self.pull_outputs();
     }
 
+    /// The first half of a system sleep with no WoWLAN configured, what mac80211's `__ieee80211_suspend` does before it
+    /// stops the device: the scan is cancelled (`pm.c:34` `ieee80211_scan_cancel`, and the driver's `ath10k_scan_finish`
+    /// in `ath10k_halt`, `mac.c:4790`) and the interface goes (`pm.c:156` `ieee80211_mgd_quiesce`, `pm.c:164`
+    /// `drv_remove_interface`, which for ath10k is `ath10k_stop`'s `ath10k_drain_tx` (`mac.c:5371`) and
+    /// `ath10k_peer_cleanup_all` (`mac.c:4791`)). It is [`Wifi::disconnect`] for the link, plus the scan's remaining legs.
+    /// What is already on its way out - the deauth, the peer delete - goes through [`Wifi::poll`] in the order the driver
+    /// queued it, so it cannot fall behind the suspend command [`Wifi::suspend_target`] adds afterwards.
+    pub fn suspend_quiesce(&mut self) {
+        self.legs.clear();
+        if self.scanning
+            && let Err(err) = self.driver.stop_scan()
+        {
+            self.log.push_back(format!("scan stop for sleep: {err:?}"));
+        }
+        self.disconnect();
+    }
+
+    /// Whether [`Wifi::suspend_quiesce`] has worked out, as far as this crate can see: no scan the firmware still runs,
+    /// no link, nothing of ours left to send or waiting for an answer. mac80211's `synchronize_net` and
+    /// `flush_workqueue` (`pm.c:61,69`) over the queues it stopped (`pm.c:57`) are what this stands in for; the driver's
+    /// own tx completions are counted too, since a suspended target does not complete what it never got.
+    pub fn quiet(&self) -> bool {
+        !self.scanning
+            && !self.link_up
+            && self.wait == Wait::None
+            && self.outbox.is_empty()
+            && self.driver.tx_pending() == 0
+    }
+
+    /// The second half of the sleep, `ath10k_core_stop`'s try to suspend the target (`core.c:3291-3294`): the WMI
+    /// pdev-suspend and the wait for the target's message. The wait runs in [`Wifi::poll`], which the caller keeps
+    /// calling until [`Wifi::suspended`] says the block sleeps; it ends on its own if the target never answers, as
+    /// Linux lets it (`core.c:3294`).
+    pub fn suspend_target(&mut self) -> Result<(), DriverError> {
+        self.driver.suspend_target()
+    }
+
+    /// Whether the target sleeps: [`Wifi::poll`] touches nothing of it now, and [`Wifi::resume_target`] is the way back.
+    pub fn suspended(&self) -> bool {
+        self.driver.suspended()
+    }
+
+    /// The reverse of [`Wifi::suspend_target`], the WMI pdev-resume (`wmi-ops.h:566-579`); see
+    /// [`Driver::resume_target`] for why Linux has no caller for it. The caller unmasks the copy engine lines first, as
+    /// `ath10k_snoc_hif_start` does (`snoc.c:940`). The link does not come back here: with no WoWLAN mac80211 lets the
+    /// supplicant rejoin, so the caller tells user space the link is down and [`Wifi::connect`] runs again.
+    pub fn resume_target(&mut self) -> Result<(), DriverError> {
+        self.driver.resume_target()
+    }
+
     fn begin_scan(&mut self, ssid: Option<Vec<u8>>) {
         let now = self.now;
         let Some(station) = self.station.as_mut() else {
@@ -419,7 +473,8 @@ impl<P: Platform> Wifi<P> {
     /// When [`Wifi::poll`] must run again by itself: the driver's timers, and the station's while no join is on its way (its
     /// clock stops then, as in `poll`). `None`: nothing until the device or a command moves it.
     pub fn next_deadline(&self) -> Option<u64> {
-        let joining = self.wait == Wait::Join || matches!(self.outbox.front(), Some(Output::JoinBss(_)));
+        let joining =
+            self.wait == Wait::Join || matches!(self.outbox.front(), Some(Output::JoinBss(_)));
         let station = if joining {
             None
         } else {
@@ -470,7 +525,8 @@ impl<P: Platform> Wifi<P> {
                     caps.ht_cap_info,
                     caps.regdomain
                 ));
-                let mut hw = HwCaps::from_wmi(caps.ht_cap_info, caps.vht_cap_info, chains, mask, mask);
+                let mut hw =
+                    HwCaps::from_wmi(caps.ht_cap_info, caps.vht_cap_info, chains, mask, mask);
                 if self.no_vht {
                     hw.vht = None;
                 }
@@ -807,8 +863,16 @@ impl<P: Platform> Wifi<P> {
         };
         let _ = writeln!(out, "state {state}");
         let _ = writeln!(out, "mac {}", hex(&self.mac));
-        let _ = writeln!(out, "rx {} frames {} bytes", self.counters[0], self.counters[1]);
-        let _ = writeln!(out, "tx {} frames {} bytes", self.counters[2], self.counters[3]);
+        let _ = writeln!(
+            out,
+            "rx {} frames {} bytes",
+            self.counters[0], self.counters[1]
+        );
+        let _ = writeln!(
+            out,
+            "tx {} frames {} bytes",
+            self.counters[2], self.counters[3]
+        );
         if let Some(why) = &self.failed {
             let _ = writeln!(out, "failed {why}");
         }

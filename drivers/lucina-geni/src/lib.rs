@@ -14,6 +14,9 @@
 //!   command each, polling `M_IRQ_STATUS`. On a NACK, bus error or lost arbitration it stops filling the FIFO,
 //!   cancels the command and, if that does not finish, aborts it. [`I2c::transfer_recovering`] also tries one bus clear
 //!   after a bus error or lost arbitration, for a bus with no other master.
+//! * [`sleep::Gate`] is what a system sleep asks of the bus before it takes the engine's clocks away: nothing in
+//!   flight, the owner quiesced, and every later transfer refused rather than tried on an unclocked engine.
+//!   [`I2c::gate`] hands the same gate to whoever owns the engine.
 //! * [`gcc`] reads the source clock and starts a stopped one; [`pad`] is a TLMM pad's control value.
 //!
 //! Interrupts stay off in the GIC: the engine's interrupt line is never mapped, only its status register is read.
@@ -21,10 +24,16 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
+use alloc::sync::Arc;
 use core::fmt;
 
 pub mod gcc;
 pub mod pad;
+pub mod sleep;
+
+use sleep::Gate;
 
 /// Register access to a serial engine (the `reg` of its node, 0x4000 bytes), by byte offset.
 pub trait Regs {
@@ -312,6 +321,9 @@ pub enum Error {
     Timeout,
     /// The engine did not finish a cancel or an abort either: it needs a reset.
     Stuck,
+    /// The bus is down for a sleep ([`sleep::State::Down`]): Linux's answer to a transfer over a suspended adapter is
+    /// `-EAGAIN` (`i2c_mark_adapter_suspended`, `i2c-qcom-geni.c:1011`; `i2c-core-base.c:2284-2287`).
+    Suspended,
 }
 
 impl fmt::Display for Error {
@@ -338,6 +350,7 @@ impl fmt::Display for Error {
             Error::ShortRead { got } => write!(f, "read ended after {got} bytes"),
             Error::Timeout => f.write_str("timeout"),
             Error::Stuck => f.write_str("cancel and abort did not finish"),
+            Error::Suspended => f.write_str("the bus is down for a sleep"),
         }
     }
 }
@@ -353,6 +366,8 @@ pub struct I2c {
     tx_depth: usize,
     timing: Timing,
     bus_clears: u32,
+    /// Shared with whoever owns the engine, so a sleep can ask it before the clocks go (`sleep`).
+    gate: Arc<Gate>,
 }
 
 impl I2c {
@@ -450,11 +465,17 @@ impl I2c {
             tx_depth: probe.tx_depth,
             timing,
             bus_clears: 0,
+            gate: Arc::new(Gate::new()),
         })
     }
 
     pub fn timing(&self) -> Timing {
         self.timing
+    }
+
+    /// The bus's sleep gate, for the thread that registers this engine with the suspend list (patch 1356).
+    pub fn gate(&self) -> Arc<Gate> {
+        self.gate.clone()
     }
 
     /// Runs `msgs` to the 7-bit address `addr`, with repeated starts between them and a stop after the last.
@@ -468,6 +489,11 @@ impl I2c {
         addr: u8,
         msgs: &mut [Msg<'_>],
     ) -> Result<(), Error> {
+        // Linux refuses here rather than later: `i2c_mark_adapter_suspended` (`i2c-qcom-geni.c:1011`) makes
+        // `__i2c_transfer` answer before anything reaches the engine (`i2c-core-base.c:2284-2287`), and this driver's
+        // own rule is that an unclocked engine is never touched.
+        let gate = self.gate.clone();
+        let _bus = gate.try_use().ok_or(Error::Suspended)?;
         let n = msgs.len();
         for (i, msg) in msgs.iter_mut().enumerate() {
             let param =
@@ -504,6 +530,11 @@ impl I2c {
 
     /// Runs an I2C bus clear command. Returns whether it finished without an error.
     pub fn clear_bus(&mut self, r: &mut impl Regs, clock: &mut impl Clock) -> bool {
+        let gate = self.gate.clone();
+        let _bus = match gate.try_use() {
+            Some(bus) => bus,
+            None => return false,
+        };
         self.bus_clears = self.bus_clears.saturating_add(1);
         select_fifo_mode(r);
         r.write32(reg::M_CMD0, OPCODE_BUS_CLEAR << 27);

@@ -19,6 +19,7 @@
 //!   level as a floor client of its own until the interconnect's `sync_state`.
 //! * [`share`]: one table of every ARC and XO vote on the apps DRV, aggregated across drivers as Linux's genpd, `rpmhpd.c` and
 //!   the clock framework do; its rules are [`vote_rules`], which Verus checks.
+//! * [`sleep_votes`]: what each device's sleep hook lets go of those votes (patch 1354), and GCC's XO hold.
 //! * [`plan`]: [`plan::modem_plan`] and [`plan::wcn3990_plan`], the complete lists as `(name, command)`, and
 //!   [`plan::modem_votes`] with the sleep and wake cache.
 //!
@@ -41,6 +42,7 @@ pub mod plan;
 pub mod rpmh;
 pub mod rsc;
 pub mod share;
+pub mod sleep_votes;
 pub mod tree;
 pub mod vote_rules;
 pub mod vrm;

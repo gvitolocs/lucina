@@ -28,6 +28,24 @@ fn start(m: &Model, reset: ResetPolicy, policy: WritePolicy) -> Result<TestHost,
     Host::start(m.regs(), m.area(), m.clock(), reset, policy)
 }
 
+/// [`start`] with the error handler's reset off, what a Qualcomm host runs by default (`ufs.recover`, patch 1359).
+/// The tests that use it are about the request path that is left when nothing is reset: a hung request ending the
+/// host, and the buffers of a request that was not proved over being kept. [`the_reset_brings_a_hung_request_back`]
+/// and its neighbours are the same failures with the reset on.
+fn start_no_recover(m: &Model, reset: ResetPolicy, policy: WritePolicy) -> Result<TestHost, Error> {
+    Host::start_with(
+        m.regs(),
+        m.area(),
+        m.clock(),
+        reset,
+        policy,
+        crate::Options {
+            restart_lists: true,
+            recover: false,
+        },
+    )
+}
+
 fn seg(off: u64, len: usize) -> DataSegment {
     DataSegment {
         daddr: DATA_DADDR + off,
@@ -349,11 +367,12 @@ fn errors_from_the_device_are_reported() {
     assert_eq!(h.read(0, 0, 1, &[seg(2, 4096)]), Err(Error::BadBuffer));
 }
 
-/// A SCSI command that hangs is taken back, and the host stops: the device may still hold its tag.
+/// A SCSI command that hangs, with nothing reset after it, is taken back and ends the host: the device may still
+/// hold its tag. The reset that Linux sends instead is [`the_reset_brings_a_hung_request_back`].
 #[test]
 fn a_hung_request_ends_the_host() {
     let m = Model::cold(laptop_lus());
-    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    let mut h = start_no_recover(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
     m.0.borrow_mut().hang_next = true;
     assert_eq!(
         h.read(0, 0, 1, &[seg(0, 4096)]),
@@ -366,7 +385,7 @@ fn a_hung_request_ends_the_host() {
 #[test]
 fn a_request_that_cannot_be_cleared_kills_the_host() {
     let m = Model::cold(laptop_lus());
-    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    let mut h = start_no_recover(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
     {
         let mut s = m.0.borrow_mut();
         s.hang_next = true;
@@ -374,6 +393,185 @@ fn a_request_that_cannot_be_cleared_kills_the_host() {
     }
     assert!(h.read(0, 0, 1, &[seg(0, 4096)]).is_err());
     assert_eq!(h.read(0, 1, 1, &[seg(0, 4096)]), Err(Error::Dead));
+}
+
+/// Patch 1359, Linux's error handler: a request that will not end is answered by a reset of the host and the link
+/// (`ufshcd_eh_timed_out` → `ufshcd_link_recovery`, `ufshcd_err_handler` → `ufshcd_reset_and_restore`), and the
+/// command goes again. Here that is one `full_init`, the bring-up's own, so the read comes back with its data and
+/// nothing was ever written outside LUN 0.
+#[test]
+fn the_reset_brings_a_hung_request_back() {
+    let m = Model::cold(laptop_lus());
+    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    let pattern: Vec<u8> = (0..4096).map(|i| (i * 11 % 251) as u8).collect();
+    m.mem_write(DATA_DADDR, &pattern);
+    h.write(0, 3, 1, &[seg(0, 4096)]).unwrap();
+    m.mem_write(DATA_DADDR, &vec![0u8; 4096]);
+    let hce_before = m.0.borrow().n.hce_writes;
+    m.0.borrow_mut().hang_next = true;
+    assert_eq!(h.read(0, 3, 1, &[seg(0, 4096)]), Ok(()));
+    assert!(!h.is_dead());
+    assert_eq!(m.mem_read(DATA_DADDR, 4096), pattern);
+    let s = m.0.borrow();
+    assert!(
+        s.n.hce_writes >= hce_before + 2,
+        "the controller was not stopped and started again: {}",
+        s.n.hce_writes
+    );
+    assert!(
+        s.n.uic.contains(&regs::UIC_DME_LINK_STARTUP),
+        "the link was not started again"
+    );
+    assert!(
+        s.n.queries
+            .contains(&(upiu::QUERY_OP_SET_FLAG, desc::FLAG_DEVICE_INIT, 0)),
+        "the device was not initialized again"
+    );
+    // The hung request's data never went anywhere, so the retry is the second READ (10) of the burst.
+    let reads =
+        s.n.scsi
+            .iter()
+            .filter(|(lun, op)| *lun == 0 && *op == scsi::READ_10)
+            .count();
+    assert!(reads >= 2, "the command was not sent again: {reads} reads");
+    // Nothing anywhere but the main user LUN, and no write in the whole recovery.
+    assert!(
+        s.n.scsi
+            .iter()
+            .filter(|(lun, _)| *lun != 0)
+            .all(|(_, op)| !matches!(
+                *op,
+                scsi::WRITE_10 | scsi::WRITE_16 | scsi::SYNCHRONIZE_CACHE_10
+            )),
+        "the recovery wrote another LUN: {:?}",
+        s.n.scsi
+    );
+    let log = s.notes.join("\n");
+    assert!(log.contains("recovery: link up"), "{log}");
+    assert!(log.contains("no device reset"), "{log}");
+}
+
+/// The resume case of patch 1353 with the answer patch 1359 gives: the link went to hibern8 for the sleep, the way
+/// back does not bring it up, and the reset does. `hibernate_exit` says so the way Linux's `ufshcd_uic_pwr_ctrl`
+/// does - UPMCRS not PWR_LOCAL, the link broken - and the disk works again afterwards.
+#[test]
+fn a_wake_that_does_not_bring_the_link_back_is_reset() {
+    let m = Model::firmware_left(laptop_lus());
+    let mut h = start(&m, ResetPolicy::Never, WritePolicy::default()).unwrap();
+    h.hibernate_enter().unwrap();
+    m.0.borrow_mut().hiber_exit_upmcrs = 3; // PWR_BUSY: the peer kept the link
+    assert_eq!(h.hibernate_exit(), Err(Error::NoDevice));
+    assert!(h.error_recovery().is_ok());
+    assert!(!h.is_dead());
+    // The disk works both ways again.
+    let pattern: Vec<u8> = (0..4096).map(|i| (i * 5 % 251) as u8).collect();
+    m.mem_write(DATA_DADDR, &pattern);
+    h.write(0, 7, 1, &[seg(0, 4096)]).unwrap();
+    m.mem_write(DATA_DADDR, &vec![0u8; 4096]);
+    assert_eq!(h.read(0, 7, 1, &[seg(0, 4096)]), Ok(()));
+    assert_eq!(m.mem_read(DATA_DADDR, 4096), pattern);
+    let s = m.0.borrow();
+    assert!(
+        s.n.uic.contains(&regs::UIC_DME_LINK_STARTUP),
+        "the link was started again"
+    );
+    // The link was down before the reset, so the recovery's NOP OUT is what proved it back up.
+    let log = s.notes.join("\n");
+    assert!(log.contains("recovery: link up"), "{log}");
+}
+
+/// The same resume with the handler switched off (`ufs.recover=off`, what a Qualcomm controller runs by default,
+/// patch 1359): the call declines, the controller is left exactly as the failed exit left it and the host is not
+/// marked dead, so a request after the link does come back reaches the disk as it always did.
+#[test]
+fn a_declined_recovery_changes_nothing() {
+    let m = Model::firmware_left(laptop_lus());
+    let mut h = start_no_recover(&m, ResetPolicy::Never, WritePolicy::default()).unwrap();
+    h.hibernate_enter().unwrap();
+    m.0.borrow_mut().hiber_exit_upmcrs = 3; // PWR_BUSY: the peer kept the link
+    assert!(h.hibernate_exit().is_err());
+    let before = m.0.borrow().n.hce_writes;
+    assert_eq!(h.error_recovery(), Err(Error::Dead));
+    assert!(!h.is_dead(), "a declined reset is not a dead host");
+    let s = m.0.borrow();
+    assert_eq!(s.n.hce_writes, before, "the host was not reset");
+    assert!(
+        !s.n.uic.contains(&regs::UIC_DME_LINK_STARTUP),
+        "the link was not restarted"
+    );
+    assert!(
+        s.notes.join("\n").contains("recovery: off"),
+        "{}",
+        s.notes.join("\n")
+    );
+    drop(s);
+    // The exit did bring the model's link out of hibern8 - only its UPMCRS answer was distrusted - so a plain read
+    // still goes through the same request path as before the decline.
+    assert_eq!(h.read(0, 7, 1, &[seg(0, 4096)]), Ok(()));
+}
+
+/// Once per failure, not five times as Linux loops (`MAX_HOST_RESET_RETRIES`, `ufshcd.c:81`): a request that ends
+/// afterwards opens a new failure, and a reset that did not bring the controller back is not tried again - the host
+/// is left dead, which is Linux's `UFSHCD_STATE_ERROR` (`:7763-7768`) and an I/O error rather than a wait.
+#[test]
+fn the_reset_is_tried_once_per_failure() {
+    let m = Model::cold(laptop_lus());
+    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    let base = m.0.borrow().n.hce_writes;
+    // Two hung requests, each with its own reset, because the first one ended with the read completing.
+    for lba in [3u64, 4] {
+        m.0.borrow_mut().hang_next = true;
+        assert_eq!(h.read(0, lba, 1, &[seg(0, 4096)]), Ok(()));
+    }
+    let after_two = m.0.borrow().n.hce_writes;
+    assert!(
+        after_two >= base + 4,
+        "two failures, two resets: {base} -> {after_two}"
+    );
+    // A third failure whose reset cannot bring the device back: the request's own error, the host dead, and no
+    // fourth reset behind it.
+    {
+        let mut s = m.0.borrow_mut();
+        s.hang_next = true;
+        s.hang_nop = 40;
+    }
+    assert_eq!(
+        h.read(0, 5, 1, &[seg(0, 4096)]),
+        Err(Error::Timeout("a transfer request"))
+    );
+    assert!(h.is_dead());
+    let after_fail = m.0.borrow().n.hce_writes;
+    assert_eq!(h.read(0, 6, 1, &[seg(0, 4096)]), Err(Error::Dead));
+    assert_eq!(
+        m.0.borrow().n.hce_writes,
+        after_fail,
+        "a host the reset gave up on is not reset again"
+    );
+    let log = m.0.borrow().notes.join("\n");
+    assert!(log.contains("recovery: reset failed"), "{log}");
+}
+
+/// A recovery of a controller that will not come back is an error, not a wait and not a second try: the bring-up
+/// inside it fails, the host is left dead, and the request's own error is what the caller sees.
+#[test]
+fn a_reset_that_fails_reports_the_request_error() {
+    let m = Model::cold(laptop_lus());
+    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    {
+        let mut s = m.0.borrow_mut();
+        s.hang_next = true;
+        // Every NOP OUT after the reset hangs too, so `verify_device` inside `full_init` gives up.
+        s.hang_nop = 40;
+    }
+    assert_eq!(
+        h.read(0, 0, 1, &[seg(0, 4096)]),
+        Err(Error::Timeout("a transfer request"))
+    );
+    assert!(h.is_dead());
+    // Nothing waits any more: the host is dead, so the next request is refused where it stands.
+    assert_eq!(h.read(0, 1, 1, &[seg(0, 4096)]), Err(Error::Dead));
+    let log = m.0.borrow().notes.join("\n");
+    assert!(log.contains("recovery: reset failed"), "{log}");
 }
 
 #[test]
@@ -767,6 +965,7 @@ fn the_lists_can_be_left_running() {
     let m = Model::firmware_left(laptop_lus());
     let options = crate::Options {
         restart_lists: false,
+        recover: true,
     };
     let h = Host::start_with(
         m.regs(),
@@ -844,12 +1043,12 @@ fn is_fatal_is_linuxs_int_fatal_errors() {
     );
 }
 
-/// D-B: a fatal interrupt bit fails the request and kills the host (Linux's "reset failed" outcome, as this
-/// driver cannot reset).
+/// D-B: a fatal interrupt bit fails the request and, with the reset off, kills the host - Linux's "reset failed"
+/// outcome. With the reset on the same bits go through it: [`the_reset_brings_a_hung_request_back`].
 #[test]
 fn a_fatal_interrupt_bit_kills_the_host() {
     let m = Model::cold(laptop_lus());
-    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    let mut h = start_no_recover(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
     m.0.borrow_mut().hang_and_fatal = Some(regs::IS_ULLS);
     assert_eq!(
         h.read(0, 0, 1, &[seg(0, 4096)]),
@@ -929,12 +1128,13 @@ fn a_short_transfer_fails_but_an_overflowing_residual_does_not() {
     h.read(0, 0, 1, &[seg(0, 4096)]).unwrap();
 }
 
-/// D-G: IS.UE in the poll path is read, logged and cleared; the PA_INIT class is fatal, the others are not.
+/// D-G: IS.UE in the poll path is read, logged and cleared; the PA_INIT class is fatal, the others are not. The
+/// reset is off here, as in the tests above: which class counts as fatal is what this is about, not what follows.
 #[test]
 fn uic_errors_in_the_poll_path_are_logged_and_only_pa_init_is_fatal() {
     // PA_INIT in UECDL: the class Linux treats as needing a reset.
     let m = Model::cold(laptop_lus());
-    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    let mut h = start_no_recover(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
     m.0.borrow_mut().hang_and_ue = Some([0, regs::UECDL_PA_INIT_ERROR, 0, 0, 0]);
     assert!(matches!(
         h.read(0, 0, 1, &[seg(0, 4096)]),
@@ -949,7 +1149,7 @@ fn uic_errors_in_the_poll_path_are_logged_and_only_pa_init_is_fatal() {
 
     // A network-layer error: logged and cleared, not fatal by itself.
     let m = Model::cold(laptop_lus());
-    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    let mut h = start_no_recover(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
     m.0.borrow_mut().hang_and_ue = Some([0, 0, 0x8000_0000, 0, 0]);
     assert!(matches!(
         h.read(0, 0, 1, &[seg(0, 4096)]),
@@ -1064,12 +1264,14 @@ fn no_write_ever_reaches_a_lun_but_0() {
     assert_eq!(writes, [0], "every WRITE went to LUN 0");
 }
 
-/// Unsafe audit round 2, U-1: the request that ends the host keeps its buffers when its slot never clears.
+/// Unsafe audit round 2, U-1: the request that ends the host keeps its buffers when its slot never clears. With a
+/// reset after it the controller is stopped and the buffers are safe, which is the other half of
+/// [`the_reset_brings_a_hung_request_back`]; here nothing is reset, which is the case that needs the quarantine.
 #[test]
 fn a_request_whose_slot_never_clears_keeps_its_buffers() {
     use alloc::sync::Arc;
     let m = Model::cold(laptop_lus());
-    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    let mut h = start_no_recover(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
     {
         let mut s = m.0.borrow_mut();
         s.hang_next = true;
@@ -1097,11 +1299,12 @@ fn a_request_whose_slot_never_clears_keeps_its_buffers() {
 }
 
 /// U-2: UTRLCLR takes the slot back, but no ABORT TASK reached the device, which may still send data for tag 0.
+/// The reset is off: this is the case where the request is not proved over, so the buffers go to quarantine.
 #[test]
 fn a_request_cleared_without_abort_task_keeps_its_buffers() {
     use alloc::sync::Arc;
     let m = Model::cold(laptop_lus());
-    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    let mut h = start_no_recover(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
     m.0.borrow_mut().hang_next = true;
     let owner = Arc::new(seg(0, 4096));
     let mut quarantine = Vec::new();
@@ -1114,11 +1317,12 @@ fn a_request_cleared_without_abort_task_keeps_its_buffers() {
     assert_eq!(Arc::strong_count(&owner), 2);
 }
 
-/// A fatal error mid-transfer keeps the buffers too; a request that fails with a status keeps nothing.
+/// A fatal error mid-transfer keeps the buffers too; a request that fails with a status keeps nothing. The reset
+/// is off, because this is about what a request that was not proved over leaves behind.
 #[test]
 fn only_requests_not_proved_over_keep_their_buffers() {
     let m = Model::cold(laptop_lus());
-    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    let mut h = start_no_recover(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
     let mut quarantine = Vec::new();
     // A completed request with a bad OCS: the controller gave the slot back and wrote the descriptor.
     m.0.borrow_mut().ocs_fail = (6, upiu::OCS_INVALID_PRDT_ATTR);
@@ -1133,7 +1337,7 @@ fn only_requests_not_proved_over_keep_their_buffers() {
     assert_eq!(h.keep_held([2u8], &mut quarantine), 0);
     // Fatal bits.
     let m = Model::cold(laptop_lus());
-    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    let mut h = start_no_recover(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
     m.0.borrow_mut().hang_and_fatal = Some(regs::IS_ULLS);
     assert!(h.read(0, 0, 1, &[seg(0, 4096)]).is_err());
     assert_eq!(h.keep_held([3u8], &mut quarantine), 4096);
@@ -1233,10 +1437,11 @@ fn a_lost_interrupt_is_found_after_one_capped_sleep() {
 }
 
 /// A request that never finishes still times out at 30 s, as before the sleeps were capped; no miss is counted.
+/// The reset is off, so the 30 s of waiting on the interrupt is the whole of what the request costs.
 #[test]
 fn a_hung_request_with_a_lost_interrupt_times_out_at_30_s() {
     let m = Model::cold(laptop_lus());
-    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    let mut h = start_no_recover(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
     {
         let mut s = m.0.borrow_mut();
         s.irq = true;

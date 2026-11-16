@@ -17,6 +17,7 @@
 
 pub mod app;
 pub mod camera_mark;
+pub mod compose;
 pub mod dirty;
 pub mod edit;
 pub mod fb;
@@ -30,6 +31,7 @@ pub mod input_watch;
 pub mod intent;
 pub mod keys;
 pub mod manifest;
+pub mod perf;
 pub mod prof;
 pub mod program;
 pub mod screen;

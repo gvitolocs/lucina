@@ -239,10 +239,19 @@ impl State {
                 self.set_long(csd);
             }
             (_, 7) => {
-                assert_eq!(arg >> 16, self.rca as u32);
-                self.selected = true;
-                self.set_response([self.r1(), 0, 0, 0]);
-                status |= INT_DATA_END;
+                if arg == 0 {
+                    // `mmc_deselect_cards` (`sd.c:1704-1705`), whose command is `_mmc_select_card(host, NULL)`: the
+                    // same opcode, no argument and no response asked for (`mmc_ops.c:103-110`). The card leaves the
+                    // transfer state and keeps its address. The response bit still comes, as for any command: this
+                    // driver always waits for `INT_RESPONSE` (`host.rs:528`).
+                    self.selected = false;
+                    self.set_response([self.r1(), 0, 0, 0]);
+                } else {
+                    assert_eq!(arg >> 16, self.rca as u32);
+                    self.selected = true;
+                    self.set_response([self.r1(), 0, 0, 0]);
+                    status |= INT_DATA_END;
+                }
             }
             (_, 16) => self.set_response([self.r1(), 0, 0, 0]),
             (_, 13) => {

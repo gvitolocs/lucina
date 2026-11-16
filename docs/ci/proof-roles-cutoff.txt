@@ -1,0 +1,10 @@
+# The coordinator's list of units that may have a pre-rule record (docs/ci/PROOF-ROLES.md). Full 40-hex ids only.
+# An entry is added only with an independent strong verdict that covers the listed commit. Added 2026-11-11.
+cutoff ebc0a4efd5371645bad2cae439655c1223d7fd56
+shipped/lucina-crash/layout	f7003b743abb50adb594081750ba156aae144854	patch 1213: one session wrote code and proof before roles landed; independent Opus review review-1213-verdict.md (accept with fixes)
+shipped/lucina-crash/waits	f7003b743abb50adb594081750ba156aae144854	patch 1213: one session wrote code and proof before roles landed; independent Opus review review-1213-verdict.md (accept with fixes)
+shipped/lucina-glass/browser_rules	19d0246cdcad5fdab63dca6bfd7567ad9a796298	glass browser rules: Sonnet-written statements in the creating commit (21869837d) before roles landed; independent Opus verdict (accept) and Qwen review (reject, then accept after the tap fix)
+verus/juno-kexec/rules	d007197a87cc646a655f528e72c296bf56f45429	kexec pages proofs: one Opus session wrote code and proof before roles landed; independent Opus verdicts kexec-review-verdict.md and kexec-recheck-verdict.md, with the 2026-11-11 addendum covering d007197a8
+shipped/lucina-log/rules	32a406fdb59ae8db453801ebf23cc22a024a02c8	lucina-log: Sonnet-written clauses in the creating commit (b58d51b02) before roles landed; independent Opus verdict (accept with fixes)
+shipped/lucina-spinwatch/rules	c9d2b8b7dfb68c222329f037b18202582ffcac2e	patch 1214 spinwatch: one Opus lane wrote code and proof before roles landed; independent Opus verdict verdict-1214.md (accept with fixes)
+verus/juno-surface/rules	7fd2fa4fe1df0da5c3b63331acbd7180fb0bf520	zero-copy surface rules: crate and first Verus clauses written by a builder before roles landed; independent Opus review verdict-surface-rules.md (accept with changes, closed by the later Opus pass)

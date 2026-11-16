@@ -1934,12 +1934,18 @@ pub fn slide_compose(
     t: f32,
     dir: i32,
 ) {
-    let k = Ease::EMPHASIZED.at(t.clamp(0.0, 1.0));
-    let unit = (k * 65536.0).round().clamp(0.0, 65536.0) as u32;
-    let off = hr::slide(w as u32, unit) as usize;
-    let drift = (w as u32 / 4 - hr::slide(w as u32 / 4, unit)) as usize;
-    // The page behind darkens to 45 % as the new one covers it.
-    let dim = 256 - (141.0 * k) as u32;
+    let (sp, dim) = slide_frame(w as u32, t, dir);
+    let (bs, bd, bl) = (
+        sp.back_src as usize,
+        sp.back_dst as usize,
+        sp.back_len as usize,
+    );
+    let (gd, gl) = (sp.gap_dst as usize, sp.gap_len as usize);
+    let (fs, fd, fl) = (
+        sp.front_src as usize,
+        sp.front_dst as usize,
+        sp.front_len as usize,
+    );
     for y in 0..h {
         let row = y * w;
         let (o, b, f) = (
@@ -1948,26 +1954,29 @@ pub fn slide_compose(
             &front[row..row + w],
         );
         // Whole slices, so the darkening loop vectorises: it runs over two million pixels a frame.
-        let drift = drift.min(w);
-        if dir >= 0 {
-            // The front page's left edge is at `off`; the back page has moved `drift` to the left.
-            let edge = off.min(w);
-            let shown = edge.min(w - drift);
-            for (o, v) in o[..shown].iter_mut().zip(&b[drift..drift + shown]) {
-                *o = darken(*v, dim);
-            }
-            o[shown..edge].fill(0);
-            o[edge..w].copy_from_slice(&f[..w - edge]);
-        } else {
-            let edge = w - off.min(w);
-            o[..edge].copy_from_slice(&f[off.min(w)..w]);
-            let start = edge.max(drift);
-            o[edge..start].fill(0);
-            for (o, v) in o[start..w].iter_mut().zip(&b[start - drift..w - drift]) {
-                *o = darken(*v, dim);
-            }
+        for (o, v) in o[bd..bd + bl].iter_mut().zip(&b[bs..bs + bl]) {
+            *o = darken(*v, dim);
         }
+        o[gd..gd + gl].fill(0);
+        o[fd..fd + fl].copy_from_slice(&f[fs..fs + fl]);
     }
+}
+
+/// One frame of a page slide for a `w` pixels wide screen: the row's spans (the proved [`slide_rules::slide_spans`]) and how far
+/// the leaving page is dimmed, in 256ths (256 = not at all). `t` is 0..1 of the move, `dir` 1 when the new page comes from the
+/// right. The CPU compose above and the GPU compose in the shell both draw from this.
+pub fn slide_frame(w: u32, t: f32, dir: i32) -> (crate::slide_rules::Spans, u32) {
+    let k = Ease::EMPHASIZED.at(t.clamp(0.0, 1.0));
+    let unit = (k * 65536.0).round().clamp(0.0, 65536.0) as u32;
+    let w = w.min(crate::slide_rules::MAX_W);
+    let off = hr::slide(w, unit).min(w);
+    let drift = (w / 4 - hr::slide(w / 4, unit)).min(w);
+    // The page behind darkens to 45 % as the new one covers it.
+    let dim = 256 - (141.0 * k) as u32;
+    (
+        crate::slide_rules::slide_spans(w, off, drift, dir >= 0),
+        dim,
+    )
 }
 
 #[inline]

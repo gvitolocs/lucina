@@ -677,6 +677,43 @@ mod tests {
         assert!(!icc.synced());
     }
 
+    /// Venus's power-down with `lucina.suspend.media=on` (patch 1354): both paths to 0 (`core.c:486`, `:490`) while the CPUs
+    /// hold theirs; the CPUs' request and the floor client stay in the sum, and the power-up's two votes give back exactly
+    /// what was sent before.
+    #[test]
+    fn a_devices_paths_go_to_zero_and_back_without_the_others() {
+        let mut icc = laptop();
+        let mut cache = Cache::new();
+        let held = |addr, x, y| (0u32, 0u32, addr, bcm::command_data(true, x, y));
+        let slots = [held(0x50088, 2, 0), held(0x50028, 1, 0)];
+        let cpus = set(
+            &mut icc,
+            &mut cache,
+            req(User::Cpus, 3, 0, 8_532_000),
+            &slots,
+        );
+        let up = |icc: &mut Icc<User>, cache: &mut Cache| {
+            let mut v = set(icc, cache, req(User::VideoMem, 0, 1_000_000, 0), &slots);
+            v.extend(set(icc, cache, req(User::CpuCfg, 0, 1000, 0), &slots));
+            v
+        };
+        let first = up(&mut icc, &mut cache);
+        let mut down = set(&mut icc, &mut cache, req(User::VideoMem, 0, 0, 0), &slots);
+        down.extend(set(
+            &mut icc,
+            &mut cache,
+            req(User::CpuCfg, 0, 0, 0),
+            &slots,
+        ));
+        // The CPUs' BCMs are what the CPUs alone ask for, the same as before Venus voted.
+        for name in ["SH4", "MC0", "ACV"] {
+            assert_eq!(of(&down, name), of(&cpus, name), "{name}");
+        }
+        // MM1 has no other consumer: the floor's.
+        assert_eq!(of(&down, "MM1"), [(2, 0); 3]);
+        assert_eq!(up(&mut icc, &mut cache), first);
+    }
+
     /// `icc_sync_state` (core.c:1093-1120): the floor client lets go, and each BCM is what its consumers ask. Nothing in the
     /// kernel calls it in this patch.
     #[test]

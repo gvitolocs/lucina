@@ -129,6 +129,8 @@ mod timeout {
     pub const SCAN_START: u64 = 1000;
     /// `ath10k_scan_stop`.
     pub const SCAN_STOP: u64 = 3000;
+    /// `ath10k_wait_for_suspend`: `wait_for_completion_timeout(&ar->target_suspend, 1 * HZ)` (`core.c:3276`).
+    pub const SUSPEND: u64 = 1000;
 }
 
 /// A DMA buffer: mapped non-cacheable by the kernel, so that no sync is needed, and at a device address equal to the
@@ -496,6 +498,23 @@ enum Link {
     WaitVdevStopped(u64),
 }
 
+/// Where the block stands with respect to a system sleep (patch 1352). The way down is mac80211's path without WoWLAN:
+/// `__ieee80211_suspend` (`pm.c:147-183`) ends in `ieee80211_stop_device(local, true)` (`pm.c:174`), which reaches
+/// `ath10k_stop(hw, suspend=true)` (`mac.c:5366`), `ath10k_halt` (`mac.c:4773`) and `ath10k_core_stop` (`core.c:3286`);
+/// the way back there is no inverse in Linux of v6.12 - `ath10k_wmi_pdev_resume_target` has no caller - because
+/// mac80211 restarts the firmware through `ieee80211_reconfig`, and that needs the modem's QMI `wlan_enable`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sleep {
+    Awake,
+    /// [`Driver::suspend_target`] sent the WMI pdev-suspend and the target has not answered yet: the deadline of
+    /// `ath10k_wait_for_suspend`'s wait (`core.c:3276`).
+    Suspending(u64),
+    /// The target said it sleeps (HTC `SEND_SUSPEND_COMPLETE`, `htc.c:557` → `ath10k_send_suspend_complete`,
+    /// `core.c:812`), or the wait ran out as Linux tolerates (`ath10k_core_stop` ignores the result, `core.c:3294`).
+    /// Nothing of the block is read or written until [`Driver::resume_target`].
+    Suspended,
+}
+
 /// `ATH10K_SNOC_RX_POST_RETRY_MS` (`snoc.c`): a receive pipe that could not get a buffer is posted again after this.
 const RX_POST_RETRY_MS: u64 = 50;
 
@@ -517,6 +536,8 @@ pub struct Driver<P: Platform> {
     rx: Option<HttRx>,
     tx: Option<HttTx>,
     boot: Boot,
+    /// Where a system sleep left the target (patch 1352), see [`Sleep`].
+    sleep: Sleep,
     deadline: Option<u64>,
     now: u64,
     /// When the HTT ring or a CE receive pipe is to be refilled again (`HTT_RX_RING_REFILL_*_MS`,
@@ -592,6 +613,7 @@ impl<P: Platform> Driver<P> {
             rx: None,
             tx: None,
             boot: Boot::Off,
+            sleep: Sleep::Awake,
             deadline: None,
             now: 0,
             refill_due: None,
@@ -674,6 +696,7 @@ impl<P: Platform> Driver<P> {
         }
         self.hif.post_all(&mut self.plat);
         self.boot = Boot::HtcReady;
+        self.sleep = Sleep::Awake;
         self.deadline = None;
         Ok(())
     }
@@ -698,11 +721,51 @@ impl<P: Platform> Driver<P> {
         }
         self.wmiq.clear();
         self.boot = Boot::Off;
+        self.sleep = Sleep::Awake;
     }
 
     /// Every engine's registers and rings, for a log when the firmware does not answer. Reads only.
     pub fn ce_report(&mut self) -> Vec<alloc::string::String> {
         self.hif.report(&mut self.plat)
+    }
+
+    // ---- the sleep (patch 1352) ---------------------------------------------------------------------------------
+
+    /// `ath10k_core_stop`'s "try to suspend target" (`core.c:3291-3294`), which mac80211's suspend without WoWLAN reaches
+    /// through `ieee80211_stop_device(local, true)` (`pm.c:174`) → `ath10k_stop` → `ath10k_halt` (`mac.c:4793`): the WMI
+    /// pdev-suspend with `WMI_PDEV_SUSPEND_AND_DISABLE_INTR` and the wait for the target's answer
+    /// (`ath10k_wait_for_suspend`, `core.c:3263-3283`). The wait runs in [`Driver::poll`] and
+    /// [`Driver::next_deadline`]; [`Driver::suspended`] says when it is over. A wait that runs out ends it the same way:
+    /// Linux ignores the result and stops the interface anyway (`ath10k_core_stop` takes no return value, `core.c:3294`).
+    pub fn suspend_target(&mut self) -> Result<(), DriverError> {
+        self.is_up()?;
+        self.push_q(
+            cmd::PDEV_SUSPEND,
+            wmi::gen_pdev_suspend(wmi::suspend_opt::SUSPEND_AND_DISABLE_INTR),
+        );
+        self.sleep = Sleep::Suspending(self.now.saturating_add(timeout::SUSPEND));
+        Ok(())
+    }
+
+    /// Whether the target sleeps: [`Driver::poll`] and [`Driver::ack_interrupts`] touch nothing of it now, as nothing is
+    /// touched there after Linux's `ath10k_snoc_irq_disable` (`snoc.c:829-836`, from `ath10k_snoc_hif_stop`:925).
+    pub fn suspended(&self) -> bool {
+        self.sleep == Sleep::Suspended
+    }
+
+    /// The inverse of [`Driver::suspend_target`]: WMI pdev-resume (`ath10k_wmi_pdev_resume_target`, `wmi-ops.h:566-579`,
+    /// `wmi-tlv.c:1735-1754`). Linux v6.12 has no caller for it - without WoWLAN its resume restarts the whole firmware
+    /// (`ieee80211_reconfig` → `ath10k_start` → `ath10k_snoc_hif_power_up`, `snoc.c:1073-1113`), which for this block is a
+    /// QMI `wlan_enable` through the modem and its rails with it (patch 1354). The caller unmasks the engines' lines
+    /// first, as `ath10k_snoc_hif_start` does (`snoc.c:940`, `:838-845`). The link is not restored here: it comes back
+    /// the way a cold one does, through [`Driver::join`].
+    pub fn resume_target(&mut self) -> Result<(), DriverError> {
+        if self.sleep != Sleep::Suspended {
+            return Err(DriverError::WrongState);
+        }
+        self.sleep = Sleep::Awake;
+        self.push_q(cmd::PDEV_RESUME, wmi::gen_pdev_resume());
+        Ok(())
     }
 
     // ---- the poll ------------------------------------------------------------------------------------------------
@@ -711,10 +774,12 @@ impl<P: Platform> Driver<P> {
     /// never goes back.
     pub fn poll(&mut self, now_ms: u64) -> Vec<Event> {
         self.now = now_ms;
-        if self.boot == Boot::Off {
+        // `Off` never started; `Suspended` is the block asleep, whose registers and rings are not touched, as Linux
+        // touches none after `ath10k_snoc_irq_disable` (`snoc.c:829-836`, from `ath10k_snoc_hif_stop`:925).
+        if self.boot == Boot::Off || self.sleep == Sleep::Suspended {
             return Vec::new();
         }
-        // the data path keeps moving in every state but Off: buffers must keep coming back
+        // the data path keeps moving in every state but Off and Suspended: buffers must keep coming back
         let msgs = self.hif.service(&mut self.plat);
         for m in msgs {
             self.on_message(m);
@@ -732,19 +797,23 @@ impl<P: Platform> Driver<P> {
         }
         if self.hif.rx_owed() {
             // ath10k_snoc_rx_post_pipe failed: its rx_post_retry timer, ATH10K_SNOC_RX_POST_RETRY_MS
-            self.refill_due = earliest(self.refill_due, Some(now_ms.saturating_add(RX_POST_RETRY_MS)));
+            self.refill_due = earliest(
+                self.refill_due,
+                Some(now_ms.saturating_add(RX_POST_RETRY_MS)),
+            );
         }
         self.pump_boot();
         self.pump_timeouts();
         self.pump_keys();
         self.pump_wmi();
+        self.pump_sleep();
         core::mem::take(&mut self.events)
     }
 
     /// `ath10k_snoc_napi_poll`'s first half for the engines whose interrupt came (bit `id` of `mask`): their `HOST_IS` is cleared
     /// before the caller unmasks their lines; the next [`Driver::poll`] drains them.
     pub fn ack_interrupts(&mut self, mask: u32) {
-        if self.boot == Boot::Off {
+        if self.boot == Boot::Off || self.sleep == Sleep::Suspended {
             return;
         }
         self.hif.ack(&mut self.plat, mask);
@@ -758,14 +827,27 @@ impl<P: Platform> Driver<P> {
         let mut due = self.refill_due;
         if matches!(
             self.boot,
-            Boot::HtcReady | Boot::HtcConnect | Boot::ServiceReady | Boot::WmiReady | Boot::HttVersion | Boot::Settle
+            Boot::HtcReady
+                | Boot::HtcConnect
+                | Boot::ServiceReady
+                | Boot::WmiReady
+                | Boot::HttVersion
+                | Boot::Settle
         ) {
             due = earliest(due, self.deadline.and_then(after));
         }
         if let Scan::Starting(d) | Scan::Running(d) | Scan::Aborting(d) = self.scan {
             due = earliest(due, after(d));
         }
-        if let Link::WaitVdevStart(d) | Link::WaitPeerMap(d) | Link::WaitPeerGone(d) | Link::WaitVdevStopped(d) = self.link {
+        if let Sleep::Suspending(d) = self.sleep {
+            // the wait for the target's suspend answer, `timeout::SUSPEND`
+            due = earliest(due, after(d));
+        }
+        if let Link::WaitVdevStart(d)
+        | Link::WaitPeerMap(d)
+        | Link::WaitPeerGone(d)
+        | Link::WaitVdevStopped(d) = self.link
+        {
             due = earliest(due, after(d));
         }
         if let Some((_, d)) = self.key_wait {
@@ -842,6 +924,14 @@ impl<P: Platform> Driver<P> {
                         }
                         Err(_) => self.fail(Fault::Htc),
                     }
+                }
+            }
+            Ok(htc::Event::SuspendComplete) => {
+                // `ath10k_htc_control_rx_complete`'s `HTC_MSG_SEND_SUSPEND_COMPLETE` (`htc.c:556-558`) calls
+                // `target_send_suspend_complete`, which `ath10k_core_start` set to `ath10k_send_suspend_complete`
+                // (`core.c:3000-3001`): `complete(&ar->target_suspend)` (`core.c:812-817`).
+                if matches!(self.sleep, Sleep::Suspending(_)) {
+                    self.sleep = Sleep::Suspended;
                 }
             }
             Ok(_) => {}
@@ -1235,8 +1325,10 @@ impl<P: Platform> Driver<P> {
             T2h::TxComplInd => match htt::parse_tx_completion(buf) {
                 Ok(c) => {
                     self.stats.tx_compl_msgs = self.stats.tx_compl_msgs.saturating_add(1);
-                    self.stats.tx_compl_msdus =
-                        self.stats.tx_compl_msdus.saturating_add(c.msdus.len() as u32);
+                    self.stats.tx_compl_msdus = self
+                        .stats
+                        .tx_compl_msdus
+                        .saturating_add(c.msdus.len() as u32);
                     if c.result != TxResult::Ack {
                         self.stats.tx_not_acked =
                             self.stats.tx_not_acked.saturating_add(c.msdus.len() as u32);
@@ -1451,7 +1543,11 @@ impl<P: Platform> Driver<P> {
             if self.cfg.power_save {
                 self.push_q(
                     cmd::STA_POWERSAVE_PARAM,
-                    wmi::gen_set_sta_ps(VDEV_ID, sta_ps::PARAM_INACTIVITY_TIME, DYNAMIC_PS_TIMEOUT_MS),
+                    wmi::gen_set_sta_ps(
+                        VDEV_ID,
+                        sta_ps::PARAM_INACTIVITY_TIME,
+                        DYNAMIC_PS_TIMEOUT_MS,
+                    ),
                 );
                 self.push_q(
                     cmd::STA_POWERSAVE_MODE,
@@ -1725,6 +1821,17 @@ impl<P: Platform> Driver<P> {
         }
     }
 
+    /// The wait for the target's suspend answer running out, `wait_for_completion_timeout(&ar->target_suspend, 1 * HZ)`
+    /// (`core.c:3276`), whose expiry Linux only complains about (`core.c:3279`) and then ignores (`core.c:3294`): a block
+    /// that does not answer is no reason to stay awake, so the sleep goes ahead with the block marked asleep.
+    fn pump_sleep(&mut self) {
+        if let Sleep::Suspending(d) = self.sleep
+            && self.now > d
+        {
+            self.sleep = Sleep::Suspended;
+        }
+    }
+
     /// Keys go one at a time: `ath10k_install_key` waits for the security indication of each.
     fn pump_keys(&mut self) {
         if self.key_wait.is_some() {
@@ -1823,7 +1930,7 @@ impl<P: Platform> Driver<P> {
     // ---- commands -------------------------------------------------------------------------------------------------
 
     fn is_up(&self) -> Result<(), DriverError> {
-        if self.boot == Boot::Up {
+        if self.boot == Boot::Up && self.sleep == Sleep::Awake {
             Ok(())
         } else {
             Err(DriverError::NotReady)
@@ -2265,6 +2372,7 @@ impl<P: Platform> Driver<P> {
     /// Whether a frame would be accepted now.
     pub fn can_tx(&self) -> bool {
         self.boot == Boot::Up
+            && self.sleep == Sleep::Awake
             && self.tx.as_ref().is_some_and(HttTx::has_room)
             && self
                 .hif

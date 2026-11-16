@@ -1,0 +1,27 @@
+# The coordinator's exemption records (docs/ci/PROOF-ROLES.md, "The named exemption"): a named approval for the past of one
+# unit that no `pre-rule` record covers. The cutoff list alone exempts nobody; a line here or a covering record is what does.
+# A line covers EXACTLY the commits that are reachable from to_commit and not from from_commit, for that unit and no other:
+# from_commit is exclusive, to_commit inclusive and is the commit `docs/ci/proof-roles-cutoff.txt` fixes for the unit. The first
+# commit after to_commit that changes the unit's code or statements falls under the full rule. Withdraw the line, and the past
+# it exempted is walked again.
+# Fields (tab-separated, none empty, no tab inside a field): unit, from_commit, to_commit, code_author, statement_author,
+# approver, approved_on (YYYY-MM-DD), note. The two author fields are what the trailers and the ledger show for the covered
+# range, or `not established` where history shows nothing. They are a record of what was accepted, not a claim it was clean.
+# This file belongs to the coordinator: a branch that creates, changes or deletes it is refused (`cutoff-protected`). An absent
+# file means no pre-rule unit at all: a branch cannot write its own list, and a cutoff listing with neither a covering `pre-rule`
+# record nor a line here is refused (`cutoff-listing-without-exemption`).
+#
+# No unit is exempt today: the list is EMPTY, and the mechanism is everything. The two lines this file carried are gone, because
+# each named a commit that is not in the history being checked: `32a406fdb` (log) lives only on `juno-log-crate`, which carries the
+# unit's own `pre-rule` record `opus-prerule.lucina-log.rules.1`, and `ee84a430f` (flight) only on the abandoned
+# `juno-flight-recorder`, while that unit was rebuilt on `juno-flight2` with its own statement record `STMT-flight-01`. Both lines
+# also injected a `code_author` for a past this history does not contain. A line must name commits that exist HERE and are ancestors
+# of what is checked, or the existence check below refuses the run: so a line lands only together with the history it names, and the
+# coordinator drops the matching `docs/ci/proof-roles-cutoff.txt` line when the past it lists is not in main.
+# Dropping it is the whole of the care a stale line needs while it sleeps, and no more: a line whose commit is not in HEAD's history is inert,
+# it exempts nothing and its authors name nobody. But inertness is judged against HEAD, so a line (or a cutoff listing, which is the ground a
+# `pre-rule` record stands on) wakes the moment a range merges the branch it names, and what it then drops is real history that range brought
+# in. `roles --check` refuses that range by name (`exemption-revived`, docs/ci/PROOF-ROLES.md): delete the line, or land over it with the
+# `cutoff:<why>` allow having read what it now exempts.
+#
+# unit	from_commit	to_commit	code_author	statement_author	approver	approved_on	note

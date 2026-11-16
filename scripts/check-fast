@@ -227,7 +227,15 @@ runner=()
 if [ -x "$bqbin" ]; then
     bq_usage=$(timeout 5 "$bqbin" </dev/null 2>&1 || true)
     case "$bq_usage" in
-        *'--class short|long|proof'*) runner=("$bqbin" run --class short --who "$(basename "$root")" --) ;;
+        *'--class short|long|proof'*)
+            runner=("$bqbin" run --class short --who "$(basename "$root")" --)
+            # Waiting for the slot is bounded on its own (15 minutes, CHECK_FAST_SLOT_WAIT_S), and a step's time limit starts only
+            # after the slot is mine, so a full queue ("no build slot in 15 minutes") and a slow step ("past its N s limit at
+            # merge") read differently. A queue older than this option does not know it and is run without.
+            case "$bq_usage" in
+                *'--max-wait'*) runner=("$bqbin" run --class short --who "$(basename "$root")" --max-wait "${CHECK_FAST_SLOT_WAIT_S:-900}" --) ;;
+            esac
+            ;;
     esac
 fi
 # A run that ends without its summary line (killed, cut off mid-step, a tool that exited early) is a failure even when the exit code
