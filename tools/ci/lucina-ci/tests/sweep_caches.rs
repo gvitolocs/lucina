@@ -534,6 +534,45 @@ fn a_target_a_live_process_is_using_is_kept_and_named_by_pid() {
 }
 
 #[test]
+fn a_holder_whose_cwd_path_holds_a_newline_and_spaces_keeps_the_target_under_it() {
+    // The fixture has to go even when an assert below does not, because a run that got this path wrong leaves the folder behind.
+    struct Gone<'a>(&'a Path);
+    impl Drop for Gone<'_> {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(self.0);
+        }
+    }
+    let home = tmp("idle-cwd-newline");
+    let _home = Gone(&home);
+    // A folder of the LucinaNet cache is a candidate by sitting in it, whatever it is named, so this name is really reached: a
+    // leading space, a newline, a trailing space. Records framed by lines cut this cwd at the newline, and what is left of it names
+    // no target at all - so the keep is gone and an applied run removes the folder the build stands in.
+    let odd = home.join(".cache/lucinanet-target/ we\nird ");
+    idle_target(&odd, 72);
+    let _kids = Sleeps(vec![hold(&odd, false)]);
+
+    // With --apply, because a path the pass carries wrong must not end in a removal.
+    let (code, msg) = run_idle(&home, true);
+    assert_eq!(code, 0, "{msg}");
+    assert!(
+        msg.contains(&format!("idle-sweep: {}", odd.display())),
+        "the candidate is named by its whole path, newline and spaces and all: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("kept: in use by pid {}", _kids.0[0].id())),
+        "the process standing in it is the reason it stays: {msg}"
+    );
+    assert!(
+        odd.exists(),
+        "a target a live process stands in is left whole: {msg}"
+    );
+    assert!(
+        msg.contains("freed 0.0 GiB from 0 targets"),
+        "one idle target and it is held, so nothing is freed: {msg}"
+    );
+}
+
+#[test]
 fn a_build_only_the_cargo_lock_shows_keeps_its_target_and_a_free_lock_keeps_nothing() {
     let home = tmp("idle-lock");
     let held = home.join("scratch/builds/target-held");

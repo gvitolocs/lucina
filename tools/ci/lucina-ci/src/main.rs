@@ -1407,7 +1407,7 @@ fn main() -> ExitCode {
 
 /// One step of `check-fast` under its own scope. Returns (passed, seconds).
 /// `gate_limit` is the merge-gate limit actually enforced on this step: `Some` prints it beside the measured time
-/// (`ok   unit-tests-tools-ci-lucina-ci  197.3s / 360s`) and `near-limit` when the step used more than 80% of it.
+/// (`ok   unit-tests-tools-ci-lucina-ci  197.3s / 300s`) and `near-limit` when the step used more than 80% of it.
 /// The columns before it are exactly what they were, so nothing that reads the line has to change.
 #[allow(clippy::too_many_arguments)]
 fn fast_step(
@@ -1487,10 +1487,10 @@ fn tool_exists(t: &str) -> bool {
 /// slot (docs/ci/SHIFT-LEFT.md, "Known slow tests"): `unit-tests-tools-ci-lucina-ci` 160.2 s at load 26, 300.5 s (killed
 /// by its own timeout) at load 30, 297.4 s at load 41; `mutants-text` 107.0, 162.3, 116.7 s at those loads.
 /// A limit never raises a step above its own timeout (the `t` of its `step(...)` call): it only ever cuts, so
-/// `unit-tests-tools-ci-lucina-ci` here means "give it its whole 360 s at the gate", and `mutants-text` is a cut from
+/// `unit-tests-tools-ci-lucina-ci` here means "give it its whole 300 s at the gate", and `mutants-text` is a cut from
 /// the 360 s the step is built with (`mutants_pre::STEP_TIMEOUT_S`, above the tool's own 260 s sweep budget).
 const MERGE_STEP_LIMITS: &[(&str, u64)] = &[
-    ("unit-tests-tools-ci-lucina-ci", 360),
+    ("unit-tests-tools-ci-lucina-ci", 300),
     ("mutants-text", 240),
 ];
 /// The limit of a step named in no table and no override.
@@ -2104,16 +2104,16 @@ mod tests {
     fn merge_limits_are_per_step_with_an_180_default() {
         let no_override = MergeCaps::default();
         let limit = |n: &str| no_override.limit_of(n, MERGE_STEP_LIMIT_DEFAULT);
-        assert_eq!(limit("unit-tests-tools-ci-lucina-ci"), Some(360));
+        assert_eq!(limit("unit-tests-tools-ci-lucina-ci"), Some(300));
         assert_eq!(limit("mutants-text"), Some(240));
         assert_eq!(limit("clippy-tools-ci-lucina-ci"), Some(180));
         assert_eq!(limit("diffgate"), Some(180));
         assert_eq!(limit("unit-tests-tools-bq"), Some(180));
         assert_eq!(limit("roles"), None);
         assert_eq!(limit("trust"), None);
-        // a limit only ever cuts: the table's 360 does not lift a step whose own timeout is 60
+        // a limit only ever cuts: the table's 300 does not lift a step whose own timeout is 60
         for (name, own, enforced) in [
-            ("unit-tests-tools-ci-lucina-ci", 360_u64, 360_u64),
+            ("unit-tests-tools-ci-lucina-ci", 300_u64, 300_u64),
             ("clippy-tools-ci-lucina-ci", 300, 180),
             ("diffgate", 60, 60),
             ("mutants-text", 360, 240),

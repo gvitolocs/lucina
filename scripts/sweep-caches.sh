@@ -110,12 +110,13 @@ real_path() { # <path>
 # too, and is still listed once so the run shows what it did not touch and why. In use is asked two ways: the process table (what a
 # process stands in or names), and the cargo build lock of the target itself, which is what a build holds when its target directory
 # came from a config file and so appears nowhere in the table. The tests run in the order of their cost: the exclude and the name
-# and fingerprint check touch one folder, the process table is read once for the whole run, the walk of a target stops at the first
-# young file, and a size is measured only for a target that is really going.
+# and fingerprint check touch one folder, the process table is read once for the whole run and only once a folder reaches it, the walk
+# of a target stops at the first young file, and a size is measured only for a target that is really going.
 
 declare -a idle=()
 declare -A idle_seen=()
 declare -A cwd_resolved=()
+declare -A cwd_raw=()
 declare -A hold_seen=()
 declare -a excl_path=()
 declare -a excl_where=()
@@ -366,19 +367,36 @@ newest_side() { # <dir> <cutoff epoch>
                   else print "0 broken" }'
 }
 
-# cwd_of: where a process stands, resolved. A box like this one has hundreds of shells in the same folder, so each distinct path
-# is resolved once for the run.
+# cwd_of: fills `cwd` with where a process stands, resolved, from the raw link of the one pass in read_cwds. A box like this one
+# has hundreds of shells in the same folder, so each distinct path is resolved once for the run. Empty when the process has no
+# readable cwd link, which is what a failed readlink meant before. Nothing is forked per process here: a `readlink` for every
+# process of ours is two forks each and on a loaded box that is seconds per hundred processes, for one string per process.
 cwd_of() { # <pid>
-    local raw seen
-    raw=$(readlink -- "/proc/$1/cwd" 2>/dev/null) || return 1
-    [ -n "$raw" ] || return 1
-    if [ -n "${cwd_resolved[$raw]:-}" ]; then
-        printf '%s' "${cwd_resolved[$raw]}"
-        return 0
+    local raw=${cwd_raw[$1]:-} seen
+    if [ -z "$raw" ]; then
+        cwd=""
+    elif [ -n "${cwd_resolved[$raw]:-}" ]; then
+        cwd=${cwd_resolved[$raw]}
+    else
+        seen=$(readlink -f -- "$raw" 2>/dev/null) || seen=$raw
+        cwd_resolved[$raw]=$seen
+        cwd=$seen
     fi
-    seen=$(readlink -f -- "$raw" 2>/dev/null) || seen=$raw
-    cwd_resolved[$raw]=$seen
-    printf '%s' "$seen"
+}
+
+# read_cwds: the raw cwd link of every process of ours, in ONE find pass instead of a readlink per process. find reads the same
+# links in the same traversal; a link it cannot read comes out with nothing in it, and a process that is gone has no line at all,
+# which is the same answer the per-process readlink gave. Both fields are NUL-terminated and read with an empty IFS: a cwd is a
+# path and a path may hold a newline or a leading or trailing space, and newline-framed records would truncate it at the first
+# newline and let that fragment be stored under some later pid. `-uid` is the same filter the pid list applies, so a link that is
+# not ours to ask about is never even tokenized. Keyed by the pid that the `/proc/<pid>` folder of the first field names, and only
+# the pids that read_proc_table asks about are ever looked up.
+read_cwds() {
+    local dir raw
+    cwd_raw=()
+    while IFS= read -r -d '' dir && IFS= read -r -d '' raw; do
+        cwd_raw[${dir##*/}]=$raw
+    done < <(find /proc -mindepth 2 -maxdepth 2 -uid "$our_uid" -name cwd -printf '%h\0%l\0' 2>/dev/null)
 }
 
 # hold: remember a process string as a reason to keep, for the first pid that showed it. Two tests drop most of what the table
@@ -396,22 +414,29 @@ hold() { # <path-or-word> <pid>
     fi
 }
 
-# read_proc_table: what a running process could be holding, read ONCE for the whole run: the cwd, the arguments and
-# CARGO_TARGET_DIR / CARGO_BUILD_TARGET_DIR of every process of ours. The idle pass and the third pass share the answer, and
-# `proc_read` says that it happened. The owner of a /proc folder is the process's own uid, so one find pass says whose these are, and
-# an entry of another user is skipped: it is not ours to ask about. An entry of OURS that cannot be read at all is a reason to keep,
-# because the unseen build is exactly the one a sweep would destroy; see the guard in the loop, which is what keeps the privileged
-# programs of a session from freezing the whole pass.
+# read_proc_table: what a running process could be holding, read ONCE for the whole run and only when a verdict asks for it
+# (need_proc_table): the cwd, the arguments and CARGO_TARGET_DIR / CARGO_BUILD_TARGET_DIR of every process of ours. The idle pass
+# and the third pass share the answer, and `proc_read` says that it happened. The owner of a /proc folder is the process's own uid,
+# so one find pass says whose these are, and an entry of another user is skipped: it is not ours to ask about. An entry of OURS that
+# cannot be read at all is a reason to keep, because the unseen build is exactly the one a sweep would destroy; see the guard in the
+# loop, which is what keeps the privileged programs of a session from freezing the whole pass.
+#
+# The pids are listed before their links are read, so a process that dies in between simply has no cwd line, which is the answer the
+# old per-process readlink gave for a process that died mid-loop; one that starts in between is in neither list, as before.
 read_proc_table() {
     local uid pid cwd a v line ok comm
-    local -a w=()
+    local -a w=() ours=()
     proc_hold=()
     proc_blind=()
     hold_seen=()
     while read -r uid pid; do
         [ "$uid" = "$our_uid" ] || continue
+        ours+=("$pid")
+    done < <(find /proc -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -printf '%U %f\n' 2>/dev/null)
+    read_cwds
+    for pid in ${ours[@]+"${ours[@]}"}; do
         ok=0
-        cwd=$(cwd_of "$pid") || cwd=""
+        cwd_of "$pid"
         if [ -n "$cwd" ]; then
             hold "$cwd" "$pid"
             ok=1
@@ -452,8 +477,15 @@ read_proc_table() {
                 cargo | rustc | rustdoc | build-script* | cargo-*) proc_blind+=("$pid") ;;
             esac
         fi
-    done < <(find /proc -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -printf '%U %f\n' 2>/dev/null)
+    done
     proc_read=1
+}
+
+# need_proc_table: read the process table the first time a verdict really asks it, and once for the run. Nothing else in a sweep
+# needs it, so a run with no candidate to judge - the size pass alone, a table that is not there, everything excluded - never pays
+# for it. The passes call this where they used to be handed a table that had been read before the candidates were even collected.
+need_proc_table() {
+    [ "$proc_read" = 1 ] || read_proc_table
 }
 
 # names_target: does a string of the process table name this target, or a path inside it? A substring test, deliberately: an
@@ -527,7 +559,6 @@ idle_sweep() {
     now=$(date +%s)
     cut=$((now - idle_hours * 3600))
     read_excludes || exit 2
-    read_proc_table
     idle_candidates
     for dir in ${idle[@]+"${idle[@]}"}; do
         if where=$(excluded_by "$dir"); then
@@ -538,6 +569,8 @@ idle_sweep() {
             idle_line "$dir - newest - h: skipped: not a cargo target"
             continue
         fi
+        # Cheaper keeps first, the process table last of the reasons that are asked per folder: it is the dearest of them.
+        need_proc_table
         size=-
         age=-
         if [ ${#proc_blind[@]} -gt 0 ]; then
@@ -695,14 +728,14 @@ main_line() { # <what>
 
 # main_debug_sweep: report every checkout target, and drop its debug/ only with --apply. The size and the age of one that is kept by a
 # cheaper reason are never measured, as in the idle pass: a `du` or a walk of a 90 GiB tree for a target that stays anyway is minutes
-# for nothing. The process table is the one the idle pass read for the whole run; read_proc_table is asked again only should that ever
-# stop running first, since an empty table would fail this pass OPEN.
+# for nothing. The process table is the one the idle pass read for the whole run, and it is asked the same way here: `need_proc_table`
+# is the first thing a folder reaches that a table answer can decide, so a folder kept by a cheaper reason never reads it, and an
+# empty table never fails this pass OPEN.
 main_debug_sweep() {
     local now cut dir dbg raw res epoch state age size unit link holder verdict freed=0 removed=0
     now=$(date +%s)
     cut=$((now - main_debug_days * 86400))
     main_candidates
-    [ "$proc_read" = 1 ] || read_proc_table
     for dir in ${mdbg[@]+"${mdbg[@]}"}; do
         if ! is_cargo_target "$dir"; then
             continue
@@ -713,7 +746,7 @@ main_debug_sweep() {
         raw=${mdbg_raw[$dir]}
         if [ ! -d "$dbg" ]; then
             verdict="kept: no debug/"
-        elif [ ${#proc_blind[@]} -gt 0 ]; then
+        elif need_proc_table && [ ${#proc_blind[@]} -gt 0 ]; then
             verdict="kept: proc table unreadable (pid ${proc_blind[*]})"
         elif holder=$(proc_holder "$dir"); then
             verdict="kept: in use by pid $holder"

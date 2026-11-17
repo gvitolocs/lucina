@@ -132,8 +132,8 @@ pub fn cargo_steps(owners: &BTreeSet<Owner>, changed: &[String]) -> Vec<(String,
             steps.push((
                 format!("unit-tests-{d}"),
                 format!("cargo test --quiet --locked --manifest-path {m}"),
-                // MERGE_STEP_LIMITS asks 360 here; a limit never lifts above this own timeout
-                360,
+                // MERGE_STEP_LIMITS asks 300 here; a limit never lifts above this own timeout
+                300,
             ));
         }
     }
