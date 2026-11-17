@@ -113,12 +113,34 @@ impl WorkflowRun {
 /// the runs a minute or more after the push (seen 2026-11-11: the first poll, 60 s after the push, found none).
 pub const START_GRACE_SECS: u64 = 15 * 60;
 
+/// A green result is a decision only while nothing else is running for the commit. Seen 2026-11-17: the `sync/` branch was pushed
+/// again while its gates were already green, which STARTED NEW runs of the same sha; their check runs had not registered yet, so the
+/// gate read the older `success`es and let `main` move, and GitHub refused the push (`GH006`: the required checks are expected
+/// again). Each attempt re-pushed and fell into the same trap, so a sync could never succeed. `Some` names the checks and the ids of
+/// the runs that hold them. Narrow on purpose: a completed FAILURE is still decided at once (the caller reads it from `runs`).
+fn newer_run_going(workflow: &[WorkflowRun], required: &[String]) -> Option<String> {
+    let going: Vec<&str> = workflow
+        .iter()
+        .filter(|w| w.going())
+        .map(|w| w.id.as_str())
+        .collect();
+    if going.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}: a newer run is going: {}",
+        required.join(", "),
+        going.join(", ")
+    ))
+}
+
 /// `since_push_secs`: time since the `sync/` branch was pushed. A red gate fails at once, with or without a run going. A check that
 /// has not appeared waits while a workflow run of the commit is queued or going (the gate job is that run's last job: seen
 /// 2026-11-16, the verus matrix ran 16 min and the sync called `verus-gate` "never started" at 15), waits inside the grace period
 /// when no run of the commit is known yet, and is a stall (`Stuck`) only when nothing runs any more: no run for the sha at all, or
 /// runs that finished without ever producing that check. `workflow` may be empty when the caller could not read it: that is the old
-/// behaviour, the grace period and then `Stuck`.
+/// behaviour, the grace period and then `Stuck`. Both gates green is not enough either while a run of the commit is going
+/// (`newer_run_going`, the trap of 2026-11-17).
 pub fn gate_step(
     runs: &[CheckRun],
     workflow: &[WorkflowRun],
@@ -132,7 +154,10 @@ pub fn gate_step(
     let missing: Vec<&String> = required.iter().filter(|n| !present(n)).collect();
     if missing.is_empty() {
         return match merge_verdict(runs, required) {
-            MergeVerdict::Pass => GateStep::Promote,
+            MergeVerdict::Pass => match newer_run_going(workflow, required) {
+                Some(w) => GateStep::Wait(w),
+                None => GateStep::Promote,
+            },
             MergeVerdict::Pending(w) => GateStep::Wait(w),
             MergeVerdict::Refuse(w) => GateStep::Fail(w),
         };
@@ -661,6 +686,47 @@ mod tests {
         assert!(matches!(
             gate_step(&red, &going, &req(), 20 * 60),
             GateStep::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn a_green_gate_does_not_decide_while_a_newer_run_of_the_commit_is_going() {
+        // The trap of 2026-11-17: the identical sha was pushed again at 11:07, the check runs of the new attempts had not
+        // registered yet, the gate answered from the 10:52 successes and let `main` move - which GitHub refused (GH006, the
+        // required checks expected again). Every attempt fell into the same trap.
+        let fresh = [
+            wf("44071050230", "verus", "in_progress", ""),
+            wf("44071050210", "rust-ci", "queued", ""),
+        ];
+        match gate_step(&green(), &fresh, &req(), 60) {
+            GateStep::Wait(w) => assert_eq!(
+                w,
+                "verus-gate, rust-gate: a newer run is going: 44071050230, 44071050210"
+            ),
+            other => panic!("expected a wait, got {other:?}"),
+        }
+        // (c) Nothing pending: the completed results decide exactly as they did before.
+        let done = [
+            wf("44071050230", "verus", "completed", "success"),
+            wf("44071050210", "rust-ci", "completed", "success"),
+        ];
+        assert_eq!(gate_step(&green(), &done, &req(), 60), GateStep::Promote);
+        // The runs API gave no answer (`workflow` empty, main.rs's fallback): the old verdict too.
+        assert_eq!(gate_step(&green(), &[], &req(), 60), GateStep::Promote);
+        // A completed FAILURE of the newest completed run is a verdict at once: the red-gate rule is not widened.
+        let red = [
+            run("verus-gate", "completed", "failure"),
+            run("rust-gate", "completed", "success"),
+        ];
+        assert!(matches!(
+            gate_step(&red, &fresh, &req(), 60),
+            GateStep::Fail(_)
+        ));
+        // A check that has not appeared yet keeps the wait it already had, which names the run it waits on.
+        let one_green = [run("rust-gate", "completed", "success")];
+        assert!(matches!(
+            gate_step(&one_green, &fresh, &req(), 60),
+            GateStep::Wait(_)
         ));
     }
 
