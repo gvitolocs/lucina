@@ -24,10 +24,22 @@
 # candidates here: they are capped by size, and public-sync has to survive between syncs. What else stays out is said in the same
 # table, by `exclude <path>` lines and one keyword that names the juno auto-install loop's build tree; see read_excludes.
 #
+# A THIRD pass takes what neither of those reaches: the `debug/` folder of the target of a MAIN checkout, `~/Projects/<group>/<repo>/target`
+# (exactly two levels, never `.worktrees`, which the idle pass already covers). Those targets belong to no cache and to no worktree, so
+# nothing capped them: one main checkout carried 93.7 GiB of debug build last written four days earlier. It removes ONLY that one
+# directory named `debug`, and only when nothing under it was written in the last LUCINA_SWEEP_MAIN_DEBUG_DAYS (7) days, no running
+# process names it (the idle pass' own checks), no systemd unit mentions the target and no link in a bin folder points into it. A
+# `release/`, a `<triple>/` (musl, wasm32, ...) or any other profile beside it is never touched, since that is where an installed
+# binary or a cross build lives and the idle pass does not reach it either. Dry unless --apply, one line per candidate prefixed
+# `main-debug:`, the same total line as the idle pass. See main_debug_sweep.
+#
 # For a test: HOME moves the cache and the log, LUCINA_SWEEP_CONF names the folder table, LUCINA_CI_SWEEP names the binary,
 # LUCINA_JUNO_AUTO_SCRIPT the juno loop script the exclude keyword reads, and LUCINA_SWEEP_LIMIT_KIB (with LUCINA_SWEEP_TO_KIB)
 # caps every folder in KiB, so a few KiB of fake tree is enough to exercise it.
 # The idle pass is tested the same way and asks the real /proc, so a test holds a target with a real process of its own.
+# The third pass moves every root it reads: LUCINA_SWEEP_PROJECTS_ROOT the checkouts, LUCINA_SWEEP_MAIN_DEBUG_DAYS the age,
+# LUCINA_SWEEP_SYSTEMD_DIRS the unit folders to grep and LUCINA_SWEEP_BIN_DIRS the folders to scan for links, so a test never
+# asks the real /etc or the real ~/.config.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -39,6 +51,20 @@ check_target=$HOME/.cache/lucina-check-target
 lucinanet_target=$HOME/.cache/lucinanet-target
 auto_install=${LUCINA_JUNO_AUTO_SCRIPT:-$here/juno-auto-install.sh}
 idle_hours=${LUCINA_SWEEP_IDLE_HOURS:-24}
+projects_root=${LUCINA_SWEEP_PROJECTS_ROOT:-$HOME/Projects}
+main_debug_days=${LUCINA_SWEEP_MAIN_DEBUG_DAYS:-7}
+
+# unit_dirs and bin_dirs: the two lists the third pass asks besides the process table, each a whitespace-separated set of folders a
+# test may replace wholesale so it never reads the real /etc or the real ~/.config. The defaults are where a user unit lives and
+# where a binary gets installed by hand.
+unit_dirs=("$HOME/.config/systemd/user" /etc/systemd/system /usr/lib/systemd/user)
+bin_dirs=("$HOME/.local/bin" /usr/local/bin)
+if [ -n "${LUCINA_SWEEP_SYSTEMD_DIRS:-}" ]; then
+    read -r -a unit_dirs <<< "$LUCINA_SWEEP_SYSTEMD_DIRS"
+fi
+if [ -n "${LUCINA_SWEEP_BIN_DIRS:-}" ]; then
+    read -r -a bin_dirs <<< "$LUCINA_SWEEP_BIN_DIRS"
+fi
 
 dry=()
 apply=0
@@ -96,33 +122,44 @@ declare -a excl_where=()
 declare -A excl_seen=()
 proc_hold=()
 proc_blind=()
+proc_read=0
 cache_real=$(real_path "$cache") || cache_real=""
 our_uid=$(id -u)
 
-# add_idle: one candidate, judged the same way whatever found it: it is there, its resolved last component is what its source
-# promised, its resolved path lies under the root that source may reach, and it is not one of the table's own targets. `rule` is
-# `target` for a worktree's, `targetx` for a scratch folder named target..., `wt` for a folder of the fast-check cache named wt...,
-# `any` for a folder of a cache whose name is nobody's business (the LucinaNet targets, and the fast-check cache taken as one unit).
-# A folder gone by the time we look is simply not reported.
-add_idle() { # <candidate> <root it must lie under> <rule>
+# resolve_candidate: what one raw path has to satisfy before any pass takes it as a target: it is there, its resolved last component
+# is what its source promised, its resolved path lies under the root that source may reach, and it is not one of the table's own
+# targets. Echoes the resolved path, which is the ONLY form a candidate is ever used in: a link that aims out of the roots cannot
+# move a sweep somewhere else, because what comes out here has every symlink followed. The two passes share it for exactly that
+# reason, so neither can be steered by a folder that merely looks right where it was found.
+resolve_candidate() { # <candidate> <root it must lie under> <rule>
     local raw=$1 root=$2 rule=$3 d base r
-    d=$(real_path "$raw") || return 0
+    d=$(real_path "$raw") || return 1
     base=${d##*/}
     case $rule/$base in
         target/target | wt/wt-* | any/*) ;;
         targetx/target*) ;;
-        *) return 0 ;;
+        *) return 1 ;;
     esac
-    r=$(real_path "$root") || return 0
+    r=$(real_path "$root") || return 1
     case $d in
         "$r"|"$r"/*) ;;
-        *) return 0 ;;
+        *) return 1 ;;
     esac
     if [ -n "$cache_real" ]; then
         case $d in
-            "$cache_real"|"$cache_real"/*) return 0 ;;
+            "$cache_real"|"$cache_real"/*) return 1 ;;
         esac
     fi
+    printf '%s' "$d"
+}
+
+# add_idle: one candidate of the idle pass, judged by resolve_candidate and kept once. `rule` is `target` for a worktree's,
+# `targetx` for a scratch folder named target..., `wt` for a folder of the fast-check cache named wt..., `any` for a folder of a cache
+# whose name is nobody's business (the LucinaNet targets, and the fast-check cache taken as one unit).
+# A folder gone by the time we look is simply not reported.
+add_idle() { # <candidate> <root it must lie under> <rule>
+    local d
+    d=$(resolve_candidate "$1" "$2" "$3") || return 0
     if [ -n "${idle_seen[$d]:-}" ]; then
         return 0
     fi
@@ -264,8 +301,9 @@ idle_candidates() {
     while IFS= read -r d; do
         add_idle "$d" "$HOME/scratch" targetx
     done < <(find -H "$HOME/scratch" -maxdepth 4 -type d -name 'target*' -prune -print 2>/dev/null)
-    # The worktrees, and nothing else of ~/Projects ever: the glob fixes how deep the name sits, add_idle re-checks both the
-    # resolved root and the last component, so a stray folder there is not even a candidate.
+    # The worktrees, and nothing else of ~/Projects is a candidate HERE: the glob fixes how deep the name sits, add_idle re-checks
+    # both the resolved root and the last component, so a stray folder there is not even a candidate. A main checkout reaches its
+    # target by the third pass, and only for its `debug/`.
     for d in "$HOME"/Projects/.worktrees/*/*/target; do
         add_idle "$d" "$HOME/Projects/.worktrees" target
     done
@@ -358,11 +396,12 @@ hold() { # <path-or-word> <pid>
     fi
 }
 
-# read_proc_table: what a running process could be holding, read ONCE for the whole pass: the cwd, the arguments and
-# CARGO_TARGET_DIR / CARGO_BUILD_TARGET_DIR of every process of ours. The owner of a /proc folder is the process's own uid, so one
-# find pass says whose these are, and an entry of another user is skipped: it is not ours to ask about. An entry of OURS that
-# cannot be read at all is a reason to keep, because the unseen build is exactly the one a sweep would destroy; see the guard in
-# the loop, which is what keeps the privileged programs of a session from freezing the whole pass.
+# read_proc_table: what a running process could be holding, read ONCE for the whole run: the cwd, the arguments and
+# CARGO_TARGET_DIR / CARGO_BUILD_TARGET_DIR of every process of ours. The idle pass and the third pass share the answer, and
+# `proc_read` says that it happened. The owner of a /proc folder is the process's own uid, so one find pass says whose these are, and
+# an entry of another user is skipped: it is not ours to ask about. An entry of OURS that cannot be read at all is a reason to keep,
+# because the unseen build is exactly the one a sweep would destroy; see the guard in the loop, which is what keeps the privileged
+# programs of a session from freezing the whole pass.
 read_proc_table() {
     local uid pid cwd a v line ok comm
     local -a w=()
@@ -414,6 +453,7 @@ read_proc_table() {
             esac
         fi
     done < <(find /proc -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -printf '%U %f\n' 2>/dev/null)
+    proc_read=1
 }
 
 # names_target: does a string of the process table name this target, or a path inside it? A substring test, deliberately: an
@@ -543,7 +583,183 @@ idle_sweep() {
     fi
 }
 
+# ---- the third pass: the debug/ of a MAIN checkout's target ----
+#
+# The table caps the targets it names under ~/.cache/cargo-target by SIZE; the idle pass takes a target WHOLE by IDLENESS, but only of
+# a worktree, a scratch build or one of the two check caches. The target of a main checkout, `~/Projects/<group>/<repo>/target`, is
+# neither: nothing has ever cleaned it, and one carried 93.7 GiB of debug build last written four days earlier on a box whose disk has
+# run short before. This pass takes exactly ONE directory of it, the `debug/` directly under the target, which is the profile a hand
+# run of `cargo build` fills and nothing else. A `release/` beside it is where an installed or packaged binary came from, a `<triple>/`
+# folder (musl for a static build, wasm32 for a landing) is a cross target somebody keeps on purpose, `tmp/` is other people's output:
+# none of those is ever named here, whatever its age.
+#
+# Four things have to hold, asked cheapest first: nothing under `debug/` written in the last LUCINA_SWEEP_MAIN_DEBUG_DAYS (7) days;
+# no process of the table the idle pass read naming the target, and no cargo build lock of it held; no systemd unit mentioning the
+# target, in any of the three folders one can live in; no symlink in a bin folder pointing into it. The last two are asked against the
+# TARGET and not against `debug/` alone, on purpose: a unit or an installed command that reaches into this checkout to RUN something
+# is a reason to leave the folder to a human, where the age and the process table only ask whether someone is BUILDING here.
+
+declare -a mdbg=()
+declare -A mdbg_seen=()
+declare -A mdbg_raw=()
+
+# main_add: one checkout target, judged by the same resolve_candidate the idle pass uses (so a symlink cannot steer it), remembering
+# the path as the glob found it: a unit says what whoever wrote it typed, which on a box with a linked checkout is not the resolved
+# spelling.
+main_add() { # <raw candidate>
+    local d
+    d=$(resolve_candidate "$1" "$projects_root" target) || return 0
+    if [ -n "${mdbg_seen[$d]:-}" ]; then
+        return 0
+    fi
+    mdbg_seen[$d]=1
+    mdbg_raw[$d]=$1
+    mdbg+=("$d")
+}
+
+# main_candidates: every checkout two levels under the projects root and nothing else. The glob fixes the depth, so a repo sitting
+# directly in it, a target one folder deeper and a folder that is not named target are never looked at. `.worktrees` is said out loud
+# as well: the glob already skips a dot folder, and the idle pass owns those targets anyway.
+main_candidates() {
+    local d r
+    r=$(real_path "$projects_root") || return 0
+    for d in "$r"/*/*/target; do
+        case $d in
+            "$r"/.worktrees/*) continue ;;
+        esac
+        main_add "$d"
+    done
+    return 0
+}
+
+# unit_holder: the first unit file that names this target, and nothing when no unit does. `grep -R` follows the symlinks those folders
+# are full of, since an enabled unit is a link to a file that lives somewhere else; `-I` keeps a binary out of the answer. A unit is a
+# reason to keep that no other check gives: what is removed here would be what the service points at, not a cache it rebuilds.
+unit_holder() { # <resolved target> <path as found>
+    local d f
+    local -a pat=(-R -l -I -F -e "$1")
+    if [ -n "${2:-}" ]; then
+        pat+=(-e "$2")
+    fi
+    for d in ${unit_dirs[@]+"${unit_dirs[@]}"}; do
+        [ -d "$d" ] || continue
+        f=$(grep "${pat[@]}" -- "$d" 2>/dev/null | head -n 1) || f=""
+        if [ -n "$f" ]; then
+            printf '%s' "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# link_holder: a symlink of a bin folder that aims at this target or into it, and nothing when no link does. Both spellings are
+# asked, what the link says and where it lands, because a link is often relative; only links are asked, a real file in a bin folder
+# says nothing about where it came from.
+link_holder() { # <resolved target>
+    local d l raw r
+    for d in ${bin_dirs[@]+"${bin_dirs[@]}"}; do
+        [ -d "$d" ] || continue
+        for l in "$d"/*; do
+            [ -L "$l" ] || continue
+            raw=$(readlink -- "$l" 2>/dev/null) || continue
+            r=$(readlink -f -- "$l" 2>/dev/null) || r=$raw
+            case $r in
+                "$1" | "$1"/*)
+                    printf '%s' "$l"
+                    return 0
+                    ;;
+            esac
+            case $raw in
+                "$1" | "$1"/*)
+                    printf '%s' "$l"
+                    return 0
+                    ;;
+            esac
+        done
+    done
+    return 1
+}
+
+# safe_to_remove_debug: the last guard before an rm, one notch stricter than the idle pass needs. What goes is the folder named debug
+# directly under the resolved candidate and nothing else, so a bug upstream that hands this a target, a profile of another name or the
+# home itself is refused here as well.
+safe_to_remove_debug() { # <debug dir> <resolved target>
+    [ -n "$1" ] && [ "$1" = "$2/debug" ] && [ "$1" != "/debug" ] && safe_to_remove "$1"
+}
+
+# main_line: one report of the third pass, on stdout and stamped into the state log like the other two.
+main_line() { # <what>
+    echo "main-debug: $1"
+    log_line "$(date -u +%Y-%m-%dT%H:%M:%SZ) main-debug: $1"
+}
+
+# main_debug_sweep: report every checkout target, and drop its debug/ only with --apply. The size and the age of one that is kept by a
+# cheaper reason are never measured, as in the idle pass: a `du` or a walk of a 90 GiB tree for a target that stays anyway is minutes
+# for nothing. The process table is the one the idle pass read for the whole run; read_proc_table is asked again only should that ever
+# stop running first, since an empty table would fail this pass OPEN.
+main_debug_sweep() {
+    local now cut dir dbg raw res epoch state age size unit link holder verdict freed=0 removed=0
+    now=$(date +%s)
+    cut=$((now - main_debug_days * 86400))
+    main_candidates
+    [ "$proc_read" = 1 ] || read_proc_table
+    for dir in ${mdbg[@]+"${mdbg[@]}"}; do
+        if ! is_cargo_target "$dir"; then
+            continue
+        fi
+        dbg=$dir/debug
+        size=-
+        age=-
+        raw=${mdbg_raw[$dir]}
+        if [ ! -d "$dbg" ]; then
+            verdict="kept: no debug/"
+        elif [ ${#proc_blind[@]} -gt 0 ]; then
+            verdict="kept: proc table unreadable (pid ${proc_blind[*]})"
+        elif holder=$(proc_holder "$dir"); then
+            verdict="kept: in use by pid $holder"
+        elif cargo_locks "$dir" && [ ${#locks[@]} -gt 0 ] && lock_held "${locks[@]}"; then
+            verdict="kept: cargo build lock held"
+        elif unit=$(unit_holder "$dir" "$raw"); then
+            verdict="kept: referenced by unit $unit"
+        elif link=$(link_holder "$dir"); then
+            verdict="kept: referenced by symlink $link"
+        else
+            res=$(newest_side "$dbg" "$cut")
+            epoch=${res%% *}
+            state=${res##* }
+            if [ "$state" != broken ]; then
+                age=$(( (now - epoch) / 86400 ))
+            fi
+            case $state in
+                broken) verdict="kept: not walked" ;;
+                recent) verdict="kept: written $age d ago" ;;
+                *)
+                    size=$(size_kib "$dbg")
+                    verdict="would remove $(gib "$size") GiB"
+                    if [ "$apply" = 1 ]; then
+                        if safe_to_remove_debug "$dbg" "$dir" && rm -rf -- "$dbg"; then
+                            verdict="removed $(gib "$size") GiB"
+                            freed=$((freed + ${size:-0}))
+                            removed=$((removed + 1))
+                        else
+                            verdict="kept: removal failed"
+                        fi
+                    fi
+                    ;;
+            esac
+        fi
+        if [ "$size" != - ]; then
+            size="$(gib "$size") GiB"
+        fi
+        main_line "$dir $size newest $age d: $verdict"
+    done
+    if [ "$apply" = 1 ]; then
+        main_line "freed $(gib "$freed") GiB from $removed debug folders"
+    fi
+}
+
 idle_sweep
+main_debug_sweep
 
 if [ ! -x "$sweep" ]; then
     echo "sweep-caches: no $sweep: build tools/ci/lucina-ci and install it there, or set LUCINA_CI_SWEEP" >&2

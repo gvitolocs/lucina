@@ -204,7 +204,9 @@ pub fn class(model: &str) -> &'static str {
 }
 
 /// The model family; `unknown` and `-` stay as they are. A strong name is `claude`; for other names the words `opus` and `fable` do
-/// not decide (`qwen3-opus-distill` is qwen).
+/// not decide (`qwen3-opus-distill` is qwen). One family the amendment table (`amend::family`) does not carry is decided here, on the
+/// NORMALISED name: `grok` is a word of it (`grok-4-7-high`, `xai-grok-3`) and nothing else a family knows answers. A word inside
+/// another word is not the family (`groking` is `other`), and a name a known family already claims keeps that family.
 pub fn family(model: &str) -> &'static str {
     match model {
         "-" => "-",
@@ -214,7 +216,12 @@ pub fn family(model: &str) -> &'static str {
             if STRONG.contains(&n.as_str()) {
                 "claude"
             } else {
-                amend::family(&n.replace("opus", "-").replace("fable", "-"))
+                let f = amend::family(&n.replace("opus", "-").replace("fable", "-"));
+                if f == "other" && n.split('-').any(|w| w == "grok") {
+                    "grok"
+                } else {
+                    f
+                }
             }
         }
     }
@@ -3235,6 +3242,35 @@ pub fn check(i: &CheckIn) -> Outcome {
     }
     // New lines: well formed, a known unit, a unique id, written by the commit of the prover they name.
     let base_n = i.base_log.lines().count();
+    // An INVALID line is a refusal whatever else the log holds. A line nobody can parse, and a `statement` record that breaks the
+    // prover/reviewer pairing, is skipped by every search for a covering record: with an older valid record of the same unit the run
+    // said ok and a refused review read as coverage (2026-11-17). A line NEW in this branch is refused by the loop below, whose hint
+    // says it may still be rewritten; a line of the base is history, so only the coordinator lands over it.
+    for e in i.entries.iter().filter(|e| e.line <= base_n) {
+        let m = match &e.res {
+            Err(m) => m.clone(),
+            Ok(r) => {
+                // Only a statement record of an ACCEPTED verdict is judged: a `rejected` or `escalated` line is history that
+                // authorises nothing (never a refusal), and a seed names no roles at all.
+                if r.kind != "statement" || r.verdict != "accepted" {
+                    continue;
+                }
+                match validate(r, need_kind(r), i.verdict_ok) {
+                    Ok(()) => continue,
+                    Err(m) => m,
+                }
+            }
+        };
+        o.refusals.push(Refusal {
+            unit: e.res.as_ref().map_or("-".to_string(), |r| r.unit.clone()),
+            rule: "invalid-record-line".into(),
+            detail: format!("{LOG} line {} (id `{}`): {m}", e.line, e.id),
+            hint: "the line is older than this branch and the log is append-only, so it cannot be fixed here: report it and the \
+                   coordinator decides (a statement record needs a reviewer of a known family, not `other`, that is neither the \
+                   prover's family nor the prover or the implementer)"
+                .into(),
+        });
+    }
     let mut ids: BTreeMap<&str, usize> = BTreeMap::new();
     for e in i.entries {
         *ids.entry(e.id.as_str()).or_insert(0) += 1;
@@ -6042,6 +6078,51 @@ pub proof fn lemma_len(m: Ring) requires inv(m) ensures m.contents.len() <= 4 { 
         let mut s = scn(Some(a()), w.clone(), vec![r]);
         s.extra_log = Some("# h\nbroken\tline\n".to_string());
         assert!(rules(&run(&s)).contains(&"malformed-record"));
+    }
+
+    /// The hole (2026-11-17): a line of the log that cannot be read, or a statement record the roles rules refuse, was skipped in
+    /// silence, so a branch whose unit an OLDER valid record covers reported ok with a refused review sitting in the log. An
+    /// invalid line is a refusal of its own, named by file, line and id, whatever other records match.
+    #[test]
+    fn an_invalid_line_of_the_base_log_is_refused_although_a_valid_record_matches() {
+        let mut w = a();
+        w.stmt = "1111111111111111".into();
+        let good = rec("statement", "verus/u", &w);
+        let invalid = |o: &Outcome| {
+            o.refusals
+                .iter()
+                .find(|x| x.rule == "invalid-record-line")
+                .unwrap_or_else(|| panic!("{:?}", o.refusals))
+                .detail
+                .clone()
+        };
+        // a malformed line of the base, and a valid record of the same unit that covers the change: still refused, and the bad line
+        // is named so the reader finds it.
+        let mut s = scn(Some(a()), w.clone(), vec![good.clone()]);
+        s.base_log = "# h\nbroken\tline\n".into();
+        let d = invalid(&run(&s));
+        assert!(d.contains("line 2"), "{d}");
+        assert!(d.contains("broken"), "{d}");
+        assert!(d.contains("expected 19"), "{d}");
+        // a line that parses but is a refused statement record: a reviewer of the prover's own family
+        let mut bad = rec("statement", "verus/u", &a());
+        bad.id = "old-review".into();
+        bad.verdict_ref = "docs/ci/verdicts/old-review.md".into();
+        bad.reviewer_model = "claude-haiku-4-5".into();
+        bad.reviewer_family = "claude".into();
+        let mut s = scn(Some(a()), w.clone(), vec![good]);
+        s.base_log = format!("# h\n{}\n", line(&bad));
+        let d = invalid(&run(&s));
+        assert!(d.contains("line 2"), "{d}");
+        assert!(d.contains("old-review"), "{d}");
+        assert!(d.contains("is the prover's family"), "{d}");
+        // a log of only valid lines stays ok: the same scenario, with a well-formed statement record of the base
+        let mut older = rec("statement", "verus/u", &a());
+        older.id = "old-ok".into();
+        older.verdict_ref = "docs/ci/verdicts/old-ok.md".into();
+        let mut s = scn(Some(a()), w.clone(), vec![rec("statement", "verus/u", &w)]);
+        s.base_log = format!("# h\n{}\n", line(&older));
+        assert!(run(&s).refusals.is_empty(), "{:?}", run(&s).refusals);
     }
 
     #[test]
@@ -10714,6 +10795,78 @@ pub fn plain(a: u32,b: u32,   c: u32) -> u32 { let _ = (a,b,c,); if a > b {2} el
                 "{rm}"
             );
         }
+    }
+
+    #[test]
+    fn a_grok_model_name_is_the_grok_family_a_word_holding_it_is_not() {
+        for (m, f) in [
+            ("grok-4.7-high", "grok"),
+            ("grok-4", "grok"),
+            ("xai/grok-3", "grok"),
+            ("cursor-grok", "grok"),
+            ("Grok 4.7 High", "grok"),
+            // the rule is the WORD `grok` of the normalised name, not the letters in it
+            ("groking", "other"),
+            ("grokish-lane", "other"),
+            // every other name keeps the family it had
+            ("claude-sonnet-5-5", "claude"),
+            ("Claude Opus 5.5 (1M context)", "claude"),
+            ("qwen3.8-27b", "qwen"),
+            ("zen-deepseek-v4.1-flash-free", "deepseek"),
+            ("glm-5.3-flash", "glm"),
+            ("mistral-large", "mistral"),
+            ("qoder-efficient", "qoder"),
+            ("gpt-6.1-sol", "gpt"),
+            ("something-new", "other"),
+        ] {
+            assert_eq!(family(m), f, "family of {m}");
+        }
+        assert!(amend::FAMILIES.contains(&"grok"), "grok is a known family");
+    }
+
+    #[test]
+    fn a_grok_reviewer_meets_the_same_pairing_rule_as_the_other_lane_families() {
+        let mut w = a();
+        w.stmt = "1111111111111111".into();
+        let vok = |_: &str, _: &Record| true;
+        // reviewed by the grok lane, prover and implementer both Claude
+        let mut r = rec("statement", "verus/u", &w);
+        r.reviewer_model = "grok-4.7-high".into();
+        r.reviewer_family = "grok".into();
+        assert!(
+            parse_fields(&line(&r).split('\t').collect::<Vec<_>>()).is_ok(),
+            "the family derived from `grok-4.7-high` is grok"
+        );
+        assert!(validate(&r, Need::Statement, &vok).is_ok());
+        // as author: grok code, a strong prover of another name, a reviewer of a third family
+        let mut au = r.clone();
+        au.impl_model = "grok-4.7-high".into();
+        au.impl_family = "grok".into();
+        au.reviewer_model = "zen-deepseek-flash".into();
+        au.reviewer_family = "deepseek".into();
+        assert!(parse_fields(&line(&au).split('\t').collect::<Vec<_>>()).is_ok());
+        assert!(
+            validate(&au, Need::Statement, &vok).is_ok(),
+            "{:?}",
+            validate(&au, Need::Statement, &vok)
+        );
+        // nothing is relaxed for grok: the reviewer family is still never the prover's ...
+        let mut same = r.clone();
+        same.reviewer_model = "claude-haiku-4-5".into();
+        same.reviewer_family = "claude".into();
+        let e = validate(&same, Need::Statement, &vok).unwrap_err();
+        assert!(e.contains("is the prover's family"), "{e}");
+        // ... a stated family that disagrees with the model name is malformed ...
+        let mut claim = r.clone();
+        claim.reviewer_model = "something-new".into();
+        claim.reviewer_family = "grok".into();
+        assert!(parse_fields(&line(&claim).split('\t').collect::<Vec<_>>()).is_err());
+        // ... and `other` is still nobody's reviewer family.
+        let mut o = r.clone();
+        o.reviewer_model = "something-new".into();
+        o.reviewer_family = "other".into();
+        let e = validate(&o, Need::Statement, &vok).unwrap_err();
+        assert!(e.contains("not a known family"), "{e}");
     }
 
     // ---- full object ids only, harness spellings, unknown-class implementers
