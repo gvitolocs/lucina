@@ -542,6 +542,15 @@ pub fn analyse_capture(root: &Path, cap: &Path, calls: usize) -> Analysed {
     Analysed { findings, unclear }
 }
 
+/// The script of a unit and the arguments its name carries. A mutants unit that declares `# mutants-units:` names targets
+/// `verification/<x>/mutants.sh <name>` (inventory.rs), and the precheck has to run the script with that name: with none the
+/// script takes its default proof, so the other names' mutants are never reached.
+pub fn script_and_args(target: &str) -> (&str, Vec<&str>) {
+    let mut words = target.split_whitespace();
+    let script = words.next().unwrap_or(target);
+    (script, words.collect())
+}
+
 /// Runs one unit's script under the stub. `work` is a private directory for this unit (TMPDIR of the script, the log, the copies).
 pub fn check_unit(root: &Path, unit: &Unit, stub: &Path, work: &Path, limit: Duration) -> Outcome {
     let tmp = work.join("tmp");
@@ -552,7 +561,8 @@ pub fn check_unit(root: &Path, unit: &Unit, stub: &Path, work: &Path, limit: Dur
             return Outcome::Inconclusive(format!("{}: {e}", d.display()));
         }
     }
-    if !root.join(&unit.target).exists() {
+    let (script, args) = script_and_args(&unit.target);
+    if !root.join(script).exists() {
         return Outcome::Inconclusive(format!("{} is missing", unit.target));
     }
     let out = work.join("script.out");
@@ -566,7 +576,7 @@ pub fn check_unit(root: &Path, unit: &Unit, stub: &Path, work: &Path, limit: Dur
         Err(e) => return Outcome::Inconclusive(e.to_string()),
     };
     let mut cmd = Command::new("bash");
-    cmd.arg(&unit.target).current_dir(root);
+    cmd.arg(script).args(args).current_dir(root);
     script_env(&mut cmd, root, stub, work, &log);
     let mut child = match cmd
         .stdin(Stdio::null())
@@ -1160,6 +1170,94 @@ exit $fail
                 assert!(f[0].starts_with("NOT FOUND"), "{f:?}");
                 // a multi-line search text shows its first line only
                 assert!(f[0].contains("} else {"), "{f:?}");
+            }
+            o => panic!("{o:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A script that proves several files and picks one by its first argument, which is what `# mutants-units:` declares
+    /// (inventory.rs). Without the argument it runs only its default proof, and the precheck must say so rather than pass it.
+    const NAMED: &str = r#"#!/usr/bin/env bash
+set -uo pipefail
+verus=${VERUS:?}
+name=${1:-disk_rules}
+work=$(mktemp -d "${TMPDIR:-/tmp}/named-mutants.XXXXXX")
+trap 'rm -rf "${work:?}"' EXIT
+fail=0
+if [ "$name" != patch_rules ]; then echo "no mutants for $name"; exit 0; fi
+try() {
+    local from=$1 to=$2
+    mkdir -p "$work/crates/n/src"
+    cp crates/n/src/lib.rs "$work/crates/n/src/"
+    local target=$work/crates/n/src/lib.rs
+    local text; text=$(<"$target")
+    case "$text" in
+        *"$from"*) ;;
+        *) echo "NOT FOUND: $from"; fail=1; return ;;
+    esac
+    printf "%s\n" "${text/"$from"/"$to"}" > "$target"
+    if "$verus" "$work/verification/n/rules.rs" > "$work/out" 2>&1; then
+        echo "NOT REFUSED: $from -> $to"; fail=1
+    else
+        echo "refused: $from -> $to"
+    fi
+}
+if "$verus" verification/n/rules.rs > "$work/baseline" 2>&1; then echo "baseline: verifies"; else echo "mutants: the unchanged files do not verify"; exit 1; fi
+try 'let room = PAGE - offset;' 'let room = PAGE - offset + 1;'
+echo "mutants: 1 refused by verification, 0 refused without a verification run"
+exit $fail
+"#;
+
+    fn named_units() -> (PathBuf, Unit, Unit) {
+        let root = scratch("named");
+        fs::create_dir_all(root.join("crates/n/src")).unwrap();
+        fs::create_dir_all(root.join("verification/n")).unwrap();
+        fs::write(root.join("crates/n/src/lib.rs"), ORIGINAL).unwrap();
+        fs::write(root.join("verification/n/rules.rs"), "// proof\n").unwrap();
+        fs::write(root.join("verification/n/mutants.sh"), NAMED).unwrap();
+        let named = Unit {
+            name: "mutants/n/patch_rules".into(),
+            group: "g".into(),
+            kind: "mutants".into(),
+            target: "verification/n/mutants.sh patch_rules".into(),
+            inputs: vec!["crates/n/".into(), "verification/n/".into()],
+        };
+        let bare = Unit {
+            name: "mutants/n".into(),
+            target: "verification/n/mutants.sh".into(),
+            ..named.clone()
+        };
+        (root, named, bare)
+    }
+
+    #[test]
+    fn a_named_unit_reaches_the_script_as_its_argument() {
+        let (root, named, bare) = named_units();
+        let work = root.join(".work");
+        let stub = write_stub(&work.join("stub")).unwrap();
+        // The name arrives, so that proof's one mutant is checked.
+        assert_eq!(
+            check_unit(
+                &root,
+                &named,
+                &stub,
+                &work.join("u"),
+                Duration::from_secs(20)
+            ),
+            Outcome::Clean(1)
+        );
+        // The same script with no argument prints its default branch and none of its mutants: inconclusive, the hole found
+        // in the Brimstone copy of this CI, where one unit stood for five proofs.
+        match check_unit(
+            &root,
+            &bare,
+            &stub,
+            &work.join("b"),
+            Duration::from_secs(20),
+        ) {
+            Outcome::Inconclusive(why) => {
+                assert!(why.contains("did not run to its closing line"), "{why}");
             }
             o => panic!("{o:?}"),
         }

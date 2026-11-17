@@ -1782,11 +1782,11 @@ fn mutant_stmts(tree: &dyn Tree, units: &[Unit]) -> Vec<Stmt> {
         .into_iter()
         .filter(|f| f.ends_with("/mutants.sh"))
         .collect();
-    for u in units
-        .iter()
-        .filter(|u| u.kind == "mutants" && u.target.ends_with(".sh"))
-    {
-        scripts.insert(u.target.clone());
+    for u in units.iter().filter(|u| u.kind == "mutants") {
+        // A named mutants unit carries its proof name after the script: the statements come from the one file.
+        if let Some(s) = u.target.split_whitespace().find(|w| w.ends_with(".sh")) {
+            scripts.insert(s.to_string());
+        }
     }
     let mut out = Vec::new();
     for s in &scripts {

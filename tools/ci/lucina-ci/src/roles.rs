@@ -4398,9 +4398,16 @@ fn is_script_unit(kind: &str) -> bool {
 }
 
 /// The files that make a script unit what it is: the target script and the directory it sits in (`verification/<x>/`).
+/// A named mutants unit carries its proof name after the script in its target (inventory.rs), which is not part of the path.
 fn own_files_of(u: &Unit) -> Vec<String> {
-    let mut v = vec![u.target.clone()];
-    if let Some((dir, _)) = u.target.rsplit_once('/') {
+    let script = u
+        .target
+        .split_whitespace()
+        .next()
+        .unwrap_or(u.target.as_str())
+        .to_string();
+    let mut v = vec![script.clone()];
+    if let Some((dir, _)) = script.rsplit_once('/') {
         v.push(format!("{dir}/"));
     }
     v

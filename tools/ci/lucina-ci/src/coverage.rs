@@ -148,6 +148,135 @@ pub fn unguarded_mutant_scripts(root: &Path, units: &[Unit]) -> Vec<String> {
     out
 }
 
+/// The bash name characters of an assignment's left side: `x=…`, nothing else.
+fn is_shell_ident(s: &str) -> bool {
+    let mut c = s.chars();
+    let Some(f) = c.next() else { return false };
+    (f.is_ascii_alphabetic() || f == '_') && c.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The variable a mutants script reads its first argument into: `name=${1:-disk_rules}` or `name=${1:?usage}`. None for a
+/// script that takes no argument, which is the state `inventory` registers as the single `mutants/<dir>` unit.
+fn argument_variable(text: &str) -> Option<String> {
+    for l in text.lines() {
+        let t = l.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let Some((lhs, rhs)) = t.split_once('=') else {
+            continue;
+        };
+        if is_shell_ident(lhs) && rhs.trim_start().starts_with("${1") {
+            return Some(lhs.to_string());
+        }
+    }
+    None
+}
+
+/// `true` when the variable use at `i` of `s` is a whole one: `$name` and `${name}`, not `$names`.
+fn var_at(s: &str, i: usize, var: &str) -> bool {
+    let after = &s[i..];
+    if after.starts_with(&format!("${{{var}}}")) {
+        return true;
+    }
+    after.starts_with(&format!("${var}"))
+        && after[var.len() + 1..]
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+}
+
+/// The word with each whole `$<var>` / `${<var>}` replaced by `name`, and whether anything was replaced.
+fn interpolate(word: &str, var: &str, name: &str) -> (String, bool) {
+    let mut out = String::new();
+    let mut rest = word;
+    let mut did = false;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        if var_at(rest, i, var) {
+            out.push_str(name);
+            let used = if rest[i..].starts_with(&format!("${{{var}}}")) {
+                var.len() + 3
+            } else {
+                var.len() + 1
+            };
+            rest = &rest[i + used..];
+            did = true;
+        } else {
+            out.push('$');
+            rest = &rest[i + 1..];
+        }
+    }
+    out.push_str(rest);
+    (out, did)
+}
+
+/// The files a mutants script builds from one of its names: every word that interpolates `$<var>` and ends in `.rs`, with the
+/// shell around it stripped (`${2:-dir/$name.rs}` and `"dir/$name.rs"` both give `dir/<name>.rs`). Empty when the script
+/// states no such convention: discovery cannot invent a file for a name, so it asks nothing of it.
+fn files_for_name(text: &str, var: &str, name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for l in text.lines() {
+        let t = l.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        for w in t.split_whitespace() {
+            let mut w = w.trim_matches(|c| c == '"' || c == '\'');
+            // `${2:-src/dir/$name.rs}` is a default value: the path is what follows the `:-`, up to the closing brace.
+            if let Some(k) = w.find(":-")
+                && w[..k].contains("${")
+            {
+                w = &w[k + 2..];
+            }
+            w = w
+                .trim_matches(|c| c == '"' || c == '\'')
+                .trim_end_matches('}');
+            if !w.ends_with(".rs") {
+                continue;
+            }
+            let (file, did) = interpolate(w, var, name);
+            if did && !out.contains(&file) {
+                out.push(file);
+            }
+        }
+    }
+    out
+}
+
+/// Named mutant units whose name leads to a file no shipped unit verifies: the script says in its own text which file the
+/// name is the proof of, so a name that points elsewhere is a proof CI does not run. A script that states no such convention
+/// is not judged (there is nothing generic to judge it by), and the plain `mutants/<dir>` unit has no name to check.
+pub fn unverified_named_mutants(root: &Path, units: &[Unit]) -> Vec<String> {
+    let mut out = Vec::new();
+    for u in units.iter().filter(|u| u.kind == "mutants") {
+        let mut words = u.target.split_whitespace();
+        let (Some(script), Some(name)) = (words.next(), words.next()) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(root.join(script)) else {
+            continue;
+        };
+        let Some(var) = argument_variable(&text) else {
+            continue;
+        };
+        let files = files_for_name(&text, &var, name);
+        if files.is_empty() {
+            continue;
+        }
+        if !units
+            .iter()
+            .any(|s| s.kind == "shipped" && files.contains(&s.target))
+        {
+            out.push(format!(
+                "{}: the name `{name}` is {} by the script's own convention, and no shipped unit verifies that file",
+                u.name, files[0]
+            ));
+        }
+    }
+    out
+}
+
 /// Licence ids a crate carries: its `license` field and the `SPDX-License-Identifier` in the first lines of its sources.
 pub fn licences_of(crate_dir: &Path) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -590,6 +719,105 @@ mod tests {
         let p = t.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, text).unwrap();
+    }
+
+    /// A script of the Brimstone shape: one file per name, the path built from the name itself.
+    const NAMED_SH: &str = r#"#!/usr/bin/env bash
+# mutants-units: disk_rules wire
+name=${1:-disk_rules}
+rules=${2:-src/js/runtime/bytecode/fncache/$name.rs}
+"$verus" --triggers-mode silent "$work/base-$name.rs" && echo "baseline: verifies"
+echo "mutants: 4 refused by verification"
+"#;
+
+    /// A script of the LucinaOS shape: no argument at all.
+    const PLAIN_SH: &str =
+        "#!/usr/bin/env bash\necho 'baseline: verifies'\necho 'refused by verification'\n";
+
+    /// A script that takes a name but builds no file from it: which proof the name is cannot be derived from its text.
+    const NOCONV_SH: &str = "#!/bin/sh\nname=${1:-disk_rules}\ncp crates/fncache/$name.src copy\n";
+
+    fn mutants_unit(t: &str, arg: Option<&str>) -> Unit {
+        let mut u = unit(
+            &format!("mutants/{t}"),
+            &format!("verification/{t}/mutants.sh"),
+        );
+        u.kind = "mutants".into();
+        if let Some(a) = arg {
+            u.name = format!("mutants/{t}/{a}");
+            u.target = format!("verification/{t}/mutants.sh {a}");
+        }
+        u
+    }
+
+    fn shipped_unit(file: &str) -> Unit {
+        let stem = file
+            .rsplit_once('/')
+            .map_or(file, |(_, f)| f)
+            .trim_end_matches(".rs");
+        let mut u = unit(&format!("shipped/x/{stem}"), file);
+        u.kind = "shipped".into();
+        u
+    }
+
+    #[test]
+    fn a_named_script_states_which_file_its_names_are_the_proof_of() {
+        assert_eq!(argument_variable(NAMED_SH).as_deref(), Some("name"));
+        assert_eq!(
+            argument_variable(PLAIN_SH),
+            None,
+            "a script with no argument names no variable"
+        );
+        // The repo-relative path the script defaults to, and the copy it writes under its work directory.
+        assert_eq!(
+            files_for_name(NAMED_SH, "name", "wire"),
+            [
+                "src/js/runtime/bytecode/fncache/wire.rs".to_string(),
+                "$work/base-wire.rs".to_string()
+            ]
+        );
+        // A name with no `.rs` word built from it gives nothing to check.
+        assert!(
+            files_for_name(NOCONV_SH, "name", "wire").is_empty(),
+            "{:?}",
+            files_for_name(NOCONV_SH, "name", "wire")
+        );
+    }
+
+    #[test]
+    fn a_name_with_no_shipped_unit_is_refused_and_neither_the_plain_nor_the_unreadable_one_is() {
+        let t = std::env::temp_dir().join(format!("lucina-ci-named-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        zz_file(&t, "verification/fncache/mutants.sh", NAMED_SH);
+        zz_file(&t, "verification/plain/mutants.sh", PLAIN_SH);
+        zz_file(&t, "verification/nocconv/mutants.sh", NOCONV_SH);
+        let wire = "src/js/runtime/bytecode/fncache/wire.rs";
+        // `wire` is a shipped proof; `disk_rules` is a name whose file CI never verifies. The dir unit of a script with no
+        // marker has no name to judge, and a script that states no convention is not judged either.
+        let units = [
+            mutants_unit("fncache", Some("wire")),
+            mutants_unit("fncache", Some("disk_rules")),
+            shipped_unit(wire),
+            mutants_unit("plain", None),
+            mutants_unit("nocconv", Some("wire")),
+        ];
+        let f = unverified_named_mutants(&t, &units);
+        assert_eq!(f.len(), 1, "{f:?}");
+        let said = &f[0];
+        assert!(said.starts_with("mutants/fncache/disk_rules:"), "{said}");
+        assert!(
+            said.contains("src/js/runtime/bytecode/fncache/disk_rules.rs"),
+            "{said}"
+        );
+        // Put the shipped file in the list and the same run is clean.
+        let units = [
+            mutants_unit("fncache", Some("wire")),
+            mutants_unit("fncache", Some("disk_rules")),
+            shipped_unit(wire),
+            shipped_unit("src/js/runtime/bytecode/fncache/disk_rules.rs"),
+        ];
+        assert!(unverified_named_mutants(&t, &units).is_empty());
+        std::fs::remove_dir_all(&t).ok();
     }
 
     #[test]

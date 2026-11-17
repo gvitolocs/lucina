@@ -143,6 +143,16 @@ fn cmd_inventory(a: &Args) -> Result<i32, String> {
         );
         return Ok(1);
     }
+    let unverified = coverage::unverified_named_mutants(&root, &units);
+    if !unverified.is_empty() {
+        for m in &unverified {
+            eprintln!("{m}");
+        }
+        eprintln!(
+            "a `# mutants-units:` name must be a proof CI runs: add the file to scripts/verify-shipped.sh, or fix the name (docs/ci/VERUS.md)"
+        );
+        return Ok(1);
+    }
     // The public snapshot must hold every file a proof reads (the private tree only: the public one has no crates/ folder).
     let gaps = coverage::check(&root, &units)?;
     if !gaps.is_empty() {

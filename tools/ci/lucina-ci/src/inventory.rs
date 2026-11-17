@@ -102,6 +102,99 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
+/// The header line by which a mutants script declares the proofs it holds: `# mutants-units: disk_rules patch_rules`.
+/// Each name is what the script takes as its first argument, and each is a unit of its own.
+const MUTANTS_MARKER: &str = "mutants-units:";
+/// How far down the script the marker may sit: it belongs with the header comments that say what the script proves.
+const MUTANTS_MARKER_TOP: usize = 40;
+
+/// The names written on the `# mutants-units:` line, however the `#` and the colon are spaced; None for any other line.
+fn marker_line(line: &str) -> Option<&str> {
+    let after = line.trim_start().strip_prefix('#')?.trim_start();
+    after.strip_prefix(MUTANTS_MARKER).map(str::trim)
+}
+
+/// The names a mutants.sh declares, or None when it declares none. Without the marker the script is one unit and is run with
+/// no argument, which for a script that picks its proof from `$1` means only the default proof's mutants ever run
+/// (found in the Brimstone copy of this CI, 2026-11-17). A marker that names nothing, repeats a name or uses a name CI
+/// cannot put in a unit name is refused here, so a half-written marker is never quietly read as no marker.
+fn mutant_unit_names(text: &str) -> Result<Option<Vec<String>>, String> {
+    let hits: Vec<usize> = text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| marker_line(l).is_some())
+        .map(|(i, _)| i + 1)
+        .collect();
+    let line = match hits.as_slice() {
+        [] => return Ok(None),
+        [n] => *n,
+        many => {
+            return Err(format!(
+                "lines {} each carry the `{MUTANTS_MARKER}` marker: one marker line",
+                many.iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    };
+    if line > MUTANTS_MARKER_TOP {
+        return Err(format!(
+            "the `{MUTANTS_MARKER}` line is line {line}: it must be in the first {MUTANTS_MARKER_TOP} lines, where the script says what it proves"
+        ));
+    }
+    let names: Vec<String> = marker_line(text.lines().nth(line - 1).unwrap_or(""))
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
+        return Err(format!(
+            "line {line} carries the marker with no name after it: name the proofs or drop the line"
+        ));
+    }
+    for n in &names {
+        if !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!(
+                "line {line} names `{n}`: a unit name is letters, digits and underscore"
+            ));
+        }
+    }
+    let mut sorted = names.clone();
+    sorted.sort();
+    if let Some(d) = sorted.windows(2).find(|w| w[0] == w[1]) {
+        return Err(format!("line {line} names `{}` twice", d[0]));
+    }
+    Ok(Some(names))
+}
+
+/// Whether scripts/verify-mutations.sh carries a global mutation list: an entry between `mutations=(` and its `)`, on the
+/// opening line or on lines of its own. The same walk `spec.rs` and the precheck use to read the entries.
+fn has_mutation_entries(text: &str) -> bool {
+    let mut inside = false;
+    for l in text.lines() {
+        let t = l.trim();
+        if !inside {
+            if let Some(rest) = t.strip_prefix("mutations=(") {
+                let rest = rest.trim();
+                if let Some(inner) = rest.strip_suffix(')') {
+                    // The whole list on the opening line: `mutations=()` is empty, `mutations=('a|s/x/y/|w')` is not.
+                    return !inner.trim().is_empty();
+                }
+                inside = true;
+            }
+            continue;
+        }
+        if t.starts_with(')') {
+            break;
+        }
+        if !t.is_empty() && !t.starts_with('#') {
+            return true;
+        }
+    }
+    false
+}
+
 /// `crates/foo/src/x.rs` -> `crates/foo/`: a proof reads a crate through `mod` lines that this scan does not follow, so the
 /// whole crate directory is its input. Anything else stays the exact file.
 fn owner_dir(path: &str) -> String {
@@ -305,6 +398,7 @@ pub fn discover(root: &Path) -> Result<Vec<Unit>, String> {
             });
         } else if parts[2] == "mutants.sh" {
             let text = fs::read_to_string(root.join(f)).map_err(|e| format!("{f}: {e}"))?;
+            let names = mutant_unit_names(&text).map_err(|e| format!("{f}: {e}"))?;
             let mut start: Vec<String> = Vec::new();
             for c in crate_tokens(&text) {
                 start.extend(rs_files(root, &c));
@@ -319,13 +413,24 @@ pub fn discover(root: &Path) -> Result<Vec<Unit>, String> {
             );
             let mut inputs = closure(root, &start);
             inputs.insert(format!("verification/{dir}/"));
-            units.push(Unit {
-                name: format!("mutants/{dir}"),
-                group: group_of(dir)?,
-                kind: "mutants".into(),
-                target: f.to_string(),
-                inputs: inputs.into_iter().collect(),
-            });
+            let inputs: Vec<String> = inputs.into_iter().collect();
+            // One unit per declared name, each run with that name as its argument; the marker replaces the plain
+            // `mutants/<dir>` unit rather than adding to it, so no proof is counted twice.
+            for (name, target) in match names {
+                None => vec![(format!("mutants/{dir}"), f.to_string())],
+                Some(ns) => ns
+                    .into_iter()
+                    .map(|n| (format!("mutants/{dir}/{n}"), format!("{f} {n}")))
+                    .collect(),
+            } {
+                units.push(Unit {
+                    name,
+                    group: group_of(dir)?,
+                    kind: "mutants".into(),
+                    target,
+                    inputs: inputs.clone(),
+                });
+            }
         }
     }
 
@@ -359,21 +464,26 @@ pub fn discover(root: &Path) -> Result<Vec<Unit>, String> {
         });
     }
 
-    let global_mutants =
-        fs::read_to_string(root.join("scripts/verify-mutations.sh")).map_err(|e| e.to_string())?;
-    let mut inputs: BTreeSet<String> = [
-        "scripts/verify-mutations.sh".to_string(),
-        "verification/".to_string(),
-    ]
-    .into();
-    inputs.extend(crate_tokens(&global_mutants));
-    units.push(Unit {
-        name: "mutations/global".into(),
-        group: group_of("global-mutations")?,
-        kind: "mutations".into(),
-        target: "scripts/verify-mutations.sh".into(),
-        inputs: inputs.into_iter().collect(),
-    });
+    // The global mutation list is a unit only where the repository keeps one with entries in it. An absent script or an empty
+    // list proves nothing, so emitting the unit anyway gives a check that passes trivially (found in the Brimstone copy of
+    // this CI, 2026-11-17: an empty `mutations=()` stood in for no list at all).
+    if let Ok(text) = fs::read_to_string(root.join("scripts/verify-mutations.sh"))
+        && has_mutation_entries(&text)
+    {
+        let mut inputs: BTreeSet<String> = [
+            "scripts/verify-mutations.sh".to_string(),
+            "verification/".to_string(),
+        ]
+        .into();
+        inputs.extend(crate_tokens(&text));
+        units.push(Unit {
+            name: "mutations/global".into(),
+            group: group_of("global-mutations")?,
+            kind: "mutations".into(),
+            target: "scripts/verify-mutations.sh".into(),
+            inputs: inputs.into_iter().collect(),
+        });
+    }
 
     // The models call the shipped crates through Cargo: any crate or the lock file can change them.
     units.push(Unit {
@@ -652,6 +762,75 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(t, vec!["kernel/lucina-idle/".to_string()]);
+    }
+
+    #[test]
+    fn the_marker_declares_the_names_and_a_script_without_it_declares_none() {
+        let sh = "#!/usr/bin/env bash\n# What this proves.\n# mutants-units: disk_rules patch_rules wire\nset -uo pipefail\n";
+        assert_eq!(
+            mutant_unit_names(sh).unwrap(),
+            Some(vec![
+                "disk_rules".to_string(),
+                "patch_rules".to_string(),
+                "wire".to_string()
+            ])
+        );
+        // The spacing of the comment and of the names is the script's own, and a script that takes no argument is one unit.
+        assert_eq!(
+            mutant_unit_names("#!/bin/sh\n#mutants-units:   a_b2   \nname=${1:-a_b2}\n").unwrap(),
+            Some(vec!["a_b2".to_string()])
+        );
+        assert_eq!(
+            mutant_unit_names("#!/bin/sh\necho 'not a marker: mutants-units: a'\n").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_read_as_names_is_refused() {
+        // The empty and duplicated lists are the ones that would otherwise register nothing or the same file twice.
+        for (sh, why) in [
+            ("#!/bin/sh\n# mutants-units:\n", "no name"),
+            (
+                "#!/bin/sh\n# mutants-units: wire\n# mutants-units: patch\n",
+                "one marker line",
+            ),
+            ("#!/bin/sh\n# mutants-units: wire wire\n", "twice"),
+            (
+                "#!/bin/sh\n# mutants-units: wire-rules\n",
+                "letters, digits and underscore",
+            ),
+        ] {
+            let e = mutant_unit_names(sh).unwrap_err();
+            assert!(e.contains(why), "{sh:?} gave {e}");
+        }
+        // A marker the script's own header has grown away from is refused too, never read as no marker.
+        let deep = format!(
+            "{}# mutants-units: wire\n",
+            "# fill to the top\n".repeat(MUTANTS_MARKER_TOP)
+        );
+        let e = mutant_unit_names(&deep).unwrap_err();
+        assert!(e.contains("first 40 lines"), "{e}");
+    }
+
+    #[test]
+    fn an_empty_global_mutation_list_is_not_a_list() {
+        // The shape Brimstone carried as a stub: the script is there, so the unit was, and it proved nothing.
+        for empty in [
+            "#!/bin/sh\nmutations=(\n)\n",
+            "#!/bin/sh\nmutations=(\n\n    # every mutant lives with its unit\n)\n",
+            "#!/bin/sh\nmutations=()\n",
+            "#!/bin/sh\necho no list\n",
+        ] {
+            assert!(!has_mutation_entries(empty), "{empty:?}");
+        }
+        for one in [
+            "#!/bin/sh\nmutations=(\n    'a.rs|s/x/y/|weakens one'\n)\n",
+            "#!/bin/sh\nmutations=('a.rs|s/x/y/|weakens one')\n",
+            "#!/bin/sh\nmutations=(\n    # a comment\n    'a.rs|s/x/y/|weakens one'\n    'b.rs|s/p/q/|weakens two'\n)\n",
+        ] {
+            assert!(has_mutation_entries(one), "{one:?}");
+        }
     }
 
     #[test]
