@@ -48,6 +48,6 @@ mod tests;
 pub use error::Error;
 pub use host::{
     Clock, DataSegment, DmaArea, Host, IrqWait, LinkState, Options, Probe, Regs, ResetPolicy,
-    Started, Unit,
+    Resume, Started, Unit,
 };
 pub use policy::{UnitRole, WritePolicy};

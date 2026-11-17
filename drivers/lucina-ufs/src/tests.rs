@@ -408,6 +408,13 @@ fn the_reset_brings_a_hung_request_back() {
     h.write(0, 3, 1, &[seg(0, 4096)]).unwrap();
     m.mem_write(DATA_DADDR, &vec![0u8; 4096]);
     let hce_before = m.0.borrow().n.hce_writes;
+    // The traffic of the recovery, counted from here: what the reset may put on the wire is the bring-up's own, and
+    // the replayed request keeps the LUN of the one it replays ([`Host::execute`]). The boundary is judged on what the
+    // controller accepted ([`Counters::submitted`]), so a command that hung before the device saw it is counted too.
+    let marked = m.0.borrow();
+    let submitted_before = marked.n.submitted.len();
+    let queries_before = marked.n.queries.len();
+    drop(marked);
     m.0.borrow_mut().hang_next = true;
     assert_eq!(h.read(0, 3, 1, &[seg(0, 4096)]), Ok(()));
     assert!(!h.is_dead());
@@ -434,35 +441,148 @@ fn the_reset_brings_a_hung_request_back() {
             .filter(|(lun, op)| *lun == 0 && *op == scsi::READ_10)
             .count();
     assert!(reads >= 2, "the command was not sent again: {reads} reads");
-    // Nothing anywhere but the main user LUN, and no write in the whole recovery.
-    assert!(
-        s.n.scsi
-            .iter()
-            .filter(|(lun, _)| *lun != 0)
-            .all(|(_, op)| !matches!(
-                *op,
-                scsi::WRITE_10 | scsi::WRITE_16 | scsi::SYNCHRONIZE_CACHE_10
-            )),
-        "the recovery wrote another LUN: {:?}",
-        s.n.scsi
-    );
+    // What the recovery itself sent, and nothing outside it: no SCSI command for a unit but the main user LUN, and
+    // no query but the device-initialization flag. A reset that reached another unit, or wrote a descriptor or an
+    // attribute there, would show up in this suffix.
+    for (lun, op) in &s.n.submitted[submitted_before..] {
+        assert_eq!(*lun, 0, "the recovery touched another LUN: {op:#04x}");
+    }
+    for (op, idn, index) in &s.n.queries[queries_before..] {
+        assert!(
+            *index == 0
+                && *idn == desc::FLAG_DEVICE_INIT
+                && (*op == upiu::QUERY_OP_SET_FLAG || *op == upiu::QUERY_OP_READ_FLAG),
+            "a query the recovery has no business sending: op {op:#x}, idn {idn:#x}, index {index}"
+        );
+    }
     let log = s.notes.join("\n");
     assert!(log.contains("recovery: link up"), "{log}");
     assert!(log.contains("no device reset"), "{log}");
 }
 
-/// The resume case of patch 1353 with the answer patch 1359 gives: the link went to hibern8 for the sleep, the way
-/// back does not bring it up, and the reset does. `hibernate_exit` says so the way Linux's `ufshcd_uic_pwr_ctrl`
-/// does - UPMCRS not PWR_LOCAL, the link broken - and the disk works again afterwards.
+/// The boundary the write rule holds for a replayed request: it is the same command, to the same LUN, with the same
+/// buffers. A recovery that moved a read-only unit's request to the main LUN - or the main LUN's to a boot LUN -
+/// would show up here as traffic it never sent.
+#[test]
+fn the_replay_goes_to_the_lun_of_the_request_it_replays() {
+    let m = Model::cold(laptop_lus());
+    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    let s0 = m.0.borrow();
+    let submitted_before = s0.n.submitted.len();
+    let queries_before = s0.n.queries.len();
+    drop(s0);
+    m.0.borrow_mut().hang_next = true;
+    // LUN 4 is a firmware unit: readable, never written, and not the main LUN.
+    assert_eq!(h.read(4, 2, 1, &[seg(0, 4096)]), Ok(()));
+    assert!(!h.is_dead());
+    let s = m.0.borrow();
+    assert!(
+        !s.n.submitted[submitted_before..].is_empty(),
+        "the request was never sent again"
+    );
+    // Every command after the hang is the same read to the same unit: the replay did not move to the main LUN, and
+    // the recovery itself put no SCSI command anywhere. (Two of them: the reset leaves the device answering a UNIT
+    // ATTENTION once, which is sent again as every retryable status is.) The hung first attempt is in this trace
+    // too, which is the point of the submission record.
+    for (lun, op) in &s.n.submitted[submitted_before..] {
+        assert_eq!(
+            (*lun, *op),
+            (4, scsi::READ_10),
+            "the recovery sent other traffic, or moved the request: {:?}",
+            &s.n.submitted[submitted_before..]
+        );
+    }
+    for (op, idn, index) in &s.n.queries[queries_before..] {
+        assert!(
+            *index == 0
+                && *idn == desc::FLAG_DEVICE_INIT
+                && (*op == upiu::QUERY_OP_SET_FLAG || *op == upiu::QUERY_OP_READ_FLAG),
+            "a query the recovery has no business sending: op {op:#x}, idn {idn:#x}, index {index}"
+        );
+    }
+    let log = s.notes.join("\n");
+    assert!(log.contains("recovery: link up"), "{log}");
+}
+
+/// Finding 1 of the port review, the case `ufs.recover=on` has to answer: the first attempt hangs, the reset works,
+/// the replay hangs too with UTRLCLR having taken the slot back. The replay is a hung request like any other - the
+/// device may hold task tag 0 again - so the host ends, its buffers stay quarantined, and no later request gets the
+/// tag back. [`a_hung_request_ends_the_host`] is the same end with the reset off.
+#[test]
+fn a_replay_that_hangs_ends_the_host_like_the_request_it_replays() {
+    use alloc::sync::Arc;
+    let m = Model::cold(laptop_lus());
+    let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
+    // Both the first attempt and the replay after the reset never complete.
+    m.0.borrow_mut().hang_scsi = 2;
+    let owner = Arc::new(seg(0, 4096));
+    let mut quarantine = Vec::new();
+    assert_eq!(
+        h.read(0, 0, 1, &[*owner]),
+        Err(Error::Timeout("a transfer request"))
+    );
+    let s = m.0.borrow();
+    assert!(h.is_dead(), "a hung replay is a hung request");
+    assert_eq!(s.utrldbr & 1, 0, "UTRLCLR took the slot back");
+    let log = s.notes.join("\n");
+    assert!(log.contains("recovery: link up"), "{log}");
+    assert!(
+        log.contains("a SCSI command timed out: no more requests"),
+        "{log}"
+    );
+    drop(s);
+    // The replay's own buffers are what is kept: the reset proved the first request over, the hung replay did not.
+    assert_eq!(h.keep_held([owner.clone()], &mut quarantine), 4096);
+    assert_eq!(Arc::strong_count(&owner), 2, "nothing frees them");
+    // A later request is refused before the controller sees it: tag 0 is not handed out twice.
+    let bells = m.0.borrow().bells;
+    assert_eq!(h.read(0, 1, 1, &[*owner]), Err(Error::Dead));
+    assert_eq!(m.0.borrow().bells, bells, "nothing reached the controller");
+}
+
+/// The resume case of patch 1353 with the answer patch 1359 gives, as the whole sequence the wake runs
+/// ([`Host::resume`], what `ctl_wake` calls): the link went to hibern8 for the sleep, the way back does not bring it
+/// up, the error handler is asked once, and the device answers the proof with the UNIT ATTENTION a reset always
+/// asks for - which is retried, not taken for a broken link. The disk works again and the resume says so.
 #[test]
 fn a_wake_that_does_not_bring_the_link_back_is_reset() {
     let m = Model::firmware_left(laptop_lus());
     let mut h = start(&m, ResetPolicy::Never, WritePolicy::default()).unwrap();
     h.hibernate_enter().unwrap();
     m.0.borrow_mut().hiber_exit_upmcrs = 3; // PWR_BUSY: the peer kept the link
-    assert_eq!(h.hibernate_exit(), Err(Error::NoDevice));
-    assert!(h.error_recovery().is_ok());
+    let s0 = m.0.borrow();
+    let scsi_before = s0.n.scsi.len();
+    let uic_before = s0.n.uic.len();
+    drop(s0);
+    let r = h.resume(0);
+    assert!(
+        r.proved(),
+        "the resume did not prove its link: {:?}",
+        r.failed
+    );
+    assert!(r.reset, "the link came back through a reset, not the exit");
+    assert!(!r.hibernating);
     assert!(!h.is_dead());
+    let s = m.0.borrow();
+    // One reset, and the proof it took to believe it: the attention the reset caused, then the answer.
+    assert_eq!(
+        s.n.uic[uic_before..]
+            .iter()
+            .filter(|c| **c == regs::UIC_DME_LINK_STARTUP)
+            .count(),
+        1,
+        "the resume reset the link more than once"
+    );
+    assert_eq!(
+        &s.n.scsi[scsi_before..],
+        &[(0, scsi::TEST_UNIT_READY), (0, scsi::TEST_UNIT_READY)],
+        "the proof was not the bounded TUR sequence of a reset device"
+    );
+    let log = s.notes.join("\n");
+    assert!(log.contains("is not PWR_LOCAL"), "{log}");
+    assert!(log.contains("resume: hibern8 exit"), "{log}");
+    assert!(log.contains("recovery: link up"), "{log}");
+    drop(s);
     // The disk works both ways again.
     let pattern: Vec<u8> = (0..4096).map(|i| (i * 5 % 251) as u8).collect();
     m.mem_write(DATA_DADDR, &pattern);
@@ -470,14 +590,6 @@ fn a_wake_that_does_not_bring_the_link_back_is_reset() {
     m.mem_write(DATA_DADDR, &vec![0u8; 4096]);
     assert_eq!(h.read(0, 7, 1, &[seg(0, 4096)]), Ok(()));
     assert_eq!(m.mem_read(DATA_DADDR, 4096), pattern);
-    let s = m.0.borrow();
-    assert!(
-        s.n.uic.contains(&regs::UIC_DME_LINK_STARTUP),
-        "the link was started again"
-    );
-    // The link was down before the reset, so the recovery's NOP OUT is what proved it back up.
-    let log = s.notes.join("\n");
-    assert!(log.contains("recovery: link up"), "{log}");
 }
 
 /// The same resume with the handler switched off (`ufs.recover=off`, what a Qualcomm controller runs by default,
@@ -508,6 +620,334 @@ fn a_declined_recovery_changes_nothing() {
     // The exit did bring the model's link out of hibern8 - only its UPMCRS answer was distrusted - so a plain read
     // still goes through the same request path as before the decline.
     assert_eq!(h.read(0, 7, 1, &[seg(0, 4096)]), Ok(()));
+}
+
+/// The refusal of the UIC command itself, which is what Linux's `ufshcd_uic_pwr_ctrl` hands back: the controller
+/// answers FAILURE, the link stays in hibern8, and `hibernate_exit` says so. The takeover of the firmware's link is
+/// the only caller that ignores that answer, and it does so for a link it could not read ([`a_failed_exit_does_not_end_bring_up`]).
+#[test]
+fn hibernate_exit_reports_a_refused_uic_command() {
+    let m = Model::firmware_left(laptop_lus());
+    let mut h = start(&m, ResetPolicy::Never, WritePolicy::default()).unwrap();
+    h.hibernate_enter().unwrap();
+    m.0.borrow_mut().hiber_exit_fails = true;
+    assert_eq!(
+        h.hibernate_exit(),
+        Err(Error::Uic {
+            cmd: regs::UIC_DME_HIBER_EXIT,
+            result: 1
+        })
+    );
+    assert!(
+        m.0.borrow().hibernated,
+        "a refused exit leaves the link down"
+    );
+}
+
+/// The same refusal on the way back from a sleep, with the handler on: the exit tried twice, the link still down, so
+/// the resume asks for the one reset it is allowed and believes the link only when a command answered after it. The
+/// refusal is not swallowed to get a green resume, and it is not taken for a proved link either.
+#[test]
+fn a_refused_hibern8_exit_on_a_wake_is_reset_and_proved() {
+    let m = Model::firmware_left(laptop_lus());
+    let mut h = start(&m, ResetPolicy::Never, WritePolicy::default()).unwrap();
+    h.hibernate_enter().unwrap();
+    m.0.borrow_mut().hiber_exit_fails = true;
+    let s0 = m.0.borrow();
+    let scsi_before = s0.n.scsi.len();
+    let uic_before = s0.n.uic.len();
+    drop(s0);
+    let r = h.resume(0);
+    assert!(
+        r.proved(),
+        "the resume did not prove its link: {:?}",
+        r.failed
+    );
+    assert!(r.reset, "the exit never brought the link up");
+    assert!(!r.hibernating);
+    assert!(!h.is_dead());
+    let s = m.0.borrow();
+    assert_eq!(
+        s.n.uic[uic_before..]
+            .iter()
+            .filter(|c| **c == regs::UIC_DME_HIBER_EXIT)
+            .count(),
+        2,
+        "the exit was not tried twice"
+    );
+    assert_eq!(
+        s.n.uic[uic_before..]
+            .iter()
+            .filter(|c| **c == regs::UIC_DME_LINK_STARTUP)
+            .count(),
+        1,
+        "more than one reset for one wake"
+    );
+    assert_eq!(
+        &s.n.scsi[scsi_before..],
+        &[(0, scsi::TEST_UNIT_READY), (0, scsi::TEST_UNIT_READY)],
+        "the proof was not the bounded TUR of a reset device: {:?}",
+        &s.n.scsi[scsi_before..]
+    );
+    let log = s.notes.join("\n");
+    assert!(log.contains("resume: hibern8 exit"), "{log}");
+    assert!(log.contains("result 0x01 FAILURE"), "{log}");
+    assert!(log.contains("recovery: link up"), "{log}");
+}
+
+/// One recovery budget for a whole resume. The proof hangs, is replayed after the reset the request itself asked
+/// for, and hangs again: the resume does not spend a second reset on the same failure. Linux's `needs_reset` is one
+/// `ufshcd_reset_and_restore` and what is left is an error, never another attempt.
+#[test]
+fn a_wake_resets_once_and_never_twice() {
+    let m = Model::firmware_left(laptop_lus());
+    let mut h = start(&m, ResetPolicy::Never, WritePolicy::default()).unwrap();
+    h.hibernate_enter().unwrap();
+    m.0.borrow_mut().hang_scsi = 2;
+    let s0 = m.0.borrow();
+    let scsi_before = s0.n.scsi.len();
+    let uic_before = s0.n.uic.len();
+    drop(s0);
+    let r = h.resume(0);
+    assert!(
+        !r.proved(),
+        "a proof that never answered is not a proved link"
+    );
+    assert!(
+        r.failed.unwrap().contains("recovery"),
+        "the resume did not report the refused second reset"
+    );
+    assert!(!r.reset, "the reset the resume asked for was refused");
+    assert!(
+        !r.hibernating,
+        "the link the one reset brought up is not taken for hibernating"
+    );
+    assert!(
+        h.is_dead(),
+        "a hung request is a hung request, resumed or not"
+    );
+    let s = m.0.borrow();
+    assert_eq!(
+        s.n.uic[uic_before..]
+            .iter()
+            .filter(|c| **c == regs::UIC_DME_LINK_STARTUP)
+            .count(),
+        1,
+        "a wake that resets the link twice"
+    );
+    assert_eq!(s.hang_scsi, 0, "the proof and its replay are the two hangs");
+    assert!(
+        s.n.scsi[scsi_before..].is_empty(),
+        "the device answered something over a link that never came back: {:?}",
+        &s.n.scsi[scsi_before..]
+    );
+    let log = s.notes.join("\n");
+    assert!(
+        log.contains("already reset once since a request worked"),
+        "{log}"
+    );
+    assert!(
+        log.contains("a SCSI command timed out: no more requests"),
+        "{log}"
+    );
+}
+
+/// Finding 2 of the Codex recheck, the case the ordinary per-burst counter allowed: both exits are refused, the
+/// resume's own reset works, and the proof answers the UNIT ATTENTION a reset always leaves behind - which, transport
+/// completed, is what cleared `recoveries` and reopened the budget. The retried proof then times out. Inside one
+/// [`Host::resume`] the budget is the call's own ([`Host::resume_resets`]) and nothing in between replenishes it, so
+/// the wake still gets exactly one reset and the disk is not believed.
+#[test]
+fn an_answered_status_inside_a_wake_does_not_open_its_reset_budget() {
+    let m = Model::firmware_left(laptop_lus());
+    let mut h = start(&m, ResetPolicy::Never, WritePolicy::default()).unwrap();
+    h.hibernate_enter().unwrap();
+    m.0.borrow_mut().hiber_exit_fails = true;
+    let s0 = m.0.borrow();
+    let scsi_before = s0.n.scsi.len();
+    let submitted_before = s0.n.submitted.len() as u32;
+    let uic_before = s0.n.uic.len();
+    drop(s0);
+    // The proof after the reset is answered (with attention), the one that follows it never comes back.
+    m.0.borrow_mut().hang_scsi_after = Some(submitted_before + 1);
+    let r = h.resume(0);
+    assert!(
+        !r.proved(),
+        "a wake whose proof ended in a timeout is not a proved link: {:?}",
+        r.failed
+    );
+    assert!(r.reset, "the resume's own reset did happen");
+    assert!(!r.hibernating, "the reset raised the link");
+    let s = m.0.borrow();
+    assert_eq!(
+        s.n.uic[uic_before..]
+            .iter()
+            .filter(|c| **c == regs::UIC_DME_LINK_STARTUP)
+            .count(),
+        1,
+        "the answered status in between reopened the wake's reset budget"
+    );
+    // Both proofs reached the controller; the device answered one of them. The submission record is what makes the
+    // hung command visible at all ([`Counters::submitted`]), the completion record stays the device's own receipt.
+    assert_eq!(
+        &s.n.submitted[submitted_before as usize..],
+        &[(0, scsi::TEST_UNIT_READY), (0, scsi::TEST_UNIT_READY)],
+        "the wake's submissions: {:?}",
+        &s.n.submitted[submitted_before as usize..]
+    );
+    assert_eq!(
+        &s.n.scsi[scsi_before..],
+        &[(0, scsi::TEST_UNIT_READY)],
+        "the device answered more than the one proof it saw: {:?}",
+        &s.n.scsi[scsi_before..]
+    );
+    let log = s.notes.join("\n");
+    assert!(
+        log.contains("already reset once in this resume"),
+        "the refusal did not name the wake's budget: {log}"
+    );
+    drop(s);
+    assert!(
+        h.is_dead(),
+        "a hung proof is a hung request, resumed or not"
+    );
+    // The task tag of the proof that never came back is not handed out again.
+    let bells = m.0.borrow().bells;
+    assert_eq!(h.read(0, 1, 1, &[seg(0, 4096)]), Err(Error::Dead));
+    assert_eq!(m.0.borrow().bells, bells, "nothing reached the controller");
+}
+
+/// The same budget with the wake's one reset spent by the proof's own request rather than by the resume: the first
+/// TUR hangs, so `execute` asks for the reset and the replay answers the attention it left, and the retry that
+/// follows hangs too. Neither the answered status nor the resume's own later ask gets a second reset, and nothing is
+/// submitted on the tag the hung proof may still hold.
+#[test]
+fn a_wake_whose_reset_a_hung_proof_spent_does_not_reset_again() {
+    let m = Model::firmware_left(laptop_lus());
+    let mut h = start(&m, ResetPolicy::Never, WritePolicy::default()).unwrap();
+    h.hibernate_enter().unwrap();
+    // The exits work; the first proof never answers, and that hang is what brings the link back.
+    m.0.borrow_mut().hang_scsi = 1;
+    let s0 = m.0.borrow();
+    let scsi_before = s0.n.scsi.len();
+    let submitted_before = s0.n.submitted.len() as u32;
+    let uic_before = s0.n.uic.len();
+    drop(s0);
+    // The replay answers (attention), the retry after it hangs: submissions 2 and 3 of the wake.
+    m.0.borrow_mut().hang_scsi_after = Some(submitted_before + 2);
+    let r = h.resume(0);
+    assert!(
+        !r.proved(),
+        "a wake that ends with a proof that never answered is not proved: {:?}",
+        r.failed
+    );
+    assert!(
+        !r.reset,
+        "the resume's own ask was refused, so it reports the reset the proof spent, not one it made"
+    );
+    let s = m.0.borrow();
+    assert_eq!(
+        s.n.uic[uic_before..]
+            .iter()
+            .filter(|c| **c == regs::UIC_DME_LINK_STARTUP)
+            .count(),
+        1,
+        "the wake reset the link twice"
+    );
+    assert_eq!(
+        s.n.submitted[submitted_before as usize..].len(),
+        3,
+        "the wake's submissions: {:?}",
+        &s.n.submitted[submitted_before as usize..]
+    );
+    assert!(
+        s.n.submitted[submitted_before as usize..]
+            .iter()
+            .all(|&(lun, op)| lun == 0 && op == scsi::TEST_UNIT_READY),
+        "the wake sent something but the proof"
+    );
+    assert_eq!(
+        &s.n.scsi[scsi_before..],
+        &[(0, scsi::TEST_UNIT_READY)],
+        "only the replay answered, and it answered the attention the reset left"
+    );
+    let log = s.notes.join("\n");
+    assert!(log.contains("recovery: link up"), "{log}");
+    assert!(
+        log.contains("already reset once in this resume"),
+        "the refusal did not name the wake's budget: {log}"
+    );
+    drop(s);
+    assert!(
+        h.is_dead(),
+        "a hung proof is a hung request, resumed or not"
+    );
+    let bells = m.0.borrow().bells;
+    assert_eq!(h.read(0, 1, 1, &[seg(0, 4096)]), Err(Error::Dead));
+    assert_eq!(m.0.borrow().bells, bells, "nothing reached the controller");
+}
+
+/// A wake that comes back: the ordinary per-burst rule is left alone once the scope closes, so the read that fails
+/// after a proved resume still gets its reset, and the request completes.
+#[test]
+fn a_proved_wake_leaves_later_io_its_own_reset_budget() {
+    let m = Model::firmware_left(laptop_lus());
+    let mut h = start(&m, ResetPolicy::Never, WritePolicy::default()).unwrap();
+    h.hibernate_enter().unwrap();
+    m.0.borrow_mut().hiber_exit_upmcrs = 3; // PWR_BUSY: the peer kept the link
+    let r = h.resume(0);
+    assert!(
+        r.proved(),
+        "the wake did not prove its link: {:?}",
+        r.failed
+    );
+    let s0 = m.0.borrow();
+    let uic_before = s0.n.uic.len();
+    drop(s0);
+    // A failure burst of ordinary I/O, after the wake spent its one reset.
+    m.0.borrow_mut().hang_next = true;
+    assert_eq!(h.read(0, 3, 1, &[seg(0, 4096)]), Ok(()));
+    let s = m.0.borrow();
+    assert_eq!(
+        s.n.uic[uic_before..]
+            .iter()
+            .filter(|c| **c == regs::UIC_DME_LINK_STARTUP)
+            .count(),
+        1,
+        "ordinary I/O after a wake is not held to the wake's budget"
+    );
+    assert!(!h.is_dead());
+}
+
+/// A refused exit with the handler off (`ufs.recover=off`, what a Qualcomm controller runs): the resume says the link
+/// is not proved, leaves it hibernating for the next wake, sends nothing to prove a link that never came up, and does
+/// not end the host. What the requests get is the disk's own answer, as before patch 1359.
+#[test]
+fn a_refused_exit_with_recovery_off_leaves_the_link_unproved() {
+    let m = Model::firmware_left(laptop_lus());
+    let mut h = start_no_recover(&m, ResetPolicy::Never, WritePolicy::default()).unwrap();
+    h.hibernate_enter().unwrap();
+    m.0.borrow_mut().hiber_exit_fails = true;
+    let s0 = m.0.borrow();
+    let scsi_before = s0.n.scsi.len();
+    let hce_before = s0.n.hce_writes;
+    drop(s0);
+    let r = h.resume(0);
+    assert!(!r.proved());
+    assert!(!r.reset);
+    assert!(r.hibernating, "the next wake must try the link again");
+    assert!(!h.is_dead(), "a refused resume is not a dead host");
+    let s = m.0.borrow();
+    assert!(s.hibernated, "the model's link is where the exit left it");
+    assert_eq!(s.n.hce_writes, hce_before, "nothing was reset");
+    assert!(
+        s.n.scsi[scsi_before..].is_empty(),
+        "a command was sent over a link that never came up: {:?}",
+        &s.n.scsi[scsi_before..]
+    );
+    let log = s.notes.join("\n");
+    assert!(log.contains("resume: hibern8 exit"), "{log}");
+    assert!(log.contains("recovery: off"), "{log}");
 }
 
 /// Once per failure, not five times as Linux loops (`MAX_HOST_RESET_RETRIES`, `ufshcd.c:81`): a request that ends
@@ -553,8 +993,19 @@ fn the_reset_is_tried_once_per_failure() {
 
 /// A recovery of a controller that will not come back is an error, not a wait and not a second try: the bring-up
 /// inside it fails, the host is left dead, and the request's own error is what the caller sees.
+///
+/// The lifetime it leaves is the half of the recovery-on coverage that [`a_hung_request_ends_the_host`] only shows
+/// with the handler off: nothing is quarantined here, because the recovery stopped the controller before anything
+/// could fail - `full_init` begins by driving HCE 1→0 and waiting for it (`enable_controller`) - which is the same
+/// proof [`Host::error_recovery`] leans on when it succeeds and clears `held`. Whether the bring-up finished after
+/// that says nothing about memory the stopped controller can no longer touch. What a failed recovery does settle is
+/// the other way round: the host is dead from here, so no later request hands it buffers at all. The request whose
+/// memory *is* kept is the hung replay of
+/// [`a_replay_that_hangs_ends_the_host_like_the_request_it_replays`], the case where no reset followed the command
+/// that hung.
 #[test]
 fn a_reset_that_fails_reports_the_request_error() {
+    use alloc::sync::Arc;
     let m = Model::cold(laptop_lus());
     let mut h = start(&m, ResetPolicy::IfNeeded, WritePolicy::default()).unwrap();
     {
@@ -563,15 +1014,26 @@ fn a_reset_that_fails_reports_the_request_error() {
         // Every NOP OUT after the reset hangs too, so `verify_device` inside `full_init` gives up.
         s.hang_nop = 40;
     }
+    let owner = Arc::new(seg(0, 4096));
+    let mut quarantine = Vec::new();
     assert_eq!(
-        h.read(0, 0, 1, &[seg(0, 4096)]),
+        h.read(0, 0, 1, &[*owner]),
         Err(Error::Timeout("a transfer request"))
     );
     assert!(h.is_dead());
-    // Nothing waits any more: the host is dead, so the next request is refused where it stands.
-    assert_eq!(h.read(0, 1, 1, &[seg(0, 4096)]), Err(Error::Dead));
     let log = m.0.borrow().notes.join("\n");
     assert!(log.contains("recovery: reset failed"), "{log}");
+    assert_eq!(h.keep_held([owner.clone()], &mut quarantine), 0);
+    assert!(
+        quarantine.is_empty(),
+        "the controller was stopped, not left running"
+    );
+    assert_eq!(Arc::strong_count(&owner), 1, "the caller frees them");
+    // Nothing waits any more: the host is dead, so the next request is refused where it stands and gives the
+    // stopped controller no memory either.
+    let bells = m.0.borrow().bells;
+    assert_eq!(h.read(0, 1, 1, &[*owner]), Err(Error::Dead));
+    assert_eq!(m.0.borrow().bells, bells, "nothing reached the controller");
 }
 
 #[test]

@@ -176,7 +176,7 @@ pub(crate) fn lex_omit_line(l: &str, line: usize) -> Vec<Tok> {
     v
 }
 
-fn lex(src: &str, tag: &[bool], carry: &[bool]) -> Vec<Tok> {
+pub(crate) fn lex(src: &str, tag: &[bool], carry: &[bool]) -> Vec<Tok> {
     let c: Vec<char> = src.chars().collect();
     let n = c.len();
     let mut out: Vec<Tok> = Vec::new();

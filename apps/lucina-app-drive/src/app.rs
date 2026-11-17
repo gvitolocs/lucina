@@ -15,12 +15,15 @@ use lucina_account::ui::SignInView;
 use lucina_app::program::{Ended, Program};
 use lucina_app::time::Zone;
 use lucina_app::{App, Face, Image, ListState, Rect, Rgb, Sender, TextEdit, Ui, keys};
-use lucina_nav as nav;
-use lucina_files::drive::{self, ArchiveListing, Crumb, DRIVE_SORTS, DRIVE_TYPES, DriveItem, DrivePreview, DriveRoots, DriveSort, DriveType, Filters, FolderEntry, Token};
+use lucina_files::drive::{
+    self, ArchiveListing, Crumb, DRIVE_SORTS, DRIVE_TYPES, DriveItem, DrivePreview, DriveRoots,
+    DriveSort, DriveType, Filters, FolderEntry, Token,
+};
 use lucina_files::media::Connect;
 use lucina_files::picker::{self, FilePicker, Mode, Picked, Setup};
 use lucina_files::pictures::{Done, Fit, Pictures, Want};
 use lucina_files::places;
+use lucina_nav as nav;
 use lucina_picture_view::PictureView;
 
 use crate::server::{Job, Msg, Next, Page, TextAnswer};
@@ -56,17 +59,31 @@ pub enum Body {
     Loading,
     /// 202: "Still reading this file…", asked again every 3 s.
     Pending(u32),
-    Text { language: Option<String>, truncated: bool, bytes: Option<u64>, lines: Vec<Vec<Token>> },
+    Text {
+        language: Option<String>,
+        truncated: bool,
+        bytes: Option<u64>,
+        lines: Vec<Vec<Token>>,
+    },
     NoText,
     Failed,
     Archive(ArchiveListing),
     /// The server cannot list this kind of archive.
     Unsupported,
     /// The picture is on its way, or here. `None` with no url: nothing to show.
-    Picture { url: Option<String>, image: Option<Image>, failed: bool },
+    Picture {
+        url: Option<String>,
+        image: Option<Image>,
+        failed: bool,
+    },
     /// Video or audio, with its poster.
-    Play { url: Option<String>, image: Option<Image> },
-    Info { note: bool },
+    Play {
+        url: Option<String>,
+        image: Option<Image>,
+    },
+    Info {
+        note: bool,
+    },
 }
 
 pub struct Preview {
@@ -129,7 +146,12 @@ pub struct Drive {
 }
 
 impl Drive {
-    pub fn new(zone: Zone, tx: Option<Sender<Msg>>, link: Option<Link>, connect: Option<Connect>) -> Drive {
+    pub fn new(
+        zone: Zone,
+        tx: Option<Sender<Msg>>,
+        link: Option<Link>,
+        connect: Option<Connect>,
+    ) -> Drive {
         let mut types = ListState::new();
         types.select(0);
         let mut d = Drive {
@@ -181,7 +203,11 @@ impl Drive {
         self
     }
 
-    pub fn with_sign_in(mut self, s: Box<dyn FnMut() -> Option<SignInView>>, w: Box<dyn FnMut() -> Option<Link>>) -> Drive {
+    pub fn with_sign_in(
+        mut self,
+        s: Box<dyn FnMut() -> Option<SignInView>>,
+        w: Box<dyn FnMut() -> Option<Link>>,
+    ) -> Drive {
         self.make_sign_in = Some(s);
         self.make_worker = Some(w);
         self
@@ -189,8 +215,15 @@ impl Drive {
 
     fn start_pictures(&mut self) {
         if let (Some(tx), Some(connect)) = (self.tx.clone(), self.connect.clone()) {
-            let cache = places::cache_dir("drive").map(|d| Arc::new(lucina_files::cache::DiskCache::new(d.join("pictures"), 512 << 20)));
-            self.pictures = Some(Pictures::start(connect, cache, move |d| tx.send(Msg::Picture(d))));
+            let cache = places::cache_dir("drive").map(|d| {
+                Arc::new(lucina_files::cache::DiskCache::new(
+                    d.join("pictures"),
+                    512 << 20,
+                ))
+            });
+            self.pictures = Some(Pictures::start(connect, cache, move |d| {
+                tx.send(Msg::Picture(d))
+            }));
         }
     }
 
@@ -248,7 +281,13 @@ impl Drive {
         self.loading = true;
         let filters = self.filters.clone();
         let context = self.context.clone();
-        self.send(Job::List { generation, context, filters, after: Next::None, more: false });
+        self.send(Job::List {
+            generation,
+            context,
+            filters,
+            after: Next::None,
+            more: false,
+        });
     }
 
     /// `load(true)`.
@@ -257,8 +296,19 @@ impl Drive {
             return;
         }
         self.loading = true;
-        let (generation, filters, context, after) = (self.generation, self.filters.clone(), self.context.clone(), self.next.clone());
-        self.send(Job::List { generation, context, filters, after, more: true });
+        let (generation, filters, context, after) = (
+            self.generation,
+            self.filters.clone(),
+            self.context.clone(),
+            self.next.clone(),
+        );
+        self.send(Job::List {
+            generation,
+            context,
+            filters,
+            after,
+            more: true,
+        });
     }
 
     pub fn rows(&self) -> Vec<Row> {
@@ -310,8 +360,13 @@ impl Drive {
                 self.context = if path.is_empty() {
                     Context::Roots
                 } else {
-                    let parent = path.rfind('/').map_or(String::new(), |i| path[..i].to_owned());
-                    Context::Folder { folder, path: parent }
+                    let parent = path
+                        .rfind('/')
+                        .map_or(String::new(), |i| path[..i].to_owned());
+                    Context::Folder {
+                        folder,
+                        path: parent,
+                    }
                 };
             }
         }
@@ -330,11 +385,17 @@ impl Drive {
 
     /// The sort in force: `filters().sort ?? (searching() ? "modified" : "name")`.
     pub fn sort(&self) -> DriveSort {
-        self.filters.sort.unwrap_or(if self.searching() { DriveSort::Modified } else { DriveSort::Name })
+        self.filters.sort.unwrap_or(if self.searching() {
+            DriveSort::Modified
+        } else {
+            DriveSort::Name
+        })
     }
 
     pub fn ascending(&self) -> bool {
-        self.filters.ascending.unwrap_or_else(|| self.sort().default_ascending())
+        self.filters
+            .ascending
+            .unwrap_or_else(|| self.sort().default_ascending())
     }
 
     /// Only folders sort, as on the web.
@@ -346,7 +407,10 @@ impl Drive {
         if !self.is_folder() {
             return;
         }
-        let at = DRIVE_SORTS.iter().position(|s| *s == self.sort()).unwrap_or(0);
+        let at = DRIVE_SORTS
+            .iter()
+            .position(|s| *s == self.sort())
+            .unwrap_or(0);
         let sort = DRIVE_SORTS[(at + 1) % DRIVE_SORTS.len()];
         self.filters.sort = Some(sort);
         self.filters.ascending = Some(sort.default_ascending());
@@ -393,7 +457,15 @@ impl Drive {
     pub fn open_preview(&mut self, item: DriveItem) {
         self.next_token += 1;
         let token = self.next_token;
-        let mut p = Preview { item, as_text: false, body: Body::Loading, lines: ListState::new(), token, focused: false, surface: PictureView::new() };
+        let mut p = Preview {
+            item,
+            as_text: false,
+            body: Body::Loading,
+            lines: ListState::new(),
+            token,
+            focused: false,
+            surface: PictureView::new(),
+        };
         p.lines.plain = true;
         self.preview = Some(p);
         self.toast.clear();
@@ -402,7 +474,9 @@ impl Drive {
 
     /// `canToggle`, where the first view is the first-page picture rather than a PDF.
     fn has_page_picture(item: &DriveItem) -> bool {
-        matches!(item.preview(), DrivePreview::Pdf | DrivePreview::Office) && item.urls.large.is_some() && item.thumb_state.as_deref() == Some("ready")
+        matches!(item.preview(), DrivePreview::Pdf | DrivePreview::Office)
+            && item.urls.large.is_some()
+            && item.thumb_state.as_deref() == Some("ready")
     }
 
     pub fn can_toggle(item: &DriveItem) -> bool {
@@ -417,24 +491,38 @@ impl Drive {
         let preview = item.preview();
         let text_first = p.as_text || !Self::has_page_picture(&item);
         let job = match preview {
-            DrivePreview::Pdf | DrivePreview::Office | DrivePreview::Text | DrivePreview::Code if text_first => match &item.urls.text {
-                Some(url) => {
-                    p.body = Body::Loading;
-                    Some(Job::Text { token, url: url.clone() })
+            DrivePreview::Pdf | DrivePreview::Office | DrivePreview::Text | DrivePreview::Code
+                if text_first =>
+            {
+                match &item.urls.text {
+                    Some(url) => {
+                        p.body = Body::Loading;
+                        Some(Job::Text {
+                            token,
+                            url: url.clone(),
+                        })
+                    }
+                    None => {
+                        p.body = Body::Info { note: true };
+                        None
+                    }
                 }
-                None => {
-                    p.body = Body::Info { note: true };
-                    None
-                }
-            },
+            }
             DrivePreview::Pdf | DrivePreview::Office => {
-                p.body = Body::Picture { url: item.urls.large.clone(), image: None, failed: false };
+                p.body = Body::Picture {
+                    url: item.urls.large.clone(),
+                    image: None,
+                    failed: false,
+                };
                 None
             }
             DrivePreview::Archive => match &item.urls.archive {
                 Some(url) => {
                     p.body = Body::Loading;
-                    Some(Job::Archive { token, url: url.clone() })
+                    Some(Job::Archive {
+                        token,
+                        url: url.clone(),
+                    })
                 }
                 None => {
                     p.body = Body::Unsupported;
@@ -444,13 +532,20 @@ impl Drive {
             DrivePreview::Image => {
                 let url = item.picture().map(str::to_owned);
                 p.body = match url {
-                    Some(u) => Body::Picture { url: Some(u), image: None, failed: false },
+                    Some(u) => Body::Picture {
+                        url: Some(u),
+                        image: None,
+                        failed: false,
+                    },
                     None => Body::Info { note: true },
                 };
                 None
             }
             DrivePreview::Video | DrivePreview::Audio => {
-                p.body = Body::Play { url: item.urls.poster.clone().or_else(|| item.urls.large.clone()), image: None };
+                p.body = Body::Play {
+                    url: item.urls.poster.clone().or_else(|| item.urls.large.clone()),
+                    image: None,
+                };
                 None
             }
             _ => {
@@ -478,7 +573,9 @@ impl Drive {
         let Some(wake) = self.wake() else { return };
         let setup = Setup {
             title: format!("Download {}", item.name()),
-            mode: Mode::Save { name: picker::safe_name(item.name()) },
+            mode: Mode::Save {
+                name: picker::safe_name(item.name()),
+            },
             places: {
                 let mut p = places::standard();
                 p.rotate_left(1);
@@ -502,14 +599,19 @@ impl Drive {
     fn picked(&mut self, p: Picked) {
         self.picker = None;
         self.focus_list = true;
-        let Some(item) = self.download.take() else { return };
+        let Some(item) = self.download.take() else {
+            return;
+        };
         let Picked::File(dest) = p else { return };
         self.toast = format!("Downloading {}…", item.name());
         lucina_app::events::emit("download.started")
             .subject(&format!("file:{}", dest.display()))
             .field("name", item.name())
             .send();
-        self.send(Job::Download { url: item.download(), dest });
+        self.send(Job::Download {
+            url: item.download(),
+            dest,
+        });
     }
 
     fn keep_thumb(&mut self, url: String, img: Image) {
@@ -529,20 +631,44 @@ impl Drive {
     }
 
     /// What the screen shows now, nearest first: the preview's picture, then the rows in view.
-    fn want_pictures(&mut self, rows: &[Row], first: usize, count: usize, side: u32, screen: (u32, u32)) {
+    fn want_pictures(
+        &mut self,
+        rows: &[Row],
+        first: usize,
+        count: usize,
+        side: u32,
+        screen: (u32, u32),
+    ) {
         let mut wants = Vec::new();
         if let Some(p) = &self.preview {
             let url = match &p.body {
-                Body::Picture { url: Some(u), image: None, failed: false } => Some(u.clone()),
-                Body::Play { url: Some(u), image: None } => Some(u.clone()),
+                Body::Picture {
+                    url: Some(u),
+                    image: None,
+                    failed: false,
+                } => Some(u.clone()),
+                Body::Play {
+                    url: Some(u),
+                    image: None,
+                } => Some(u.clone()),
                 _ => None,
             };
             if let Some(url) = url {
-                wants.push(Want { url, fit: Fit::Within(screen.0, screen.1), rotation: 0 });
+                wants.push(Want {
+                    url,
+                    fit: Fit::Within(screen.0, screen.1),
+                    rotation: 0,
+                });
             }
             // Zooming: the same picture, unfitted.
-            if let (true, None, Body::Picture { url: Some(u), .. }) = (p.surface.is_zoomed(), p.surface.source(), &p.body) {
-                wants.push(Want { url: u.clone(), fit: Fit::Within(ZOOM_FIT, ZOOM_FIT), rotation: 0 });
+            if let (true, None, Body::Picture { url: Some(u), .. }) =
+                (p.surface.is_zoomed(), p.surface.source(), &p.body)
+            {
+                wants.push(Want {
+                    url: u.clone(),
+                    fit: Fit::Within(ZOOM_FIT, ZOOM_FIT),
+                    rotation: 0,
+                });
             }
         }
         for r in rows.iter().skip(first).take(count) {
@@ -550,7 +676,11 @@ impl Drive {
                 && let Some(u) = self.files.get(*i).and_then(|f| f.thumbnail())
                 && !self.thumbs.contains_key(u)
             {
-                wants.push(Want { url: u.to_owned(), fit: Fit::Square(side), rotation: 0 });
+                wants.push(Want {
+                    url: u.to_owned(),
+                    fit: Fit::Square(side),
+                    rotation: 0,
+                });
             }
         }
         let urls: Vec<String> = wants.iter().map(|w| w.url.clone()).collect();
@@ -611,13 +741,23 @@ impl App for Drive {
                     }
                 }
             }
-            Msg::Page { generation, more, result } => {
+            Msg::Page {
+                generation,
+                more,
+                result,
+            } => {
                 if generation != self.generation {
                     return;
                 }
                 self.loading = false;
                 match result {
-                    Ok(Page { crumbs, folders, files, total, next }) => {
+                    Ok(Page {
+                        crumbs,
+                        folders,
+                        files,
+                        total,
+                        next,
+                    }) => {
                         if more {
                             self.files.extend(files);
                         } else {
@@ -626,7 +766,9 @@ impl App for Drive {
                             self.crumbs = crumbs;
                             if let Some(i) = self.come_back_to.take() {
                                 self.list.select(i);
-                            } else if self.list.selected.is_none() && (self.folders.len() + self.files.len()) > 0 {
+                            } else if self.list.selected.is_none()
+                                && (self.folders.len() + self.files.len()) > 0
+                            {
                                 self.list.select(0);
                             }
                         }
@@ -650,11 +792,29 @@ impl App for Drive {
                         p.body = Body::Pending(attempt);
                         if attempt < TEXT_RETRIES {
                             let url = p.item.urls.text.clone().unwrap_or_default();
-                            self.send(Job::TextAgain { token, url, after: TEXT_RETRY });
+                            self.send(Job::TextAgain {
+                                token,
+                                url,
+                                after: TEXT_RETRY,
+                            });
                         }
                     }
-                    TextAnswer::Ready { language, truncated, bytes, lines } => {
-                        p.body = if lines.is_empty() { Body::NoText } else { Body::Text { language, truncated, bytes, lines } };
+                    TextAnswer::Ready {
+                        language,
+                        truncated,
+                        bytes,
+                        lines,
+                    } => {
+                        p.body = if lines.is_empty() {
+                            Body::NoText
+                        } else {
+                            Body::Text {
+                                language,
+                                truncated,
+                                bytes,
+                                lines,
+                            }
+                        };
                         p.focused = false;
                     }
                     TextAnswer::Empty => p.body = Body::NoText,
@@ -681,7 +841,15 @@ impl App for Drive {
                             return;
                         }
                         match &mut p.body {
-                            Body::Picture { url: Some(u), image, .. } | Body::Play { url: Some(u), image } if *u == want.url => {
+                            Body::Picture {
+                                url: Some(u),
+                                image,
+                                ..
+                            }
+                            | Body::Play {
+                                url: Some(u),
+                                image,
+                            } if *u == want.url => {
                                 *image = Some(img);
                                 return;
                             }
@@ -694,7 +862,11 @@ impl App for Drive {
                 }
                 Done::Failed(want, _) => {
                     if let Some(p) = &mut self.preview
-                        && let Body::Picture { url: Some(u), failed, .. } = &mut p.body
+                        && let Body::Picture {
+                            url: Some(u),
+                            failed,
+                            ..
+                        } = &mut p.body
                         && *u == want.url
                         && want.fit != Fit::Within(ZOOM_FIT, ZOOM_FIT)
                     {
@@ -706,8 +878,12 @@ impl App for Drive {
             Msg::Download(r) => {
                 // Lucina waits for this instead of watching the toast (stage D).
                 match &r {
-                    Ok(p) => lucina_app::events::emit("download.done").subject(&format!("file:{}", p.display())).send(),
-                    Err(e) => lucina_app::events::emit("download.failed").field("error", e.to_string()).send(),
+                    Ok(p) => lucina_app::events::emit("download.done")
+                        .subject(&format!("file:{}", p.display()))
+                        .send(),
+                    Err(e) => lucina_app::events::emit("download.failed")
+                        .field("error", e.to_string())
+                        .send(),
                 }
                 self.toast = match r {
                     Ok(p) => format!("Saved in {}", p.display()),
@@ -722,7 +898,11 @@ impl App for Drive {
     }
 
     fn view(&mut self, ui: &mut Ui) {
-        ui.header(if self.sample { "Drive: sample data" } else { "Drive" });
+        ui.header(if self.sample {
+            "Drive: sample data"
+        } else {
+            "Drive"
+        });
         ui.pad(10.0);
         if let Some(view) = &mut self.sign_in {
             view.view(ui, "Sign in to see your Drive.");
@@ -745,7 +925,13 @@ impl App for Drive {
 
 fn row_meta(ui: &mut Ui, a: Rect, top: i32, text: &str, c: Rgb) {
     let t = ui.theme();
-    ui.text_in(Rect::new(a.x, top, a.w, t.px(16.0)), Face::Sans, t.pt(12.0), c, text);
+    ui.text_in(
+        Rect::new(a.x, top, a.w, t.px(16.0)),
+        Face::Sans,
+        t.pt(12.0),
+        c,
+        text,
+    );
 }
 
 /// `FileGlyph`: the picture when there is one, else a page with the type's badge.
@@ -759,15 +945,35 @@ fn glyph(ui: &mut Ui, r: Rect, kind: DriveType, ext: &str, thumb: Option<&Image>
     let badge = drive::type_badge(kind, ext);
     if !badge.is_empty() {
         let w = ui.measure(Face::Bold, t.pt(10.0), &badge);
-        ui.text_in(Rect::new(r.x + (r.w - w) / 2, r.y, w + 2, r.h), Face::Bold, t.pt(10.0), Rgb(0xff_ff_ff), &badge);
+        ui.text_in(
+            Rect::new(r.x + (r.w - w) / 2, r.y, w + 2, r.h),
+            Face::Bold,
+            t.pt(10.0),
+            t.text,
+            &badge,
+        );
     }
 }
 
 fn folder_glyph(ui: &mut Ui, r: Rect) {
     let t = ui.theme();
-    let tab = Rect::new(r.x + t.px(4.0), r.y + t.px(8.0), r.w / 2 - t.px(4.0), t.px(6.0));
+    let tab = Rect::new(
+        r.x + t.px(4.0),
+        r.y + t.px(8.0),
+        r.w / 2 - t.px(4.0),
+        t.px(6.0),
+    );
     ui.fill_round(tab, t.px(2.0), t.accent);
-    ui.fill_round(Rect::new(r.x + t.px(4.0), r.y + t.px(12.0), r.w - t.px(8.0), r.h - t.px(22.0)), t.px(3.0), t.accent);
+    ui.fill_round(
+        Rect::new(
+            r.x + t.px(4.0),
+            r.y + t.px(12.0),
+            r.w - t.px(8.0),
+            r.h - t.px(22.0),
+        ),
+        t.px(3.0),
+        t.accent,
+    );
 }
 
 /// A token's colour (`tokenClass` and the web's `tok-*` styles).
@@ -796,12 +1002,25 @@ impl Drive {
             Context::Roots => Vec::new(),
             Context::Album { title, .. } => vec![title.clone()],
             Context::Folder { folder, path } => {
-                if self.crumbs.is_empty() { drive::breadcrumbs(folder, path).into_iter().map(|c| c.name).collect() } else { self.crumbs.iter().map(|c| c.name.clone()).collect() }
+                if self.crumbs.is_empty() {
+                    drive::breadcrumbs(folder, path)
+                        .into_iter()
+                        .map(|c| c.name)
+                        .collect()
+                } else {
+                    self.crumbs.iter().map(|c| c.name.clone()).collect()
+                }
             }
         };
         let n = names.len();
         let root_w = ui.measure(Face::Bold, px, "Drive");
-        ui.text_in(Rect::new(x, r.y, root_w, r.h), Face::Bold, px, if n == 0 { t.text } else { t.accent }, "Drive");
+        ui.text_in(
+            Rect::new(x, r.y, root_w, r.h),
+            Face::Bold,
+            px,
+            if n == 0 { t.text } else { t.accent },
+            "Drive",
+        );
         if ui.hit("crumb-root", Rect::new(x, r.y, root_w, r.h)).clicked {
             go = Some(usize::MAX);
         }
@@ -813,7 +1032,13 @@ impl Drive {
             x += sw;
             let w = ui.measure(Face::Sans, px, name);
             let last = i + 1 == n;
-            ui.text_in(Rect::new(x, r.y, (r.right() - x).max(0), r.h), Face::Sans, px, if last { t.text } else { t.item }, name);
+            ui.text_in(
+                Rect::new(x, r.y, (r.right() - x).max(0), r.h),
+                Face::Sans,
+                px,
+                if last { t.text } else { t.item },
+                name,
+            );
             if ui.hit(("crumb", i), Rect::new(x, r.y, w, r.h)).clicked && !last {
                 go = Some(i);
             }
@@ -830,7 +1055,9 @@ impl Drive {
                 self.reload();
             }
             Some(i) => {
-                if let (Context::Folder { folder, .. }, Some(c)) = (self.context.clone(), self.crumbs.get(i).cloned()) {
+                if let (Context::Folder { folder, .. }, Some(c)) =
+                    (self.context.clone(), self.crumbs.get(i).cloned())
+                {
                     self.open_folder(folder, c.path);
                 }
             }
@@ -844,16 +1071,34 @@ impl Drive {
         let side_w = t.px(150.0);
         let gap = t.px(12.0);
         let side = Rect::new(area.x + t.px(10.0), area.y, side_w, area.h - t.px(8.0));
-        let main = Rect::new(side.right() + gap, area.y, area.w - side_w - gap - t.px(20.0), area.h - t.px(8.0));
+        let main = Rect::new(
+            side.right() + gap,
+            area.y,
+            area.w - side_w - gap - t.px(20.0),
+            area.h - t.px(8.0),
+        );
 
         // The file types.
-        let filter = |i: usize| if i == 0 { None } else { Some(DRIVE_TYPES[i - 1]) };
-        let res = ui.list("types", &mut self.types, side, DRIVE_TYPES.len() + 1, 28.0, |ui, i, selected| {
-            let a = ui.area();
-            let label = filter(i).map_or("All", DriveType::filter_label);
-            let c = if selected { t.text } else { t.item };
-            ui.text_in(a.inset(t.px(4.0)), Face::Sans, t.pt(14.0), c, label);
-        });
+        let filter = |i: usize| {
+            if i == 0 {
+                None
+            } else {
+                Some(DRIVE_TYPES[i - 1])
+            }
+        };
+        let res = ui.list(
+            "types",
+            &mut self.types,
+            side,
+            DRIVE_TYPES.len() + 1,
+            28.0,
+            |ui, i, selected| {
+                let a = ui.area();
+                let label = filter(i).map_or("All", DriveType::filter_label);
+                let c = if selected { t.text } else { t.item };
+                ui.text_in(a.inset(t.px(4.0)), Face::Sans, t.pt(14.0), c, label);
+            },
+        );
         if res.selection_changed || res.activated.is_some() {
             let i = res.activated.or(self.types.selected).unwrap_or(0);
             self.set_kind(filter(i));
@@ -865,13 +1110,29 @@ impl Drive {
         // The bar.
         let mut column = main;
         let bar = Rect::new(column.x, column.y, column.w, t.px(34.0));
-        column = Rect::new(column.x, bar.bottom() + t.px(4.0), column.w, column.h - bar.h - t.px(4.0));
+        column = Rect::new(
+            column.x,
+            bar.bottom() + t.px(4.0),
+            column.w,
+            column.h - bar.h - t.px(4.0),
+        );
         let sort_w = if self.is_folder() { t.px(150.0) } else { 0 };
-        let field = Rect::new(bar.x, bar.y, bar.w - sort_w - if sort_w > 0 { t.px(8.0) } else { 0 }, bar.h);
+        let field = Rect::new(
+            bar.x,
+            bar.y,
+            bar.w - sort_w - if sort_w > 0 { t.px(8.0) } else { 0 },
+            bar.h,
+        );
         let placeholder = match &self.context {
             Context::Roots => "Search the Drive".to_owned(),
             Context::Album { title, .. } => format!("Search in {title}"),
-            Context::Folder { folder, path } => format!("Search in {}", path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(folder)),
+            Context::Folder { folder, path } => format!(
+                "Search in {}",
+                path.rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(folder)
+            ),
         };
         self.search.placeholder = placeholder;
         let res = ui.text_field_at(field, "search", &mut self.search);
@@ -902,7 +1163,11 @@ impl Drive {
         if sort_w > 0 {
             let arrow = if self.ascending() { "↑" } else { "↓" };
             let label = format!("{} {arrow}", self.sort().label());
-            if ui.button_at(Rect::new(bar.right() - sort_w, bar.y, sort_w, bar.h), "sort", &label) {
+            if ui.button_at(
+                Rect::new(bar.right() - sort_w, bar.y, sort_w, bar.h),
+                "sort",
+                &label,
+            ) {
                 self.next_sort();
             }
         }
@@ -924,7 +1189,11 @@ impl Drive {
             note = "Loading…".to_owned();
         } else if (self.searching() || self.root_search()) && self.total.is_some() {
             let n = self.total.unwrap_or(0);
-            note = if n == 1 { "1 result".to_owned() } else { format!("{n} results") };
+            note = if n == 1 {
+                "1 result".to_owned()
+            } else {
+                format!("{n} results")
+            };
         }
         if !self.toast.is_empty() {
             note = self.toast.clone();
@@ -932,7 +1201,11 @@ impl Drive {
         if !note.is_empty() {
             let line = Rect::new(column.x, column.y, column.w, t.px(20.0));
             column = Rect::new(column.x, line.bottom(), column.w, column.h - line.h);
-            let c = if !self.error.is_empty() { t.danger } else { t.dim };
+            let c = if !self.error.is_empty() {
+                t.danger
+            } else {
+                t.dim
+            };
             ui.text_in(line, Face::Sans, t.pt(13.0), c, &note);
         }
 
@@ -943,61 +1216,110 @@ impl Drive {
         let thumb_side = t.px(36.0) as u32;
         {
             let zone = self.zone.clone();
-            let (roots, folders, files, thumbs) = (&self.roots, &self.folders, &self.files, &self.thumbs);
-            let res = ui.list("rows", &mut self.list, column, rows.len(), row_h, |ui, i, selected| {
-                let a = ui.area();
-                let glyph_rect = Rect::new(a.x + t.px(6.0), a.y + (a.h - t.px(36.0)) / 2, t.px(36.0), t.px(36.0));
-                let text = Rect::new(glyph_rect.right() + t.px(10.0), a.y, a.w - t.px(58.0), a.h);
-                let name_c = if selected { t.text } else { t.item };
-                let (name, meta): (String, String) = match rows[i] {
-                    Row::Root(n) => {
-                        folder_glyph(ui, glyph_rect);
-                        let Some(Ok(r)) = roots else { return };
-                        let f = &r.folders[n];
-                        (f.folder.clone(), drive::folder_detail(f.files, f.bytes, f.modified.as_deref(), &zone))
-                    }
-                    Row::Collection(n) => {
-                        folder_glyph(ui, glyph_rect);
-                        let Some(Ok(r)) = roots else { return };
-                        let al = &r.albums[n];
-                        let count = al.count.map_or(String::new(), |c| if c == 1 { "1 item".to_owned() } else { format!("{c} items") });
-                        (al.title.clone(), count)
-                    }
-                    Row::Folder(n) => {
-                        folder_glyph(ui, glyph_rect);
-                        let f = &folders[n];
-                        (f.name.clone(), drive::folder_detail(f.files, f.bytes, f.modified.as_deref(), &zone))
-                    }
-                    Row::File(n) => {
+            let (roots, folders, files, thumbs) =
+                (&self.roots, &self.folders, &self.files, &self.thumbs);
+            let res = ui.list(
+                "rows",
+                &mut self.list,
+                column,
+                rows.len(),
+                row_h,
+                |ui, i, selected| {
+                    let a = ui.area();
+                    let glyph_rect = Rect::new(
+                        a.x + t.px(6.0),
+                        a.y + (a.h - t.px(36.0)) / 2,
+                        t.px(36.0),
+                        t.px(36.0),
+                    );
+                    let text =
+                        Rect::new(glyph_rect.right() + t.px(10.0), a.y, a.w - t.px(58.0), a.h);
+                    let name_c = if selected { t.text } else { t.item };
+                    let (name, meta): (String, String) = match rows[i] {
+                        Row::Root(n) => {
+                            folder_glyph(ui, glyph_rect);
+                            let Some(Ok(r)) = roots else { return };
+                            let f = &r.folders[n];
+                            (
+                                f.folder.clone(),
+                                drive::folder_detail(
+                                    f.files,
+                                    f.bytes,
+                                    f.modified.as_deref(),
+                                    &zone,
+                                ),
+                            )
+                        }
+                        Row::Collection(n) => {
+                            folder_glyph(ui, glyph_rect);
+                            let Some(Ok(r)) = roots else { return };
+                            let al = &r.albums[n];
+                            let count = al.count.map_or(String::new(), |c| {
+                                if c == 1 {
+                                    "1 item".to_owned()
+                                } else {
+                                    format!("{c} items")
+                                }
+                            });
+                            (al.title.clone(), count)
+                        }
+                        Row::Folder(n) => {
+                            folder_glyph(ui, glyph_rect);
+                            let f = &folders[n];
+                            (
+                                f.name.clone(),
+                                drive::folder_detail(
+                                    f.files,
+                                    f.bytes,
+                                    f.modified.as_deref(),
+                                    &zone,
+                                ),
+                            )
+                        }
+                        Row::File(n) => {
+                            let f = &files[n];
+                            let thumb = f.thumbnail().and_then(|u| thumbs.get(u));
+                            let ext = f.drive.as_ref().map_or(String::new(), |d| d.ext.clone());
+                            glyph(ui, glyph_rect, f.file_type(), &ext, thumb);
+                            (f.name().to_owned(), f.meta(&zone))
+                        }
+                        Row::More => {
+                            ui.text_in(
+                                a.inset(t.px(10.0)),
+                                Face::Bold,
+                                t.pt(14.0),
+                                t.accent,
+                                "Load more",
+                            );
+                            return;
+                        }
+                    };
+                    ui.text_in(
+                        Rect::new(text.x, a.y + t.px(5.0), text.w, t.px(19.0)),
+                        Face::Sans,
+                        t.pt(15.0),
+                        name_c,
+                        &name,
+                    );
+                    row_meta(ui, text, a.y + t.px(24.0), &meta, t.dim);
+                    if showing_location && let Row::File(n) = rows[i] {
                         let f = &files[n];
-                        let thumb = f.thumbnail().and_then(|u| thumbs.get(u));
-                        let ext = f.drive.as_ref().map_or(String::new(), |d| d.ext.clone());
-                        glyph(ui, glyph_rect, f.file_type(), &ext, thumb);
-                        (f.name().to_owned(), f.meta(&zone))
+                        let line = f.snippet.clone().unwrap_or_else(|| f.location());
+                        row_meta(ui, text, a.y + t.px(40.0), &line, t.item);
                     }
-                    Row::More => {
-                        ui.text_in(a.inset(t.px(10.0)), Face::Bold, t.pt(14.0), t.accent, "Load more");
-                        return;
-                    }
-                };
-                ui.text_in(Rect::new(text.x, a.y + t.px(5.0), text.w, t.px(19.0)), Face::Sans, t.pt(15.0), name_c, &name);
-                row_meta(ui, text, a.y + t.px(24.0), &meta, t.dim);
-                if showing_location && let Row::File(n) = rows[i] {
-                    let f = &files[n];
-                    let line = f.snippet.clone().unwrap_or_else(|| f.location());
-                    row_meta(ui, text, a.y + t.px(40.0), &line, t.item);
-                }
-            });
+                },
+            );
             if let Some(i) = res.activated
                 && let Some(r) = rows.get(i)
             {
                 let r = *r;
                 self.activate(r);
             }
-            if res.selection_changed && let Some(s) = self.list.selected {
-                if rows.len().saturating_sub(s) < MORE_AHEAD {
-                    self.load_more();
-                }
+            if res.selection_changed
+                && let Some(s) = self.list.selected
+                && rows.len().saturating_sub(s) < MORE_AHEAD
+            {
+                self.load_more();
             }
         }
         if self.list.scroll > 0 {
@@ -1010,14 +1332,23 @@ impl Drive {
         // `EmptyState`.
         if rows.is_empty() && !self.loading && self.error.is_empty() {
             let text = if self.show_roots() {
-                self.roots.as_ref().and_then(|r| r.as_ref().ok()).map(|_| "Nothing in the Drive yet")
+                self.roots
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .map(|_| "Nothing in the Drive yet")
             } else if self.searching() || self.filters.kind.is_some() {
                 Some("Nothing found")
             } else {
                 Some("This folder is empty")
             };
             if let Some(text) = text {
-                ui.text_in(Rect::new(column.x + t.px(10.0), column.y, column.w, t.px(30.0)), Face::Sans, t.pt(15.0), t.dim, text);
+                ui.text_in(
+                    Rect::new(column.x + t.px(10.0), column.y, column.w, t.px(30.0)),
+                    Face::Sans,
+                    t.pt(15.0),
+                    t.dim,
+                    text,
+                );
             }
         }
         // A pass after a dialog closes still counts as inside it, and forgets a focus given then: until it has taken.
@@ -1066,13 +1397,17 @@ impl Drive {
                     ui.take_press();
                     ui.focus("rows");
                 }
-                keys::KEY_LEFT | keys::KEY_RIGHT if plain && !p.mods.shift && (on_rows || on_types) => {
+                keys::KEY_LEFT | keys::KEY_RIGHT
+                    if plain && !p.mods.shift && (on_rows || on_types) =>
+                {
                     ui.take_press();
                 }
                 // Space on a file opens it, as Space shows Quick Look in Finder.
                 keys::KEY_SPACE if plain && !p.mods.shift && on_rows => {
                     ui.take_press();
-                    if let Some(r @ Row::File(_)) = self.list.selected.and_then(|i| rows.get(i).copied()) {
+                    if let Some(r @ Row::File(_)) =
+                        self.list.selected.and_then(|i| rows.get(i).copied())
+                    {
                         self.activate(r);
                     }
                 }
@@ -1106,7 +1441,9 @@ impl Drive {
                 }
                 keys::KEY_D if plain => {
                     ui.take_press();
-                    if let Some(Row::File(n)) = self.list.selected.and_then(|i| rows.get(i).copied()) {
+                    if let Some(Row::File(n)) =
+                        self.list.selected.and_then(|i| rows.get(i).copied())
+                    {
                         let item = self.files[n].clone();
                         self.start_download(item);
                     }
@@ -1141,8 +1478,12 @@ impl Drive {
     /// a viewer of one kind (pictures, videos) would pass `false` for the rest to [`nav::walk`]. The ends stop: Windows Photos
     /// does not wrap, nor does a list selection (`lucina-nav`).
     fn step_preview(&mut self, step: nav::Step) {
-        let Some(id) = self.preview.as_ref().map(|p| p.item.id.clone()) else { return };
-        let Some(at) = self.files.iter().position(|f| f.id == id) else { return };
+        let Some(id) = self.preview.as_ref().map(|p| p.item.id.clone()) else {
+            return;
+        };
+        let Some(at) = self.files.iter().position(|f| f.id == id) else {
+            return;
+        };
         let ok = vec![true; self.files.len()];
         let to = nav::walk(&ok, at, step);
         if self.files.len().saturating_sub(to) < MORE_AHEAD {
@@ -1162,7 +1503,9 @@ impl Drive {
     /// last, Alt+Left closes it. A zoomed picture keeps its arrows for panning, and a text or archive list keeps Home and End.
     fn preview_keys(&mut self, ui: &mut Ui) {
         let Some(p) = ui.press() else { return };
-        let Some(open) = self.preview.as_ref() else { return };
+        let Some(open) = self.preview.as_ref() else {
+            return;
+        };
         let zoomed = open.surface.is_zoomed();
         let in_list = matches!(open.body, Body::Text { .. } | Body::Archive(_));
         if p.mods.alt && !p.mods.ctrl && !p.mods.meta && !p.mods.shift && p.code == keys::KEY_LEFT {
@@ -1202,13 +1545,33 @@ impl Drive {
             let Some(p) = &mut self.preview else { return };
             let item = p.item.clone();
             let bar = ui.cut_top(t.px(44.0));
-            let glyph_rect = Rect::new(bar.x + t.px(10.0), bar.y + t.px(4.0), t.px(36.0), t.px(36.0));
+            let glyph_rect = Rect::new(
+                bar.x + t.px(10.0),
+                bar.y + t.px(4.0),
+                t.px(36.0),
+                t.px(36.0),
+            );
             let ext = item.drive.as_ref().map_or(String::new(), |d| d.ext.clone());
             glyph(ui, glyph_rect, item.file_type(), &ext, None);
             let is_video = item.preview() == DrivePreview::Video;
-            let buttons_w = t.px(if Self::can_toggle(&item) || is_video { 300.0 } else { 200.0 });
-            let title = Rect::new(glyph_rect.right() + t.px(10.0), bar.y, bar.w - buttons_w - t.px(60.0), bar.h);
-            ui.text_in(Rect::new(title.x, bar.y + t.px(3.0), title.w, t.px(20.0)), Face::Bold, t.pt(15.0), t.text, item.name());
+            let buttons_w = t.px(if Self::can_toggle(&item) || is_video {
+                300.0
+            } else {
+                200.0
+            });
+            let title = Rect::new(
+                glyph_rect.right() + t.px(10.0),
+                bar.y,
+                bar.w - buttons_w - t.px(60.0),
+                bar.h,
+            );
+            ui.text_in(
+                Rect::new(title.x, bar.y + t.px(3.0), title.w, t.px(20.0)),
+                Face::Bold,
+                t.pt(15.0),
+                t.text,
+                item.name(),
+            );
             let meta = drive::join_dots(&[item.meta(&zone), item.location()]);
             row_meta(ui, title, bar.y + t.px(23.0), &meta, t.dim);
             let mut x = bar.right() - t.px(10.0);
@@ -1227,7 +1590,9 @@ impl Drive {
             if button(ui, "download", "Download", 100.0) {
                 download = Some(item.clone());
             }
-            if Self::can_toggle(&item) && button(ui, "toggle", if p.as_text { "Page" } else { "Text" }, 70.0) {
+            if Self::can_toggle(&item)
+                && button(ui, "toggle", if p.as_text { "Page" } else { "Text" }, 70.0)
+            {
                 toggle = true;
             }
             ui.pad(4.0);
@@ -1267,9 +1632,15 @@ impl Drive {
                         let used = p.surface.input(ui, "preview-picture", body, base);
                         if used.clicked {
                             let (px, py) = ui.pointer();
-                            p.surface.toggle((px - body.x) as f32, (py - body.y) as f32, base, body);
+                            p.surface.toggle(
+                                (px - body.x) as f32,
+                                (py - body.y) as f32,
+                                base,
+                                body,
+                            );
                         }
-                        p.surface.show(ui, body, Some(img), 0x05_07_10);
+                        p.surface
+                            .show(ui, body, Some(img), lucina_app::theme::GROUND.0);
                     } else if *failed {
                         ui.within(body, |ui| ui.label("The preview could not be loaded."));
                     } else {
@@ -1282,37 +1653,76 @@ impl Drive {
                         let inner = ui.area();
                         ui.image_in(inner, img);
                     }
-                    let note = if item.preview() == DrivePreview::Video { "Enter plays it." } else { "No player for sound here yet. Download it to keep it here." };
+                    let note = if item.preview() == DrivePreview::Video {
+                        "Enter plays it."
+                    } else {
+                        "No player for sound here yet. Download it to keep it here."
+                    };
                     ui.text_in(foot, Face::Sans, t.pt(14.0), t.item, note);
                 }
-                Body::Text { language, truncated, bytes, lines } => {
-                    let count = if lines.len() == 1 { "1 line".to_owned() } else { format!("{} lines", lines.len()) };
-                    ui.dim(&drive::join_dots(&[language.clone().unwrap_or_default(), count, drive::format_bytes(*bytes)]));
+                Body::Text {
+                    language,
+                    truncated,
+                    bytes,
+                    lines,
+                } => {
+                    let count = if lines.len() == 1 {
+                        "1 line".to_owned()
+                    } else {
+                        format!("{} lines", lines.len())
+                    };
+                    ui.dim(&drive::join_dots(&[
+                        language.clone().unwrap_or_default(),
+                        count,
+                        drive::format_bytes(*bytes),
+                    ]));
                     if *truncated {
-                        ui.dim("Only the beginning of this file is shown. Download it for the rest.");
+                        ui.dim(
+                            "Only the beginning of this file is shown. Download it for the rest.",
+                        );
                     }
                     let r = ui.area();
                     let digits = lines.len().to_string().len() as i32;
-                    let gutter = ui.measure(Face::Mono, t.pt(13.0), &"0".repeat(digits as usize + 1));
+                    let gutter =
+                        ui.measure(Face::Mono, t.pt(13.0), &"0".repeat(digits as usize + 1));
                     let lines_ref = &*lines;
-                    ui.list("text", &mut p.lines, r, lines_ref.len(), 20.0, |ui, i, selected| {
-                        let a = ui.area();
-                        if selected {
-                            ui.fill(a, t.panel);
-                        }
-                        let px = t.pt(13.0);
-                        ui.text_in(Rect::new(a.x + t.px(4.0), a.y, gutter, a.h), Face::Mono, px, t.dim, &(i + 1).to_string());
-                        let mut x = a.x + t.px(10.0) + gutter;
-                        for (cls, text) in &lines_ref[i] {
-                            if x >= a.right() {
-                                break;
+                    ui.list(
+                        "text",
+                        &mut p.lines,
+                        r,
+                        lines_ref.len(),
+                        20.0,
+                        |ui, i, selected| {
+                            let a = ui.area();
+                            if selected {
+                                ui.fill(a, t.panel);
                             }
-                            let c = token_colour(ui, cls);
-                            let clean = text.replace('\t', "    ");
-                            ui.text_in(Rect::new(x, a.y, a.right() - x, a.h), Face::Mono, px, c, &clean);
-                            x += ui.measure(Face::Mono, px, &clean);
-                        }
-                    });
+                            let px = t.pt(13.0);
+                            ui.text_in(
+                                Rect::new(a.x + t.px(4.0), a.y, gutter, a.h),
+                                Face::Mono,
+                                px,
+                                t.dim,
+                                &(i + 1).to_string(),
+                            );
+                            let mut x = a.x + t.px(10.0) + gutter;
+                            for (cls, text) in &lines_ref[i] {
+                                if x >= a.right() {
+                                    break;
+                                }
+                                let c = token_colour(ui, cls);
+                                let clean = text.replace('\t', "    ");
+                                ui.text_in(
+                                    Rect::new(x, a.y, a.right() - x, a.h),
+                                    Face::Mono,
+                                    px,
+                                    c,
+                                    &clean,
+                                );
+                                x += ui.measure(Face::Mono, px, &clean);
+                            }
+                        },
+                    );
                     if !p.focused {
                         p.focused = true;
                         p.lines.select(0);
@@ -1321,25 +1731,54 @@ impl Drive {
                 }
                 Body::Archive(l) => {
                     let n = l.total.unwrap_or(l.entries.len() as u64);
-                    let count = if n == 1 { "1 entry".to_owned() } else { format!("{n} entries") };
-                    ui.dim(&drive::join_dots(&[l.format.clone().unwrap_or_default(), count]));
+                    let count = if n == 1 {
+                        "1 entry".to_owned()
+                    } else {
+                        format!("{n} entries")
+                    };
+                    ui.dim(&drive::join_dots(&[
+                        l.format.clone().unwrap_or_default(),
+                        count,
+                    ]));
                     if l.truncated {
-                        ui.dim(&format!("Only the first {} entries are listed.", l.entries.len()));
+                        ui.dim(&format!(
+                            "Only the first {} entries are listed.",
+                            l.entries.len()
+                        ));
                     }
                     let r = ui.area();
                     let entries = &l.entries;
-                    ui.list("archive", &mut p.lines, r, entries.len(), 24.0, |ui, i, selected| {
-                        let a = ui.area();
-                        let e = &entries[i];
-                        if selected {
-                            ui.fill(a, t.panel);
-                        }
-                        let rw = t.px(90.0);
-                        ui.text_in(Rect::new(a.x + t.px(6.0), a.y, a.w - rw - t.px(10.0), a.h), Face::Sans, t.pt(14.0), if e.dir { t.accent } else { t.item }, &e.path);
-                        if !e.dir {
-                            ui.text_in(Rect::new(a.right() - rw, a.y, rw, a.h), Face::Sans, t.pt(13.0), t.dim, &drive::format_bytes(e.size));
-                        }
-                    });
+                    ui.list(
+                        "archive",
+                        &mut p.lines,
+                        r,
+                        entries.len(),
+                        24.0,
+                        |ui, i, selected| {
+                            let a = ui.area();
+                            let e = &entries[i];
+                            if selected {
+                                ui.fill(a, t.panel);
+                            }
+                            let rw = t.px(90.0);
+                            ui.text_in(
+                                Rect::new(a.x + t.px(6.0), a.y, a.w - rw - t.px(10.0), a.h),
+                                Face::Sans,
+                                t.pt(14.0),
+                                if e.dir { t.accent } else { t.item },
+                                &e.path,
+                            );
+                            if !e.dir {
+                                ui.text_in(
+                                    Rect::new(a.right() - rw, a.y, rw, a.h),
+                                    Face::Sans,
+                                    t.pt(13.0),
+                                    t.dim,
+                                    &drive::format_bytes(e.size),
+                                );
+                            }
+                        },
+                    );
                     if !p.focused {
                         p.focused = true;
                         p.lines.select(0);
@@ -1351,7 +1790,10 @@ impl Drive {
         self.want_pictures(&[], 0, 0, 0, (sw, sh));
         // Space plays a video, as Enter does (a button that has the focus takes the key first).
         if play.is_none()
-            && let Some(p) = self.preview.as_ref().filter(|p| p.item.preview() == DrivePreview::Video)
+            && let Some(p) = self
+                .preview
+                .as_ref()
+                .filter(|p| p.item.preview() == DrivePreview::Video)
             && ui.key(keys::KEY_SPACE)
         {
             play = Some(p.item.id.clone());
@@ -1386,10 +1828,10 @@ impl Drive {
         if toggle || ui.key(keys::KEY_T) {
             self.toggle_text();
         }
-        if ui.key(keys::KEY_D) {
-            if let Some(item) = self.preview.as_ref().map(|p| p.item.clone()) {
-                self.start_download(item);
-            }
+        if ui.key(keys::KEY_D)
+            && let Some(item) = self.preview.as_ref().map(|p| p.item.clone())
+        {
+            self.start_download(item);
         }
     }
 }
@@ -1410,7 +1852,19 @@ fn info_table(ui: &mut Ui, item: &DriveItem, zone: &Zone) {
         }
         let r = ui.cut_top(t.px(24.0));
         let kw = t.px(90.0);
-        ui.text_in(Rect::new(r.x, r.y, kw, r.h), Face::Sans, t.pt(13.0), t.dim, k);
-        ui.text_in(Rect::new(r.x + kw, r.y, r.w - kw, r.h), Face::Sans, t.pt(14.0), t.text, &v);
+        ui.text_in(
+            Rect::new(r.x, r.y, kw, r.h),
+            Face::Sans,
+            t.pt(13.0),
+            t.dim,
+            k,
+        );
+        ui.text_in(
+            Rect::new(r.x + kw, r.y, r.w - kw, r.h),
+            Face::Sans,
+            t.pt(14.0),
+            t.text,
+            &v,
+        );
     }
 }

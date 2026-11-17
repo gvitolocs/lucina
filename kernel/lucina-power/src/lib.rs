@@ -9,10 +9,14 @@
 //! read at takeover: only the output bit of the enable register changes, so the firmware's period and level return with the
 //! same brightness. Nothing here touches the panel link: the firmware's
 //! picture stays.
+//!
+//! [`entry`] is the one part that is not this laptop's own: what the way back runs when a sleep is given up before its
+//! entry was taken, which the kernel's `suspend.rs` reads on every arch.
 #![no_std]
 #![forbid(unsafe_code)]
 
 pub mod display;
+pub mod entry;
 pub mod level;
 pub mod quiet;
 pub mod scanout;

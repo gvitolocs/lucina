@@ -223,17 +223,30 @@ trap cleanup EXIT
 # and on laptops. The probe reads no stdin and dies after 5 s, so a queue that waits for something, or that is not a queue at all,
 # cannot hang a check. Its exit code is not part of the test: our queue is free to exit non-zero on its usage.
 bqbin=${LUCINA_BQ:-$HOME/.local/bin/bq}
+# A merge gate is the last thing a session waits for, and it timed out behind 40 ordinary jobs of its class (position 42 of 42,
+# 2026-11-13). A gate run asks the queue for the gate priority when the queue knows `--priority`, which puts it ahead of the
+# ordinary waiters that had waited less than 30 minutes; an older queue is called exactly as it is today.
+merge_gate=0
+for arg in "$@"; do
+    if [ "$arg" = "--merge-gate" ]; then merge_gate=1; fi
+done
 runner=()
 if [ -x "$bqbin" ]; then
     bq_usage=$(timeout 5 "$bqbin" </dev/null 2>&1 || true)
     case "$bq_usage" in
         *'--class short|long|proof'*)
-            runner=("$bqbin" run --class short --who "$(basename "$root")" --)
+            prio=()
+            case "$bq_usage" in
+                *'--priority'*)
+                    if [ "$merge_gate" = 1 ]; then prio=(--priority gate); fi
+                    ;;
+            esac
+            runner=("$bqbin" run --class short --who "$(basename "$root")" ${prio[@]+"${prio[@]}"} --)
             # Waiting for the slot is bounded on its own (15 minutes, CHECK_FAST_SLOT_WAIT_S), and a step's time limit starts only
             # after the slot is mine, so a full queue ("no build slot in 15 minutes") and a slow step ("past its N s limit at
             # merge") read differently. A queue older than this option does not know it and is run without.
             case "$bq_usage" in
-                *'--max-wait'*) runner=("$bqbin" run --class short --who "$(basename "$root")" --max-wait "${CHECK_FAST_SLOT_WAIT_S:-900}" --) ;;
+                *'--max-wait'*) runner=("$bqbin" run --class short --who "$(basename "$root")" ${prio[@]+"${prio[@]}"} --max-wait "${CHECK_FAST_SLOT_WAIT_S:-900}" --) ;;
             esac
             ;;
     esac

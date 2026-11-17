@@ -1,12 +1,14 @@
 //! The graph as a picture: lines and discs into our own pixels, because the toolkit has no lines. Drawn when the view changes, not on
 //! each frame.
 
+use lucina_app::theme;
 use lucina_vault::graph::Graph;
 
-const BG: u32 = 0x0c1028;
-const EDGE: u32 = 0x2a3468;
-const NODE: u32 = 0xc3cbee;
-const HOT: u32 = 0x7f8fe0;
+/// The picture's colours are the kit's tokens (rule 9): the card it is drawn on, its hairlines, its ink and its accent.
+const BG: u32 = theme::PANEL.0;
+const EDGE: u32 = theme::HAIRLINE.0;
+const NODE: u32 = theme::ITEM.0;
+const HOT: u32 = theme::ACCENT.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct View {
@@ -105,7 +107,7 @@ pub fn radius(degree: u32, zoom: f32) -> i32 {
     ((by_links * zoom.clamp(0.4, 2.0)).round() as i32).clamp(1, 12)
 }
 
-/// `hot` is the open note, in gold.
+/// `hot` is the open note, in the accent.
 pub fn draw(g: &Graph, v: View, w: i32, h: i32, hot: Option<usize>) -> Vec<u32> {
     let mut px = vec![BG; (w.max(0) * h.max(0)) as usize];
     let at: Vec<(i32, i32)> = g.nodes.iter().map(|n| v.project(n.x, n.y, w, h)).collect();

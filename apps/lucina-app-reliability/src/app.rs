@@ -11,7 +11,7 @@ use lucina_evlog::timeline::{self, Day, FORMULA};
 
 use crate::chart;
 use crate::details::{self, DLine, LOG_ROW};
-use crate::look::{BLUE, event_colour, index_colour, pill_right};
+use crate::look::{BLUE, Label, event_colour, index_colour, pill_right};
 use crate::model::{
     Data, event_clock, index_text, long_date, offset_s, problems, short_date, title,
 };
@@ -123,10 +123,11 @@ impl ReliabilityApp {
 
     /// The loaded log, for tests and `--render`.
     pub fn load(&mut self, events: Vec<Event>, meta: Meta) {
-        if let Some(d) = &self.data {
-            if d.events == events && d.meta == meta {
-                return;
-            }
+        if let Some(d) = &self.data
+            && d.events == events
+            && d.meta == meta
+        {
+            return;
         }
         self.data = Some(Rc::new(Data::new(events, meta)));
         self.generation += 1;
@@ -149,10 +150,10 @@ impl ReliabilityApp {
                 if !self.day_picked && !d.events.is_empty() {
                     self.day_picked = true;
                     let days = &self.days;
-                    if days.last().is_some_and(|t| t.records.is_empty()) {
-                        if let Some(i) = days.iter().rposition(|x| !x.records.is_empty()) {
-                            self.back = days.len() - 1 - i;
-                        }
+                    if days.last().is_some_and(|t| t.records.is_empty())
+                        && let Some(i) = days.iter().rposition(|x| !x.records.is_empty())
+                    {
+                        self.back = days.len() - 1 - i;
                     }
                 }
             }
@@ -852,16 +853,16 @@ impl ReliabilityApp {
             });
         }
         let head = ui.cut_top(t.px(30.0));
-        if let View::Group(id) = self.view_now().clone() {
-            if let Some(g) = data.group(&id) {
-                ui.text_in(
-                    Rect::new(head.x + t.px(6.0), head.y, head.w, head.h),
-                    Face::Bold,
-                    t.pt(16.0),
-                    t.text,
-                    &format!("{}  ·  {} events", g.bucket.label, self.rows.len()),
-                );
-            }
+        if let View::Group(id) = self.view_now().clone()
+            && let Some(g) = data.group(&id)
+        {
+            ui.text_in(
+                Rect::new(head.x + t.px(6.0), head.y, head.w, head.h),
+                Face::Bold,
+                t.pt(16.0),
+                t.text,
+                &format!("{}  ·  {} events", g.bucket.label, self.rows.len()),
+            );
         }
         self.event_list(ui, data, true, "group")
     }
@@ -928,21 +929,22 @@ impl ReliabilityApp {
         );
 
         // Arrow keys stop on evidence, the group and the toggle only.
-        if ui.is_focused("lines") {
-            if let Some(p) = ui.press() {
-                if !p.mods.ctrl && !p.mods.alt && !p.mods.shift {
-                    match p.code {
-                        keys::KEY_DOWN => {
-                            ui.take_press();
-                            self.move_selection(true);
-                        }
-                        keys::KEY_UP => {
-                            ui.take_press();
-                            self.move_selection(false);
-                        }
-                        _ => {}
-                    }
+        if ui.is_focused("lines")
+            && let Some(p) = ui.press()
+            && !p.mods.ctrl
+            && !p.mods.alt
+            && !p.mods.shift
+        {
+            match p.code {
+                keys::KEY_DOWN => {
+                    ui.take_press();
+                    self.move_selection(true);
                 }
+                keys::KEY_UP => {
+                    ui.take_press();
+                    self.move_selection(false);
+                }
+                _ => {}
             }
         }
 
@@ -1120,8 +1122,10 @@ fn group_row(ui: &mut Ui, g: &lucina_evlog::bucket::Group, selected: bool, zone:
         row.right() - t.px(14.0),
         row.y + t.px(8.0),
         t.px(22.0),
-        t.pt(12.0),
-        Face::Bold,
+        Label {
+            face: Face::Bold,
+            px: t.pt(12.0),
+        },
         if g.count >= 2 { t.danger } else { BLUE },
         &count,
     );

@@ -1,6 +1,6 @@
 //! LucinaOS proof CI: see docs/ci/VERUS.md.
 //!
-//!   lucina-ci inventory --check | --write      the list of proof units and the proof matrix page
+//!   lucina-ci inventory --check [--snapshot-rules PATH] | --write   the list of proof units and the proof matrix page
 //!   lucina-ci trust [--write|--check] [--json]  the trust audit: what each Verus/shipped unit assumes (docs/ci/TRUST-REPORT.md, ratchet
 //!                                              in tools/ci/trust-baseline.tsv; --accept-baseline "<reason>" lets --write raise a count)
 //!   lucina-ci plan ...                         which groups a commit needs (GitHub matrix)
@@ -154,8 +154,25 @@ fn cmd_inventory(a: &Args) -> Result<i32, String> {
         );
         return Ok(1);
     }
+    // The same for the launcher's own tests: the public copy runs `cargo test` of itself at every sync precheck, and twice
+    // in a row it died there on a `scripts/tests/` script the rules left out (2026-11-16 max-wait, 2026-11-17 priority).
+    // --snapshot-rules points at another copy of the rules: how to ask whether an older one would have passed.
+    let rules_path = a
+        .val("--snapshot-rules")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("tools/ci/public-snapshot.rules"));
+    let tp = coverage::check_test_paths(&root, &rules_path)?;
+    if !tp.is_empty() {
+        for m in &tp {
+            eprintln!("{m}");
+        }
+        eprintln!(
+            "add the path to an `include` line of tools/ci/public-snapshot.rules; if the test only carries the name as fixture text and never reads the real file, a `# private-only <path>` comment line there declares the omission instead"
+        );
+        return Ok(1);
+    }
     println!(
-        "{} units: inventory current, snapshot holds what the proofs read",
+        "{} units: inventory current, snapshot holds what the proofs and the launcher tests read",
         units.len()
     );
     Ok(0)
@@ -912,6 +929,40 @@ fn fetch_runs(repo: &str, sha: &str) -> Result<Vec<CheckRun>, String> {
     Ok(parse_runs(&String::from_utf8_lossy(&o.stdout)))
 }
 
+/// Workflow runs of one commit, newest first: what a required check that has not appeared is still waiting on, since that check is
+/// the last JOB of its run. `Err` when GitHub does not answer.
+fn fetch_workflow_runs(repo: &str, sha: &str) -> Result<Vec<sync::WorkflowRun>, String> {
+    let jq = r#".workflow_runs | sort_by(.id) | reverse | .[] | [.id, .name, .status, (.conclusion // "")] | @tsv"#;
+    let path = format!("repos/{repo}/actions/runs?head_sha={sha}&per_page=100");
+    let o = Command::new("gh")
+        .args(["api", "--paginate", &path, "--jq", jq])
+        .output()
+        .map_err(|e| format!("cannot run gh: {e}"))?;
+    if !o.status.success() {
+        return Err(format!(
+            "GitHub did not answer for the workflow runs of {sha}"
+        ));
+    }
+    Ok(String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f.len() >= 4).then(|| sync::WorkflowRun {
+                id: f[0].into(),
+                name: f[1].into(),
+                status: f[2].into(),
+                conclusion: f[3].into(),
+            })
+        })
+        .collect())
+}
+
+/// The log line for the workflow-runs API giving no answer: the sync-gate verdict is then the grace period's alone, and the line
+/// must say exactly that (grep-able; judged word for word by `the_runs_unknown_line_reads_exactly_what_the_gate_says`).
+fn runs_unknown_line(e: &str) -> String {
+    format!("sync-gate: runs API gave no answer; decided by the grace period alone ({e})")
+}
+
 /// `green-commit --repo R --private DIR [--verify FULLSHA]`: the newest private commit whose public sync is proven.
 /// Prints the full sha. Exit 0 found, 1 none is proven (or `--verify`'s commit is not), 3 GitHub did not answer.
 fn cmd_green_commit(a: &Args) -> Result<i32, String> {
@@ -1091,7 +1142,8 @@ fn cmd_infra_check() -> Result<i32, String> {
     Ok(if sync::is_infra_failure(&log) { 0 } else { 1 })
 }
 
-/// `sync-gate --repo R --sha PUBSHA --fast-forward yes|no [--scan-clean yes]`: exit 0 main may move, 10 wait, 11 a gate never started (transient), 1 stop for good, 3 no answer.
+/// `sync-gate --repo R --sha PUBSHA --fast-forward yes|no [--scan-clean yes]`: exit 0 main may move, 10 wait, 11 a required check
+/// no run for the commit will produce (transient), 1 stop for good, 3 no answer.
 fn cmd_sync_gate(a: &Args) -> Result<i32, String> {
     let repo = a.need("--repo")?;
     let sha = a.need("--sha")?;
@@ -1105,7 +1157,13 @@ fn cmd_sync_gate(a: &Args) -> Result<i32, String> {
         }
     };
     let since = a.num("--since-push-secs", sync::START_GRACE_SECS)?;
-    let step = sync::gate_step(&runs, &required_checks(a), since);
+    // The runs of the commit tell a check that has not appeared yet (its workflow is still going) from one that never will. When
+    // GitHub does not answer them, the wait is decided by the grace period alone, as it was before 2026-11-16.
+    let workflow = fetch_workflow_runs(&repo, &sha).unwrap_or_else(|e| {
+        eprintln!("{}", runs_unknown_line(&e));
+        Vec::new()
+    });
+    let step = sync::gate_step(&runs, &workflow, &required_checks(a), since);
     match sync::may_move_main(clean, &step, ff) {
         Ok(()) => {
             println!("sync-gate: both gates success on {sha}");
@@ -1949,6 +2007,21 @@ mod tests {
         if std::env::var_os("LUCINA_CHECK_FAST_MERGE_CAP_S").is_none() {
             assert_eq!(merge_step_cap(), 180);
         }
+    }
+
+    // The fetch itself shells out to gh, which a unit test cannot stub; the LINE it prints when it fails is what this pins, and
+    // cmd_sync_gate prints only this fn's return value (cmd_sync_gate in this file, `unwrap_or_else`).
+    #[test]
+    fn the_runs_unknown_line_reads_exactly_what_the_gate_says() {
+        let e = "GitHub did not answer for the workflow runs of abc1234";
+        assert_eq!(
+            runs_unknown_line(e),
+            "sync-gate: runs API gave no answer; decided by the grace period alone (GitHub did not answer for the workflow runs of abc1234)"
+        );
+        assert_eq!(
+            runs_unknown_line("cannot run gh: no such file"),
+            "sync-gate: runs API gave no answer; decided by the grace period alone (cannot run gh: no such file)"
+        );
     }
 
     #[test]

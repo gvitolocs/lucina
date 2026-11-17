@@ -82,6 +82,10 @@ pub struct Counters {
     pub uic: Vec<u8>,
     /// Every SCSI command that reached the device: (LUN, opcode).
     pub scsi: Vec<(u8, u8)>,
+    /// Every SCSI command the controller accepted through its door bell: (LUN, opcode). Recorded before an injected
+    /// hang, so a request the device never answered is here too; [`Self::scsi`] is the device's own receipt, and the
+    /// two are what separate what was submitted from what completed.
+    pub submitted: Vec<(u8, u8)>,
     pub queries: Vec<(u8, u8, u8)>,
 }
 
@@ -147,10 +151,19 @@ pub struct State {
     pub residual: Option<(u32, bool)>,
     /// The first N NOP OUTs never complete.
     pub hang_nop: u32,
+    /// The first N SCSI commands never complete. What a hung request's task tag did is what this asks.
+    pub hang_scsi: u32,
+    /// Every SCSI command the controller accepts after the Nth one in [`Counters::submitted`] never completes.
+    /// [`Self::hang_scsi`] counts from the flag and so cannot reach past the first hang; this counts from the
+    /// submission trace, which is how a test asks about a command that hangs *after* an answered one - the
+    /// interleaving a wake's reset budget is judged on.
+    pub hang_scsi_after: Option<u32>,
     /// The first N device-descriptor reads fail with OCS_PEER_COMM_FAILURE.
     pub query_fail: u32,
     /// HCS.UPMCRS after DME_HIBER_EXIT.
     pub hiber_exit_upmcrs: u32,
+    /// DME_HIBER_EXIT is refused outright (result 1, FAILURE) and the link stays in hibern8.
+    pub hiber_exit_fails: bool,
     /// The driver gave its DMA area back.
     pub area_freed: bool,
     /// What the driver logged.
@@ -209,8 +222,11 @@ impl Model {
             task_aborted: 0,
             residual: None,
             hang_nop: 0,
+            hang_scsi: 0,
+            hang_scsi_after: None,
             query_fail: 0,
             hiber_exit_upmcrs: 1,
+            hiber_exit_fails: false,
             n: Counters::default(),
         })))
     }
@@ -419,6 +435,15 @@ impl Regs for ModelRegs {
                 if s.base_ignored {
                     return;
                 }
+                // The controller took the door bell, so the request is traffic it accepted. What the device is
+                // later willing to answer is the record in `scsi`, below the injections.
+                for slot in 0..32 {
+                    if v & (1 << slot) != 0
+                        && let Some(req) = scsi_req(&s, slot)
+                    {
+                        s.n.submitted.push((req[2], req[16]));
+                    }
+                }
                 if let Some(f) = s.hang_and_fatal.take() {
                     s.utrldbr |= v;
                     s.is |= f;
@@ -443,6 +468,16 @@ impl Regs for ModelRegs {
                         }
                         if s.hang_nop > 0 && is_nop(&s, slot) {
                             s.hang_nop -= 1;
+                            continue;
+                        }
+                        if s.hang_scsi > 0 && is_scsi(&s, slot) {
+                            s.hang_scsi -= 1;
+                            continue;
+                        }
+                        let after = s.hang_scsi_after;
+                        if after.is_some_and(|k| (s.n.submitted.len() as u32) > k)
+                            && is_scsi(&s, slot)
+                        {
                             continue;
                         }
                         run_slot(&mut s, slot);
@@ -494,6 +529,9 @@ fn uic(s: &mut State, cmd: u8) {
                 | (regs::HCS_UPMCRS_PWR_LOCAL << regs::HCS_UPMCRS_SHIFT);
             0
         }
+        // A controller that refuses the exit outright: the command's own result is the failure and the link stays
+        // down, which is what Linux's `ufshcd_uic_pwr_ctrl` hands back to the resume.
+        regs::UIC_DME_HIBER_EXIT if s.hiber_exit_fails => 1,
         regs::UIC_DME_HIBER_EXIT if s.hibernated => {
             s.hibernated = false;
             s.is |= regs::IS_UHXS;
@@ -513,13 +551,36 @@ fn rd(s: &State, daddr: u64, len: usize) -> Vec<u8> {
     s.mem[o..o + len].to_vec()
 }
 
-/// Whether the request in `slot` is a NOP OUT.
-fn is_nop(s: &State, slot: u32) -> bool {
+/// The address of the request UPIU the descriptor of `slot` points at.
+fn ucd_of(s: &State, slot: u32) -> u64 {
     let base = (s.utrlba as u64 | (s.utrlbau as u64) << 32) + slot as u64 * 32;
     let utrd = rd(s, base, 32);
-    let ucd = u32::from_le_bytes(utrd[16..20].try_into().unwrap()) as u64
-        | (u32::from_le_bytes(utrd[20..24].try_into().unwrap()) as u64) << 32;
-    rd(s, ucd, 1)[0] == upiu::TT_NOP_OUT
+    u32::from_le_bytes(utrd[16..20].try_into().unwrap()) as u64
+        | (u32::from_le_bytes(utrd[20..24].try_into().unwrap()) as u64) << 32
+}
+
+/// The transaction type the request in `slot` carries, read out of its UPIU as the controller would.
+fn tt_of(s: &State, slot: u32) -> u8 {
+    rd(s, ucd_of(s, slot), 1)[0]
+}
+
+/// The SCSI command the controller reads out of `slot` when it takes its door bell, `None` for any other
+/// transaction type.
+fn scsi_req(s: &State, slot: u32) -> Option<Vec<u8>> {
+    if !is_scsi(s, slot) {
+        return None;
+    }
+    Some(rd(s, ucd_of(s, slot), UPIU_HEADER_AND_TSF))
+}
+
+/// Whether the request in `slot` is a NOP OUT.
+fn is_nop(s: &State, slot: u32) -> bool {
+    tt_of(s, slot) == upiu::TT_NOP_OUT
+}
+
+/// Whether the request in `slot` is a SCSI command.
+fn is_scsi(s: &State, slot: u32) -> bool {
+    tt_of(s, slot) == upiu::TT_COMMAND
 }
 
 fn wr(s: &mut State, daddr: u64, d: &[u8]) {

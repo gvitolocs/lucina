@@ -180,24 +180,71 @@ const CBCR_CLK_OFF: u32 = 1 << 31;
 const CBCR_FSM_SHIFT: u32 = 28;
 const CBCR_FSM_MASK: u32 = 7;
 const FSM_STATUS_ON: u32 = 2;
-/// Polls of a voted branch: at least as long as Linux's 200 x 1 us at some 100 ns per register read.
+/// Polls of a branch whose halt check is looked at: at least as long as Linux's 200 x 1 us at some 100 ns per
+/// register read (`clk_branch_wait`'s `count = 200`, `:80-86`), and none of them sleeps.
 const BRANCH_POLLS: u32 = 10_000;
+/// `clk_branch_wait`'s one fixed wait (`:75-76`): `udelay(10)`, for a `BRANCH_HALT_DELAY` in either direction and for
+/// clearing a voted branch's bit. Reported to the caller, which owns the clock.
+const BRANCH_DELAY_US: u64 = 10;
 
-/// A branch's `halt_check` in `gcc-sc7180.c`, of those a voted clock can have.
+/// A branch's `halt_check` in `gcc-sc7180.c`, as `clk-branch.h:30-36` spells the values and `clk_branch_wait`
+/// (`clk-branch.c:62-92`) acts on them. `gcc-sc7180.c` declares `BRANCH_HALT`, `BRANCH_HALT_VOTED`,
+/// `BRANCH_HALT_DELAY` and `BRANCH_HALT_SKIP`; `BRANCH_HALT_ENABLE` is here because the wait polls it like the
+/// checked types (`clk-branch.c:77`) with the halt bit read the other way (`:47`), and no sc7180 clock declares it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Halt {
-    /// `BRANCH_HALT_VOTED`: poll `CLK_OFF` after enabling.
+    /// `BRANCH_HALT` (`clk-branch.h:31`, pol: 1 = halt): not voted, so `CLK_OFF` is polled in both directions.
+    Plain,
+    /// `BRANCH_HALT_VOTED` (`:32`): polled after enabling, a fixed 10 µs after clearing the vote, never both.
     Voted,
-    /// `BRANCH_HALT_SKIP`: the bit means nothing, do not look.
+    /// `BRANCH_HALT_ENABLE` (`:33`, pol: 0 = halt): polled in both directions with `CLK_OFF` read the other way.
+    Enable,
+    /// `BRANCH_HALT_DELAY` (`:35`): no bit to check; a fixed 10 µs in either direction.
+    Delay,
+    /// `BRANCH_HALT_SKIP` (`:36`): the bit means nothing, do not look.
     Skip,
 }
 
-/// A voted branch clock. Addresses are in whatever the [`Regs`] passed use.
+impl Halt {
+    /// `voted` of `clk_branch_wait` (`:65`): the type's `BRANCH_VOTED` bit.
+    fn voted(self) -> bool {
+        self == Halt::Voted
+    }
+
+    /// `invert` of `clk_branch2_check_halt` (`:47`): `BRANCH_HALT_ENABLE` alone reads the halt bit the other way.
+    fn invert(self) -> bool {
+        self == Halt::Enable
+    }
+
+    /// Whether enabling this type looks at the halt register: `:77-79` polls `BRANCH_HALT`, `BRANCH_HALT_ENABLE`
+    /// and a voted clock alike, while `:72-76` answers a skipped or delayed one before looking. On the way down a
+    /// voted clock joins the delay instead, which is why [`disable_branch`] does not ask.
+    fn polls(self) -> bool {
+        matches!(self, Halt::Plain | Halt::Enable | Halt::Voted)
+    }
+
+    /// The fixed wait `clk_branch_wait` owes this type (`:75-76`): the 10 µs of a `BRANCH_HALT_DELAY` in either
+    /// direction and of a voted clock going down, and nothing else - a skipped or hardware gated branch is answered
+    /// before the line is reached (`:72-73`), and a checked one is polled instead. Public because the caller owns
+    /// the clock and waits: the helpers report this, they do not sleep.
+    pub fn wait_us(self, enabling: bool) -> u64 {
+        if self == Halt::Delay || (!enabling && self.voted()) {
+            BRANCH_DELAY_US
+        } else {
+            0
+        }
+    }
+}
+
+/// A branch clock, voted or not. Addresses are in whatever the [`Regs`] passed use, and `vote` is the register
+/// Linux's `.enable_reg` names: the shared APCS vote register for a voted branch, its own CBCR for a branch that
+/// is not one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Branch {
     pub cbcr: usize,
     pub vote: usize,
     pub vote_bit: u32,
+    /// The `halt_check` the branch declares in `gcc-sc7180.c`.
     pub halt: Halt,
     /// `hwcg_bit`, for the branches with `hwcg_reg` = their own CBCR: set, hardware gates the clock when idle.
     pub hwcg_bit: Option<u32>,
@@ -210,10 +257,12 @@ pub enum BranchState {
     Running,
     /// It read as off and runs since its vote.
     VotedOn,
-    /// In hardware gated mode (or `BRANCH_HALT_SKIP`) `CLK_OFF` says nothing: voted if it read as off, and taken as on,
-    /// as `clk_branch_wait` does.
+    /// `BRANCH_HALT_SKIP`, or hardware gated mode: `clk_branch_wait` returns before it looks at the halt register
+    /// (`:72-73`), so the branch is taken as on and `CLK_OFF` says nothing.
     NotCheckable,
-    /// Still off after its vote.
+    /// `BRANCH_HALT_DELAY`: the same, with Linux's fixed 10 µs owed before anything touches the block (`:75-76`).
+    Delayed { wait_us: u64 },
+    /// Still off after its vote, which is `clk_branch_wait`'s `WARN` and `-EBUSY` (`:87-89`).
     StaysOff,
 }
 
@@ -221,32 +270,64 @@ impl BranchState {
     pub fn is_on(self) -> bool {
         self != BranchState::StaysOff
     }
+
+    /// What the caller still owes before it reaches the block: the 10 µs of a `BRANCH_HALT_DELAY` enable, and
+    /// nothing else, since a poll has already been run here and the rest of Linux's answers wait for nothing.
+    pub fn wait_us(self) -> u64 {
+        match self {
+            BranchState::Delayed { wait_us } => wait_us,
+            _ => 0,
+        }
+    }
 }
 
-/// `clk_branch2_check_halt` for enabling. All ones is a read that failed, whatever the fields would say.
-fn branch_runs(cbcr: u32) -> bool {
+/// `clk_branch2_check_halt` for enabling (`clk-branch.c:54-58`): running is `CLK_OFF` at the level Linux's
+/// `invert` puts it (`:56`, `CBCR_CLK_OFF` for `BRANCH_HALT_ENABLE`), or the NOC FSM saying on. All ones is a read
+/// that failed, whatever the fields would say.
+fn branch_runs(cbcr: u32, invert: bool) -> bool {
     cbcr != u32::MAX
-        && (cbcr & CBCR_CLK_OFF == 0 || (cbcr >> CBCR_FSM_SHIFT) & CBCR_FSM_MASK == FSM_STATUS_ON)
+        && (cbcr & CBCR_CLK_OFF == if invert { CBCR_CLK_OFF } else { 0 }
+            || (cbcr >> CBCR_FSM_SHIFT) & CBCR_FSM_MASK == FSM_STATUS_ON)
 }
 
-/// Enables a voted branch as `clk_branch_toggle` and `clk_branch_wait` do. The vote bit is always set first, as
-/// `clk_enable_regmap` does, even when the CBCR already reads running; nothing is written when it is already set.
-/// Returns what it found, with the CBCR and the vote register as they are afterwards.
+/// `clk_branch2_check_halt` for disabling (`clk-branch.c:59`): `CLK_OFF` at the level opposite the enable test, and
+/// no FSM - a branch on its way down has no transaction left to gate.
+fn branch_halted(cbcr: u32, invert: bool) -> bool {
+    cbcr != u32::MAX && cbcr & CBCR_CLK_OFF == if invert { 0 } else { CBCR_CLK_OFF }
+}
+
+/// Whether the branch reads as in hardware gated mode, which is `clk_branch_in_hwcg_mode` (`:17-27`) for the
+/// branches whose `hwcg_reg` is their own CBCR: there the answer is bit 1 of the value [`enable_branch`] and
+/// [`disable_branch`] already have.
+fn in_hwcg_mode(branch: &Branch, cbcr: u32) -> bool {
+    branch
+        .hwcg_bit
+        .is_some_and(|bit| cbcr != u32::MAX && cbcr & (1 << bit) != 0)
+}
+
+/// Enables a branch as `clk_branch_toggle` and `clk_branch_wait` do. The vote bit is always set first, as
+/// `clk_enable_regmap` does (`:100-103`), even when the CBCR already reads running; nothing is written when it is
+/// already set. Returns what it found, with the CBCR and the vote register as they are afterwards.
 pub fn enable_branch(r: &mut impl Regs, branch: &Branch) -> (BranchState, u32, u32) {
     let cbcr = r.read32(branch.cbcr);
     let vote = r.read32(branch.vote);
     if vote & (1 << branch.vote_bit) == 0 {
         r.write32(branch.vote, vote | (1 << branch.vote_bit));
     }
-    if branch.halt == Halt::Voted && branch_runs(cbcr) {
+    // A branch that already reads running is answered as running before `clk_branch_wait`'s first test: the wait
+    // returns success without looking for a skipped or hardware gated branch (`:72-73`), and for a check that does
+    // look the first poll passes on the value read here (`:82-84`). Both answer on, and what the register says is
+    // the more useful half of that answer.
+    if branch.halt.polls() && branch_runs(cbcr, branch.halt.invert()) {
         return (BranchState::Running, cbcr, r.read32(branch.vote));
     }
-    let gated = branch
-        .hwcg_bit
-        .is_some_and(|bit| cbcr != u32::MAX && cbcr & (1 << bit) != 0);
-    let state = if branch.halt == Halt::Skip || gated {
+    let state = if branch.halt == Halt::Skip || in_hwcg_mode(branch, cbcr) {
         BranchState::NotCheckable
-    } else if (0..BRANCH_POLLS).any(|_| branch_runs(r.read32(branch.cbcr))) {
+    } else if branch.halt == Halt::Delay {
+        BranchState::Delayed {
+            wait_us: BRANCH_DELAY_US,
+        }
+    } else if (0..BRANCH_POLLS).any(|_| branch_runs(r.read32(branch.cbcr), branch.halt.invert())) {
         BranchState::VotedOn
     } else {
         BranchState::StaysOff
@@ -257,18 +338,19 @@ pub fn enable_branch(r: &mut impl Regs, branch: &Branch) -> (BranchState, u32, u
 /// What [`disable_branch`] did, and what it leaves for the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BranchOff {
-    /// The bit was set and is clear now. `wait_us`: what Linux waits after it - 10 µs for a voted branch
-    /// (`clk_branch_wait`'s `!enabling && voted`, `clk-branch.c:74-75`), 0 when the branch is hardware gated or its
-    /// halt check is skipped (`clk_branch_in_hwcg_mode` and `BRANCH_HALT_SKIP` come first, `:68-72`).
-    Cleared { wait_us: u64 },
+    /// The bit was set and is clear now. `wait_us`: what Linux waits after it - the 10 µs of a voted branch
+    /// (`clk_branch_wait`'s `!enabling && voted`, `clk-branch.c:75-76`) or of a `BRANCH_HALT_DELAY` one, 0 when the
+    /// branch is hardware gated, its halt check skipped (`:72-73`) or its halt check polled instead (`:77-88`).
+    /// `stuck`: that poll ran out its reads and `CLK_OFF` never appeared, which is Linux's `WARN` and `-EBUSY`
+    /// (`:87-89`) that `clk_branch2_disable` ignores (`:133-136`); false wherever nothing is polled.
+    Cleared { wait_us: u64, stuck: bool },
     /// The bit was already clear: nothing was written, as the clock's own refcount never reached this caller.
     WasOff,
 }
 
-/// `clk_branch2_disable` for one voted branch, as `clk_branch_toggle(hw, false)` does it: `clk_disable_regmap` clears
-/// only this clock's bits of the vote register, which every other QUP clock shares (`clk-branch.c:126-129`,
-/// `:95-101`, `clk_disable_regmap` of `drivers/clk/qcom/clk-regmap.c`). The wait it earns is reported, not slept: the
-/// caller has the clock.
+/// `clk_branch2_disable` for one branch, as `clk_branch_toggle(hw, false)` does it: `clk_disable_regmap` clears
+/// only this clock's bits of the vote register, which every other QUP clock shares (`clk-branch.c:104-106`,
+/// `clk-regmap.c:72-85`). The wait it earns is reported, not slept: the caller has the clock.
 ///
 /// The caller's bookkeeping is the clock framework's: this writes for a clock whose last user is going, so the vote
 /// bit is cleared once, not once per user (Linux's `clk core` counts enables, `drivers/clk/clk.c:1046-1060`).
@@ -279,13 +361,25 @@ pub fn disable_branch(r: &mut impl Regs, branch: &Branch) -> (BranchOff, u32, u3
     }
     r.write32(branch.vote, vote & !(1 << branch.vote_bit));
     let cbcr = r.read32(branch.cbcr);
-    let gated = branch
-        .hwcg_bit
-        .is_some_and(|bit| cbcr != u32::MAX && cbcr & (1 << bit) != 0);
-    let wait_us = if branch.halt == Halt::Skip || gated {
-        0
+    let off = if branch.halt == Halt::Skip || in_hwcg_mode(branch, cbcr) {
+        BranchOff::Cleared {
+            wait_us: 0,
+            stuck: false,
+        }
+    } else if branch.halt == Halt::Delay || branch.halt.voted() {
+        BranchOff::Cleared {
+            wait_us: BRANCH_DELAY_US,
+            stuck: false,
+        }
     } else {
-        10
+        // A `BRANCH_HALT` or `BRANCH_HALT_ENABLE` check is polled in both directions (`clk-branch.c:77-79`), so on
+        // the way down this waits for `CLK_OFF` to appear rather than for it to go, and never delays (`:75` needs
+        // `voted`, which neither type has).
+        BranchOff::Cleared {
+            wait_us: 0,
+            stuck: !(0..BRANCH_POLLS)
+                .any(|_| branch_halted(r.read32(branch.cbcr), branch.halt.invert())),
+        }
     };
-    (BranchOff::Cleared { wait_us }, cbcr, r.read32(branch.vote))
+    (off, r.read32(branch.cbcr), r.read32(branch.vote))
 }

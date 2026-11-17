@@ -5,7 +5,7 @@ use lucina_app::{Face, Rect, Ui};
 use lucina_evlog::event::Category;
 use lucina_evlog::timeline::Day;
 
-use crate::look::{BLUE, category_colour, centred, disc, index_colour, line};
+use crate::look::{BLUE, Label, category_colour, centred, disc, index_colour, line};
 use crate::model::{index_text, parts_of_date};
 
 pub const ROWS: [Category; 4] = [
@@ -140,8 +140,10 @@ pub fn draw(ui: &mut Ui, r: Rect, days: &[Day], sel: usize) -> Option<usize> {
             x,
             ty,
             t.px(18.0),
-            if i == sel { Face::Bold } else { Face::Sans },
-            px,
+            Label {
+                face: if i == sel { Face::Bold } else { Face::Sans },
+                px,
+            },
             if i == sel { t.text } else { t.item },
             &text,
         );
@@ -169,8 +171,10 @@ pub fn draw(ui: &mut Ui, r: Rect, days: &[Day], sel: usize) -> Option<usize> {
             cx + cw / 2,
             dates_y + t.px(3.0),
             t.px(16.0),
-            face,
-            t.pt(11.0),
+            Label {
+                face,
+                px: t.pt(11.0),
+            },
             c,
             wd,
         );
@@ -184,8 +188,10 @@ pub fn draw(ui: &mut Ui, r: Rect, days: &[Day], sel: usize) -> Option<usize> {
             cx + cw / 2,
             dates_y + t.px(18.0),
             t.px(18.0),
-            face,
-            t.pt(12.0),
+            Label {
+                face,
+                px: t.pt(12.0),
+            },
             c,
             &num,
         );
@@ -223,8 +229,10 @@ pub fn draw(ui: &mut Ui, r: Rect, days: &[Day], sel: usize) -> Option<usize> {
                 cx,
                 cy - side / 2,
                 side,
-                Face::Bold,
-                t.pt(12.0),
+                Label {
+                    face: Face::Bold,
+                    px: t.pt(12.0),
+                },
                 t.bg,
                 &s,
             );

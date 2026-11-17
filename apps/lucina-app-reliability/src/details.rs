@@ -6,7 +6,9 @@ use lucina_app::time::Zone;
 use lucina_app::{Face, Rect, Theme, Ui};
 use lucina_evlog::event::{Category, Confidence, Event};
 
-use crate::look::{BLUE, category_colour, confidence_colour, confidence_word, pill, pill_right};
+use crate::look::{
+    BLUE, Label, category_colour, confidence_colour, confidence_word, pill, pill_right,
+};
 use crate::model::{Data, boots_text, event_clock, local_day, long_date, short_date, title};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -303,8 +305,10 @@ pub fn draw(ui: &mut Ui, line: &DLine, selected: bool) {
                 card.x + t.px(14.0),
                 card.y + t.px(9.0),
                 t.px(22.0),
-                t.pt(12.0),
-                Face::Bold,
+                Label {
+                    face: Face::Bold,
+                    px: t.pt(12.0),
+                },
                 c,
                 confidence_word(*confidence),
             );
@@ -338,8 +342,10 @@ pub fn draw(ui: &mut Ui, line: &DLine, selected: bool) {
                 tag_r.x + tw / 2,
                 tag_r.y,
                 tag_h,
-                Face::Bold,
-                t.pt(11.0),
+                Label {
+                    face: Face::Bold,
+                    px: t.pt(11.0),
+                },
                 c,
                 tag,
             );
@@ -469,8 +475,10 @@ pub fn log_row(ui: &mut Ui, e: &Event, i: usize, hl: Option<usize>) {
             right,
             row.y + t.px(3.0),
             row.h - t.px(6.0),
-            t.pt(10.5),
-            Face::Bold,
+            Label {
+                face: Face::Bold,
+                px: t.pt(10.5),
+            },
             mark_colour(&m, &t),
             &m,
         );

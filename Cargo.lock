@@ -2851,6 +2851,7 @@ dependencies = [
  "libc",
  "lucina-app",
  "lucina-evlog",
+ "lucina-glass",
  "serde_json",
 ]
 
@@ -2909,6 +2910,7 @@ dependencies = [
  "eyra",
  "lucina-account",
  "lucina-app",
+ "lucina-glass",
  "secretary-tasks",
  "serde",
  "serde_json",
@@ -3559,26 +3561,6 @@ dependencies = [
 [[package]]
 name = "lucina-sdhci"
 version = "0.1.0"
-
-[[package]]
-name = "lucina-shell"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "chrono-tz",
- "eyra",
- "libc",
- "lucina-account",
- "lucina-agents-client",
- "lucina-app",
- "lucina-ax",
- "lucina-glass",
- "lucina-remote",
- "lucina-standby",
- "secretary-calendar",
- "serde_json",
- "vte",
-]
 
 [[package]]
 name = "lucina-sleep"
@@ -6694,16 +6676,6 @@ name = "virtue"
 version = "0.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7302ac74a033bf17b6e609ceec0f891ca9200d502d31f02dc7908d3d98767c9d"
-
-[[package]]
-name = "vte"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
-dependencies = [
- "arrayvec",
- "memchr",
-]
 
 [[package]]
 name = "want"

@@ -1,11 +1,14 @@
-//! Colours and small shapes shared by the screens. Red is a failure, orange an app failure, amber a warning, blue information;
-//! the toolkit's palette has no blue, so the one here is a step lighter than its navy ground and reads on it.
+//! Colours and small shapes shared by the screens. Red is a failure, the warning's amber an app failure, the accent a warning,
+//! info's blue information: all four are the kit's tokens (rules 9 and 10), read as `Rgb` through the toolkit's `theme`. `BLUE`
+//! and `ORANGE` keep the names the screens already say.
 
+use lucina_app::theme;
 use lucina_app::{Face, Rect, Rgb, Theme, Ui};
 use lucina_evlog::event::{Category, Confidence, Event, Level};
+use lucina_glass::tokens;
 
-pub const BLUE: Rgb = Rgb::hex(0x7aa8ff);
-pub const ORANGE: Rgb = Rgb::hex(0xe8975a);
+pub const BLUE: Rgb = theme::rgb(tokens::color::SIGNAL);
+pub const ORANGE: Rgb = theme::rgb(tokens::color::WARNING);
 
 pub fn category_colour(c: Category, t: &Theme) -> Rgb {
     match c {
@@ -51,13 +54,26 @@ pub fn confidence_word(c: Confidence) -> &'static str {
     }
 }
 
+/// A face and a size: the toolkit's text calls take them apart, the helpers below take them as one.
+#[derive(Clone, Copy)]
+pub struct Label {
+    pub face: Face,
+    pub px: u16,
+}
+
 /// A small filled label with `text` in the ground colour; returns its width.
-pub fn pill(ui: &mut Ui, x: i32, y: i32, h: i32, px: u16, face: Face, bg: Rgb, text: &str) -> i32 {
+pub fn pill(ui: &mut Ui, x: i32, y: i32, h: i32, label: Label, bg: Rgb, text: &str) -> i32 {
     let t = ui.theme();
-    let w = ui.measure(face, px, text) + t.px(14.0);
+    let w = ui.measure(label.face, label.px, text) + t.px(14.0);
     let r = Rect::new(x, y, w, h);
     ui.fill_round(r, h / 2, bg);
-    ui.text_in(Rect::new(x + t.px(7.0), y, w, h), face, px, t.bg, text);
+    ui.text_in(
+        Rect::new(x + t.px(7.0), y, w, h),
+        label.face,
+        label.px,
+        t.bg,
+        text,
+    );
     w
 }
 
@@ -67,14 +83,13 @@ pub fn pill_right(
     right: i32,
     y: i32,
     h: i32,
-    px: u16,
-    face: Face,
+    label: Label,
     bg: Rgb,
     text: &str,
 ) -> i32 {
     let t = ui.theme();
-    let w = ui.measure(face, px, text) + t.px(14.0);
-    pill(ui, right - w, y, h, px, face, bg, text)
+    let w = ui.measure(label.face, label.px, text) + t.px(14.0);
+    pill(ui, right - w, y, h, label, bg, text)
 }
 
 pub fn disc(ui: &mut Ui, cx: i32, cy: i32, side: i32, c: Rgb) {
@@ -99,7 +114,13 @@ pub fn line(ui: &mut Ui, x0: i32, y0: i32, x1: i32, y1: i32, th: i32, c: Rgb) {
 }
 
 /// One line of text centred on `cx`.
-pub fn centred(ui: &mut Ui, cx: i32, y: i32, h: i32, face: Face, px: u16, c: Rgb, text: &str) {
-    let w = ui.measure(face, px, text) + 2;
-    ui.text_in(Rect::new(cx - w / 2, y, w, h), face, px, c, text);
+pub fn centred(ui: &mut Ui, cx: i32, y: i32, h: i32, label: Label, c: Rgb, text: &str) {
+    let w = ui.measure(label.face, label.px, text) + 2;
+    ui.text_in(
+        Rect::new(cx - w / 2, y, w, h),
+        label.face,
+        label.px,
+        c,
+        text,
+    );
 }

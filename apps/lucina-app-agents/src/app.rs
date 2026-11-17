@@ -15,12 +15,17 @@ use lucina_agents::bucket::Bucket;
 use lucina_agents::schedule::Schedule;
 use lucina_agents::timeline::TimelineRow;
 use lucina_agents::types::{AgentListItem, AgentSnapshot};
-use lucina_app::{App, Face, ListState, Rect, Rgb, Sender, TextEdit, Ui, keys};
+use lucina_app::theme;
+use lucina_app::{App, Face, ListState, Rect, Sender, TextEdit, Ui, keys};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::api::{Api, B, enc, not_deployed};
-use crate::model::{self, DiffResult, DiffRow, FileContent, FileEntry, PermissionView, PipelineBoard, ProjectRecord, PromptEntry, ProviderInfo, Script, SearchResult, Service, Terminal, UsageReport, Workspace, agent_title, ansi_to_text, diff_rows, size_text, status_label};
+use crate::model::{
+    self, DiffResult, DiffRow, FileContent, FileEntry, PermissionView, PipelineBoard,
+    ProjectRecord, PromptEntry, ProviderInfo, Script, SearchResult, Service, Terminal, UsageReport,
+    Workspace, agent_title, ansi_to_text, diff_rows, size_text, status_label,
+};
 use crate::store::{Effect, Store, Timeline, TlStatus};
 use lucina_agents_client::pages::{self, Act, Line};
 use lucina_agents_client::ui::{bucket_colour, draw, height};
@@ -42,6 +47,7 @@ const PAGE: usize = 500;
 
 pub type Apply = Box<dyn FnOnce(&mut Agents) + Send>;
 type Work = Box<dyn FnOnce() -> Apply + Send>;
+type MakeApi = Box<dyn FnMut() -> Option<Arc<dyn Api>>>;
 
 pub enum Msg {
     Changed,
@@ -145,7 +151,7 @@ pub struct Agents {
     slow: Option<mpsc::Sender<Work>>,
     sign_in: Option<SignInView>,
     start_sign_in: Option<Box<dyn FnMut() -> SignInView>>,
-    make_api: Option<Box<dyn FnMut() -> Option<Arc<dyn Api>>>>,
+    make_api: Option<MakeApi>,
     pub store: Store,
     pub loaded: bool,
     pub load_error: Option<String>,
@@ -216,7 +222,9 @@ pub struct Agents {
 }
 
 fn clock_now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 fn describe(e: &ApiError) -> String {
@@ -225,7 +233,13 @@ fn describe(e: &ApiError) -> String {
 
 fn lax_list<T: DeserializeOwned>(v: &Value) -> Vec<T> {
     // One row a newer server added a kind to must not lose the rest.
-    v.as_array().map(|a| a.iter().filter_map(|x| serde_json::from_value(x.clone()).ok()).collect()).unwrap_or_default()
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| serde_json::from_value(x.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 struct Page {
@@ -319,7 +333,11 @@ impl Agents {
         self
     }
 
-    pub fn with_sign_in(mut self, start_sign_in: Box<dyn FnMut() -> SignInView>, make_api: Box<dyn FnMut() -> Option<Arc<dyn Api>>>) -> Agents {
+    pub fn with_sign_in(
+        mut self,
+        start_sign_in: Box<dyn FnMut() -> SignInView>,
+        make_api: MakeApi,
+    ) -> Agents {
         self.start_sign_in = Some(start_sign_in);
         self.make_api = Some(make_api);
         if self.api.is_none() {
@@ -333,14 +351,29 @@ impl Agents {
     }
 
     /// A request off the screen's thread, its answer parsed there too; `then` runs on this thread. In tests there is no thread.
-    fn call<T: DeserializeOwned + Send + 'static>(&mut self, method: &'static str, path: String, body: Option<Value>, then: impl FnOnce(&mut Agents, Result<T, ApiError>) + Send + 'static) {
+    fn call<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        method: &'static str,
+        path: String,
+        body: Option<Value>,
+        then: impl FnOnce(&mut Agents, Result<T, ApiError>) + Send + 'static,
+    ) {
         self.call_on(false, method, path, body, then);
     }
 
-    fn call_on<T: DeserializeOwned + Send + 'static>(&mut self, slow: bool, method: &'static str, path: String, body: Option<Value>, then: impl FnOnce(&mut Agents, Result<T, ApiError>) + Send + 'static) {
+    fn call_on<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        slow: bool,
+        method: &'static str,
+        path: String,
+        body: Option<Value>,
+        then: impl FnOnce(&mut Agents, Result<T, ApiError>) + Send + 'static,
+    ) {
         let Some(api) = self.api.clone() else { return };
         let work: Work = Box::new(move || -> Apply {
-            let r = api.call(method, &path, body.as_ref()).and_then(|v| serde_json::from_value::<T>(v).map_err(|e| ApiError::Protocol(e.to_string())));
+            let r = api.call(method, &path, body.as_ref()).and_then(|v| {
+                serde_json::from_value::<T>(v).map_err(|e| ApiError::Protocol(e.to_string()))
+            });
             Box::new(move |a: &mut Agents| {
                 if let Err(ApiError::Unauthorized(_)) = &r {
                     a.signed_out();
@@ -381,18 +414,23 @@ impl Agents {
 
     pub fn refresh_all(&mut self) {
         self.load_error = None;
-        self.call("GET", format!("{B}/items"), None, |a, r: Result<Value, _>| match r {
-            Ok(v) => {
-                a.store.set_items(lax_list(&v["agents"]));
-                a.loaded = true;
-                a.mark_stale();
-            }
-            Err(e) => {
-                a.load_error = Some(describe(&e));
-                a.loaded = true;
-                a.mark_stale();
-            }
-        });
+        self.call(
+            "GET",
+            format!("{B}/items"),
+            None,
+            |a, r: Result<Value, _>| match r {
+                Ok(v) => {
+                    a.store.set_items(lax_list(&v["agents"]));
+                    a.loaded = true;
+                    a.mark_stale();
+                }
+                Err(e) => {
+                    a.load_error = Some(describe(&e));
+                    a.loaded = true;
+                    a.mark_stale();
+                }
+            },
+        );
         self.load_permissions();
         self.load_workspaces();
         self.load_terminals();
@@ -404,37 +442,55 @@ impl Agents {
     }
 
     fn load_permissions(&mut self) {
-        self.call("GET", format!("{B}/permissions?all=true"), None, |a, r: Result<Value, _>| {
-            if let Ok(v) = r {
-                let list: Vec<PermissionView> = lax_list(&v["permissions"]);
-                a.store.permissions = list.into_iter().map(|p| (p.key(), p)).collect();
-                a.remember_seen();
-                a.mark_stale();
-            }
-        });
+        self.call(
+            "GET",
+            format!("{B}/permissions?all=true"),
+            None,
+            |a, r: Result<Value, _>| {
+                if let Ok(v) = r {
+                    let list: Vec<PermissionView> = lax_list(&v["permissions"]);
+                    a.store.permissions = list.into_iter().map(|p| (p.key(), p)).collect();
+                    a.remember_seen();
+                    a.mark_stale();
+                }
+            },
+        );
     }
 
     fn load_workspaces(&mut self) {
-        self.call("GET", format!("{B}/workspaces"), None, |a, r: Result<Value, _>| {
-            if let Ok(v) = r {
-                let list: Vec<Workspace> = lax_list(&v["workspaces"]);
-                a.store.workspaces = list.into_iter().map(|w| (w.workspace_id.clone(), w)).collect();
-                a.mark_stale();
-            }
-        });
+        self.call(
+            "GET",
+            format!("{B}/workspaces"),
+            None,
+            |a, r: Result<Value, _>| {
+                if let Ok(v) = r {
+                    let list: Vec<Workspace> = lax_list(&v["workspaces"]);
+                    a.store.workspaces = list
+                        .into_iter()
+                        .map(|w| (w.workspace_id.clone(), w))
+                        .collect();
+                    a.mark_stale();
+                }
+            },
+        );
     }
 
     fn load_terminals(&mut self) {
-        self.call("GET", format!("{B}/terminals"), None, |a, r: Result<Value, ApiError>| match r {
-            Ok(v) => {
-                a.terminals_available = true;
-                let list: Vec<Terminal> = lax_list(&v["terminals"]);
-                a.store.terminals = list.into_iter().map(|t| (t.id.clone(), t)).collect();
-                a.mark_stale();
-            }
-            Err(e) if not_deployed(&e) => a.terminals_available = false,
-            Err(_) => {}
-        });
+        self.call(
+            "GET",
+            format!("{B}/terminals"),
+            None,
+            |a, r: Result<Value, ApiError>| match r {
+                Ok(v) => {
+                    a.terminals_available = true;
+                    let list: Vec<Terminal> = lax_list(&v["terminals"]);
+                    a.store.terminals = list.into_iter().map(|t| (t.id.clone(), t)).collect();
+                    a.mark_stale();
+                }
+                Err(e) if not_deployed(&e) => a.terminals_available = false,
+                Err(_) => {}
+            },
+        );
     }
 
     fn detect_schedules(&mut self) {
@@ -444,19 +500,24 @@ impl Agents {
     fn load_snapshot(&mut self, id: String) {
         let path = format!("{B}/{}", enc(&id));
         let want = id;
-        self.call("GET", path, None, move |a, r: Result<AgentSnapshot, ApiError>| match r {
-            Ok(s) => {
-                a.store.apply_snapshot(s);
-                a.mark_stale();
-            }
-            Err(e) if e.status() == Some(404) => {
-                if a.agent.as_deref() == Some(&want) {
-                    a.missing = true;
+        self.call(
+            "GET",
+            path,
+            None,
+            move |a, r: Result<AgentSnapshot, ApiError>| match r {
+                Ok(s) => {
+                    a.store.apply_snapshot(s);
+                    a.mark_stale();
                 }
-                a.mark_stale();
-            }
-            Err(_) => {}
-        });
+                Err(e) if e.status() == Some(404) => {
+                    if a.agent.as_deref() == Some(&want) {
+                        a.missing = true;
+                    }
+                    a.mark_stale();
+                }
+                Err(_) => {}
+            },
+        );
     }
 
     /// `loadTimeline`: all of it on the first call, then only what is new. A rebuilt timeline starts over.
@@ -465,7 +526,15 @@ impl Agents {
             Some(t) if t.status == TlStatus::Loading => return,
             Some(t) => t.status = TlStatus::Loading,
             None => {
-                self.store.timelines.insert(id.clone(), Timeline { epoch: String::new(), rows: Vec::new(), status: TlStatus::Loading, error: None });
+                self.store.timelines.insert(
+                    id.clone(),
+                    Timeline {
+                        epoch: String::new(),
+                        rows: Vec::new(),
+                        status: TlStatus::Loading,
+                        error: None,
+                    },
+                );
             }
         }
         self.timeline_page(id, 0);
@@ -473,14 +542,23 @@ impl Agents {
 
     fn timeline_page(&mut self, id: String, guard: u32) {
         self.store.dirty.remove(&id);
-        let after = self.store.timelines.get(&id).and_then(|t| t.rows.last()).map_or(0, |r| r.seq);
+        let after = self
+            .store
+            .timelines
+            .get(&id)
+            .and_then(|t| t.rows.last())
+            .map_or(0, |r| r.seq);
         let path = format!("{B}/{}/timeline?afterSeq={after}&limit={PAGE}", enc(&id));
         let want = id;
         let Some(api) = self.api.clone() else { return };
         let work: Work = Box::new(move || -> Apply {
             let r = api.call("GET", &path, None).map(|v| {
                 let list = v["rows"].as_array().map_or(0, Vec::len);
-                Page { epoch: v["epoch"].as_str().unwrap_or("").to_owned(), rows: lax_list(&v["rows"]), count: list }
+                Page {
+                    epoch: v["epoch"].as_str().unwrap_or("").to_owned(),
+                    rows: lax_list(&v["rows"]),
+                    count: list,
+                }
             });
             Box::new(move |a: &mut Agents| a.timeline_answer(want, guard, r))
         });
@@ -500,7 +578,9 @@ impl Agents {
                 return;
             }
         };
-        let Some(t) = self.store.timelines.get_mut(&id) else { return };
+        let Some(t) = self.store.timelines.get_mut(&id) else {
+            return;
+        };
         if !t.epoch.is_empty() && page.epoch != t.epoch && !t.rows.is_empty() {
             t.epoch = page.epoch;
             t.rows.clear();
@@ -522,7 +602,9 @@ impl Agents {
 
     /// `openStream`: resumes with `Last-Event-ID`, and retries by itself.
     fn open_stream(&mut self) {
-        let (Some(api), Some(tx)) = (self.api.clone(), self.tx.clone()) else { return };
+        let (Some(api), Some(tx)) = (self.api.clone(), self.tx.clone()) else {
+            return;
+        };
         let last = self.last_id.clone();
         std::thread::spawn(move || {
             let mut wait = RETRY;
@@ -584,23 +666,28 @@ impl Agents {
             self.health = Health::Reconnecting;
         }
         self.next_poll = Some(Instant::now() + POLL);
-        self.call("GET", format!("{B}/items"), None, |a, r: Result<Value, ApiError>| {
-            if a.connected {
-                return;
-            }
-            match r {
-                Ok(v) => {
-                    a.store.set_items(lax_list(&v["agents"]));
-                    a.load_error = None;
-                    a.health = Health::Polling;
+        self.call(
+            "GET",
+            format!("{B}/items"),
+            None,
+            |a, r: Result<Value, ApiError>| {
+                if a.connected {
+                    return;
                 }
-                Err(e) => {
-                    a.load_error = Some(describe(&e));
-                    a.health = Health::Down;
+                match r {
+                    Ok(v) => {
+                        a.store.set_items(lax_list(&v["agents"]));
+                        a.load_error = None;
+                        a.health = Health::Polling;
+                    }
+                    Err(e) => {
+                        a.load_error = Some(describe(&e));
+                        a.health = Health::Down;
+                    }
                 }
-            }
-            a.mark_stale();
-        });
+                a.mark_stale();
+            },
+        );
         if self.health != Health::Down {
             self.load_permissions();
             if let Some(id) = self.agent.clone() {
@@ -614,7 +701,10 @@ impl Agents {
         match self.health {
             Health::Live => None,
             Health::Reconnecting => Some(("Reconnecting…", false)),
-            Health::Polling => Some(("Live updates are paused. Refreshing every 15 seconds.", false)),
+            Health::Polling => Some((
+                "Live updates are paused. Refreshing every 15 seconds.",
+                false,
+            )),
             Health::Down => Some(("Lucina Agents isn't answering. Trying again…", true)),
         }
     }
@@ -663,7 +753,10 @@ impl Agents {
         self.follow = true;
         self.main = ListState::new();
         self.agent = Some(id.clone());
-        self.term = TermPane { generation: self.term.generation.clone(), ..TermPane::default() };
+        self.term = TermPane {
+            generation: self.term.generation.clone(),
+            ..TermPane::default()
+        };
         self.term.generation.fetch_add(1, Ordering::SeqCst);
         self.diff = DiffPane::default();
         self.files = FilesPane::default();
@@ -676,7 +769,11 @@ impl Agents {
 
     pub fn tabs(&self) -> Vec<(Tab, &'static str)> {
         let mut out = vec![(Tab::Chat, "Chat")];
-        if self.agent.as_ref().is_some_and(|a| self.store.workspace_of(a).is_some()) {
+        if self
+            .agent
+            .as_ref()
+            .is_some_and(|a| self.store.workspace_of(a).is_some())
+        {
             out.push((Tab::Changes, "Changes"));
             out.push((Tab::Files, "Files"));
             if self.terminals_available {
@@ -721,23 +818,37 @@ impl Agents {
     }
 
     fn workspace_id(&self) -> Option<String> {
-        self.agent.as_ref().and_then(|a| self.store.workspace_of(a)).map(|w| w.workspace_id.clone())
+        self.agent
+            .as_ref()
+            .and_then(|a| self.store.workspace_of(a))
+            .map(|w| w.workspace_id.clone())
     }
 
     // ---- Actions: each says what went wrong, or nothing ----
 
-    fn act_then_note<T: DeserializeOwned + Send + 'static>(&mut self, method: &'static str, path: String, body: Option<Value>, then: impl FnOnce(&mut Agents, T) + Send + 'static) {
+    fn act_then_note<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        method: &'static str,
+        path: String,
+        body: Option<Value>,
+        then: impl FnOnce(&mut Agents, T) + Send + 'static,
+    ) {
         self.note = None;
-        self.call(method, path, body, move |a, r: Result<T, ApiError>| match r {
-            Ok(v) => {
-                then(a, v);
-                a.mark_stale();
-            }
-            Err(e) => {
-                a.note = Some(describe(&e));
-                a.mark_stale();
-            }
-        });
+        self.call(
+            method,
+            path,
+            body,
+            move |a, r: Result<T, ApiError>| match r {
+                Ok(v) => {
+                    then(a, v);
+                    a.mark_stale();
+                }
+                Err(e) => {
+                    a.note = Some(describe(&e));
+                    a.mark_stale();
+                }
+            },
+        );
     }
 
     /// `Composer`'s submit: Send while idle; while the agent runs, Steer adds to the running turn.
@@ -750,59 +861,98 @@ impl Agents {
         self.composer_busy = true;
         self.note = None;
         self.follow = true;
-        let body = if self.store.running(&id) { json!({"prompt": prompt, "activeTurnBehavior": "steer"}) } else { json!({"prompt": prompt}) };
-        self.call("POST", format!("{B}/{}/send", enc(&id)), Some(body), |a, r: Result<Value, ApiError>| {
-            a.composer_busy = false;
-            match r {
-                Ok(_) => a.composer.clear(),
-                Err(e) => a.note = Some(describe(&e)),
-            }
-            a.mark_stale();
-        });
+        let body = if self.store.running(&id) {
+            json!({"prompt": prompt, "activeTurnBehavior": "steer"})
+        } else {
+            json!({"prompt": prompt})
+        };
+        self.call(
+            "POST",
+            format!("{B}/{}/send", enc(&id)),
+            Some(body),
+            |a, r: Result<Value, ApiError>| {
+                a.composer_busy = false;
+                match r {
+                    Ok(_) => a.composer.clear(),
+                    Err(e) => a.note = Some(describe(&e)),
+                }
+                a.mark_stale();
+            },
+        );
     }
 
     pub fn stop_agent(&mut self) {
         let Some(id) = self.agent.clone() else { return };
-        self.act_then_note("POST", format!("{B}/{}/stop", enc(&id)), None, |_, _: Value| {});
+        self.act_then_note(
+            "POST",
+            format!("{B}/{}/stop", enc(&id)),
+            None,
+            |_, _: Value| {},
+        );
     }
 
     pub fn toggle_archive(&mut self) {
         let Some(id) = self.agent.clone() else { return };
         if self.store.archived(&id) {
-            self.act_then_note("POST", format!("{B}/{}/unarchive", enc(&id)), None, |a, s: AgentSnapshot| a.store.apply_snapshot(s));
+            self.act_then_note(
+                "POST",
+                format!("{B}/{}/unarchive", enc(&id)),
+                None,
+                |a, s: AgentSnapshot| a.store.apply_snapshot(s),
+            );
         } else {
-            self.act_then_note("POST", format!("{B}/{}/archive", enc(&id)), None, move |a, _: Value| a.load_snapshot(id));
+            self.act_then_note(
+                "POST",
+                format!("{B}/{}/archive", enc(&id)),
+                None,
+                move |a, _: Value| a.load_snapshot(id),
+            );
         }
     }
 
     fn detach(&mut self) {
         let Some(id) = self.agent.clone() else { return };
         self.note = None;
-        self.call("POST", format!("{B}/{}/detach", enc(&id)), None, |a, r: Result<AgentSnapshot, ApiError>| {
-            match r {
-                Ok(s) => a.store.apply_snapshot(s),
-                Err(e) if not_deployed(&e) => {
-                    a.detach_available = false;
-                    a.note = Some("Not available on this server yet.".to_owned());
+        self.call(
+            "POST",
+            format!("{B}/{}/detach", enc(&id)),
+            None,
+            |a, r: Result<AgentSnapshot, ApiError>| {
+                match r {
+                    Ok(s) => a.store.apply_snapshot(s),
+                    Err(e) if not_deployed(&e) => {
+                        a.detach_available = false;
+                        a.note = Some("Not available on this server yet.".to_owned());
+                    }
+                    Err(e) => a.note = Some(describe(&e)),
                 }
-                Err(e) => a.note = Some(describe(&e)),
-            }
-            a.mark_stale();
-        });
+                a.mark_stale();
+            },
+        );
     }
 
     fn save_title(&mut self) {
-        let (Some(id), Some(edit)) = (self.agent.clone(), self.rename.take()) else { return };
+        let (Some(id), Some(edit)) = (self.agent.clone(), self.rename.take()) else {
+            return;
+        };
         let next = edit.text.trim().to_owned();
-        let same = self.store.items.get(&id).and_then(|i| i.title.as_deref()) == Some(next.as_str());
+        let same =
+            self.store.items.get(&id).and_then(|i| i.title.as_deref()) == Some(next.as_str());
         if !next.is_empty() && !same {
-            self.act_then_note("PATCH", format!("{B}/{}", enc(&id)), Some(json!({"title": next})), |a, s: AgentSnapshot| a.store.apply_snapshot(s));
+            self.act_then_note(
+                "PATCH",
+                format!("{B}/{}", enc(&id)),
+                Some(json!({"title": next})),
+                |a, s: AgentSnapshot| a.store.apply_snapshot(s),
+            );
         }
     }
 
     /// `answerPermission`: 403, 404, 409 and 410 are told apart; all but 403 close the card.
     pub fn answer(&mut self, key: &str, allow: bool) {
-        let Some(p) = self.store.permissions.get(key).cloned() else { return };
+        let Some(p) = self.store.permissions.get(key).cloned() else {
+            return;
+        };
         if !self.busy.insert(key.to_owned()) {
             return;
         }
@@ -814,24 +964,38 @@ impl Agents {
         };
         let key = key.to_owned();
         self.mark_stale();
-        self.call("POST", path, Some(json!({"behavior": behavior})), move |a, r: Result<Value, ApiError>| {
-            a.busy.remove(&key);
-            match r {
-                Ok(_) => {
-                    if let Some(x) = a.store.permissions.get_mut(&key).filter(|x| x.status == "pending") {
-                        x.status = if allow { "allowed".into() } else { "denied".into() };
+        self.call(
+            "POST",
+            path,
+            Some(json!({"behavior": behavior})),
+            move |a, r: Result<Value, ApiError>| {
+                a.busy.remove(&key);
+                match r {
+                    Ok(_) => {
+                        if let Some(x) = a
+                            .store
+                            .permissions
+                            .get_mut(&key)
+                            .filter(|x| x.status == "pending")
+                        {
+                            x.status = if allow {
+                                "allowed".into()
+                            } else {
+                                "denied".into()
+                            };
+                        }
                     }
+                    Err(e) => match e.status() {
+                        Some(403) => a.note = Some("This device may not answer it.".to_owned()),
+                        Some(409) => a.closed_by(key, "Already answered elsewhere."),
+                        Some(410) => a.closed_by(key, "This request expired."),
+                        Some(404) => a.closed_by(key, "This request is gone."),
+                        _ => a.note = Some(describe(&e)),
+                    },
                 }
-                Err(e) => match e.status() {
-                    Some(403) => a.note = Some("This device may not answer it.".to_owned()),
-                    Some(409) => a.closed_by(key, "Already answered elsewhere."),
-                    Some(410) => a.closed_by(key, "This request expired."),
-                    Some(404) => a.closed_by(key, "This request is gone."),
-                    _ => a.note = Some(describe(&e)),
-                },
-            }
-            a.mark_stale();
-        });
+                a.mark_stale();
+            },
+        );
     }
 
     fn closed_by(&mut self, key: String, why: &str) {
@@ -841,61 +1005,85 @@ impl Agents {
 
     fn load_schedules(&mut self) {
         self.schedule_problem = None;
-        self.call("GET", format!("{B}/schedules"), None, |a, r: Result<Value, ApiError>| {
-            match r {
-                Ok(v) => {
-                    a.schedules_available = true;
-                    a.schedules = Some(lax_list(&v["schedules"]));
+        self.call(
+            "GET",
+            format!("{B}/schedules"),
+            None,
+            |a, r: Result<Value, ApiError>| {
+                match r {
+                    Ok(v) => {
+                        a.schedules_available = true;
+                        a.schedules = Some(lax_list(&v["schedules"]));
+                    }
+                    Err(e) if not_deployed(&e) => a.schedules_available = false,
+                    Err(e) => {
+                        a.schedule_problem = Some(describe(&e));
+                        a.schedules.get_or_insert_with(Vec::new);
+                    }
                 }
-                Err(e) if not_deployed(&e) => a.schedules_available = false,
-                Err(e) => {
-                    a.schedule_problem = Some(describe(&e));
-                    a.schedules.get_or_insert_with(Vec::new);
-                }
-            }
-            a.mark_stale();
-        });
+                a.mark_stale();
+            },
+        );
     }
 
     fn schedule_action(&mut self, id: String, action: &'static str) {
         self.schedule_busy = Some(id.clone());
         self.schedule_problem = None;
         self.mark_stale();
-        self.call("POST", format!("{B}/schedules/{}/{action}", enc(&id)), None, move |a, r: Result<Schedule, ApiError>| {
-            a.schedule_busy = None;
-            match r {
-                Ok(next) => {
-                    if let Some(x) = a.schedules.as_mut().and_then(|l| l.iter_mut().find(|x| x.id == id)) {
-                        *x = next;
+        self.call(
+            "POST",
+            format!("{B}/schedules/{}/{action}", enc(&id)),
+            None,
+            move |a, r: Result<Schedule, ApiError>| {
+                a.schedule_busy = None;
+                match r {
+                    Ok(next) => {
+                        if let Some(x) = a
+                            .schedules
+                            .as_mut()
+                            .and_then(|l| l.iter_mut().find(|x| x.id == id))
+                        {
+                            *x = next;
+                        }
+                    }
+                    Err(e) => {
+                        a.schedule_problem = Some(describe(&e));
+                        a.load_schedules();
                     }
                 }
-                Err(e) => {
-                    a.schedule_problem = Some(describe(&e));
-                    a.load_schedules();
-                }
-            }
-            a.mark_stale();
-        });
+                a.mark_stale();
+            },
+        );
     }
 
     fn load_usage(&mut self) {
         self.usage_loading = true;
         self.usage_problem = None;
-        self.call("GET", B.to_owned(), None, |a, r: Result<Value, ApiError>| {
-            a.usage_loading = false;
-            if let Ok(v) = r {
-                a.usage_snaps = lax_list(&v["agents"]);
-            }
-            a.mark_stale();
-        });
-        self.call("GET", format!("{B}/usage"), None, |a, r: Result<UsageReport, ApiError>| {
-            match r {
-                Ok(u) => a.usage_report = Some(u),
-                Err(e) if not_deployed(&e) => a.usage_report = None,
-                Err(e) => a.usage_problem = Some(describe(&e)),
-            }
-            a.mark_stale();
-        });
+        self.call(
+            "GET",
+            B.to_owned(),
+            None,
+            |a, r: Result<Value, ApiError>| {
+                a.usage_loading = false;
+                if let Ok(v) = r {
+                    a.usage_snaps = lax_list(&v["agents"]);
+                }
+                a.mark_stale();
+            },
+        );
+        self.call(
+            "GET",
+            format!("{B}/usage"),
+            None,
+            |a, r: Result<UsageReport, ApiError>| {
+                match r {
+                    Ok(u) => a.usage_report = Some(u),
+                    Err(e) if not_deployed(&e) => a.usage_report = None,
+                    Err(e) => a.usage_problem = Some(describe(&e)),
+                }
+                a.mark_stale();
+            },
+        );
     }
 
     fn load_board(&mut self) {
@@ -904,42 +1092,60 @@ impl Agents {
         }
         self.board_loading = true;
         self.board_at = Some(Instant::now());
-        self.call_on(true, "GET", format!("{B}/pipeline/board"), None, |a, r: Result<PipelineBoard, ApiError>| {
-            a.board_loading = false;
-            match r {
-                Ok(b) => {
-                    a.board = Some(b);
-                    a.board_problem = None;
-                    a.board_when = Some(crate::api::iso_now(a.now()));
+        self.call_on(
+            true,
+            "GET",
+            format!("{B}/pipeline/board"),
+            None,
+            |a, r: Result<PipelineBoard, ApiError>| {
+                a.board_loading = false;
+                match r {
+                    Ok(b) => {
+                        a.board = Some(b);
+                        a.board_problem = None;
+                        a.board_when = Some(crate::api::iso_now(a.now()));
+                    }
+                    Err(e) => a.board_problem = Some(describe(&e)),
                 }
-                Err(e) => a.board_problem = Some(describe(&e)),
-            }
-            a.mark_stale();
-        });
+                a.mark_stale();
+            },
+        );
     }
 
     fn load_diff(&mut self) {
-        let Some(ws) = self.workspace_id() else { return };
+        let Some(ws) = self.workspace_id() else {
+            return;
+        };
         let mode = ["all", "uncommitted", "base"][self.diff.mode];
-        let ignore = if self.diff.ignore_ws { "&ignoreWhitespace=true" } else { "" };
+        let ignore = if self.diff.ignore_ws {
+            "&ignoreWhitespace=true"
+        } else {
+            ""
+        };
         self.diff.loading = true;
         self.diff.error = None;
-        self.call_on(true, "GET", format!("{B}/workspaces/{}/diff?mode={mode}{ignore}", enc(&ws)), None, |a, r: Result<DiffResult, ApiError>| {
-            a.diff.loading = false;
-            match r {
-                Ok(d) => {
-                    a.diff.selected = 0;
-                    a.diff.files_list = ListState::new();
-                    if !d.files.is_empty() {
-                        a.diff.files_list.select(0);
+        self.call_on(
+            true,
+            "GET",
+            format!("{B}/workspaces/{}/diff?mode={mode}{ignore}", enc(&ws)),
+            None,
+            |a, r: Result<DiffResult, ApiError>| {
+                a.diff.loading = false;
+                match r {
+                    Ok(d) => {
+                        a.diff.selected = 0;
+                        a.diff.files_list = ListState::new();
+                        if !d.files.is_empty() {
+                            a.diff.files_list.select(0);
+                        }
+                        a.diff.rows = d.files.first().map(diff_rows).unwrap_or_default();
+                        a.diff.result = Some(d);
+                        a.diff.rows_list = ListState::new();
                     }
-                    a.diff.rows = d.files.first().map(diff_rows).unwrap_or_default();
-                    a.diff.result = Some(d);
-                    a.diff.rows_list = ListState::new();
+                    Err(e) => a.diff.error = Some(describe(&e)),
                 }
-                Err(e) => a.diff.error = Some(describe(&e)),
-            }
-        });
+            },
+        );
     }
 
     pub fn pick_diff_file(&mut self, i: usize) {
@@ -951,26 +1157,39 @@ impl Agents {
     }
 
     fn load_files(&mut self) {
-        let Some(ws) = self.workspace_id() else { return };
+        let Some(ws) = self.workspace_id() else {
+            return;
+        };
         let dir = self.files.dir.clone();
         self.files.error = None;
-        self.call("GET", format!("{B}/workspaces/{}/files?path={}", enc(&ws), enc(&dir)), None, |a, r: Result<Value, ApiError>| match r {
-            Ok(v) => {
-                let mut e: Vec<FileEntry> = lax_list(&v["entries"]);
-                // `entries`: folders first, then by name.
-                e.sort_by(|x, y| (x.kind != "directory").cmp(&(y.kind != "directory")).then_with(|| x.name.to_lowercase().cmp(&y.name.to_lowercase())));
-                a.files.list = ListState::new();
-                if !e.is_empty() {
-                    a.files.list.select(0);
+        self.call(
+            "GET",
+            format!("{B}/workspaces/{}/files?path={}", enc(&ws), enc(&dir)),
+            None,
+            |a, r: Result<Value, ApiError>| match r {
+                Ok(v) => {
+                    let mut e: Vec<FileEntry> = lax_list(&v["entries"]);
+                    // `entries`: folders first, then by name.
+                    e.sort_by(|x, y| {
+                        (x.kind != "directory")
+                            .cmp(&(y.kind != "directory"))
+                            .then_with(|| x.name.to_lowercase().cmp(&y.name.to_lowercase()))
+                    });
+                    a.files.list = ListState::new();
+                    if !e.is_empty() {
+                        a.files.list.select(0);
+                    }
+                    a.files.entries = Some(e);
                 }
-                a.files.entries = Some(e);
-            }
-            Err(err) => a.files.error = Some(describe(&err)),
-        });
+                Err(err) => a.files.error = Some(describe(&err)),
+            },
+        );
     }
 
     pub fn open_entry(&mut self, i: usize) {
-        let Some(e) = self.files.entries.as_ref().and_then(|l| l.get(i)).cloned() else { return };
+        let Some(e) = self.files.entries.as_ref().and_then(|l| l.get(i)).cloned() else {
+            return;
+        };
         if e.kind == "directory" {
             self.files.dir = e.path;
             self.files.open = None;
@@ -978,31 +1197,60 @@ impl Agents {
             self.load_files();
             return;
         }
-        let Some(ws) = self.workspace_id() else { return };
+        let Some(ws) = self.workspace_id() else {
+            return;
+        };
         self.files.open = Some(e.path.clone());
         self.files.file = None;
         self.files.lines.clear();
         self.files.file_error = None;
         self.files.view = ListState::new();
-        self.call("GET", format!("{B}/workspaces/{}/file?path={}&maxBytes=262144", enc(&ws), enc(&e.path)), None, |a, r: Result<FileContent, ApiError>| match r {
-            Ok(f) => {
-                if f.encoding != "base64" {
-                    a.files.lines = f.content.as_deref().unwrap_or("").lines().map(str::to_owned).collect();
+        self.call(
+            "GET",
+            format!(
+                "{B}/workspaces/{}/file?path={}&maxBytes=262144",
+                enc(&ws),
+                enc(&e.path)
+            ),
+            None,
+            |a, r: Result<FileContent, ApiError>| match r {
+                Ok(f) => {
+                    if f.encoding != "base64" {
+                        a.files.lines = f
+                            .content
+                            .as_deref()
+                            .unwrap_or("")
+                            .lines()
+                            .map(str::to_owned)
+                            .collect();
+                    }
+                    a.files.file = Some(f);
                 }
-                a.files.file = Some(f);
-            }
-            Err(err) => a.files.file_error = Some(describe(&err)),
-        });
+                Err(err) => a.files.file_error = Some(describe(&err)),
+            },
+        );
     }
 
     fn workspace_terminals(&self) -> Vec<Terminal> {
-        let Some(ws) = self.workspace_id() else { return Vec::new() };
-        self.store.terminals.values().filter(|t| t.workspace_id == ws).cloned().collect()
+        let Some(ws) = self.workspace_id() else {
+            return Vec::new();
+        };
+        self.store
+            .terminals
+            .values()
+            .filter(|t| t.workspace_id == ws)
+            .cloned()
+            .collect()
     }
 
     fn pick_terminal(&mut self) {
         let list = self.workspace_terminals();
-        if self.term.selected.as_ref().is_some_and(|s| list.iter().any(|t| &t.id == s)) {
+        if self
+            .term
+            .selected
+            .as_ref()
+            .is_some_and(|s| list.iter().any(|t| &t.id == s))
+        {
             return;
         }
         let next = list.first().map(|t| t.id.clone());
@@ -1017,7 +1265,9 @@ impl Agents {
         self.term.live = false;
         self.term.list = ListState::new();
         let generation = self.term.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let (Some(id), Some(api), Some(tx)) = (id, self.api.clone(), self.tx.clone()) else { return };
+        let (Some(id), Some(api), Some(tx)) = (id, self.api.clone(), self.tx.clone()) else {
+            return;
+        };
         let gen_now = self.term.generation.clone();
         std::thread::spawn(move || {
             let mut wait = RETRY;
@@ -1068,110 +1318,170 @@ impl Agents {
             "exit" => self.term.exit = Some(v["exitCode"].as_i64()),
             _ => return,
         }
-        self.term.lines = ansi_to_text(&self.term.raw).split('\n').map(str::to_owned).collect();
+        self.term.lines = ansi_to_text(&self.term.raw)
+            .split('\n')
+            .map(str::to_owned)
+            .collect();
         self.term.list.scroll_to_end();
     }
 
     pub fn term_send_line(&mut self) {
-        let Some(id) = self.term.selected.clone() else { return };
+        let Some(id) = self.term.selected.clone() else {
+            return;
+        };
         let line = self.term.input.text.clone();
         self.term.input.clear();
-        let keys = if line.is_empty() { json!("Enter") } else { json!([line, "Enter"]) };
+        let keys = if line.is_empty() {
+            json!("Enter")
+        } else {
+            json!([line, "Enter"])
+        };
         self.term_keys(&id, keys);
     }
 
     fn term_keys(&mut self, id: &str, keys: Value) {
         self.term.note = None;
-        self.call("POST", format!("{B}/terminals/{}/input", enc(id)), Some(json!({"keys": keys})), |a, r: Result<Value, ApiError>| {
-            if let Err(e) = r {
-                a.term.note = Some(describe(&e));
-            }
-        });
+        self.call(
+            "POST",
+            format!("{B}/terminals/{}/input", enc(id)),
+            Some(json!({"keys": keys})),
+            |a, r: Result<Value, ApiError>| {
+                if let Err(e) = r {
+                    a.term.note = Some(describe(&e));
+                }
+            },
+        );
     }
 
     fn new_terminal(&mut self) {
-        let Some(ws) = self.workspace_id() else { return };
+        let Some(ws) = self.workspace_id() else {
+            return;
+        };
         self.term.note = None;
-        self.call("POST", format!("{B}/terminals"), Some(json!({"workspaceId": ws})), |a, r: Result<Terminal, ApiError>| match r {
-            Ok(t) => {
-                let id = t.id.clone();
-                a.store.terminals.insert(t.id.clone(), t);
-                a.select_terminal(Some(id));
-            }
-            Err(e) => a.term.note = Some(describe(&e)),
-        });
+        self.call(
+            "POST",
+            format!("{B}/terminals"),
+            Some(json!({"workspaceId": ws})),
+            |a, r: Result<Terminal, ApiError>| match r {
+                Ok(t) => {
+                    let id = t.id.clone();
+                    a.store.terminals.insert(t.id.clone(), t);
+                    a.select_terminal(Some(id));
+                }
+                Err(e) => a.term.note = Some(describe(&e)),
+            },
+        );
     }
 
     fn close_terminal(&mut self) {
-        let Some(id) = self.term.selected.clone() else { return };
-        self.call("DELETE", format!("{B}/terminals/{}", enc(&id)), None, move |a, r: Result<Value, ApiError>| match r {
-            Ok(_) => {
-                a.store.terminals.remove(&id);
-                a.term.selected = None;
-                a.pick_terminal();
-            }
-            Err(e) => a.term.note = Some(describe(&e)),
-        });
+        let Some(id) = self.term.selected.clone() else {
+            return;
+        };
+        self.call(
+            "DELETE",
+            format!("{B}/terminals/{}", enc(&id)),
+            None,
+            move |a, r: Result<Value, ApiError>| match r {
+                Ok(_) => {
+                    a.store.terminals.remove(&id);
+                    a.term.selected = None;
+                    a.pick_terminal();
+                }
+                Err(e) => a.term.note = Some(describe(&e)),
+            },
+        );
     }
 
     fn load_scripts(&mut self) {
-        let Some(ws) = self.workspace_id() else { return };
+        let Some(ws) = self.workspace_id() else {
+            return;
+        };
         self.scripts_error = None;
-        self.call("GET", format!("{B}/workspaces/{}/scripts", enc(&ws)), None, |a, r: Result<Value, ApiError>| {
-            match r {
-                Ok(v) => a.scripts = lax_list(&v["scripts"]),
-                Err(e) if not_deployed(&e) => a.scripts.clear(),
-                Err(e) => a.scripts_error = Some(describe(&e)),
-            }
-            a.mark_stale();
-        });
-        self.call("GET", format!("{B}/workspaces/{}/services", enc(&ws)), None, |a, r: Result<Value, ApiError>| {
-            if let Ok(v) = r {
-                a.services = lax_list(&v["services"]);
+        self.call(
+            "GET",
+            format!("{B}/workspaces/{}/scripts", enc(&ws)),
+            None,
+            |a, r: Result<Value, ApiError>| {
+                match r {
+                    Ok(v) => a.scripts = lax_list(&v["scripts"]),
+                    Err(e) if not_deployed(&e) => a.scripts.clear(),
+                    Err(e) => a.scripts_error = Some(describe(&e)),
+                }
                 a.mark_stale();
-            }
-        });
+            },
+        );
+        self.call(
+            "GET",
+            format!("{B}/workspaces/{}/services", enc(&ws)),
+            None,
+            |a, r: Result<Value, ApiError>| {
+                if let Ok(v) = r {
+                    a.services = lax_list(&v["services"]);
+                    a.mark_stale();
+                }
+            },
+        );
     }
 
     fn script_action(&mut self, name: String, start: bool) {
-        let Some(ws) = self.workspace_id() else { return };
+        let Some(ws) = self.workspace_id() else {
+            return;
+        };
         let action = if start { "start" } else { "stop" };
         self.scripts_error = None;
-        self.call("POST", format!("{B}/workspaces/{}/scripts/{}/{action}", enc(&ws), enc(&name)), None, |a, r: Result<Value, ApiError>| {
-            match r {
-                Ok(_) => a.load_scripts(),
-                Err(e) => a.scripts_error = Some(describe(&e)),
-            }
-            a.mark_stale();
-        });
+        self.call(
+            "POST",
+            format!(
+                "{B}/workspaces/{}/scripts/{}/{action}",
+                enc(&ws),
+                enc(&name)
+            ),
+            None,
+            |a, r: Result<Value, ApiError>| {
+                match r {
+                    Ok(_) => a.load_scripts(),
+                    Err(e) => a.scripts_error = Some(describe(&e)),
+                }
+                a.mark_stale();
+            },
+        );
     }
 
     pub fn open_prompts(&mut self) {
         let Some(id) = self.agent.clone() else { return };
         self.prompts = Some((None, ListState::new()));
-        self.call("GET", format!("{B}/{}/prompts", enc(&id)), None, |a, r: Result<Value, ApiError>| {
-            let list: Vec<PromptEntry> = match r {
-                Ok(v) => lax_list(&v["prompts"]),
-                Err(e) => {
-                    if not_deployed(&e) {
-                        a.prompts_available = false;
+        self.call(
+            "GET",
+            format!("{B}/{}/prompts", enc(&id)),
+            None,
+            |a, r: Result<Value, ApiError>| {
+                let list: Vec<PromptEntry> = match r {
+                    Ok(v) => lax_list(&v["prompts"]),
+                    Err(e) => {
+                        if not_deployed(&e) {
+                            a.prompts_available = false;
+                        }
+                        Vec::new()
                     }
-                    Vec::new()
+                };
+                if let Some((p, state)) = &mut a.prompts {
+                    if !list.is_empty() {
+                        state.select(0);
+                    }
+                    *p = Some(list);
                 }
-            };
-            if let Some((p, state)) = &mut a.prompts {
-                if !list.is_empty() {
-                    state.select(0);
-                }
-                *p = Some(list);
-            }
-        });
+            },
+        );
     }
 
     /// `jump`: to the owner's message in the conversation.
     pub fn jump_to_prompt(&mut self, preview: &str) {
         let head = preview.trim_end_matches('…');
-        if let Some(i) = self.lines.iter().position(|l| matches!(l, Line::User(t) if t.starts_with(head))) {
+        if let Some(i) = self
+            .lines
+            .iter()
+            .position(|l| matches!(l, Line::User(t) if t.starts_with(head)))
+        {
             self.follow = false;
             self.main.select(i);
         }
@@ -1180,31 +1490,63 @@ impl Agents {
     }
 
     pub fn open_new_run(&mut self) {
-        self.new_run = Some(NewRun { providers: None, projects: Vec::new(), provider: 0, model: None, mode: None, target: 0, prompt: TextEdit::multiline().placeholder("What should the agent do?"), busy: false, problem: None, focus: true });
+        self.new_run = Some(NewRun {
+            providers: None,
+            projects: Vec::new(),
+            provider: 0,
+            model: None,
+            mode: None,
+            target: 0,
+            prompt: TextEdit::multiline().placeholder("What should the agent do?"),
+            busy: false,
+            problem: None,
+            focus: true,
+        });
         self.load_workspaces();
-        self.call("GET", format!("{B}/providers"), None, |a, r: Result<Vec<ProviderInfo>, ApiError>| {
-            if let Some(n) = &mut a.new_run {
-                match r {
-                    Ok(p) => n.providers = Some(p),
-                    Err(e) => {
-                        n.providers = Some(Vec::new());
-                        n.problem = Some(describe(&e));
+        self.call(
+            "GET",
+            format!("{B}/providers"),
+            None,
+            |a, r: Result<Vec<ProviderInfo>, ApiError>| {
+                if let Some(n) = &mut a.new_run {
+                    match r {
+                        Ok(p) => n.providers = Some(p),
+                        Err(e) => {
+                            n.providers = Some(Vec::new());
+                            n.problem = Some(describe(&e));
+                        }
                     }
                 }
-            }
-        });
-        self.call("GET", format!("{B}/projects"), None, |a, r: Result<Value, ApiError>| {
-            if let (Some(n), Ok(v)) = (&mut a.new_run, r) {
-                n.projects = lax_list(&v["projects"]);
-            }
-        });
+            },
+        );
+        self.call(
+            "GET",
+            format!("{B}/projects"),
+            None,
+            |a, r: Result<Value, ApiError>| {
+                if let (Some(n), Ok(v)) = (&mut a.new_run, r) {
+                    n.projects = lax_list(&v["projects"]);
+                }
+            },
+        );
     }
 
     /// `workspaces` and the new-worktree choices of the form, in the order it shows them.
     pub fn run_targets(&self) -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = self.store.workspaces.values().filter(|w| w.archived_at.is_none() && w.background != Some(true)).map(|w| (format!("ws:{}", w.workspace_id), w.label())).collect();
+        let mut out: Vec<(String, String)> = self
+            .store
+            .workspaces
+            .values()
+            .filter(|w| w.archived_at.is_none() && w.background != Some(true))
+            .map(|w| (format!("ws:{}", w.workspace_id), w.label()))
+            .collect();
         if let Some(n) = &self.new_run {
-            out.extend(n.projects.iter().map(|p| (format!("new:{}", p.project_id), format!("New worktree in {}", p.name))));
+            out.extend(n.projects.iter().map(|p| {
+                (
+                    format!("new:{}", p.project_id),
+                    format!("New worktree in {}", p.name),
+                )
+            }));
         }
         out
     }
@@ -1213,15 +1555,28 @@ impl Agents {
     pub fn start_run(&mut self) {
         let targets = self.run_targets();
         let Some(n) = &mut self.new_run else { return };
-        let Some(p) = n.providers.as_ref().and_then(|l| l.get(n.provider)).cloned() else { return };
-        let Some((choice, _)) = targets.get(n.target).cloned() else { return };
+        let Some(p) = n
+            .providers
+            .as_ref()
+            .and_then(|l| l.get(n.provider))
+            .cloned()
+        else {
+            return;
+        };
+        let Some((choice, _)) = targets.get(n.target).cloned() else {
+            return;
+        };
         if n.busy {
             return;
         }
         n.busy = true;
         n.problem = None;
         let prompt = n.prompt.text.trim().to_owned();
-        let models: Vec<_> = p.models.iter().filter(|m| m.is_selectable != Some(false)).collect();
+        let models: Vec<_> = p
+            .models
+            .iter()
+            .filter(|m| m.is_selectable != Some(false))
+            .collect();
         let model = n.model.and_then(|i| models.get(i)).map(|m| m.id.clone());
         let mode = n.mode.and_then(|i| p.modes.get(i)).map(|m| m.id.clone());
         let body = move |cwd: String, ws: String| {
@@ -1238,21 +1593,34 @@ impl Agents {
             b
         };
         if let Some(project) = choice.strip_prefix("new:") {
-            let provider = n.providers.as_ref().and_then(|l| l.get(n.provider)).map(|x| x.id.clone()).unwrap_or_default();
-            let mut w = json!({"isolation": "worktree", "projectId": project, "provider": provider});
+            let provider = n
+                .providers
+                .as_ref()
+                .and_then(|l| l.get(n.provider))
+                .map(|x| x.id.clone())
+                .unwrap_or_default();
+            let mut w =
+                json!({"isolation": "worktree", "projectId": project, "provider": provider});
             if !n.prompt.text.trim().is_empty() {
                 w["prompt"] = n.prompt.text.trim().into();
             }
-            self.call("POST", format!("{B}/workspaces"), Some(w), move |a, r: Result<Value, ApiError>| match r {
-                Ok(v) => match serde_json::from_value::<Workspace>(v["workspace"].clone()) {
-                    Ok(ws) => {
-                        a.store.workspaces.insert(ws.workspace_id.clone(), ws.clone());
-                        a.create_agent(body(ws.cwd, ws.workspace_id));
-                    }
-                    Err(e) => a.run_failed(e.to_string()),
+            self.call(
+                "POST",
+                format!("{B}/workspaces"),
+                Some(w),
+                move |a, r: Result<Value, ApiError>| match r {
+                    Ok(v) => match serde_json::from_value::<Workspace>(v["workspace"].clone()) {
+                        Ok(ws) => {
+                            a.store
+                                .workspaces
+                                .insert(ws.workspace_id.clone(), ws.clone());
+                            a.create_agent(body(ws.cwd, ws.workspace_id));
+                        }
+                        Err(e) => a.run_failed(e.to_string()),
+                    },
+                    Err(e) => a.run_failed(describe(&e)),
                 },
-                Err(e) => a.run_failed(describe(&e)),
-            });
+            );
         } else {
             let id = choice.strip_prefix("ws:").unwrap_or("");
             match self.store.workspaces.get(id).cloned() {
@@ -1270,15 +1638,20 @@ impl Agents {
     }
 
     fn create_agent(&mut self, body: Value) {
-        self.call("POST", B.to_owned(), Some(body), |a, r: Result<AgentSnapshot, ApiError>| match r {
-            Ok(s) => {
-                let id = s.id.clone();
-                a.store.apply_snapshot(s);
-                a.new_run = None;
-                a.open_agent(id);
-            }
-            Err(e) => a.run_failed(describe(&e)),
-        });
+        self.call(
+            "POST",
+            B.to_owned(),
+            Some(body),
+            |a, r: Result<AgentSnapshot, ApiError>| match r {
+                Ok(s) => {
+                    let id = s.id.clone();
+                    a.store.apply_snapshot(s);
+                    a.new_run = None;
+                    a.open_agent(id);
+                }
+                Err(e) => a.run_failed(describe(&e)),
+            },
+        );
     }
 
     // ---- Building what is on the screen ----
@@ -1286,15 +1659,30 @@ impl Agents {
     fn rebuild_rows(&mut self) {
         let now = self.now();
         let q = self.query.text.trim().to_owned();
-        let pending = |id: &str| self.store.permissions.values().filter(|p| p.agent_id.as_deref() == Some(id) && p.status == "pending").count();
+        let pending = |id: &str| {
+            self.store
+                .permissions
+                .values()
+                .filter(|p| p.agent_id.as_deref() == Some(id) && p.status == "pending")
+                .count()
+        };
         let row_of = |a: &AgentListItem| -> ListRow {
             let n = pending(&a.id);
             let label = status_label(a.bucket, a.status);
             ListRow {
                 id: a.id.clone(),
                 title: agent_title(a.title.as_deref(), &a.id, &a.cwd),
-                sub: format!("{} · {} · {}", a.provider, model::base_name(&a.cwd), model::ago(&a.updated_at, now)),
-                state: if n > 0 { format!("{label} ({n})") } else { label.to_owned() },
+                sub: format!(
+                    "{} · {} · {}",
+                    a.provider,
+                    model::base_name(&a.cwd),
+                    model::ago(&a.updated_at, now)
+                ),
+                state: if n > 0 {
+                    format!("{label} ({n})")
+                } else {
+                    label.to_owned()
+                },
                 bucket: a.bucket,
             }
         };
@@ -1312,7 +1700,10 @@ impl Agents {
                     None => ListRow {
                         id: r.agent_id.clone(),
                         title: agent_title(r.title.as_deref(), &r.agent_id, &r.cwd),
-                        sub: r.matches.first().map_or_else(|| r.provider.clone(), |m| m.snippet.clone()),
+                        sub: r
+                            .matches
+                            .first()
+                            .map_or_else(|| r.provider.clone(), |m| m.snippet.clone()),
                         state: r.status.clone(),
                         bucket: match r.status.as_str() {
                             "running" => Bucket::Running,
@@ -1326,7 +1717,20 @@ impl Agents {
             self.store
                 .agent_list(self.show_archived)
                 .into_iter()
-                .filter(|a| q.is_empty() || model::matches(&format!("{} {} {} {} {}", a.title.as_deref().unwrap_or(""), a.provider, a.model.as_deref().unwrap_or(""), a.cwd, a.short_id), &q))
+                .filter(|a| {
+                    q.is_empty()
+                        || model::matches(
+                            &format!(
+                                "{} {} {} {} {}",
+                                a.title.as_deref().unwrap_or(""),
+                                a.provider,
+                                a.model.as_deref().unwrap_or(""),
+                                a.cwd,
+                                a.short_id
+                            ),
+                            &q,
+                        )
+                })
                 .map(row_of)
                 .collect()
         };
@@ -1342,13 +1746,41 @@ impl Agents {
         self.rebuild_rows();
         let now = self.now();
         let lines = match (self.section, self.tab, &self.agent) {
-            (Section::Runs, Tab::Chat, Some(id)) => pages::chat(&self.store, id, &self.expanded, &self.seen, &self.closed, &self.busy, now),
-            (Section::Runs, Tab::Scripts, Some(_)) => pages::scripts(&self.scripts, &self.services, self.scripts_error.as_deref()),
+            (Section::Runs, Tab::Chat, Some(id)) => pages::chat(
+                &self.store,
+                id,
+                &self.expanded,
+                &self.seen,
+                &self.closed,
+                &self.busy,
+                now,
+            ),
+            (Section::Runs, Tab::Scripts, Some(_)) => {
+                pages::scripts(&self.scripts, &self.services, self.scripts_error.as_deref())
+            }
             (Section::Runs, _, _) => Vec::new(),
-            (Section::Permissions, ..) => pages::permissions(&self.store, &self.seen, &self.closed, &self.busy, now),
-            (Section::Schedules, ..) => pages::schedules(self.schedules.as_deref(), self.schedules_available, self.schedule_problem.as_deref(), self.schedule_busy.as_deref(), now),
-            (Section::Usage, ..) => pages::usage(&self.usage_snaps, self.usage_report.as_ref(), self.usage_loading, self.usage_problem.as_deref()),
-            (Section::Pipeline, ..) => pages::pipeline(self.board.as_ref(), self.board_when.as_deref(), self.board_problem.as_deref(), now),
+            (Section::Permissions, ..) => {
+                pages::permissions(&self.store, &self.seen, &self.closed, &self.busy, now)
+            }
+            (Section::Schedules, ..) => pages::schedules(
+                self.schedules.as_deref(),
+                self.schedules_available,
+                self.schedule_problem.as_deref(),
+                self.schedule_busy.as_deref(),
+                now,
+            ),
+            (Section::Usage, ..) => pages::usage(
+                &self.usage_snaps,
+                self.usage_report.as_ref(),
+                self.usage_loading,
+                self.usage_problem.as_deref(),
+            ),
+            (Section::Pipeline, ..) => pages::pipeline(
+                self.board.as_ref(),
+                self.board_when.as_deref(),
+                self.board_problem.as_deref(),
+                now,
+            ),
         };
         let grew = lines.len() != self.lines.len() || lines != self.lines;
         self.lines = lines;
@@ -1359,17 +1791,24 @@ impl Agents {
                 self.main.scroll_to_end();
             }
         }
-        if let Some(i) = self.main.selected {
-            if i >= self.lines.len() {
-                self.main.selected = self.lines.len().checked_sub(1);
-            }
+        if let Some(i) = self.main.selected
+            && i >= self.lines.len()
+        {
+            self.main.selected = self.lines.len().checked_sub(1);
         }
         if chat && self.follow {
             // The newest line, and never Allow or Deny: an Enter that was meant for the list must not answer anything.
-            self.main.selected = self.lines.iter().rposition(|l| !matches!(l, Line::Button { .. }));
+            self.main.selected = self
+                .lines
+                .iter()
+                .rposition(|l| !matches!(l, Line::Button { .. }));
             self.follow_selected = self.main.selected;
         } else if self.main.selected.is_none() && !self.lines.is_empty() {
-            let first = self.lines.iter().position(|l| matches!(l, Line::Row { act, .. } if *act != Act::None)).unwrap_or(0);
+            let first = self
+                .lines
+                .iter()
+                .position(|l| matches!(l, Line::Row { act, .. } if *act != Act::None))
+                .unwrap_or(0);
             self.main.select(first);
         }
     }
@@ -1417,20 +1856,25 @@ impl Agents {
             self.remote = None;
             return;
         }
-        self.call("GET", format!("{B}/search?q={}&limit=20", enc(&text)), None, move |a, r: Result<Value, ApiError>| {
-            if a.query.text.trim() != text {
-                return;
-            }
-            match r {
-                Ok(v) => {
-                    a.remote = Some(lax_list(&v["results"]));
-                    a.search_error = None;
+        self.call(
+            "GET",
+            format!("{B}/search?q={}&limit=20", enc(&text)),
+            None,
+            move |a, r: Result<Value, ApiError>| {
+                if a.query.text.trim() != text {
+                    return;
                 }
-                Err(e) if not_deployed(&e) => a.search_available = false,
-                Err(e) => a.search_error = Some(describe(&e)),
-            }
-            a.mark_stale();
-        });
+                match r {
+                    Ok(v) => {
+                        a.remote = Some(lax_list(&v["results"]));
+                        a.search_error = None;
+                    }
+                    Err(e) if not_deployed(&e) => a.search_available = false,
+                    Err(e) => a.search_error = Some(describe(&e)),
+                }
+                a.mark_stale();
+            },
+        );
     }
 
     // ---- Views ----
@@ -1447,13 +1891,27 @@ impl Agents {
                 new_run = true;
             }
             ui.space(8.0);
-            let perm = if open > 0 { format!("Permissions ({open})") } else { "Permissions".to_owned() };
-            let items: [(Section, &str, bool); 5] = [(Section::Runs, "Runs", true), (Section::Permissions, &perm, true), (Section::Schedules, "Schedules", self.schedules_available), (Section::Usage, "Usage", true), (Section::Pipeline, "Pipeline", true)];
+            let perm = if open > 0 {
+                format!("Permissions ({open})")
+            } else {
+                "Permissions".to_owned()
+            };
+            let items: [(Section, &str, bool); 5] = [
+                (Section::Runs, "Runs", true),
+                (Section::Permissions, &perm, true),
+                (Section::Schedules, "Schedules", self.schedules_available),
+                (Section::Usage, "Usage", true),
+                (Section::Pipeline, "Pipeline", true),
+            ];
             for (i, (s, label, show)) in items.iter().enumerate() {
                 if !*show {
                     continue;
                 }
-                let text = if self.section == *s { format!("› {label}") } else { (*label).to_owned() };
+                let text = if self.section == *s {
+                    format!("› {label}")
+                } else {
+                    (*label).to_owned()
+                };
                 if ui.button_id(("section", i), &text) {
                     chosen = Some(*s);
                 }
@@ -1505,20 +1963,53 @@ impl Agents {
             }
             let rows = &self.rows;
             let current = self.agent.clone();
-            let res = ui.list("agents", &mut self.agents_list, r, rows.len(), 58.0, |ui, i, selected| {
-                let row = ui.area();
-                let x = &rows[i];
-                if selected || current.as_deref() == Some(x.id.as_str()) {
-                    ui.fill_round(Rect::new(row.x, row.y + 1, row.w, row.h - 2), t.px(6.0), t.selection);
-                }
-                let side = t.px(10.0);
-                ui.fill_round(Rect::new(row.x + t.px(6.0), row.y + t.px(10.0), side, side), side / 2, bucket_colour(x.bucket, &t));
-                let left = row.x + side + t.px(12.0);
-                let w = row.right() - left - t.px(4.0);
-                ui.text_in(Rect::new(left, row.y + t.px(3.0), w, t.px(22.0)), Face::Sans, t.pt(14.0), t.text, &x.title);
-                ui.text_in(Rect::new(left, row.y + t.px(23.0), w, t.px(16.0)), Face::Sans, t.pt(11.0), if selected { t.item } else { t.dim }, &x.sub);
-                ui.text_in(Rect::new(left, row.y + t.px(38.0), w, t.px(16.0)), Face::Sans, t.pt(11.0), bucket_colour(x.bucket, &t), &x.state);
-            });
+            let res = ui.list(
+                "agents",
+                &mut self.agents_list,
+                r,
+                rows.len(),
+                58.0,
+                |ui, i, selected| {
+                    let row = ui.area();
+                    let x = &rows[i];
+                    if selected || current.as_deref() == Some(x.id.as_str()) {
+                        ui.fill_round(
+                            Rect::new(row.x, row.y + 1, row.w, row.h - 2),
+                            t.px(6.0),
+                            t.selection,
+                        );
+                    }
+                    let side = t.px(10.0);
+                    ui.fill_round(
+                        Rect::new(row.x + t.px(6.0), row.y + t.px(10.0), side, side),
+                        side / 2,
+                        bucket_colour(x.bucket, &t),
+                    );
+                    let left = row.x + side + t.px(12.0);
+                    let w = row.right() - left - t.px(4.0);
+                    ui.text_in(
+                        Rect::new(left, row.y + t.px(3.0), w, t.px(22.0)),
+                        Face::Sans,
+                        t.pt(14.0),
+                        t.text,
+                        &x.title,
+                    );
+                    ui.text_in(
+                        Rect::new(left, row.y + t.px(23.0), w, t.px(16.0)),
+                        Face::Sans,
+                        t.pt(11.0),
+                        if selected { t.item } else { t.dim },
+                        &x.sub,
+                    );
+                    ui.text_in(
+                        Rect::new(left, row.y + t.px(38.0), w, t.px(16.0)),
+                        Face::Sans,
+                        t.pt(11.0),
+                        bucket_colour(x.bucket, &t),
+                        &x.state,
+                    );
+                },
+            );
             if let Some(i) = res.activated {
                 open = Some(rows[i].id.clone());
             }
@@ -1534,15 +2025,20 @@ impl Agents {
         if archived_changed {
             self.mark_stale();
             if self.show_archived {
-                self.call("GET", format!("{B}/items?archived=true"), None, |a, r: Result<Value, ApiError>| {
-                    if let Ok(v) = r {
-                        let list: Vec<AgentListItem> = lax_list(&v["agents"]);
-                        for x in list {
-                            a.store.items.insert(x.id.clone(), x);
+                self.call(
+                    "GET",
+                    format!("{B}/items?archived=true"),
+                    None,
+                    |a, r: Result<Value, ApiError>| {
+                        if let Ok(v) = r {
+                            let list: Vec<AgentListItem> = lax_list(&v["agents"]);
+                            for x in list {
+                                a.store.items.insert(x.id.clone(), x);
+                            }
+                            a.mark_stale();
                         }
-                        a.mark_stale();
-                    }
-                });
+                    },
+                );
             }
         }
         if let Some(id) = open {
@@ -1554,32 +2050,64 @@ impl Agents {
         let t = ui.theme();
         let Some(id) = self.agent.clone() else {
             let a = ui.area();
-            ui.within(Rect::new(a.x + t.px(20.0), a.y + t.px(20.0), a.w - t.px(40.0), a.h), |ui| ui.dim("Pick an agent, or start a new run."));
+            ui.within(
+                Rect::new(a.x + t.px(20.0), a.y + t.px(20.0), a.w - t.px(40.0), a.h),
+                |ui| ui.dim("Pick an agent, or start a new run."),
+            );
             return;
         };
         if self.missing {
             let a = ui.area();
-            ui.within(Rect::new(a.x + t.px(20.0), a.y + t.px(20.0), a.w - t.px(40.0), a.h), |ui| ui.wrapped(Face::Sans, t.pt(14.0), t.danger, "No agent with that id."));
+            ui.within(
+                Rect::new(a.x + t.px(20.0), a.y + t.px(20.0), a.w - t.px(40.0), a.h),
+                |ui| ui.wrapped(Face::Sans, t.pt(14.0), t.danger, "No agent with that id."),
+            );
             return;
         }
         let pane = ui.area();
-        let pane = Rect::new(pane.x + t.px(10.0), pane.y + t.px(4.0), pane.w - t.px(16.0), pane.h - t.px(6.0));
+        let pane = Rect::new(
+            pane.x + t.px(10.0),
+            pane.y + t.px(4.0),
+            pane.w - t.px(16.0),
+            pane.h - t.px(6.0),
+        );
         let item = self.store.items.get(&id).cloned();
         let archived = self.store.archived(&id);
         let running = self.store.running(&id);
-        let parent = self.store.snapshots.get(&id).map(|s| &s.labels).or(item.as_ref().map(|i| &i.labels)).and_then(|l| l.get("lucina.parent-agent-id")).is_some();
+        let parent = self
+            .store
+            .snapshots
+            .get(&id)
+            .map(|s| &s.labels)
+            .or(item.as_ref().map(|i| &i.labels))
+            .and_then(|l| l.get("lucina.parent-agent-id"))
+            .is_some();
         let tabs = self.tabs();
         let ws = self.store.workspace_of(&id).map(Workspace::label);
-        let has_rows = self.store.timelines.get(&id).is_some_and(|t| !t.rows.is_empty());
-        let (mut rename, mut stop, mut archive, mut detach, mut prompts, mut tab) = (false, false, false, false, false, None);
+        let has_rows = self
+            .store
+            .timelines
+            .get(&id)
+            .is_some_and(|t| !t.rows.is_empty());
+        let (mut rename, mut stop, mut archive, mut detach, mut prompts, mut tab) =
+            (false, false, false, false, false, None);
         ui.within(pane, |ui| {
             let head = ui.cut_top(t.px(26.0));
-            let title = item.as_ref().map_or_else(|| id.chars().take(7).collect(), |a| agent_title(a.title.as_deref(), &a.id, &a.cwd));
+            let title = item.as_ref().map_or_else(
+                || id.chars().take(7).collect(),
+                |a| agent_title(a.title.as_deref(), &a.id, &a.cwd),
+            );
             ui.text_in(head, Face::Bold, t.pt(16.0), t.text, &title);
             if let Some(a) = &item {
                 let label = status_label(a.bucket, a.status);
                 let w = ui.measure(Face::Sans, t.pt(12.0), label);
-                ui.text_in(Rect::new(head.right() - w, head.y, w, head.h), Face::Sans, t.pt(12.0), bucket_colour(a.bucket, &t), label);
+                ui.text_in(
+                    Rect::new(head.right() - w, head.y, w, head.h),
+                    Face::Sans,
+                    t.pt(12.0),
+                    bucket_colour(a.bucket, &t),
+                    label,
+                );
                 let mut meta = a.provider.clone();
                 if let Some(m) = &a.model {
                     meta += &format!(" · {m}");
@@ -1611,7 +2139,11 @@ impl Agents {
             if tabs.len() > 1 {
                 ui.row(30.0, |ui| {
                     for (i, (x, label)) in tabs.iter().enumerate() {
-                        let text = if self.tab == *x { format!("› {label}") } else { (*label).to_owned() };
+                        let text = if self.tab == *x {
+                            format!("› {label}")
+                        } else {
+                            (*label).to_owned()
+                        };
                         if ui.button_id(("tab", i), &text) {
                             tab = Some(*x);
                         }
@@ -1630,7 +2162,10 @@ impl Agents {
             }
         });
         if rename {
-            let cur = item.as_ref().and_then(|a| a.title.clone()).unwrap_or_default();
+            let cur = item
+                .as_ref()
+                .and_then(|a| a.title.clone())
+                .unwrap_or_default();
             self.rename = Some(TextEdit::with_text(&cur));
         }
         if stop {
@@ -1659,7 +2194,14 @@ impl Agents {
             self.focus = None;
         }
         let lines = &self.lines;
-        let res = ui.list_measured("main", &mut self.main, r, lines.len(), |text, i, w| height(text, &lines[i], w, &t), |ui, i, selected| draw(ui, &lines[i], selected));
+        let res = ui.list_measured(
+            "main",
+            &mut self.main,
+            r,
+            lines.len(),
+            |text, i, w| height(text, &lines[i], w, &t),
+            |ui, i, selected| draw(ui, &lines[i], selected),
+        );
         let act = res.activated.and_then(|i| lines[i].act().cloned());
         if let Some(a) = act {
             self.do_act(a);
@@ -1689,8 +2231,21 @@ impl Agents {
             }
             let bw = t.px(74.0);
             let rx = compose.right() - if running { 2 * bw + t.px(6.0) } else { bw };
-            self.composer.placeholder = if running { "Steer the agent while it works".to_owned() } else { "Message the agent".to_owned() };
-            let res = ui.text_field_at(Rect::new(compose.x, compose.y + t.px(6.0), rx - compose.x - t.px(6.0), t.px(32.0)), "composer", &mut self.composer);
+            self.composer.placeholder = if running {
+                "Steer the agent while it works".to_owned()
+            } else {
+                "Message the agent".to_owned()
+            };
+            let res = ui.text_field_at(
+                Rect::new(
+                    compose.x,
+                    compose.y + t.px(6.0),
+                    rx - compose.x - t.px(6.0),
+                    t.px(32.0),
+                ),
+                "composer",
+                &mut self.composer,
+            );
             if self.focus == Some("composer") {
                 ui.focus("composer");
                 self.focus = None;
@@ -1698,10 +2253,20 @@ impl Agents {
             if res.submitted {
                 send = true;
             }
-            if ui.button_at(Rect::new(rx, compose.y + t.px(6.0), bw, t.px(32.0)), "send", if running { "Steer" } else { "Send" }) {
+            if ui.button_at(
+                Rect::new(rx, compose.y + t.px(6.0), bw, t.px(32.0)),
+                "send",
+                if running { "Steer" } else { "Send" },
+            ) {
                 send = true;
             }
-            if running && ui.button_at(Rect::new(rx + bw + t.px(6.0), compose.y + t.px(6.0), bw, t.px(32.0)), "stop", "Stop") {
+            if running
+                && ui.button_at(
+                    Rect::new(rx + bw + t.px(6.0), compose.y + t.px(6.0), bw, t.px(32.0)),
+                    "stop",
+                    "Stop",
+                )
+            {
                 stop = true;
             }
         });
@@ -1718,10 +2283,20 @@ impl Agents {
         let t = ui.theme();
         let mut mode = None;
         let mut reload = false;
-        let totals = self.diff.result.as_ref().map(|d| (d.files.len(), d.files.iter().map(|f| f.additions).sum::<u64>(), d.files.iter().map(|f| f.deletions).sum::<u64>()));
+        let totals = self.diff.result.as_ref().map(|d| {
+            (
+                d.files.len(),
+                d.files.iter().map(|f| f.additions).sum::<u64>(),
+                d.files.iter().map(|f| f.deletions).sum::<u64>(),
+            )
+        });
         ui.row(30.0, |ui| {
             for (i, m) in MODES.iter().enumerate() {
-                let text = if self.diff.mode == i { format!("› {m}") } else { (*m).to_owned() };
+                let text = if self.diff.mode == i {
+                    format!("› {m}")
+                } else {
+                    (*m).to_owned()
+                };
                 if ui.button_id(("diff-mode", i), &text) {
                     mode = Some(i);
                 }
@@ -1737,7 +2312,11 @@ impl Agents {
             ui.dim(&format!("{n} files +{add} −{del}"));
         }
         let mut pick = None;
-        let (d, loading, error) = (self.diff.result.as_ref(), self.diff.loading, self.diff.error.as_deref());
+        let (d, loading, error) = (
+            self.diff.result.as_ref(),
+            self.diff.loading,
+            self.diff.error.as_deref(),
+        );
         if let Some(e) = error {
             ui.wrapped(Face::Sans, t.pt(13.0), t.danger, e);
         }
@@ -1745,7 +2324,12 @@ impl Agents {
             ui.wrapped(Face::Sans, t.pt(13.0), t.danger, e);
         }
         if d.is_some_and(|d| d.diff_too_large) {
-            ui.wrapped(Face::Sans, t.pt(13.0), t.accent, "The diff is too large; some files are left out.");
+            ui.wrapped(
+                Face::Sans,
+                t.pt(13.0),
+                t.accent,
+                "The diff is too large; some files are left out.",
+            );
         }
         match d.filter(|d| !d.files.is_empty()) {
             None => {
@@ -1763,16 +2347,55 @@ impl Agents {
                     self.focus = None;
                 }
                 let selected = self.diff.selected;
-                let res = ui.list("diff-files", &mut self.diff.files_list, left, files.len(), 42.0, |ui, i, sel| {
-                    let row = ui.area();
-                    if sel || i == selected {
-                        ui.fill_round(Rect::new(row.x, row.y + 1, row.w, row.h - 2), t.px(5.0), t.selection);
-                    }
-                    let f = &files[i];
-                    ui.text_in(Rect::new(row.x + t.px(6.0), row.y + t.px(2.0), row.w - t.px(10.0), t.px(20.0)), Face::Sans, t.pt(13.0), t.text, model::base_name(&f.path));
-                    let state = if f.is_new { " new" } else if f.is_deleted { " deleted" } else { "" };
-                    ui.text_in(Rect::new(row.x + t.px(6.0), row.y + t.px(21.0), row.w - t.px(10.0), t.px(18.0)), Face::Sans, t.pt(11.0), t.dim, &format!("+{} −{}{state}", f.additions, f.deletions));
-                });
+                let res = ui.list(
+                    "diff-files",
+                    &mut self.diff.files_list,
+                    left,
+                    files.len(),
+                    42.0,
+                    |ui, i, sel| {
+                        let row = ui.area();
+                        if sel || i == selected {
+                            ui.fill_round(
+                                Rect::new(row.x, row.y + 1, row.w, row.h - 2),
+                                t.px(5.0),
+                                t.selection,
+                            );
+                        }
+                        let f = &files[i];
+                        ui.text_in(
+                            Rect::new(
+                                row.x + t.px(6.0),
+                                row.y + t.px(2.0),
+                                row.w - t.px(10.0),
+                                t.px(20.0),
+                            ),
+                            Face::Sans,
+                            t.pt(13.0),
+                            t.text,
+                            model::base_name(&f.path),
+                        );
+                        let state = if f.is_new {
+                            " new"
+                        } else if f.is_deleted {
+                            " deleted"
+                        } else {
+                            ""
+                        };
+                        ui.text_in(
+                            Rect::new(
+                                row.x + t.px(6.0),
+                                row.y + t.px(21.0),
+                                row.w - t.px(10.0),
+                                t.px(18.0),
+                            ),
+                            Face::Sans,
+                            t.pt(11.0),
+                            t.dim,
+                            &format!("+{} −{}{state}", f.additions, f.deletions),
+                        );
+                    },
+                );
                 if res.selection_changed {
                     pick = self.diff.files_list.selected;
                 }
@@ -1786,36 +2409,78 @@ impl Agents {
                     if let Some(o) = f.old_path.as_ref().filter(|o| **o != f.path) {
                         title += &format!(" ← {o}");
                     }
-                    ui.text_in(Rect::new(head.x + t.px(8.0), head.y, head.w - t.px(8.0), head.h), Face::Mono, t.pt(12.0), t.item, &title);
+                    ui.text_in(
+                        Rect::new(head.x + t.px(8.0), head.y, head.w - t.px(8.0), head.h),
+                        Face::Mono,
+                        t.pt(12.0),
+                        t.item,
+                        &title,
+                    );
                 }
                 let r = ui.area();
                 let body = Rect::new(r.x + t.px(6.0), r.y, r.w - t.px(6.0), r.h);
                 if cur.is_some_and(|f| f.status != "ok" && !f.status.is_empty()) {
                     let s = cur.map_or("", |f| f.status.as_str());
-                    ui.within(body, |ui| ui.dim(if s == "binary" { "Binary file." } else { "This file's diff is too large to show." }));
+                    ui.within(body, |ui| {
+                        ui.dim(if s == "binary" {
+                            "Binary file."
+                        } else {
+                            "This file's diff is too large to show."
+                        })
+                    });
                 } else {
                     let rows = &self.diff.rows;
-                    ui.list("diff-rows", &mut self.diff.rows_list, body, rows.len(), 19.0, |ui, i, sel| {
-                        let row = ui.area();
-                        let x = &rows[i];
-                        let (bg, fg, sign) = match x.kind.as_str() {
-                            "add" => (Some(Rgb::hex(0x103824)), t.text, "+"),
-                            "remove" => (Some(Rgb::hex(0x461a1e)), t.text, "−"),
-                            "hunk" => (None, t.accent, ""),
-                            "header" => (None, t.dim, ""),
-                            _ => (None, t.item, ""),
-                        };
-                        if let Some(c) = bg {
-                            ui.fill(row, c);
-                        }
-                        if sel {
-                            ui.fill(Rect::new(row.x, row.y, t.px(3.0), row.h), t.accent);
-                        }
-                        let nw = t.px(42.0);
-                        ui.text_in(Rect::new(row.x + t.px(4.0), row.y, nw, row.h), Face::Mono, t.pt(11.0), t.dim, &x.n);
-                        ui.text_in(Rect::new(row.x + nw, row.y, t.px(12.0), row.h), Face::Mono, t.pt(12.0), fg, sign);
-                        ui.text_in(Rect::new(row.x + nw + t.px(12.0), row.y, row.w - nw - t.px(12.0), row.h), Face::Mono, t.pt(12.0), fg, &x.content);
-                    });
+                    ui.list(
+                        "diff-rows",
+                        &mut self.diff.rows_list,
+                        body,
+                        rows.len(),
+                        19.0,
+                        |ui, i, sel| {
+                            let row = ui.area();
+                            let x = &rows[i];
+                            let (bg, fg, sign) = match x.kind.as_str() {
+                                "add" => (Some(theme::GREEN.over(t.panel, 0x28)), t.text, "+"),
+                                "remove" => (Some(theme::DANGER.over(t.panel, 0x28)), t.text, "−"),
+                                "hunk" => (None, t.accent, ""),
+                                "header" => (None, t.dim, ""),
+                                _ => (None, t.item, ""),
+                            };
+                            if let Some(c) = bg {
+                                ui.fill(row, c);
+                            }
+                            if sel {
+                                ui.fill(Rect::new(row.x, row.y, t.px(3.0), row.h), t.accent);
+                            }
+                            let nw = t.px(42.0);
+                            ui.text_in(
+                                Rect::new(row.x + t.px(4.0), row.y, nw, row.h),
+                                Face::Mono,
+                                t.pt(11.0),
+                                t.dim,
+                                &x.n,
+                            );
+                            ui.text_in(
+                                Rect::new(row.x + nw, row.y, t.px(12.0), row.h),
+                                Face::Mono,
+                                t.pt(12.0),
+                                fg,
+                                sign,
+                            );
+                            ui.text_in(
+                                Rect::new(
+                                    row.x + nw + t.px(12.0),
+                                    row.y,
+                                    row.w - nw - t.px(12.0),
+                                    row.h,
+                                ),
+                                Face::Mono,
+                                t.pt(12.0),
+                                fg,
+                                &x.content,
+                            );
+                        },
+                    );
                 }
             }
         }
@@ -1855,18 +2520,53 @@ impl Agents {
                     self.focus = None;
                 }
                 let cur = self.files.open.clone();
-                let res = ui.list("files", &mut self.files.list, left, entries.len(), 28.0, |ui, i, sel| {
-                    let row = ui.area();
-                    let e = &entries[i];
-                    if sel || cur.as_deref() == Some(e.path.as_str()) {
-                        ui.fill_round(Rect::new(row.x, row.y + 1, row.w, row.h - 2), t.px(4.0), t.selection);
-                    }
-                    let name = if e.kind == "directory" { format!("{}/", e.name) } else { e.name.clone() };
-                    let size = if e.kind == "directory" { String::new() } else { size_text(e.size) };
-                    let sw = ui.measure(Face::Sans, t.pt(11.0), &size);
-                    ui.text_in(Rect::new(row.x + t.px(6.0), row.y, row.w - sw - t.px(14.0), row.h), Face::Sans, t.pt(13.0), if e.kind == "directory" { t.item } else { t.text }, &name);
-                    ui.text_in(Rect::new(row.right() - sw - t.px(4.0), row.y, sw, row.h), Face::Sans, t.pt(11.0), t.dim, &size);
-                });
+                let res = ui.list(
+                    "files",
+                    &mut self.files.list,
+                    left,
+                    entries.len(),
+                    28.0,
+                    |ui, i, sel| {
+                        let row = ui.area();
+                        let e = &entries[i];
+                        if sel || cur.as_deref() == Some(e.path.as_str()) {
+                            ui.fill_round(
+                                Rect::new(row.x, row.y + 1, row.w, row.h - 2),
+                                t.px(4.0),
+                                t.selection,
+                            );
+                        }
+                        let name = if e.kind == "directory" {
+                            format!("{}/", e.name)
+                        } else {
+                            e.name.clone()
+                        };
+                        let size = if e.kind == "directory" {
+                            String::new()
+                        } else {
+                            size_text(e.size)
+                        };
+                        let sw = ui.measure(Face::Sans, t.pt(11.0), &size);
+                        ui.text_in(
+                            Rect::new(row.x + t.px(6.0), row.y, row.w - sw - t.px(14.0), row.h),
+                            Face::Sans,
+                            t.pt(13.0),
+                            if e.kind == "directory" {
+                                t.item
+                            } else {
+                                t.text
+                            },
+                            &name,
+                        );
+                        ui.text_in(
+                            Rect::new(row.right() - sw - t.px(4.0), row.y, sw, row.h),
+                            Face::Sans,
+                            t.pt(11.0),
+                            t.dim,
+                            &size,
+                        );
+                    },
+                );
                 open = res.activated;
             }
         }
@@ -1880,16 +2580,31 @@ impl Agents {
                 ui.within(view, |ui| ui.wrapped(Face::Sans, t.pt(13.0), t.danger, e));
             } else if let Some(f) = &self.files.file {
                 if f.encoding == "base64" || f.content.is_none() {
-                    ui.within(view, |ui| ui.dim(&format!("Binary file, {}.", size_text(f.size))));
+                    ui.within(view, |ui| {
+                        ui.dim(&format!("Binary file, {}.", size_text(f.size)))
+                    });
                 } else {
                     let lines = &self.files.lines;
-                    ui.list("file-view", &mut self.files.view, view, lines.len(), 19.0, |ui, i, sel| {
-                        let row = ui.area();
-                        if sel {
-                            ui.fill(Rect::new(row.x, row.y, t.px(3.0), row.h), t.accent);
-                        }
-                        ui.text_in(Rect::new(row.x + t.px(6.0), row.y, row.w - t.px(6.0), row.h), Face::Mono, t.pt(12.0), t.text, &lines[i]);
-                    });
+                    ui.list(
+                        "file-view",
+                        &mut self.files.view,
+                        view,
+                        lines.len(),
+                        19.0,
+                        |ui, i, sel| {
+                            let row = ui.area();
+                            if sel {
+                                ui.fill(Rect::new(row.x, row.y, t.px(3.0), row.h), t.accent);
+                            }
+                            ui.text_in(
+                                Rect::new(row.x + t.px(6.0), row.y, row.w - t.px(6.0), row.h),
+                                Face::Mono,
+                                t.pt(12.0),
+                                t.text,
+                                &lines[i],
+                            );
+                        },
+                    );
                 }
             } else {
                 ui.within(view, |ui| ui.dim("Loading…"));
@@ -1906,19 +2621,39 @@ impl Agents {
     }
 
     fn view_terminal(&mut self, ui: &mut Ui) {
-        const KEYS: [(&str, &str); 7] = [("C-c", "Ctrl-C"), ("C-d", "Ctrl-D"), ("Tab", "Tab"), ("Escape", "Esc"), ("Up", "↑"), ("Down", "↓"), ("Enter", "Enter")];
+        const KEYS: [(&str, &str); 7] = [
+            ("C-c", "Ctrl-C"),
+            ("C-d", "Ctrl-D"),
+            ("Tab", "Tab"),
+            ("Escape", "Esc"),
+            ("Up", "↑"),
+            ("Down", "↓"),
+            ("Enter", "Enter"),
+        ];
         let t = ui.theme();
         let list = self.workspace_terminals();
-        if self.term.selected.as_ref().is_none_or(|s| !list.iter().any(|x| &x.id == s)) && !list.is_empty() {
+        if self
+            .term
+            .selected
+            .as_ref()
+            .is_none_or(|s| !list.iter().any(|x| &x.id == s))
+            && !list.is_empty()
+        {
             self.pick_terminal();
         }
         let (mut new, mut close, mut next, mut key) = (false, false, false, None);
-        let current = list.iter().find(|x| Some(&x.id) == self.term.selected.as_ref());
+        let current = list
+            .iter()
+            .find(|x| Some(&x.id) == self.term.selected.as_ref());
         ui.row(30.0, |ui| {
             if list.len() > 1 {
                 let label = current.map_or_else(String::new, |x| {
                     let n = x.title.clone().unwrap_or_else(|| x.name.clone());
-                    if x.status == "exited" { format!("{n} (exited)") } else { n }
+                    if x.status == "exited" {
+                        format!("{n} (exited)")
+                    } else {
+                        n
+                    }
                 });
                 if ui.button_id("term-next", &label) {
                     next = true;
@@ -1938,19 +2673,35 @@ impl Agents {
             ui.dim("No terminal is open in this workspace.");
         } else {
             let status = match self.term.exit {
-                Some(c) => format!("The terminal exited (code {}).", c.map_or_else(|| "?".to_owned(), |c| c.to_string())),
+                Some(c) => format!(
+                    "The terminal exited (code {}).",
+                    c.map_or_else(|| "?".to_owned(), |c| c.to_string())
+                ),
                 None if self.term.live => "Connected".to_owned(),
                 None => "Connecting…".to_owned(),
             };
             ui.dim(&status);
             let bottom = ui.cut_bottom(t.px(72.0));
             let r = ui.area();
-            ui.fill(r, Rgb::hex(0x0a0c14));
+            ui.fill(r, theme::TERM_BG);
             let lines = &self.term.lines;
-            ui.list("term-output", &mut self.term.list, r, lines.len(), 18.0, |ui, i, _| {
-                let row = ui.area();
-                ui.text_in(Rect::new(row.x + t.px(6.0), row.y, row.w - t.px(6.0), row.h), Face::Mono, t.pt(12.0), t.text, &lines[i]);
-            });
+            ui.list(
+                "term-output",
+                &mut self.term.list,
+                r,
+                lines.len(),
+                18.0,
+                |ui, i, _| {
+                    let row = ui.area();
+                    ui.text_in(
+                        Rect::new(row.x + t.px(6.0), row.y, row.w - t.px(6.0), row.h),
+                        Face::Mono,
+                        t.pt(12.0),
+                        t.text,
+                        &lines[i],
+                    );
+                },
+            );
             let mut send = false;
             ui.within(bottom, |ui| {
                 let field = ui.cut_top(t.px(36.0));
@@ -1960,11 +2711,24 @@ impl Agents {
                     self.focus = None;
                 }
                 self.term.input.placeholder = "Type a command".to_owned();
-                let res = ui.text_field_at(Rect::new(field.x, field.y + t.px(4.0), field.w - bw - t.px(6.0), t.px(30.0)), "term-input", &mut self.term.input);
+                let res = ui.text_field_at(
+                    Rect::new(
+                        field.x,
+                        field.y + t.px(4.0),
+                        field.w - bw - t.px(6.0),
+                        t.px(30.0),
+                    ),
+                    "term-input",
+                    &mut self.term.input,
+                );
                 if res.submitted {
                     send = true;
                 }
-                if ui.button_at(Rect::new(field.right() - bw, field.y + t.px(4.0), bw, t.px(30.0)), "term-send", "Send") {
+                if ui.button_at(
+                    Rect::new(field.right() - bw, field.y + t.px(4.0), bw, t.px(30.0)),
+                    "term-send",
+                    "Send",
+                ) {
                     send = true;
                 }
                 ui.row(30.0, |ui| {
@@ -1985,10 +2749,12 @@ impl Agents {
         if close {
             self.close_terminal();
         }
-        if next {
-            if let Some(i) = list.iter().position(|x| Some(&x.id) == self.term.selected.as_ref()) {
-                self.select_terminal(Some(list[(i + 1) % list.len()].id.clone()));
-            }
+        if next
+            && let Some(i) = list
+                .iter()
+                .position(|x| Some(&x.id) == self.term.selected.as_ref())
+        {
+            self.select_terminal(Some(list[(i + 1) % list.len()].id.clone()));
         }
         if let (Some(k), Some(id)) = (key, self.term.selected.clone()) {
             self.term_keys(&id, json!(k));
@@ -1998,14 +2764,22 @@ impl Agents {
     fn view_page(&mut self, ui: &mut Ui, title: &str) {
         let t = ui.theme();
         let a = ui.area();
-        ui.within(Rect::new(a.x + t.px(12.0), a.y + t.px(4.0), a.w - t.px(20.0), a.h - t.px(8.0)), |ui| {
-            let head = ui.cut_top(t.px(28.0));
-            ui.text_in(head, Face::Bold, t.pt(16.0), t.text, title);
-            if let Some(n) = &self.note {
-                ui.wrapped(Face::Sans, t.pt(13.0), t.danger, n);
-            }
-            self.view_lines(ui);
-        });
+        ui.within(
+            Rect::new(
+                a.x + t.px(12.0),
+                a.y + t.px(4.0),
+                a.w - t.px(20.0),
+                a.h - t.px(8.0),
+            ),
+            |ui| {
+                let head = ui.cut_top(t.px(28.0));
+                ui.text_in(head, Face::Bold, t.pt(16.0), t.text, title);
+                if let Some(n) = &self.note {
+                    ui.wrapped(Face::Sans, t.pt(13.0), t.danger, n);
+                }
+                self.view_lines(ui);
+            },
+        );
     }
 
     fn view_new_run(&mut self, ui: &mut Ui) {
@@ -2024,17 +2798,33 @@ impl Agents {
                 ui.wrapped(Face::Sans, t.pt(13.0), t.danger, p);
             }
             let cur = list.get(n.provider).cloned();
-            let models: Vec<_> = cur.as_ref().map_or_else(Vec::new, |p| p.models.iter().filter(|m| m.is_selectable != Some(false)).cloned().collect());
+            let models: Vec<_> = cur.as_ref().map_or_else(Vec::new, |p| {
+                p.models
+                    .iter()
+                    .filter(|m| m.is_selectable != Some(false))
+                    .cloned()
+                    .collect()
+            });
             let modes = cur.as_ref().map_or_else(Vec::new, |p| p.modes.clone());
             ui.row(32.0, |ui| {
-                if ui.button_id("nr-provider", &format!("Provider: {}", cur.as_ref().map_or("?", |p| p.label.as_str()))) && !list.is_empty() {
+                if ui.button_id(
+                    "nr-provider",
+                    &format!(
+                        "Provider: {}",
+                        cur.as_ref().map_or("?", |p| p.label.as_str())
+                    ),
+                ) && !list.is_empty()
+                {
                     n.provider = (n.provider + 1) % list.len();
                     n.model = None;
                     n.mode = None;
                 }
             });
             ui.row(32.0, |ui| {
-                let label = n.model.and_then(|i| models.get(i)).map_or("Default", |m| m.label.as_str());
+                let label = n
+                    .model
+                    .and_then(|i| models.get(i))
+                    .map_or("Default", |m| m.label.as_str());
                 if ui.button_id("nr-model", &format!("Model: {label}")) {
                     n.model = match n.model {
                         None if !models.is_empty() => Some(0),
@@ -2045,7 +2835,10 @@ impl Agents {
             });
             if !modes.is_empty() {
                 ui.row(32.0, |ui| {
-                    let label = n.mode.and_then(|i| modes.get(i)).map_or("Default", |m| m.label.as_str());
+                    let label = n
+                        .mode
+                        .and_then(|i| modes.get(i))
+                        .map_or("Default", |m| m.label.as_str());
                     if ui.button_id("nr-mode", &format!("Mode: {label}")) {
                         n.mode = match n.mode {
                             None => Some(0),
@@ -2057,7 +2850,8 @@ impl Agents {
             }
             ui.row(32.0, |ui| {
                 let label = targets.get(n.target).map_or("?", |x| x.1.as_str());
-                if ui.button_id("nr-target", &format!("Workspace: {label}")) && !targets.is_empty() {
+                if ui.button_id("nr-target", &format!("Workspace: {label}")) && !targets.is_empty()
+                {
                     n.target = (n.target + 1) % targets.len();
                 }
             });
@@ -2123,7 +2917,9 @@ impl Agents {
 
     fn view_prompts(&mut self, ui: &mut Ui) {
         let t = ui.theme();
-        let Some((list, state)) = &mut self.prompts else { return };
+        let Some((list, state)) = &mut self.prompts else {
+            return;
+        };
         let mut jump = None;
         let mut close = false;
         ui.modal(640.0, 420.0, |ui| {
@@ -2139,9 +2935,19 @@ impl Agents {
                     let res = ui.list("prompt-list", state, r, rows.len(), 32.0, |ui, i, sel| {
                         let row = ui.area();
                         if sel {
-                            ui.fill_round(Rect::new(row.x, row.y + 1, row.w, row.h - 2), t.px(5.0), t.selection);
+                            ui.fill_round(
+                                Rect::new(row.x, row.y + 1, row.w, row.h - 2),
+                                t.px(5.0),
+                                t.selection,
+                            );
                         }
-                        ui.text_in(Rect::new(row.x + t.px(6.0), row.y, row.w - t.px(10.0), row.h), Face::Sans, t.pt(13.0), t.text, &rows[i].preview);
+                        ui.text_in(
+                            Rect::new(row.x + t.px(6.0), row.y, row.w - t.px(10.0), row.h),
+                            Face::Sans,
+                            t.pt(13.0),
+                            t.text,
+                            &rows[i].preview,
+                        );
                     });
                     if let Some(i) = res.activated {
                         jump = Some(rows[i].preview.clone());
@@ -2207,24 +3013,38 @@ impl App for Agents {
     }
 
     fn view(&mut self, ui: &mut Ui) {
-        ui.header(if self.sample { "Agents (sample data)" } else { "Agents" });
+        ui.header(if self.sample {
+            "Agents (sample data)"
+        } else {
+            "Agents"
+        });
         if let Some(s) = &mut self.sign_in {
             s.view(ui, "The coding agents are in your account.");
             return;
         }
-        if self.lost_at.is_some_and(|t| t.elapsed() >= QUIET) || self.next_poll.is_some_and(|t| Instant::now() >= t) {
+        if self.lost_at.is_some_and(|t| t.elapsed() >= QUIET)
+            || self.next_poll.is_some_and(|t| Instant::now() >= t)
+        {
             self.next_poll = None;
             self.check_backend();
         }
         if self.search_at.is_some_and(|t| t.elapsed() >= SEARCH_REST) {
             self.run_search();
         }
-        if self.section == Section::Pipeline && self.board_at.is_none_or(|t| t.elapsed() >= BOARD_REFRESH) {
+        if self.section == Section::Pipeline
+            && self.board_at.is_none_or(|t| t.elapsed() >= BOARD_REFRESH)
+        {
             self.load_board();
         }
         let pending = !self.store.pending_permissions().is_empty();
-        let ticking = pending && (self.section == Section::Permissions || (self.section == Section::Runs && self.tab == Tab::Chat));
-        let tick = if ticking { Duration::from_secs(1) } else { Duration::from_secs(30) };
+        let ticking = pending
+            && (self.section == Section::Permissions
+                || (self.section == Section::Runs && self.tab == Tab::Chat));
+        let tick = if ticking {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(30)
+        };
         if self.built_at.is_none_or(|t| t.elapsed() >= tick) {
             self.stale = true;
         }
@@ -2246,14 +3066,24 @@ impl App for Agents {
         }
         if self.refocus > 0 {
             self.refocus -= 1;
-            self.focus = Some(if self.section == Section::Runs && self.agent.is_none() { "agents" } else { "main" });
+            self.focus = Some(if self.section == Section::Runs && self.agent.is_none() {
+                "agents"
+            } else {
+                "main"
+            });
         }
 
         if let Some((text, alert)) = self.banner() {
             let t = ui.theme();
             let r = ui.cut_top(t.px(24.0));
             ui.fill(r, t.panel_hi);
-            ui.text_in(Rect::new(r.x + t.px(10.0), r.y, r.w - t.px(20.0), r.h), Face::Sans, t.pt(13.0), if alert { t.danger } else { t.item }, text);
+            ui.text_in(
+                Rect::new(r.x + t.px(10.0), r.y, r.w - t.px(20.0), r.h),
+                Face::Sans,
+                t.pt(13.0),
+                if alert { t.danger } else { t.item },
+                text,
+            );
         }
         self.view_rail(ui);
         match self.section {
@@ -2295,7 +3125,13 @@ impl App for Agents {
                 self.follow = true;
                 self.main.scroll_to_end();
             }
-            const SECTION_KEYS: [(u16, Section); 5] = [(keys::KEY_1, Section::Runs), (keys::KEY_2, Section::Permissions), (keys::KEY_3, Section::Schedules), (keys::KEY_4, Section::Usage), (keys::KEY_5, Section::Pipeline)];
+            const SECTION_KEYS: [(u16, Section); 5] = [
+                (keys::KEY_1, Section::Runs),
+                (keys::KEY_2, Section::Permissions),
+                (keys::KEY_3, Section::Schedules),
+                (keys::KEY_4, Section::Usage),
+                (keys::KEY_5, Section::Pipeline),
+            ];
             for (code, s) in SECTION_KEYS {
                 if ui.key(code) {
                     self.switch(s);

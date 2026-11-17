@@ -5,12 +5,13 @@
 //!
 //! Springs are advanced by absolute time (`now_us - t0`), so skipping frames never changes what a given instant looks like.
 //! Layers are never zero-sized, but they are not clipped to the screen: a layer may lie fully outside it (an overview neighbour), and the
-//! caller clips.
+//! caller clips. The keyboard switcher (Meta+Tab / Alt+Tab) is the exception: once its popup is up, every tile of that row lies inside the screen.
 
 use crate::overview::{space_rect, zoom_at};
 use crate::rubber::Band;
-use crate::spaces::Spaces;
+use crate::spaces::{Space, Spaces};
 use crate::spring::{Params, Spring};
+use crate::switcher::{AppId, MAX_APPS, Mru, Switcher};
 use crate::tile::Rect;
 use crate::tracker::{Axis, AxisLock, Tracker, commit_overview, release_target};
 
@@ -27,6 +28,12 @@ pub const OVERVIEW_DISTANCE: f64 = 300.0;
 pub const OVERVIEW_ZOOM_PERMILLE: i32 = 600;
 /// Fewest fingers that make a swipe a shell gesture (GNOME and niri use three for workspace and overview swipes).
 pub const MIN_FINGERS: u8 = 3;
+/// How long Meta or Alt is held before the switcher popup is drawn. A quicker tap shows none (GNOME Shell, 150 ms).
+pub const POPUP_DELAY_US: u64 = 150_000;
+/// Opacity of a switcher tile that is not the selected one.
+const SWITCHER_DIM: u8 = 160;
+/// Gap in pixels between switcher tiles when the row has room for it.
+const SWITCHER_GAP: i32 = 24;
 
 /// Phase of a gesture record (`lucina_gesture` begin / update / end).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +61,8 @@ pub struct GestureIn {
 pub enum Mode {
     Spaces,
     Overview,
+    /// Meta+Tab / Alt+Tab. Drawn only after [`POPUP_DELAY_US`]; before that the scene stays the ordinary one.
+    Switcher,
 }
 
 /// One layer of the frame, in draw order: the surface of the app in space slot `space` (index into `Spaces`), drawn from its full
@@ -101,12 +110,12 @@ impl Scene {
     }
 
     fn push(&mut self, space: usize, to: Rect) {
+        self.push_opacity(space, to, 255);
+    }
+
+    fn push_opacity(&mut self, space: usize, to: Rect, opacity: u8) {
         if self.len < MAX_LAYERS {
-            self.layers[self.len] = Layer {
-                space,
-                to,
-                opacity: 255,
-            };
+            self.layers[self.len] = Layer { space, to, opacity };
             self.len += 1;
         }
     }
@@ -155,13 +164,25 @@ enum State {
     },
 }
 
-/// The space switcher and overview.
+/// A Meta+Tab / Alt+Tab session held over the gesture state, so cancel can put that state back unchanged.
+#[derive(Clone, Copy, Debug)]
+struct SwitcherHold {
+    switcher: Switcher,
+    begun_us: u64,
+    /// `overview_at` was above 0 when the session started. A commit that lands returns to that view.
+    overview: bool,
+}
+
+/// The gesture-driven space switch and overview, plus the keyboard app switcher.
 #[derive(Clone, Debug)]
 pub struct Controller {
     screen: Rect,
     state: State,
     /// Whether the overview is open while in [`State::Rest`].
     open: bool,
+    /// Focused app first. Seeded from the row the first time it is needed, then updated on each commit.
+    mru: Mru,
+    switcher: Option<SwitcherHold>,
 }
 
 fn elapsed_s(now_us: u64, t0: u64) -> f64 {
@@ -175,6 +196,173 @@ fn clamp_f(x: f64, lo: f64, hi: f64) -> f64 {
         hi
     } else {
         x
+    }
+}
+
+fn clamp_i64(v: i64, lo: i64, hi: i64) -> i64 {
+    if lo > hi || v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
+fn sat_i32(v: i64) -> i32 {
+    if v > i32::MAX as i64 {
+        i32::MAX
+    } else if v < i32::MIN as i64 {
+        i32::MIN
+    } else {
+        v as i32
+    }
+}
+
+fn primary_app(space: Space) -> Option<AppId> {
+    match space {
+        Space::Home => None,
+        Space::App(id) => Some(id),
+        Space::Tiles(t) => t.get(0),
+    }
+}
+
+/// Live apps, left to right, Home skipped, at most [`MAX_APPS`], duplicates dropped.
+fn live_apps(spaces: &Spaces, out: &mut [AppId; MAX_APPS]) -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < spaces.len() && n < MAX_APPS {
+        let Some(space) = spaces.get(i) else {
+            break;
+        };
+        match space {
+            Space::Home => {}
+            Space::App(id) => {
+                if !listed(out, n, id) {
+                    out[n] = id;
+                    n += 1;
+                }
+            }
+            Space::Tiles(t) => {
+                let mut k = 0;
+                while k < t.len() && n < MAX_APPS {
+                    if let Some(id) = t.get(k)
+                        && !listed(out, n, id)
+                    {
+                        out[n] = id;
+                        n += 1;
+                    }
+                    k += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    n
+}
+
+fn listed(ids: &[AppId], n: usize, id: AppId) -> bool {
+    let mut i = 0;
+    while i < n && i < ids.len() {
+        if ids[i] == id {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// How many different spaces the snapshot still points at.
+fn distinct_spaces(sw: &Switcher, spaces: &Spaces) -> usize {
+    let mut seen = [usize::MAX; MAX_APPS];
+    let mut n = 0;
+    let items = sw.items();
+    let mut i = 0;
+    while i < items.len() {
+        if let Some(sp) = spaces.space_of(items[i])
+            && !listed_usize(&seen, n, sp)
+            && n < seen.len()
+        {
+            seen[n] = sp;
+            n += 1;
+        }
+        i += 1;
+    }
+    n
+}
+
+fn listed_usize(ids: &[usize], n: usize, id: usize) -> bool {
+    let mut i = 0;
+    while i < n && i < ids.len() {
+        if ids[i] == id {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// One centred row of `n` equal tiles. `space_rect` pins the active space to the middle and lets neighbours leave the
+/// screen; `overview::layout` may split into several rows. The switcher is a single row, kept inside a positive screen
+/// by shrinking the gap and then overlapping when the screen is narrower than the row.
+fn switcher_row(screen: Rect, n: usize, out: &mut [Rect; MAX_LAYERS]) {
+    let n = n.min(MAX_LAYERS).min(out.len());
+    if n == 0 {
+        return;
+    }
+    let sx = screen.x as i64;
+    let sy = screen.y as i64;
+    let sw = (screen.w as i64).max(0);
+    let sh = (screen.h as i64).max(0);
+    let box_w = sw.max(1);
+    let box_h = sh.max(1);
+    let n_i = n as i64;
+    let gap_pref = (SWITCHER_GAP as i64).max(0);
+    let gaps = gap_pref.saturating_mul(n_i.saturating_sub(1));
+    let tile_w = if sw >= n_i.saturating_add(gaps) {
+        (sw - gaps) / n_i
+    } else if sw >= n_i {
+        sw / n_i
+    } else {
+        1
+    };
+    let tile_w = tile_w.max(1).min(box_w);
+    let gap = if sw >= n_i.saturating_add(gaps) {
+        gap_pref
+    } else {
+        0
+    };
+    let tile_h = if sh >= 3 {
+        (sh.saturating_mul(2) / 3).clamp(1, box_h)
+    } else {
+        box_h
+    };
+    let natural = tile_w.saturating_add(gap);
+    let stride = if n_i <= 1 {
+        0
+    } else {
+        let room = box_w.saturating_sub(tile_w);
+        let max_stride = room / (n_i - 1);
+        natural.min(max_stride)
+    };
+    let row_w = tile_w
+        .saturating_add(stride.saturating_mul(n_i - 1))
+        .min(box_w);
+    let x0 = sx.saturating_add((box_w - row_w) / 2);
+    let y0 = sy.saturating_add((box_h - tile_h) / 2);
+    let x_hi = sx.saturating_add(box_w.saturating_sub(tile_w));
+    let y_hi = sy.saturating_add(box_h.saturating_sub(tile_h));
+    let mut i = 0;
+    while i < n {
+        let x = clamp_i64(x0.saturating_add(stride.saturating_mul(i as i64)), sx, x_hi);
+        let y = clamp_i64(y0, sy, y_hi);
+        out[i] = Rect {
+            x: sat_i32(x),
+            y: sat_i32(y),
+            w: sat_i32(tile_w),
+            h: sat_i32(tile_h),
+        };
+        i += 1;
     }
 }
 
@@ -211,6 +399,80 @@ impl Controller {
             screen,
             state: State::Rest,
             open: false,
+            mru: Mru::new(),
+            switcher: None,
+        }
+    }
+
+    /// Rebuild the MRU from the row. Apps the controller has already focused keep that order; apps it has never seen are
+    /// older, left to right. The app in the active space, when there is one, is focused last so it sits at the front.
+    fn sync_mru(&mut self, spaces: &Spaces) {
+        let old = self.mru;
+        let mut live = [AppId(0); MAX_APPS];
+        let n = live_apps(spaces, &mut live);
+        self.mru = Mru::new();
+        let mut i = 0;
+        while i < n {
+            self.mru.focus(live[i]);
+            i += 1;
+        }
+        let mut i = old.len();
+        while i > 0 {
+            i -= 1;
+            let id = old.as_slice()[i];
+            if spaces.space_of(id).is_some() {
+                self.mru.focus(id);
+            }
+        }
+        if let Some(id) = spaces.get(spaces.active()).and_then(primary_app) {
+            self.mru.focus(id);
+        }
+    }
+
+    fn popup_due(&self, now_us: u64) -> bool {
+        match self.switcher {
+            Some(hold) => now_us.saturating_sub(hold.begun_us) >= POPUP_DELAY_US,
+            None => false,
+        }
+    }
+
+    fn write_switcher(&self, spaces: &Spaces, out: &mut Scene) {
+        out.len = 0;
+        out.mode = Mode::Switcher;
+        out.animating = true;
+        let Some(hold) = self.switcher else {
+            return;
+        };
+        let items = hold.switcher.items();
+        let sel = hold.switcher.selected();
+        let mut ids = [AppId(0); MAX_LAYERS];
+        let mut n = 0;
+        let mut i = 0;
+        while i < items.len() && n < MAX_LAYERS {
+            if spaces.space_of(items[i]).is_some() {
+                ids[n] = items[i];
+                n += 1;
+            }
+            i += 1;
+        }
+        let mut rects = [Rect {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+        }; MAX_LAYERS];
+        switcher_row(self.screen, n, &mut rects);
+        i = 0;
+        while i < n {
+            if let Some(space) = spaces.space_of(ids[i]) {
+                let opacity = if sel == Some(ids[i]) {
+                    255
+                } else {
+                    SWITCHER_DIM
+                };
+                out.push_opacity(space, rects[i], opacity);
+            }
+            i += 1;
         }
     }
 
@@ -257,7 +519,11 @@ impl Controller {
     /// during a gesture or a settle takes over from the position shown at that instant. An `End` ends the gesture in progress whatever
     /// its finger count says (the fingers of one gesture do not change).
     /// When a gesture begun during a settle locks on the other axis, the held position of the first axis snaps to its rest value.
+    /// While a switcher session is open the keyboard owns the controller: every record is ignored.
     pub fn gesture(&mut self, g: GestureIn, spaces: &mut Spaces) {
+        if self.switcher.is_some() {
+            return;
+        }
         if !g.swipe {
             return;
         }
@@ -345,6 +611,7 @@ impl Controller {
                 spaces.go_to(target);
                 self.open = false;
                 self.state = spring_state_spaces(p, target, velocity, t);
+                self.sync_mru(spaces);
             }
             State::DragOverview {
                 base_o,
@@ -407,6 +674,10 @@ impl Controller {
             }
             _ => {}
         }
+        if self.popup_due(now_us) {
+            self.write_switcher(spaces, out);
+            return;
+        }
         let o = self.overview_at(now_us);
         let p = self.position_at(now_us, active, last);
         out.len = 0;
@@ -438,6 +709,9 @@ impl Controller {
             }
             out.push(active, space_rect(s, zoom, active, active));
         }
+        if self.switcher.is_some() {
+            out.animating = true;
+        }
     }
 
     /// Keyboard and other triggers: switch to space `target` (clamped to the row) with the spring from rest, from the position shown now.
@@ -448,6 +722,7 @@ impl Controller {
         let o = self.overview_at(now_us);
         let p = self.position_at(now_us, active, last);
         spaces.go_to(target);
+        self.sync_mru(spaces);
         if o > 0.0 {
             return;
         }
@@ -465,11 +740,54 @@ impl Controller {
         }
         self.state = spring_state_overview(o, open, 0.0, now_us);
     }
+
+    /// Open a Meta+Tab / Alt+Tab session. The list is the MRU snapshot ([`Switcher::begin`]): the focused app first, the
+    /// selection on the previous one. The popup stays hidden until [`POPUP_DELAY_US`] has passed. A session already open
+    /// is replaced. The gesture state underneath is left as it is, so [`Self::switcher_cancel`] puts the previous mode back.
+    pub fn switcher_begin(&mut self, spaces: &Spaces, now_us: u64) {
+        self.sync_mru(spaces);
+        let overview = self.overview_at(now_us) > 0.0;
+        self.switcher = Some(SwitcherHold {
+            switcher: Switcher::begin(&self.mru, false),
+            begun_us: now_us,
+            overview,
+        });
+    }
+
+    /// Tab (`forward`) or Shift+Tab moves the selection, wrapping at either end. Does nothing when no session is open.
+    pub fn switcher_step(&mut self, forward: bool) {
+        if let Some(hold) = self.switcher.as_mut() {
+            hold.switcher.step(!forward);
+        }
+    }
+
+    /// Release. Goes to the selected app's space and returns that index. `None`, with the mode put back and no space
+    /// changed, when no session is open, the list is empty or covers a single space, or the selected app is gone.
+    pub fn switcher_commit(&mut self, spaces: &mut Spaces) -> Option<usize> {
+        let hold = self.switcher.take()?;
+        if distinct_spaces(&hold.switcher, spaces) < 2 {
+            return None;
+        }
+        let app = hold.switcher.selected()?;
+        let idx = spaces.space_of(app)?;
+        spaces.go_to(idx);
+        self.sync_mru(spaces);
+        self.mru.focus(app);
+        self.state = State::Rest;
+        self.open = hold.overview;
+        Some(idx)
+    }
+
+    /// Drop the session. The space and the mode underneath are unchanged.
+    pub fn switcher_cancel(&mut self) {
+        self.switcher = None;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spaces::Space;
     use crate::switcher::AppId;
 
     const SCREEN: Rect = Rect {
@@ -1030,5 +1348,416 @@ mod tests {
             c.scene(t + 10_000_000, &s, &mut sc);
             assert!(!sc.animating, "seed {seed}");
         }
+    }
+
+    fn apps(ids: &[u16]) -> Spaces {
+        let mut s = Spaces::new();
+        for id in ids {
+            assert!(s.open_app(AppId(*id)).is_some(), "room for {id}");
+        }
+        s
+    }
+
+    fn scene_at(c: &mut Controller, t_us: u64, s: &Spaces) -> Scene {
+        let mut out = Scene::new();
+        c.scene(t_us, s, &mut out);
+        out
+    }
+
+    /// The one tile drawn at full opacity. Every other tile is dimmed.
+    fn highlighted(sc: &Scene) -> usize {
+        let mut found = None;
+        for l in sc.as_slice() {
+            if l.opacity == 255 {
+                assert!(found.is_none(), "one tile at full opacity");
+                found = Some(l.space);
+            } else {
+                assert_eq!(l.opacity, 160, "dimmed tile");
+            }
+        }
+        found.expect("the selected tile")
+    }
+
+    fn inside(screen: Rect, r: Rect) -> bool {
+        let sx = screen.x as i64;
+        let sy = screen.y as i64;
+        let rx = r.x as i64;
+        let ry = r.y as i64;
+        r.w > 0
+            && r.h > 0
+            && screen.w > 0
+            && screen.h > 0
+            && rx >= sx
+            && ry >= sy
+            && rx + r.w as i64 <= sx + screen.w as i64
+            && ry + r.h as i64 <= sy + screen.h as i64
+    }
+
+    #[test]
+    fn begin_then_immediate_commit_selects_the_second_mru_app_and_shows_no_popup() {
+        let mut s = apps(&[1, 2, 3]);
+        assert_eq!(s.active_space(), Space::App(AppId(3)));
+        let mut c = Controller::new(SCREEN);
+        let idle = scene_at(&mut c, 10, &s);
+        c.switcher_begin(&s, 10);
+        let early = scene_at(&mut c, 10, &s);
+        assert_eq!(early.mode, Mode::Spaces);
+        assert_ne!(early.mode, Mode::Switcher);
+        assert_eq!(early.as_slice(), idle.as_slice());
+        assert!(early.animating, "the shell has to come back for the popup");
+        let idx = c.switcher_commit(&mut s).expect("three apps");
+        assert_eq!(s.space_of(AppId(2)), Some(idx), "the previous app");
+        assert_eq!(s.active(), idx);
+        let landed = scene_at(&mut c, 10, &s);
+        assert_eq!(landed.mode, Mode::Spaces);
+        assert!(!landed.animating);
+        assert_eq!(landed.as_slice(), idle_scene(idx).as_slice());
+        // Releasing again flips back: the app just chosen is now the front of the MRU.
+        c.switcher_begin(&s, 20);
+        let back = c.switcher_commit(&mut s).expect("still three apps");
+        assert_eq!(s.space_of(AppId(3)), Some(back));
+        assert_eq!(s.active(), back);
+    }
+
+    #[test]
+    fn commit_after_the_delay_shows_the_popup() {
+        let mut s = apps(&[1, 2, 3]);
+        let mut c = Controller::new(SCREEN);
+        let t0 = 1_000_000u64;
+        c.switcher_begin(&s, t0);
+        let before = scene_at(&mut c, t0 + POPUP_DELAY_US - 1, &s);
+        assert_eq!(before.mode, Mode::Spaces);
+        assert_eq!(before.as_slice(), idle_scene(3).as_slice());
+        let pop = scene_at(&mut c, t0 + POPUP_DELAY_US, &s);
+        assert_eq!(pop.mode, Mode::Switcher);
+        assert!(pop.animating);
+        assert_eq!(pop.len, 3);
+        let order = [
+            s.space_of(AppId(3)).unwrap(),
+            s.space_of(AppId(2)).unwrap(),
+            s.space_of(AppId(1)).unwrap(),
+        ];
+        for (i, space) in order.iter().enumerate() {
+            assert_eq!(pop.layers[i].space, *space);
+        }
+        assert_eq!(highlighted(&pop), s.space_of(AppId(2)).unwrap());
+        let w = pop.layers[0].to.w;
+        let h = pop.layers[0].to.h;
+        assert!(w > 0 && h > 0);
+        for l in pop.as_slice() {
+            assert_eq!(l.to.w, w);
+            assert_eq!(l.to.h, h);
+            assert_eq!(l.to.y, pop.layers[0].to.y);
+            assert!(inside(SCREEN, l.to));
+        }
+        assert!(pop.layers[1].to.x > pop.layers[0].to.x);
+        assert!(pop.layers[2].to.x > pop.layers[1].to.x);
+        let gap = pop.layers[1].to.x - (pop.layers[0].to.x + pop.layers[0].to.w);
+        assert_eq!(gap, 24);
+        assert_eq!(
+            pop.layers[2].to.x - (pop.layers[1].to.x + pop.layers[1].to.w),
+            gap
+        );
+        let left = pop.layers[0].to.x - SCREEN.x;
+        let right = SCREEN.x + SCREEN.w - (pop.layers[2].to.x + pop.layers[2].to.w);
+        assert!(
+            (left - right).abs() <= 1,
+            "centred, left {left} right {right}"
+        );
+        // Asking again before the delay hides it; the session itself is still open.
+        let back = scene_at(&mut c, t0, &s);
+        assert_eq!(back.mode, Mode::Spaces);
+        let idx = c.switcher_commit(&mut s).unwrap();
+        assert_eq!(Some(idx), s.space_of(AppId(2)));
+        assert_eq!(scene_at(&mut c, t0 + POPUP_DELAY_US, &s).mode, Mode::Spaces);
+    }
+
+    #[test]
+    fn step_forward_and_backward_wrap() {
+        let s = apps(&[1, 2, 3]);
+        let mut c = Controller::new(SCREEN);
+        let t0 = 0u64;
+        c.switcher_begin(&s, t0);
+        let at = t0 + POPUP_DELAY_US;
+        let space = |id: u16| s.space_of(AppId(id)).unwrap();
+        // Begin sits on the previous app. Forward walks 1, then 3, then back to 2.
+        assert_eq!(highlighted(&scene_at(&mut c, at, &s)), space(2));
+        c.switcher_step(true);
+        assert_eq!(highlighted(&scene_at(&mut c, at, &s)), space(1));
+        c.switcher_step(true);
+        assert_eq!(highlighted(&scene_at(&mut c, at, &s)), space(3));
+        c.switcher_step(true);
+        assert_eq!(highlighted(&scene_at(&mut c, at, &s)), space(2));
+        c.switcher_step(false);
+        assert_eq!(highlighted(&scene_at(&mut c, at, &s)), space(3));
+        c.switcher_step(false);
+        assert_eq!(highlighted(&scene_at(&mut c, at, &s)), space(1));
+        c.switcher_step(false);
+        assert_eq!(highlighted(&scene_at(&mut c, at, &s)), space(2));
+    }
+
+    #[test]
+    fn shift_tab_from_the_first_selects_the_last() {
+        let mut s = apps(&[1, 2, 3]);
+        let mut c = Controller::new(SCREEN);
+        c.switcher_begin(&s, 0);
+        let at = POPUP_DELAY_US;
+        // One Shift+Tab from the previous app lands on the first MRU entry.
+        c.switcher_step(false);
+        assert_eq!(
+            highlighted(&scene_at(&mut c, at, &s)),
+            s.space_of(AppId(3)).unwrap()
+        );
+        // The next Shift+Tab wraps onto the last entry.
+        c.switcher_step(false);
+        assert_eq!(
+            highlighted(&scene_at(&mut c, at, &s)),
+            s.space_of(AppId(1)).unwrap()
+        );
+        let idx = c.switcher_commit(&mut s).unwrap();
+        assert_eq!(Some(idx), s.space_of(AppId(1)));
+        assert_eq!(s.active(), idx);
+    }
+
+    #[test]
+    fn cancel_returns_to_the_previous_mode_and_changes_no_space() {
+        let mut s = apps(&[1, 2, 3]);
+        let mut c = Controller::new(SCREEN);
+        c.switcher_step(true);
+        c.switcher_cancel();
+        assert!(c.switcher_commit(&mut s).is_none());
+        assert_eq!(s.active(), 3);
+        let before = scene_at(&mut c, 0, &s);
+        let active = s.active();
+        c.switcher_begin(&s, 0);
+        c.switcher_step(true);
+        c.switcher_cancel();
+        assert_eq!(s.active(), active);
+        let after = scene_at(&mut c, 0, &s);
+        assert_eq!(after.mode, Mode::Spaces);
+        assert!(!after.animating);
+        assert_eq!(after.as_slice(), before.as_slice());
+
+        c.set_overview(1_000_000, true);
+        let open = scene_at(&mut c, 5_000_000, &s);
+        assert_eq!(open.mode, Mode::Overview);
+        assert!(!open.animating);
+        let active = s.active();
+        c.switcher_begin(&s, 5_000_000);
+        c.switcher_step(false);
+        let during = scene_at(&mut c, 5_000_000 + POPUP_DELAY_US, &s);
+        assert_eq!(during.mode, Mode::Switcher);
+        c.switcher_cancel();
+        assert_eq!(s.active(), active);
+        let back = scene_at(&mut c, 5_000_000 + POPUP_DELAY_US, &s);
+        assert_eq!(back.mode, Mode::Overview);
+        assert_eq!(back.as_slice(), open.as_slice());
+        assert!(!back.animating);
+    }
+
+    #[test]
+    fn single_space_commit_returns_none() {
+        let mut home = Spaces::new();
+        let mut c = Controller::new(SCREEN);
+        c.switcher_begin(&home, 0);
+        assert!(c.switcher_commit(&mut home).is_none());
+        assert_eq!(home.active(), 0);
+        assert_eq!(scene_at(&mut c, 0, &home).mode, Mode::Spaces);
+        assert_eq!(
+            scene_at(&mut c, 0, &home).as_slice(),
+            idle_scene(0).as_slice()
+        );
+
+        let mut one = apps(&[7]);
+        let active = one.active();
+        c.switcher_begin(&one, 0);
+        let pop = scene_at(&mut c, POPUP_DELAY_US, &one);
+        assert_eq!(pop.mode, Mode::Switcher);
+        assert_eq!(pop.len, 1);
+        assert_eq!(pop.layers[0].opacity, 255);
+        assert!(inside(SCREEN, pop.layers[0].to));
+        assert!(c.switcher_commit(&mut one).is_none());
+        assert_eq!(one.active(), active);
+        assert_eq!(scene_at(&mut c, POPUP_DELAY_US, &one).mode, Mode::Spaces);
+
+        let mut pair = apps(&[1, 2]);
+        assert!(pair.tile_together(AppId(2), AppId(1)));
+        let active = pair.active();
+        c.set_overview(0, true);
+        let open = scene_at(&mut c, 4_000_000, &pair);
+        assert_eq!(open.mode, Mode::Overview);
+        c.switcher_begin(&pair, 4_000_000);
+        c.switcher_step(true);
+        assert!(c.switcher_commit(&mut pair).is_none());
+        assert_eq!(pair.active(), active);
+        let back = scene_at(&mut c, 4_000_000, &pair);
+        assert_eq!(back.mode, Mode::Overview);
+        assert_eq!(back.as_slice(), open.as_slice());
+    }
+
+    #[test]
+    fn gestures_are_ignored_while_the_switcher_is_open() {
+        let mut s = apps(&[1, 2, 3]);
+        let mut c = Controller::new(SCREEN);
+        let before = scene_at(&mut c, 0, &s);
+        c.switcher_begin(&s, 0);
+        swipe(&mut c, &mut s, 0, -400.0, false, 10);
+        c.gesture(g(Phase::End, 0.0, 0.0, 200), &mut s);
+        let mut up = g(Phase::Begin, 0.0, -80.0, 210);
+        c.gesture(up, &mut s);
+        up.phase = Phase::Update;
+        c.gesture(up, &mut s);
+        up.phase = Phase::End;
+        c.gesture(up, &mut s);
+        assert_eq!(s.active(), 3);
+        let held = scene_at(&mut c, 0, &s);
+        assert_eq!(held.mode, Mode::Spaces);
+        assert_eq!(held.as_slice(), before.as_slice());
+        let pop = scene_at(&mut c, POPUP_DELAY_US, &s);
+        assert_eq!(pop.mode, Mode::Switcher);
+        assert_eq!(highlighted(&pop), s.space_of(AppId(2)).unwrap());
+        c.switcher_step(true);
+        assert_eq!(
+            highlighted(&scene_at(&mut c, POPUP_DELAY_US, &s)),
+            s.space_of(AppId(1)).unwrap()
+        );
+    }
+
+    #[test]
+    fn switcher_layers_stay_within_max_layers() {
+        let mut s = Spaces::new();
+        for id in 1..=15u16 {
+            assert!(s.open_app(AppId(id)).is_some());
+        }
+        assert!(s.tile_together(AppId(15), AppId(14)));
+        assert!(s.open_app(AppId(16)).is_some(), "the tile frees a slot");
+        let mut c = Controller::new(SCREEN);
+        c.switcher_begin(&s, 0);
+        let pop = scene_at(&mut c, POPUP_DELAY_US, &s);
+        assert_eq!(pop.mode, Mode::Switcher);
+        assert_eq!(pop.len, 16, "every app the MRU can hold");
+        assert!(pop.len <= MAX_LAYERS);
+        let mut full = 0;
+        for l in pop.as_slice() {
+            assert!(l.space < s.len());
+            assert!(l.to.w > 0 && l.to.h > 0);
+            assert!(inside(SCREEN, l.to));
+            if l.opacity == 255 {
+                full += 1;
+            } else {
+                assert_eq!(l.opacity, 160);
+            }
+        }
+        assert_eq!(full, 1);
+    }
+
+    #[test]
+    fn switcher_tiles_lie_inside_the_screen() {
+        let screens = [
+            SCREEN,
+            Rect {
+                x: 10,
+                y: 20,
+                w: 640,
+                h: 480,
+            },
+            Rect {
+                x: -40,
+                y: 5,
+                w: 2000,
+                h: 100,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                w: 3,
+                h: 3,
+            },
+        ];
+        for screen in screens {
+            let s = apps(&[1, 2, 3, 4, 5]);
+            let mut c = Controller::new(screen);
+            c.switcher_begin(&s, 0);
+            let pop = scene_at(&mut c, POPUP_DELAY_US, &s);
+            assert_eq!(pop.mode, Mode::Switcher);
+            assert_eq!(pop.len, 5);
+            assert!(pop.len <= MAX_LAYERS);
+            let w = pop.layers[0].to.w;
+            let h = pop.layers[0].to.h;
+            for (i, l) in pop.as_slice().iter().enumerate() {
+                assert!(inside(screen, l.to), "{screen:?} {:?}", l.to);
+                assert_eq!(l.to.w, w);
+                assert_eq!(l.to.h, h);
+                assert_eq!(l.to.y, pop.layers[0].to.y);
+                if i > 0 {
+                    assert!(l.to.x >= pop.layers[i - 1].to.x);
+                }
+            }
+            let left = pop.layers[0].to.x as i64 - screen.x as i64;
+            let right = screen.x as i64 + screen.w as i64
+                - (pop.layers[4].to.x as i64 + pop.layers[4].to.w as i64);
+            assert!(
+                (left - right).abs() <= 1,
+                "{screen:?} left {left} right {right}"
+            );
+        }
+        // Degenerate screens and a clock at the end of time must not panic. A begin at `u64::MAX` can never
+        // reach the popup delay; a begin at 0 still draws non-empty tiles.
+        for screen in [
+            Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                w: -8,
+                h: -4,
+            },
+            Rect {
+                x: i32::MAX - 10,
+                y: i32::MIN / 2,
+                w: 80,
+                h: 40,
+            },
+        ] {
+            let mut s = apps(&[1, 2, 3]);
+            let mut c = Controller::new(screen);
+            c.switcher_begin(&s, u64::MAX);
+            assert!(scene_at(&mut c, 0, &s).len <= MAX_LAYERS);
+            assert_ne!(scene_at(&mut c, u64::MAX, &s).mode, Mode::Switcher);
+            c.switcher_cancel();
+            c.switcher_begin(&s, 0);
+            let pop = scene_at(&mut c, POPUP_DELAY_US, &s);
+            assert_eq!(pop.mode, Mode::Switcher);
+            assert!(pop.len <= MAX_LAYERS && pop.len >= 1);
+            for l in pop.as_slice() {
+                assert!(l.to.w > 0 && l.to.h > 0, "{screen:?} {:?}", l.to);
+            }
+            c.switcher_step(true);
+            c.switcher_step(false);
+            let _ = c.switcher_commit(&mut s);
+        }
+    }
+
+    #[test]
+    fn switcher_scene_is_deterministic() {
+        let once = || {
+            let mut s = apps(&[1, 2, 3, 4]);
+            let mut c = Controller::new(SCREEN);
+            c.switcher_begin(&s, 50);
+            c.switcher_step(true);
+            c.switcher_step(false);
+            c.switcher_step(true);
+            let t = 50 + POPUP_DELAY_US;
+            let first = scene_at(&mut c, t, &s);
+            let second = scene_at(&mut c, t, &s);
+            assert_eq!(first, second);
+            let idx = c.switcher_commit(&mut s).unwrap();
+            (first, idx, s.active())
+        };
+        assert_eq!(once(), once());
     }
 }

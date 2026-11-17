@@ -4,8 +4,9 @@
 use std::time::{Duration, Instant};
 
 use lucina_app::keys;
+use lucina_app::theme;
 use lucina_app::time::Zone;
-use lucina_app::{Face, ListState, Rect, Rgb, TextEdit, Ui};
+use lucina_app::{Face, ListState, Rect, TextEdit, Ui};
 use lucina_app_support::dates::{edited_label, now_ms, reminder_label, reminder_presets, to_iso};
 
 use crate::model::{
@@ -534,7 +535,7 @@ impl Editor {
                             }
                         }
                         if ui.painting() {
-                            let fill = palette(c).unwrap_or(Rgb::hex(0x202124));
+                            let fill = palette(c).unwrap_or(theme::PANEL);
                             ui.fill_round(rect.inset(t.px(3.0)), size / 2, fill);
                             if self.color == c {
                                 ui.text_in(

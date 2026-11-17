@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use lucina_app::program::{Ended, Program};
-use lucina_app::{Face, Image, Rect, Rgb, TextEdit, Ui, keys};
+use lucina_app::{Face, Image, Rect, TextEdit, Ui, keys};
 use lucina_files::pictures::{Fit, Want};
 use lucina_nav as nav;
 use lucina_picture_view::PictureView;
@@ -76,18 +76,34 @@ impl Viewer {
                 && let Some(url) = item.preview_url()
                 && !self.fitted.contains_key(&(url.to_owned(), item.rotation))
             {
-                out.push(Want { url: url.to_owned(), fit, rotation: item.rotation });
+                out.push(Want {
+                    url: url.to_owned(),
+                    fit,
+                    rotation: item.rotation,
+                });
             }
         };
         at(self.index, &mut out);
-        if let (true, Some(view), Some(item)) = (self.picture.is_zoomed(), self.picture.view(), items.get(self.index)) {
+        if let (true, Some(view), Some(item)) = (
+            self.picture.is_zoomed(),
+            self.picture.view(),
+            items.get(self.index),
+        ) {
             let have = self.source_url.as_deref();
             // The original only when the drawn size has outrun the 1600 px picture, as on the other Secretary apps.
-            let want = if view.wants_original(1600.0, 1.0) { item.decodable_original().or(item.preview_url()) } else { item.preview_url() };
+            let want = if view.wants_original(1600.0, 1.0) {
+                item.decodable_original().or(item.preview_url())
+            } else {
+                item.preview_url()
+            };
             if let Some(url) = want
                 && have != Some(url)
             {
-                out.push(Want { url: url.to_owned(), fit: Fit::Within(ZOOM_FIT, ZOOM_FIT), rotation: item.rotation });
+                out.push(Want {
+                    url: url.to_owned(),
+                    fit: Fit::Within(ZOOM_FIT, ZOOM_FIT),
+                    rotation: item.rotation,
+                });
             }
         }
         at(self.index + 1, &mut out);
@@ -115,7 +131,9 @@ impl Viewer {
 
     pub fn picture_failed(&mut self, want: &Want, e: &str) {
         // A larger form that does not decode (a HEIC): the 1600 px picture goes on being the zoom.
-        if want.fit != Fit::Within(ZOOM_FIT, ZOOM_FIT) && !self.fitted.keys().any(|(u, _)| *u == want.url) {
+        if want.fit != Fit::Within(ZOOM_FIT, ZOOM_FIT)
+            && !self.fitted.keys().any(|(u, _)| *u == want.url)
+        {
             self.failed = Some(e.to_owned());
         }
     }
@@ -128,12 +146,16 @@ impl Viewer {
         if self.fitted.len() <= KEPT {
             return;
         }
-        let keep: Vec<(String, u16)> = [self.index.checked_sub(1), Some(self.index), Some(self.index + 1)]
-            .into_iter()
-            .flatten()
-            .filter_map(|i| items.get(i))
-            .filter_map(|it| it.preview_url().map(|u| (u.to_owned(), it.rotation)))
-            .collect();
+        let keep: Vec<(String, u16)> = [
+            self.index.checked_sub(1),
+            Some(self.index),
+            Some(self.index + 1),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|i| items.get(i))
+        .filter_map(|it| it.preview_url().map(|u| (u.to_owned(), it.rotation)))
+        .collect();
         self.fitted.retain(|k, _| keep.contains(k));
     }
 
@@ -157,7 +179,9 @@ pub fn view(g: &mut Gallery, ui: &mut Ui) {
     if let Some(Ended::Failed(why) | Ended::NotStarted(why)) = ui.program_ended() {
         g.say(why);
     }
-    let Some(index) = g.viewer.as_ref().map(|v| v.index) else { return };
+    let Some(index) = g.viewer.as_ref().map(|v| v.index) else {
+        return;
+    };
     let Some(item) = g.items.get(index).cloned() else {
         g.viewer = None;
         return;
@@ -167,33 +191,75 @@ pub fn view(g: &mut Gallery, ui: &mut Ui) {
     // The bar.
     let bar = ui.cut_top(t.px(40.0));
     ui.fill(bar, t.bar);
-    let title = if item.title.is_empty() { "Photo".to_owned() } else { item.title.clone() };
+    let title = if item.title.is_empty() {
+        "Photo".to_owned()
+    } else {
+        item.title.clone()
+    };
     let n = g.items.len();
     let more = if g.has_more() { "+" } else { "" };
-    ui.text_in(Rect::new(bar.x + t.px(12.0), bar.y + t.px(2.0), bar.w - t.px(360.0), t.px(20.0)), Face::Bold, t.pt(14.0), t.text, &title);
-    let when = item.taken_at.as_deref().map_or_else(|| "Date unknown".to_owned(), |x| model::taken_label(x, None, &g.zone));
     ui.text_in(
-        Rect::new(bar.x + t.px(12.0), bar.y + t.px(21.0), bar.w - t.px(360.0), t.px(16.0)),
+        Rect::new(
+            bar.x + t.px(12.0),
+            bar.y + t.px(2.0),
+            bar.w - t.px(360.0),
+            t.px(20.0),
+        ),
+        Face::Bold,
+        t.pt(14.0),
+        t.text,
+        &title,
+    );
+    let when = item.taken_at.as_deref().map_or_else(
+        || "Date unknown".to_owned(),
+        |x| model::taken_label(x, None, &g.zone),
+    );
+    ui.text_in(
+        Rect::new(
+            bar.x + t.px(12.0),
+            bar.y + t.px(21.0),
+            bar.w - t.px(360.0),
+            t.px(16.0),
+        ),
         Face::Sans,
         t.pt(12.0),
         t.dim,
         &format!("{when} · {} of {n}{more}", index + 1),
     );
-    let hint = if trash { "← → · r restore · Delete forever · i info · Esc" } else { "← → · f ♥ · r rotate · i info · d download · Esc" };
+    let hint = if trash {
+        "← → · r restore · Delete forever · i info · Esc"
+    } else {
+        "← → · f ♥ · r rotate · i info · d download · Esc"
+    };
     let hint_w = ui.measure(Face::Sans, t.pt(12.0), hint);
-    ui.text_in(Rect::new(bar.right() - hint_w - t.px(10.0), bar.y, hint_w, bar.h), Face::Sans, t.pt(12.0), t.dim, hint);
+    ui.text_in(
+        Rect::new(bar.right() - hint_w - t.px(10.0), bar.y, hint_w, bar.h),
+        Face::Sans,
+        t.pt(12.0),
+        t.dim,
+        hint,
+    );
     if item.favorite {
-        ui.text_in(Rect::new(bar.right() - hint_w - t.px(36.0), bar.y, t.px(20.0), bar.h), Face::Bold, t.pt(15.0), Rgb(0xff_6b_81), "♥");
+        ui.text_in(
+            Rect::new(bar.right() - hint_w - t.px(36.0), bar.y, t.px(20.0), bar.h),
+            Face::Bold,
+            t.pt(15.0),
+            t.danger,
+            "♥",
+        );
     }
 
     let area = ui.area();
     let (pic, panel) = if info {
         let w = t.px(INFO_W).min(area.w / 2);
-        (Rect::new(area.x, area.y, area.w - w, area.h), Some(Rect::new(area.right() - w, area.y, w, area.h)))
+        (
+            Rect::new(area.x, area.y, area.w - w, area.h),
+            Some(Rect::new(area.right() - w, area.y, w, area.h)),
+        )
     } else {
         (area, None)
     };
-    ui.fill(pic, Rgb(0x05_07_10));
+    ui.fill(pic, t.bg);
     // First in the focus order, so that the keyboard starts here and not in the caption. It takes no pointer: the picture does.
     let enter = ui.focus_area("viewer-keys", Rect::new(pic.x, pic.y, 0, 0));
 
@@ -210,31 +276,69 @@ pub fn view(g: &mut Gallery, ui: &mut Ui) {
         let key = url.clone().map(|u| (u, item.rotation));
         let image = key.as_ref().and_then(|k| v.fitted.get(k));
         if v.picture.is_zoomed() || image.is_some() {
-            v.picture.show(ui, pic, image, 0x05_07_10);
+            v.picture.show(ui, pic, image, t.bg.0);
             if let (true, Some(view)) = (v.picture.is_zoomed(), v.picture.view()) {
                 let pct = (view.scale * 100.0).round() as u32;
                 let tag = Rect::new(pic.x + t.px(8.0), pic.y + t.px(8.0), t.px(60.0), t.px(20.0));
-                ui.fill_round(tag, t.px(4.0), Rgb(0x10_14_28));
-                ui.text_in(tag.inset(t.px(3.0)), Face::Sans, t.pt(12.0), t.text, &format!("{pct}%"));
+                ui.fill_round(tag, t.px(4.0), t.panel);
+                ui.text_in(
+                    tag.inset(t.px(3.0)),
+                    Face::Sans,
+                    t.pt(12.0),
+                    t.text,
+                    &format!("{pct}%"),
+                );
             }
         } else if url.is_none() {
-            ui.text_in(pic.inset(t.px(20.0)), Face::Sans, t.pt(15.0), t.item, "No picture of this one yet: the server has not made it.");
+            ui.text_in(
+                pic.inset(t.px(20.0)),
+                Face::Sans,
+                t.pt(15.0),
+                t.item,
+                "No picture of this one yet: the server has not made it.",
+            );
         } else if let Some(e) = &v.failed {
-            ui.text_in(pic.inset(t.px(20.0)), Face::Sans, t.pt(15.0), t.item, &format!("Couldn't load the picture. {e}"));
+            ui.text_in(
+                pic.inset(t.px(20.0)),
+                Face::Sans,
+                t.pt(15.0),
+                t.item,
+                &format!("Couldn't load the picture. {e}"),
+            );
         } else if let Some(tile) = g.tiles.get(&item.id) {
             // The tile, until the large picture is here.
             ui.image_in(pic, &tile.image);
         }
         if item.video {
             let foot = Rect::new(pic.x, pic.bottom() - t.px(30.0), pic.w, t.px(30.0));
-            ui.fill(foot, Rgb(0x10_14_28));
-            ui.text_in(foot.inset(t.px(6.0)), Face::Sans, t.pt(14.0), t.text, &format!("▶ {}  Enter plays it", model::format_duration(item.duration_ms.unwrap_or(0))));
+            ui.fill(foot, t.panel);
+            ui.text_in(
+                foot.inset(t.px(6.0)),
+                Face::Sans,
+                t.pt(14.0),
+                t.text,
+                &format!(
+                    "▶ {}  Enter plays it",
+                    model::format_duration(item.duration_ms.unwrap_or(0))
+                ),
+            );
         }
     }
     if !toast.is_empty() {
-        let line = Rect::new(pic.x + t.px(8.0), pic.bottom() - t.px(60.0), pic.w - t.px(16.0), t.px(24.0));
-        ui.fill_round(line, t.px(4.0), Rgb(0x10_14_28));
-        ui.text_in(line.inset(t.px(4.0)), Face::Sans, t.pt(13.0), t.text, &toast);
+        let line = Rect::new(
+            pic.x + t.px(8.0),
+            pic.bottom() - t.px(60.0),
+            pic.w - t.px(16.0),
+            t.px(24.0),
+        );
+        ui.fill_round(line, t.px(4.0), t.panel);
+        ui.text_in(
+            line.inset(t.px(4.0)),
+            Face::Sans,
+            t.pt(13.0),
+            t.text,
+            &toast,
+        );
     }
 
     // The panel.
@@ -262,9 +366,11 @@ pub fn view(g: &mut Gallery, ui: &mut Ui) {
         let used = v.picture.input(ui, "viewer-picture", pic, base);
         if used.clicked {
             let (px, py) = ui.pointer();
-            v.picture.toggle((px - pic.x) as f32, (py - pic.y) as f32, base, pic);
+            v.picture
+                .toggle((px - pic.x) as f32, (py - pic.y) as f32, base, pic);
         } else if enter.clicked {
-            v.picture.toggle(pic.w as f32 / 2.0, pic.h as f32 / 2.0, base, pic);
+            v.picture
+                .toggle(pic.w as f32 / 2.0, pic.h as f32 / 2.0, base, pic);
         }
     }
     let Some(p) = ui.press() else { return };
@@ -302,7 +408,9 @@ pub fn view(g: &mut Gallery, ui: &mut Ui) {
             };
             match to {
                 Some(to) if to != index => walk(g, to),
-                _ if p.code == keys::KEY_RIGHT && g.has_more() => g.load_more(crate::app::FIRST_PAGE),
+                _ if p.code == keys::KEY_RIGHT && g.has_more() => {
+                    g.load_more(crate::app::FIRST_PAGE)
+                }
                 _ => {}
             }
         }
@@ -323,7 +431,10 @@ pub fn view(g: &mut Gallery, ui: &mut Ui) {
 }
 
 fn picture_size(item: &Item, pic: Rect) -> (u32, u32) {
-    let (mut w, mut h) = (item.width.unwrap_or(pic.w.max(1) as u32), item.height.unwrap_or(pic.h.max(1) as u32));
+    let (mut w, mut h) = (
+        item.width.unwrap_or(pic.w.max(1) as u32),
+        item.height.unwrap_or(pic.h.max(1) as u32),
+    );
     if item.rotation == 90 || item.rotation == 270 {
         std::mem::swap(&mut w, &mut h);
     }
@@ -364,7 +475,9 @@ fn toggle_info(g: &mut Gallery, item: &Item) {
     v.info = !v.info;
     if v.info {
         v.details = None;
-        g.send(Job::Details { id: item.id.clone() });
+        g.send(Job::Details {
+            id: item.id.clone(),
+        });
     }
 }
 
@@ -400,18 +513,26 @@ fn info_panel(g: &mut Gallery, ui: &mut Ui, r: Rect, item: &Item) {
         Some(Ok(a)) => a.iter().map(|x| (x.id.clone(), x.title.clone())).collect(),
         _ => Vec::new(),
     };
-    let trash_note = item.trash_expires_at.as_deref().and_then(|e| model::days_left(e, g.now_ms)).map(|left| match left {
-        0 => "In the Trash. About to be removed for good.".to_owned(),
-        1 => "In the Trash. Removed for good in 1 day.".to_owned(),
-        n => format!("In the Trash. Removed for good in {n} days."),
-    });
+    let trash_note = item
+        .trash_expires_at
+        .as_deref()
+        .and_then(|e| model::days_left(e, g.now_ms))
+        .map(|left| match left {
+            0 => "In the Trash. About to be removed for good.".to_owned(),
+            1 => "In the Trash. Removed for good in 1 day.".to_owned(),
+            n => format!("In the Trash. Removed for good in {n} days."),
+        });
     let mut save = false;
     if let Some(v) = g.viewer.as_mut() {
         if v.caption_id != item.id {
             v.caption_id = item.id.clone();
             v.caption.set(item.caption.as_deref().unwrap_or(""));
         }
-        let details = v.details.as_ref().filter(|(id, _)| *id == item.id).map(|(_, d)| d);
+        let details = v
+            .details
+            .as_ref()
+            .filter(|(id, _)| *id == item.id)
+            .map(|(_, d)| d);
         let trash = trash_note.clone();
         ui.within(r.inset(t.px(12.0)), |ui| {
             ui.heading("Info");
@@ -448,7 +569,19 @@ fn info_rows(ui: &mut Ui, rows: &[(String, String)]) {
     let t = ui.theme();
     for (k, v) in rows {
         let r = ui.cut_top(t.px(36.0));
-        ui.text_in(Rect::new(r.x, r.y, r.w, t.px(15.0)), Face::Sans, t.pt(11.0), t.dim, k);
-        ui.text_in(Rect::new(r.x, r.y + t.px(15.0), r.w, t.px(19.0)), Face::Sans, t.pt(14.0), t.text, v);
+        ui.text_in(
+            Rect::new(r.x, r.y, r.w, t.px(15.0)),
+            Face::Sans,
+            t.pt(11.0),
+            t.dim,
+            k,
+        );
+        ui.text_in(
+            Rect::new(r.x, r.y + t.px(15.0), r.w, t.px(19.0)),
+            Face::Sans,
+            t.pt(14.0),
+            t.text,
+            v,
+        );
     }
 }

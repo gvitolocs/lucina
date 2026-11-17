@@ -33,23 +33,28 @@ extern crate eyra;
 mod app_groups;
 mod apps;
 mod ax;
+mod backdrop;
 mod backlight;
 mod control;
 mod dash;
 mod events;
 mod fnkeys;
+mod gesture_feed;
 mod home_cache;
 mod home_feed;
 mod net;
 mod power_watch;
+mod pressure_watch;
 mod pty;
 mod settings;
 mod spawn;
 mod standby;
+mod surface_table;
 mod system;
 mod term;
 mod ui;
 mod volume;
+mod wm_scene;
 
 use std::time::{Duration, Instant};
 

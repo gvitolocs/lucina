@@ -1225,7 +1225,7 @@ fn card(ui: &mut Ui, e: &Entry, r: Rect, selected: bool, zone: &Zone, now: i64) 
             ui.fill_round(
                 pill,
                 pill.h / 2,
-                Rgb::hex(0xffffff).over(palette(&n.color).unwrap_or(t.panel), 0x28),
+                lucina_app::theme::WHITE.over(palette(&n.color).unwrap_or(t.panel), 0x28),
             );
             ui.text_in(
                 Rect::new(x + t.px(7.0), pill.y, w - t.px(10.0), pill.h),

@@ -1,10 +1,14 @@
 //! A proof must not read a file the public snapshot leaves out (docs/ci/AUTO-SYNC.md). On 2026-11-11 the net-installer proof read
 //! `services/lucina-release/src/rules.rs`, a crate no `group` line of `tools/ci/public-snapshot.rules` named, so the sync branch failed on
 //! GitHub with "couldn't find file". This finds that on buildhost, at merge time: every `#[path = "..."]` file a Verus proof pulls in,
-//! followed through the files it pulls in, must be one the snapshot rules include.
+//! followed through the files it pulls in, must be one the snapshot rules include. The same rule for the launcher's own tests
+//! (`test_path_gaps`): the public copy runs `cargo test` of itself at every auto-sync precheck, and on 2026-11-16 and 2026-11-17 two
+//! launcher tests in a row died there because the `scripts/tests/` script each runs was left out of the copy.
 
 use crate::inventory::Unit;
 use crate::snapshot::{self, Rules};
+use crate::spec;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The `#[path = "..."]` strings of a Rust source, in order.
@@ -232,6 +236,193 @@ fn check_proofs(root: &Path, units: &[Unit]) -> Result<Vec<(String, String)>, St
     Ok(gaps(root, units, &rules))
 }
 
+/// The repo paths a `scripts/` or `docs/ci/` text names: from each marker to the end of the path word. A marker glued into a
+/// longer word (`userscripts/x`) is not a path, and one that ends the text (`docs/ci/` alone) names nothing.
+fn named_paths(text: &str) -> Vec<String> {
+    const MARKERS: [&str; 2] = ["scripts/", "docs/ci/"];
+    let mut out: Vec<String> = Vec::new();
+    for m in MARKERS {
+        let mut at = 0;
+        while let Some(k) = text[at..].find(m) {
+            let i = at + k;
+            at = i + m.len();
+            let glued = text[..i]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            if glued {
+                continue;
+            }
+            let rest = &text[i..];
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || "_-./".contains(c)))
+                .unwrap_or(rest.len());
+            let w = &rest[..end];
+            if w.len() > m.len() && !out.iter().any(|p| p == w) {
+                out.push(w.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The token ranges of the bodies of this file's `#[cfg(test)]` items. The lexer reads a string whole, so a `#[cfg(test)]`
+/// inside fixture text opens nothing; a `mod t;` declaration has no body here and its file is not opened.
+fn cfg_test_regions(t: &[spec::Tok]) -> Vec<(usize, usize)> {
+    let mut regions = Vec::new();
+    let mut i = 0;
+    while i < t.len() {
+        let Some(e) = spec::attr_end(t, i) else {
+            i += 1;
+            continue;
+        };
+        let name: String = t[i..e]
+            .iter()
+            .map(|x| x.s.as_str())
+            .collect::<Vec<_>>()
+            .join("");
+        if !name.contains("cfg(test)") {
+            i = e;
+            continue;
+        }
+        let mut k = e;
+        while let Some(e2) = spec::attr_end(t, k) {
+            k = e2;
+        }
+        let mut d = 0i32;
+        let mut j = k;
+        while j < t.len() {
+            match t[j].s.as_str() {
+                "(" | "[" => d += 1,
+                ")" | "]" => d -= 1,
+                "{" if d <= 0 => {
+                    let close = spec::match_brace(t, j);
+                    regions.push((j, close + 1));
+                    j = close;
+                    break;
+                }
+                ";" if d <= 0 => break,
+                _ => {}
+            }
+            j += 1;
+        }
+        i = j + 1;
+    }
+    regions
+}
+
+/// A token holding a string literal (a raw one included).
+fn is_string(s: &str) -> bool {
+    s.starts_with('"') || s.starts_with("r\"") || s.starts_with("r#\"")
+}
+
+/// `const NAME: &str = "value"` of this file: name to value. A test names the record paths through them (`CUTOFF`-style
+/// constants), so a use of the name counts as naming the value. Cross-file and `concat!` values are not followed.
+fn path_consts(t: &[spec::Tok]) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut i = 0;
+    while i + 2 < t.len() {
+        if t[i].s == "const" && t[i + 1].ident {
+            let mut j = i + 2;
+            while j < t.len() && !(t[j].s == "=" || t[j].s == ";" || t[j].s == "{") {
+                j += 1;
+            }
+            if j + 1 < t.len() && t[j].s == "=" && !t[j + 1].ident && is_string(&t[j + 1].s) {
+                out.insert(t[i + 1].s.clone(), t[j + 1].s.clone());
+            }
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The paths a token range names: in its strings, and through the file's `const` values used as names.
+fn named_in(
+    t: &[spec::Tok],
+    a: usize,
+    b: usize,
+    consts: &BTreeMap<String, String>,
+    out: &mut Vec<String>,
+) {
+    for tok in &t[a.min(t.len())..b.min(t.len())] {
+        let found = if tok.ident {
+            consts.get(&tok.s).map_or(Vec::new(), |v| named_paths(v))
+        } else {
+            named_paths(&tok.s)
+        };
+        for p in found {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+}
+
+/// The omissions the rules declare on purpose: a `# private-only <path>` comment line, for a test that carries a private
+/// path as fixture text and never reads the real file.
+pub fn private_only_markers(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("# private-only "))
+        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+        .collect()
+}
+
+/// The messages for every `scripts/` or `docs/ci/` path the launcher's own tests name that exists in the private tree but
+/// the snapshot neither includes nor declares private. The tests of `tools/ci/lucina-ci/tests` count whole (each is one),
+/// in `src` only the `#[cfg(test)]` bodies do: production text is prose, not a test reading.
+pub fn test_path_gaps(root: &Path, rules: &Rules, marked: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in ["tools/ci/lucina-ci/tests", "tools/ci/lucina-ci/src"] {
+        let Ok(rd) = std::fs::read_dir(root.join(dir)) else {
+            continue;
+        };
+        let mut names: Vec<String> = rd
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".rs"))
+            .collect();
+        names.sort();
+        for name in names {
+            let rel = format!("{dir}/{name}");
+            let Ok(src) = std::fs::read_to_string(root.join(&rel)) else {
+                continue;
+            };
+            let t = spec::lex(&src, &[], &[]);
+            let consts = path_consts(&t);
+            let mut paths = Vec::new();
+            if dir.ends_with("src") {
+                for (a, b) in cfg_test_regions(&t) {
+                    named_in(&t, a, b, &consts, &mut paths);
+                }
+            } else {
+                named_in(&t, 0, t.len(), &consts, &mut paths);
+            }
+            for p in paths {
+                if root.join(&p).exists() && !snapshot::included(rules, &p) && !marked.contains(&p)
+                {
+                    out.push(format!(
+                        "{rel} reads {p}, which tools/ci/public-snapshot.rules leaves out (the public copy runs this test)"
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Only in the private tree, like the `#[path]` check above: the public copy has neither `crates/` nor the rules file.
+/// `rules_path` may name another copy of the rules, to ask whether an older one would have passed.
+pub fn check_test_paths(root: &Path, rules_path: &Path) -> Result<Vec<String>, String> {
+    if !root.join("crates").is_dir() || !rules_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(rules_path).map_err(|e| e.to_string())?;
+    let rules = snapshot::parse_rules(&text)?;
+    Ok(test_path_gaps(root, &rules, &private_only_markers(&text)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +583,93 @@ mod tests {
         )
         .unwrap();
         assert!(gaps(&t, &both, &rules).is_empty());
+        std::fs::remove_dir_all(&t).ok();
+    }
+
+    fn zz_file(t: &Path, rel: &str, text: &str) {
+        let p = t.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+
+    #[test]
+    fn a_launcher_test_may_only_name_paths_the_snapshot_holds() {
+        let t = std::env::temp_dir().join(format!("lucina-ci-testpaths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(t.join("crates")).unwrap();
+        zz_file(&t, "scripts/tests/zzz-test.sh", "");
+        zz_file(
+            &t,
+            "tools/ci/lucina-ci/tests/zzz_launcher.rs",
+            "use std::path::Path;\n#[test]\nfn z() {\n    let s = Path::new(env!(\"CARGO_MANIFEST_DIR\")).join(\"../../../scripts/tests/zzz-test.sh\");\n    let gone = \"scripts/tests/zzz-gone.sh\";\n    assert!(s.exists() || gone.is_empty());\n}\n",
+        );
+        let rp = t.join("tools/ci/public-snapshot.rules");
+        // Included: nothing to say.
+        std::fs::write(&rp, "include scripts/\n").unwrap();
+        assert!(check_test_paths(&t, &rp).unwrap().is_empty());
+        // Left out: refused with that message. The named path that does not exist (zzz-gone.sh) is ignored.
+        std::fs::write(&rp, "include scripts/zzz-other.sh\n").unwrap();
+        assert_eq!(
+            check_test_paths(&t, &rp).unwrap(),
+            [
+                "tools/ci/lucina-ci/tests/zzz_launcher.rs reads scripts/tests/zzz-test.sh, which tools/ci/public-snapshot.rules leaves out (the public copy runs this test)"
+            ]
+        );
+        // Excluded by an `exclude` line: still an omission the copy runs into, not a declared one.
+        std::fs::write(&rp, "include scripts/\nexclude scripts/tests/zzz-test.sh\n").unwrap();
+        assert_eq!(check_test_paths(&t, &rp).unwrap().len(), 1);
+        // Declared private with a comment marker: the check takes the word and asks no more.
+        std::fs::write(
+            &rp,
+            "# private-only scripts/tests/zzz-test.sh the test carries the name only\ninclude scripts/zzz-other.sh\n",
+        )
+        .unwrap();
+        assert!(check_test_paths(&t, &rp).unwrap().is_empty());
+        std::fs::remove_dir_all(&t).ok();
+    }
+
+    #[test]
+    fn only_the_cfg_test_bodies_of_src_files_count() {
+        let t =
+            std::env::temp_dir().join(format!("lucina-ci-testpaths-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(t.join("crates")).unwrap();
+        for f in [
+            "scripts/tests/zzz-a.sh",
+            "scripts/tests/zzz-b.sh",
+            "scripts/tests/zzz-c.sh",
+            "scripts/tests/zzz-prod.sh",
+        ] {
+            zz_file(&t, f, "");
+        }
+        zz_file(
+            &t,
+            "tools/ci/lucina-ci/src/zzz.rs",
+            r##"pub const SCRIPT: &str = "scripts/tests/zzz-c.sh";
+pub fn prod() { let _ = "scripts/tests/zzz-prod.sh"; }
+#[cfg(test)]
+mod tests {
+    fn z() { let _ = super::SCRIPT; let _ = "scripts/tests/zzz-a.sh"; }
+}
+fn fixture() { let _ = "#[cfg(test)]\nmod fake { let _ = \"scripts/tests/zzz-b.sh\"; }"; }
+"##,
+        );
+        let rp = t.join("tools/ci/public-snapshot.rules");
+        std::fs::write(&rp, "include scripts/zzz-other.sh\n").unwrap();
+        let g = check_test_paths(&t, &rp).unwrap();
+        // The literal of the test mod and the CUTOFF-style constant it uses count; production text and a `#[cfg(test)]`
+        // that only lives inside a fixture string do not.
+        assert!(
+            g.iter()
+                .any(|m| m.contains("reads scripts/tests/zzz-a.sh,")),
+            "{g:?}"
+        );
+        assert!(
+            g.iter()
+                .any(|m| m.contains("reads scripts/tests/zzz-c.sh,")),
+            "{g:?}"
+        );
+        assert_eq!(g.len(), 2, "{g:?}");
         std::fs::remove_dir_all(&t).ok();
     }
 }

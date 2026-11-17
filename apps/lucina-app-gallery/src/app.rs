@@ -50,7 +50,14 @@ pub enum Dialog {
     /// `AlbumPicker`, for these ids.
     AddToAlbum(Vec<String>),
     /// `DeleteDialog`, for these ids.
-    Delete { ids: Vec<String>, purge: bool, also_device: bool, understood: bool, error: Option<String>, busy: bool },
+    Delete {
+        ids: Vec<String>,
+        purge: bool,
+        also_device: bool,
+        understood: bool,
+        error: Option<String>,
+        busy: bool,
+    },
 }
 
 pub struct Tile {
@@ -127,11 +134,17 @@ pub struct Gallery {
 }
 
 impl Gallery {
-    pub fn new(zone: Zone, tx: Option<Sender<Msg>>, link: Option<Link>, connect: Option<Connect>) -> Gallery {
+    pub fn new(
+        zone: Zone,
+        tx: Option<Sender<Msg>>,
+        link: Option<Link>,
+        connect: Option<Connect>,
+    ) -> Gallery {
         let pictures = match (&tx, connect) {
             (Some(tx), Some(c)) => {
                 let tx = tx.clone();
-                let cache = places::cache_dir("gallery").map(|d| Arc::new(DiskCache::new(d.join("pictures"), CACHE_LIMIT)));
+                let cache = places::cache_dir("gallery")
+                    .map(|d| Arc::new(DiskCache::new(d.join("pictures"), CACHE_LIMIT)));
                 Some(Pictures::start(c, cache, move |d| tx.send(Msg::Picture(d))))
             }
             _ => None,
@@ -202,7 +215,11 @@ impl Gallery {
         self
     }
 
-    pub fn with_sign_in(mut self, s: Box<dyn FnMut() -> Option<SignInView>>, w: Box<dyn FnMut() -> Option<Link>>) -> Gallery {
+    pub fn with_sign_in(
+        mut self,
+        s: Box<dyn FnMut() -> Option<SignInView>>,
+        w: Box<dyn FnMut() -> Option<Link>>,
+    ) -> Gallery {
         self.make_sign_in = Some(s);
         self.make_worker = Some(w);
         self
@@ -237,8 +254,15 @@ impl Gallery {
             q: self.words.clone(),
             favorite: self.favorites && !trash,
             trashed: trash,
-            album: if let Shelf::Album { id, .. } = &self.shelf { Some(id.clone()) } else { None },
-            smart: self.smart_ready && !self.smart_refused && !trash && !self.words.trim().is_empty(),
+            album: if let Shelf::Album { id, .. } = &self.shelf {
+                Some(id.clone())
+            } else {
+                None
+            },
+            smart: self.smart_ready
+                && !self.smart_refused
+                && !trash
+                && !self.words.trim().is_empty(),
         }
     }
 
@@ -267,7 +291,12 @@ impl Gallery {
             return;
         }
         self.loading = true;
-        let job = Job::Page { generation: self.generation, query: self.query(), cursor: self.cursor.clone(), limit };
+        let job = Job::Page {
+            generation: self.generation,
+            query: self.query(),
+            cursor: self.cursor.clone(),
+            limit,
+        };
         self.send(job);
     }
 
@@ -286,13 +315,17 @@ impl Gallery {
         while i < n {
             let key = model::section_key(self.items[i].at_ms, &self.zone);
             if last_key.as_deref() != Some(&key) {
-                self.labels.insert(self.rows.len(), model::section_label(&key));
+                self.labels
+                    .insert(self.rows.len(), model::section_label(&key));
                 self.rows.push(GridRow::Header { key_at: i });
                 last_key = Some(key);
                 in_row = 0;
             }
             if in_row == 0 {
-                self.rows.push(GridRow::Tiles { start: i, end: i + 1 });
+                self.rows.push(GridRow::Tiles {
+                    start: i,
+                    end: i + 1,
+                });
             } else if let Some(GridRow::Tiles { end, .. }) = self.rows.last_mut() {
                 *end = i + 1;
             }
@@ -336,9 +369,15 @@ impl Gallery {
 
     /// `scrollToReveal`.
     fn reveal(&mut self) {
-        let Some((row, y)) = self.locate(self.focus) else { return };
+        let Some((row, y)) = self.locate(self.focus) else {
+            return;
+        };
         // The day's header too, when it is the first row of its section.
-        let top = if row > 0 && matches!(self.rows[row - 1], GridRow::Header { .. }) { y - self.header_h() } else { y };
+        let top = if row > 0 && matches!(self.rows[row - 1], GridRow::Header { .. }) {
+            y - self.header_h()
+        } else {
+            y
+        };
         if top < self.scroll {
             self.scroll = top;
         } else if y + self.side > self.scroll + self.view_h {
@@ -353,8 +392,12 @@ impl Gallery {
 
     /// `neighbour`: left and right follow the reading order; up and down stay in the column.
     pub fn neighbour(&self, index: usize, up: bool) -> usize {
-        let Some((row, _)) = self.locate(index) else { return index };
-        let GridRow::Tiles { start, .. } = self.rows[row] else { return index };
+        let Some((row, _)) = self.locate(index) else {
+            return index;
+        };
+        let GridRow::Tiles { start, .. } = self.rows[row] else {
+            return index;
+        };
         let col = index - start;
         let mut r = row as i64 + if up { -1 } else { 1 };
         while r >= 0 && (r as usize) < self.rows.len() {
@@ -382,7 +425,9 @@ impl Gallery {
     }
 
     fn toggle_selected(&mut self, index: usize) {
-        let Some(id) = self.items.get(index).map(|i| i.id.clone()) else { return };
+        let Some(id) = self.items.get(index).map(|i| i.id.clone()) else {
+            return;
+        };
         if !self.selected.remove(&id) {
             self.selected.insert(id);
         }
@@ -390,7 +435,11 @@ impl Gallery {
     }
 
     pub fn selected_ids(&self) -> Vec<String> {
-        self.items.iter().filter(|i| self.selected.contains(&i.id)).map(|i| i.id.clone()).collect()
+        self.items
+            .iter()
+            .filter(|i| self.selected.contains(&i.id))
+            .map(|i| i.id.clone())
+            .collect()
     }
 
     fn items_of(&self, ids: &[String]) -> Vec<&Item> {
@@ -455,9 +504,20 @@ impl Gallery {
         self.toast_until = Some(Instant::now() + Duration::from_secs(6));
     }
 
-    pub(crate) fn run_batch(&mut self, op: &'static str, ids: Vec<String>, album: Option<String>, also_from_device: bool) {
+    pub(crate) fn run_batch(
+        &mut self,
+        op: &'static str,
+        ids: Vec<String>,
+        album: Option<String>,
+        also_from_device: bool,
+    ) {
         if !ids.is_empty() {
-            self.send(Job::Batch { op, ids, album, also_from_device });
+            self.send(Job::Batch {
+                op,
+                ids,
+                album,
+                also_from_device,
+            });
         }
     }
 
@@ -466,7 +526,14 @@ impl Gallery {
             return;
         }
         let purge = self.shelf == Shelf::Trash;
-        self.dialog = Some(Dialog::Delete { ids, purge, also_device: false, understood: false, error: None, busy: false });
+        self.dialog = Some(Dialog::Delete {
+            ids,
+            purge,
+            also_device: false,
+            understood: false,
+            error: None,
+            busy: false,
+        });
     }
 
     pub(crate) fn open_album_picker(&mut self, ids: Vec<String>) {
@@ -486,18 +553,32 @@ impl Gallery {
                 tx.send(Msg::Changed);
             }
         });
-        let name = if item.title.is_empty() { "photo".to_owned() } else { picker::safe_name(&item.title) };
+        let name = if item.title.is_empty() {
+            "photo".to_owned()
+        } else {
+            picker::safe_name(&item.title)
+        };
         let mut list = places::standard();
         list.rotate_left(2); // Pictures first.
-        let setup = Setup { title: format!("Download {name}"), mode: Mode::Save { name }, places: list, drive: None, fetch_to: None };
+        let setup = Setup {
+            title: format!("Download {name}"),
+            mode: Mode::Save { name },
+            places: list,
+            drive: None,
+            fetch_to: None,
+        };
         self.download = Some(item);
         self.picker = Some(FilePicker::start(setup, wake));
     }
 
     fn picked(&mut self, p: Picked) {
         self.picker = None;
-        let Some(item) = self.download.take() else { return };
-        let Picked::File(dest): Picked = p else { return };
+        let Some(item) = self.download.take() else {
+            return;
+        };
+        let Picked::File(dest): Picked = p else {
+            return;
+        };
         self.say("Downloading…".to_owned());
         let url = item.download_url();
         self.send(Job::Download { url, dest });
@@ -527,9 +608,14 @@ impl Gallery {
     }
 
     fn continue_seek(&mut self) {
-        let Some(month) = self.seek_month.clone() else { return };
+        let Some(month) = self.seek_month.clone() else {
+            return;
+        };
         let day = month.len();
-        let found = self.items.iter().position(|i| model::section_key(i.at_ms, &self.zone)[..day.min(7)] <= *month);
+        let found = self
+            .items
+            .iter()
+            .position(|i| model::section_key(i.at_ms, &self.zone)[..day.min(7)] <= *month);
         if let Some(i) = found {
             self.seek_month = None;
             self.move_focus(i, false);
@@ -551,14 +637,20 @@ impl Gallery {
         } else {
             let (first, last) = self.visible_range();
             let span = last.saturating_sub(first).max(1);
-            let order = (first..last).chain(last..(last + span).min(self.items.len())).chain(first.saturating_sub(span)..first);
+            let order = (first..last)
+                .chain(last..(last + span).min(self.items.len()))
+                .chain(first.saturating_sub(span)..first);
             for i in order {
                 let item = &self.items[i];
                 if self.tiles.get(&item.id).is_some_and(|t| !t.placeholder) {
                     continue;
                 }
                 let Some(url) = item.tile_url() else { continue };
-                wants.push(Want { url: url.to_owned(), fit: Fit::Square(side), rotation: item.rotation });
+                wants.push(Want {
+                    url: url.to_owned(),
+                    fit: Fit::Square(side),
+                    rotation: item.rotation,
+                });
                 if !self.tiles.contains_key(&item.id)
                     && !self.asked_placeholder.contains(&item.id)
                     && let Some(h) = &item.thumbhash
@@ -579,7 +671,10 @@ impl Gallery {
             for (id, _) in &hashes {
                 self.asked_placeholder.insert(id.clone());
             }
-            self.send(Job::Placeholders { side, wanted: hashes });
+            self.send(Job::Placeholders {
+                side,
+                wanted: hashes,
+            });
         }
         self.let_go();
     }
@@ -589,11 +684,12 @@ impl Gallery {
         let (mut y, mut first, mut last) = (0, None, 0);
         for r in &self.rows {
             let h = self.row_h(*r);
-            if y + h > self.scroll && y < self.scroll + self.view_h {
-                if let GridRow::Tiles { start, end } = r {
-                    first.get_or_insert(*start);
-                    last = *end;
-                }
+            if y + h > self.scroll
+                && y < self.scroll + self.view_h
+                && let GridRow::Tiles { start, end } = r
+            {
+                first.get_or_insert(*start);
+                last = *end;
             }
             y += h;
             if y >= self.scroll + self.view_h {
@@ -672,7 +768,10 @@ impl App for Gallery {
                 self.loading = false;
                 match result {
                     Ok((page, next)) => {
-                        let fresh: Vec<Item> = page.into_iter().filter(|i| self.known.insert(i.id.clone())).collect();
+                        let fresh: Vec<Item> = page
+                            .into_iter()
+                            .filter(|i| self.known.insert(i.id.clone()))
+                            .collect();
                         self.items.extend(fresh);
                         self.cursor = next;
                         self.started = true;
@@ -697,7 +796,13 @@ impl App for Gallery {
                     self.say(e);
                 }
             },
-            Msg::Batched { op, album, done, failed, error } => self.batched(op, album, done, failed, error),
+            Msg::Batched {
+                op,
+                album,
+                done,
+                failed,
+                error,
+            } => self.batched(op, album, done, failed, error),
             Msg::AlbumMade(r) => match r {
                 Ok(a) => {
                     if let Some(Ok(list)) = &mut self.albums {
@@ -717,7 +822,10 @@ impl App for Gallery {
                 Done::SignedOut => self.signed_out_now(),
             },
             Msg::Placeholder(id, image) => {
-                self.tiles.entry(id).or_insert(Tile { image, placeholder: true });
+                self.tiles.entry(id).or_insert(Tile {
+                    image,
+                    placeholder: true,
+                });
             }
             Msg::Download(r) => {
                 let s = match r {
@@ -726,7 +834,9 @@ impl App for Gallery {
                 };
                 self.say(s);
             }
-            Msg::DownloadProgress(bytes) => self.say(format!("Downloading… {}", format_bytes(Some(bytes)))),
+            Msg::DownloadProgress(bytes) => {
+                self.say(format!("Downloading… {}", format_bytes(Some(bytes))))
+            }
         }
         crate::intents::answer_pending(self);
     }
@@ -756,7 +866,11 @@ impl App for Gallery {
             }
             return;
         }
-        ui.header(if self.sample { "Gallery: sample data" } else { "Gallery" });
+        ui.header(if self.sample {
+            "Gallery: sample data"
+        } else {
+            "Gallery"
+        });
         ui.pad(8.0);
         if self.albums_page {
             self.albums_view(ui);
@@ -782,19 +896,43 @@ impl Gallery {
         };
         if let Fit::Square(_) = want.fit {
             // The url names the item: `/v1/media/items/<id>/…` or a token's `/s/<token>/<id>/…`.
-            if let Some(item) = self.items.iter().find(|i| i.tile_url() == Some(want.url.as_str()) && i.rotation == want.rotation) {
+            if let Some(item) = self
+                .items
+                .iter()
+                .find(|i| i.tile_url() == Some(want.url.as_str()) && i.rotation == want.rotation)
+            {
                 let id = item.id.clone();
-                self.tiles.insert(id, Tile { image: img, placeholder: false });
+                self.tiles.insert(
+                    id,
+                    Tile {
+                        image: img,
+                        placeholder: false,
+                    },
+                );
             }
         }
     }
 
-    fn batched(&mut self, op: &'static str, album: Option<String>, done: Vec<String>, failed: usize, error: Option<String>) {
-        if let Some(Dialog::Delete { error: slot, busy, .. }) = &mut self.dialog {
+    fn batched(
+        &mut self,
+        op: &'static str,
+        album: Option<String>,
+        done: Vec<String>,
+        failed: usize,
+        error: Option<String>,
+    ) {
+        if let Some(Dialog::Delete {
+            error: slot, busy, ..
+        }) = &mut self.dialog
+        {
             *busy = false;
             if done.is_empty() && (failed > 0 || error.is_some()) {
                 *slot = Some(if failed > 0 {
-                    if failed == 1 { "1 item couldn't be removed.".to_owned() } else { format!("{failed} items couldn't be removed.") }
+                    if failed == 1 {
+                        "1 item couldn't be removed.".to_owned()
+                    } else {
+                        format!("{failed} items couldn't be removed.")
+                    }
                 } else {
                     "Couldn't finish. Check the connection and try again.".to_owned()
                 });
@@ -808,18 +946,37 @@ impl Gallery {
         let n = done.len();
         let plural = |one: &str, many: String| if n == 1 { one.to_owned() } else { many };
         let mut note = match op {
-            "trash" => plural("1 item moved to the Trash.", format!("{n} items moved to the Trash.")),
+            "trash" => plural(
+                "1 item moved to the Trash.",
+                format!("{n} items moved to the Trash."),
+            ),
             "purge" => plural("1 item deleted.", format!("{n} items deleted.")),
             "restore" => plural("1 item restored.", format!("{n} items restored.")),
-            "album_add" => plural("1 item added to the album.", format!("{n} items added to the album.")),
-            "album_remove" => plural("1 item removed from the album.", format!("{n} items removed from the album.")),
-            "favorite" => plural("1 item added to favorites.", format!("{n} items added to favorites.")),
-            "unfavorite" => plural("1 item removed from favorites.", format!("{n} items removed from favorites.")),
+            "album_add" => plural(
+                "1 item added to the album.",
+                format!("{n} items added to the album."),
+            ),
+            "album_remove" => plural(
+                "1 item removed from the album.",
+                format!("{n} items removed from the album."),
+            ),
+            "favorite" => plural(
+                "1 item added to favorites.",
+                format!("{n} items added to favorites."),
+            ),
+            "unfavorite" => plural(
+                "1 item removed from favorites.",
+                format!("{n} items removed from favorites."),
+            ),
             _ => String::new(),
         };
         if failed > 0 {
             note.push(' ');
-            note.push_str(&if failed == 1 { "1 item couldn't be changed.".to_owned() } else { format!("{failed} items couldn't be changed.") });
+            note.push_str(&if failed == 1 {
+                "1 item couldn't be changed.".to_owned()
+            } else {
+                format!("{failed} items couldn't be changed.")
+            });
         }
         if error.is_some() && done.is_empty() {
             note = "That didn't work. Try again.".to_owned();
@@ -871,8 +1028,16 @@ impl Gallery {
         };
         let mut go = None;
         let in_trash = self.shelf == Shelf::Trash;
-        if ui.button_at(place(58.0), "tb-trash", if in_trash { "Back" } else { "Trash" }) {
-            go = Some(if in_trash { Shelf::Everything } else { Shelf::Trash });
+        if ui.button_at(
+            place(58.0),
+            "tb-trash",
+            if in_trash { "Back" } else { "Trash" },
+        ) {
+            go = Some(if in_trash {
+                Shelf::Everything
+            } else {
+                Shelf::Trash
+            });
         }
         if ui.button_at(place(70.0), "tb-albums", "Albums") {
             self.albums_page = true;
@@ -902,7 +1067,12 @@ impl Gallery {
                 }
             }
         }
-        let field = Rect::new(bar.x + t.px(10.0), bar.y, (x - bar.x - t.px(10.0)).max(t.px(60.0)), t.px(32.0));
+        let field = Rect::new(
+            bar.x + t.px(10.0),
+            bar.y,
+            (x - bar.x - t.px(10.0)).max(t.px(60.0)),
+            t.px(32.0),
+        );
         let res = ui.text_field_at(field, "search", &mut self.search);
         if res.changed {
             self.search_at = Some(Instant::now() + DEBOUNCE);
@@ -997,11 +1167,26 @@ impl Gallery {
             self.selection_bar(ui);
         } else if !title.is_empty() || !self.toast.is_empty() {
             let r = ui.cut_top(t.px(22.0));
-            let line = if self.toast.is_empty() { title } else { self.toast.clone() };
-            ui.text_in(Rect::new(r.x + t.px(12.0), r.y, r.w - t.px(24.0), r.h), Face::Sans, t.pt(13.0), t.item, &line);
+            let line = if self.toast.is_empty() {
+                title
+            } else {
+                self.toast.clone()
+            };
+            ui.text_in(
+                Rect::new(r.x + t.px(12.0), r.y, r.w - t.px(24.0), r.h),
+                Face::Sans,
+                t.pt(13.0),
+                t.item,
+                &line,
+            );
         }
         let area = ui.area();
-        let r = Rect::new(area.x + t.px(10.0), area.y, area.w - t.px(20.0), area.h - t.px(4.0));
+        let r = Rect::new(
+            area.x + t.px(10.0),
+            area.y,
+            area.w - t.px(20.0),
+            area.h - t.px(4.0),
+        );
         // The grid's shape. It changes only with the screen, so a tile fetched once stays right.
         let target = t.px(128.0).max(48);
         let gap = (target / 40).max(2);
@@ -1045,7 +1230,11 @@ impl Gallery {
         self.paint_grid(ui, r);
         // `EmptyState` and friends.
         let empty_note = if let Some(e) = &self.failed {
-            Some(if self.items.is_empty() { format!("Couldn't load the gallery. {e}") } else { format!("Couldn't load more. {e}") })
+            Some(if self.items.is_empty() {
+                format!("Couldn't load the gallery. {e}")
+            } else {
+                format!("Couldn't load more. {e}")
+            })
         } else if self.items.is_empty() && self.loading {
             Some("Loading…".to_owned())
         } else if self.items.is_empty() && self.started {
@@ -1059,10 +1248,20 @@ impl Gallery {
             None
         };
         if let Some(n) = empty_note {
-            ui.text_in(Rect::new(r.x + t.px(4.0), r.y + t.px(4.0), r.w, t.px(28.0)), Face::Sans, t.pt(15.0), t.dim, &n);
+            ui.text_in(
+                Rect::new(r.x + t.px(4.0), r.y + t.px(4.0), r.w, t.px(28.0)),
+                Face::Sans,
+                t.pt(15.0),
+                t.dim,
+                &n,
+            );
         }
         // Next page, ahead of the scroll.
-        if self.has_more() && !self.loading && self.failed.is_none() && self.total_h() - self.scroll - self.view_h < self.view_h * 2 {
+        if self.has_more()
+            && !self.loading
+            && self.failed.is_none()
+            && self.total_h() - self.scroll - self.view_h < self.view_h * 2
+        {
             self.load_more(FIRST_PAGE);
         }
         // A pass after a dialog closes still counts as inside it, and forgets a focus given then: until it has taken.
@@ -1087,15 +1286,20 @@ impl Gallery {
         let Some(p) = ui.press() else { return };
         let (shift, plain) = (p.mods.shift, !p.mods.ctrl && !p.mods.alt && !p.mods.meta);
         let n = self.items.len();
-        let per_page = ((self.view_h / (self.side + self.gap()).max(1)).max(1) as usize) * self.cols;
+        let per_page =
+            ((self.view_h / (self.side + self.gap()).max(1)).max(1) as usize) * self.cols;
         let mut taken = true;
         match p.code {
             keys::KEY_LEFT if plain => self.move_focus(self.focus.saturating_sub(1), shift),
-            keys::KEY_RIGHT if plain => self.move_focus((self.focus + 1).min(n.saturating_sub(1)), shift),
+            keys::KEY_RIGHT if plain => {
+                self.move_focus((self.focus + 1).min(n.saturating_sub(1)), shift)
+            }
             keys::KEY_UP if plain => self.move_focus(self.neighbour(self.focus, true), shift),
             keys::KEY_DOWN if plain => self.move_focus(self.neighbour(self.focus, false), shift),
             keys::KEY_PAGEDOWN if plain => self.move_focus(self.focus + per_page, shift),
-            keys::KEY_PAGEUP if plain => self.move_focus(self.focus.saturating_sub(per_page), shift),
+            keys::KEY_PAGEUP if plain => {
+                self.move_focus(self.focus.saturating_sub(per_page), shift)
+            }
             keys::KEY_HOME if plain => self.move_focus(0, shift),
             keys::KEY_END if plain => self.move_focus(n.saturating_sub(1), shift),
             keys::KEY_ENTER | keys::KEY_KPENTER if plain => self.open_viewer(self.focus),
@@ -1116,7 +1320,14 @@ impl Gallery {
                 }
             }
             keys::KEY_DELETE | keys::KEY_BACKSPACE if plain => {
-                let ids = if self.selected.is_empty() { self.items.get(self.focus).map(|i| vec![i.id.clone()]).unwrap_or_default() } else { self.selected_ids() };
+                let ids = if self.selected.is_empty() {
+                    self.items
+                        .get(self.focus)
+                        .map(|i| vec![i.id.clone()])
+                        .unwrap_or_default()
+                } else {
+                    self.selected_ids()
+                };
                 self.open_delete(ids);
             }
             keys::KEY_SLASH if plain && !shift => self.focus_search = true,
@@ -1124,7 +1335,11 @@ impl Gallery {
             keys::KEY_S if plain => self.open_sources(),
             keys::KEY_G if plain => self.open_months(),
             keys::KEY_T if plain => {
-                let s = if self.shelf == Shelf::Trash { Shelf::Everything } else { Shelf::Trash };
+                let s = if self.shelf == Shelf::Trash {
+                    Shelf::Everything
+                } else {
+                    Shelf::Trash
+                };
                 self.set_shelf(s);
             }
             keys::KEY_A if plain && !shift => {
@@ -1132,7 +1347,14 @@ impl Gallery {
                 self.send(Job::Albums);
             }
             keys::KEY_A if plain && shift => {
-                let ids = if self.selected.is_empty() { self.items.get(self.focus).map(|i| vec![i.id.clone()]).unwrap_or_default() } else { self.selected_ids() };
+                let ids = if self.selected.is_empty() {
+                    self.items
+                        .get(self.focus)
+                        .map(|i| vec![i.id.clone()])
+                        .unwrap_or_default()
+                } else {
+                    self.selected_ids()
+                };
                 self.open_album_picker(ids);
             }
             keys::KEY_F if plain && !shift => self.favorite_key(),
@@ -1159,12 +1381,24 @@ impl Gallery {
 
     /// `f` on the grid: the selection, else the tile under the cursor; on when any of them is off.
     fn favorite_key(&mut self) {
-        let ids = if self.selected.is_empty() { self.items.get(self.focus).map(|i| vec![i.id.clone()]).unwrap_or_default() } else { self.selected_ids() };
+        let ids = if self.selected.is_empty() {
+            self.items
+                .get(self.focus)
+                .map(|i| vec![i.id.clone()])
+                .unwrap_or_default()
+        } else {
+            self.selected_ids()
+        };
         if self.shelf == Shelf::Trash || ids.is_empty() {
             return;
         }
         let any_off = self.items_of(&ids).iter().any(|i| !i.favorite);
-        self.run_batch(if any_off { "favorite" } else { "unfavorite" }, ids, None, false);
+        self.run_batch(
+            if any_off { "favorite" } else { "unfavorite" },
+            ids,
+            None,
+            false,
+        );
     }
 
     fn selection_bar(&mut self, ui: &mut Ui) {
@@ -1172,7 +1406,13 @@ impl Gallery {
         let r = ui.cut_top(t.px(36.0));
         ui.fill(r, t.bar);
         let n = self.selected.len();
-        ui.text_in(Rect::new(r.x + t.px(12.0), r.y, t.px(110.0), r.h), Face::Bold, t.pt(14.0), t.text, &format!("{n} selected"));
+        ui.text_in(
+            Rect::new(r.x + t.px(12.0), r.y, t.px(110.0), r.h),
+            Face::Bold,
+            t.pt(14.0),
+            t.text,
+            &format!("{n} selected"),
+        );
         let mut x = r.x + t.px(124.0);
         let mut button = |ui: &mut Ui, id: &str, label: &str, w: f32| {
             let w = t.px(w);
@@ -1231,7 +1471,13 @@ impl Gallery {
                 match row {
                     GridRow::Header { .. } => {
                         if let Some(label) = self.labels.get(&row_i) {
-                            ui.text_in(Rect::new(r.x + t.px(2.0), y, r.w, h), Face::Bold, t.pt(13.0), t.item, label);
+                            ui.text_in(
+                                Rect::new(r.x + t.px(2.0), y, r.w, h),
+                                Face::Bold,
+                                t.pt(13.0),
+                                t.item,
+                                label,
+                            );
                         }
                     }
                     GridRow::Tiles { start, end } => {
@@ -1246,26 +1492,85 @@ impl Gallery {
                             let selected = self.selected.contains(&item.id);
                             if item.video {
                                 let badge = model::format_duration(item.duration_ms.unwrap_or(0));
-                                let b = Rect::new(x + t.px(3.0), y + side - t.px(18.0), t.px(44.0), t.px(16.0));
-                                ui.fill_round(b, t.px(3.0), Rgb(0x10_14_28));
-                                ui.text_in(b.inset(t.px(2.0)), Face::Sans, t.pt(11.0), t.text, &format!("▶ {badge}"));
+                                let b = Rect::new(
+                                    x + t.px(3.0),
+                                    y + side - t.px(18.0),
+                                    t.px(44.0),
+                                    t.px(16.0),
+                                );
+                                ui.fill_round(b, t.px(3.0), t.panel);
+                                ui.text_in(
+                                    b.inset(t.px(2.0)),
+                                    Face::Sans,
+                                    t.pt(11.0),
+                                    t.text,
+                                    &format!("▶ {badge}"),
+                                );
                             }
                             if item.favorite {
-                                ui.text_in(Rect::new(x + side - t.px(18.0), y + t.px(2.0), t.px(16.0), t.px(16.0)), Face::Bold, t.pt(13.0), Rgb(0xff_6b_81), "♥");
+                                ui.text_in(
+                                    Rect::new(
+                                        x + side - t.px(18.0),
+                                        y + t.px(2.0),
+                                        t.px(16.0),
+                                        t.px(16.0),
+                                    ),
+                                    Face::Bold,
+                                    t.pt(13.0),
+                                    t.danger,
+                                    "♥",
+                                );
                             }
-                            if let Some(days) = item.trash_expires_at.as_deref().and_then(|e| model::days_left(e, self.now_ms)) {
-                                let b = Rect::new(x + t.px(3.0), y + side - t.px(18.0), t.px(52.0), t.px(16.0));
-                                ui.fill_round(b, t.px(3.0), Rgb(0x10_14_28));
-                                let label = if days == 0 { "today".to_owned() } else if days == 1 { "1 day".to_owned() } else { format!("{days} days") };
-                                ui.text_in(b.inset(t.px(2.0)), Face::Sans, t.pt(11.0), t.text, &label);
+                            if let Some(days) = item
+                                .trash_expires_at
+                                .as_deref()
+                                .and_then(|e| model::days_left(e, self.now_ms))
+                            {
+                                let b = Rect::new(
+                                    x + t.px(3.0),
+                                    y + side - t.px(18.0),
+                                    t.px(52.0),
+                                    t.px(16.0),
+                                );
+                                ui.fill_round(b, t.px(3.0), t.panel);
+                                let label = if days == 0 {
+                                    "today".to_owned()
+                                } else if days == 1 {
+                                    "1 day".to_owned()
+                                } else {
+                                    format!("{days} days")
+                                };
+                                ui.text_in(
+                                    b.inset(t.px(2.0)),
+                                    Face::Sans,
+                                    t.pt(11.0),
+                                    t.text,
+                                    &label,
+                                );
                             }
                             if selected {
-                                let tick = Rect::new(x + t.px(3.0), y + t.px(3.0), t.px(18.0), t.px(18.0));
+                                let tick =
+                                    Rect::new(x + t.px(3.0), y + t.px(3.0), t.px(18.0), t.px(18.0));
                                 ui.fill_round(tick, t.px(9.0), t.accent);
-                                ui.text_in(tick.inset(t.px(2.0)), Face::Bold, t.pt(12.0), t.bg, "✓");
+                                ui.text_in(
+                                    tick.inset(t.px(2.0)),
+                                    Face::Bold,
+                                    t.pt(12.0),
+                                    t.bg,
+                                    "✓",
+                                );
                             }
                             if i == self.focus {
-                                outline(ui, cell, t.px(3.0).max(2), if ui.is_focused("grid") { t.accent } else { t.dim });
+                                outline(
+                                    ui,
+                                    cell,
+                                    t.px(3.0).max(2),
+                                    if ui.is_focused("grid") {
+                                        t.accent
+                                    } else {
+                                        t.dim
+                                    },
+                                );
                             } else if selected {
                                 outline(ui, cell, t.px(2.0).max(2), t.accent);
                             }
@@ -1298,9 +1603,20 @@ impl Gallery {
         let total = self.total_h();
         if total > self.view_h {
             let bar = t.px(6.0).max(4);
-            let h = ((self.view_h as i64 * self.view_h as i64 / total as i64) as i32).max(t.px(24.0));
-            let top = r.y + (self.scroll as i64 * (self.view_h - h) as i64 / (total - self.view_h).max(1) as i64) as i32;
-            ui.fill_round(Rect::new(r.right() - bar + 1, top, bar - 2, h), bar / 2, if ui.is_focused("grid") { t.accent } else { t.panel_hi });
+            let h =
+                ((self.view_h as i64 * self.view_h as i64 / total as i64) as i32).max(t.px(24.0));
+            let top = r.y
+                + (self.scroll as i64 * (self.view_h - h) as i64
+                    / (total - self.view_h).max(1) as i64) as i32;
+            ui.fill_round(
+                Rect::new(r.right() - bar + 1, top, bar - 2, h),
+                bar / 2,
+                if ui.is_focused("grid") {
+                    t.accent
+                } else {
+                    t.panel_hi
+                },
+            );
         }
     }
 
@@ -1308,13 +1624,26 @@ impl Gallery {
     fn albums_view(&mut self, ui: &mut Ui) {
         let t = ui.theme();
         let r = ui.cut_top(t.px(30.0));
-        ui.text_in(Rect::new(r.x + t.px(12.0), r.y, r.w, r.h), Face::Bold, t.pt(16.0), t.text, "Albums");
+        ui.text_in(
+            Rect::new(r.x + t.px(12.0), r.y, r.w, r.h),
+            Face::Bold,
+            t.pt(16.0),
+            t.text,
+            "Albums",
+        );
         let area = ui.area();
-        let list = Rect::new(area.x + t.px(10.0), area.y, area.w - t.px(20.0), area.h - t.px(6.0));
+        let list = Rect::new(
+            area.x + t.px(10.0),
+            area.y,
+            area.w - t.px(20.0),
+            area.h - t.px(6.0),
+        );
         let albums: Vec<Album> = match &self.albums {
             Some(Ok(a)) => a.clone(),
             Some(Err(e)) => {
-                ui.within(list, |ui| ui.label(&format!("Couldn't load the albums. {e}")));
+                ui.within(list, |ui| {
+                    ui.label(&format!("Couldn't load the albums. {e}"))
+                });
                 Vec::new()
             }
             None => {
@@ -1322,15 +1651,52 @@ impl Gallery {
                 Vec::new()
             }
         };
-        let res = ui.list("albums", &mut self.albums_list, list, albums.len(), 44.0, |ui, i, selected| {
-            let a = ui.area();
-            let al = &albums[i];
-            let c = if selected { t.text } else { t.item };
-            ui.text_in(Rect::new(a.x + t.px(10.0), a.y + t.px(4.0), a.w - t.px(20.0), t.px(20.0)), Face::Sans, t.pt(15.0), c, &al.title);
-            let count = if al.count == 1 { "1 photo".to_owned() } else { format!("{} photos", al.count) };
-            let sub = if al.system { format!("{count} · Made by Lucina") } else { count };
-            ui.text_in(Rect::new(a.x + t.px(10.0), a.y + t.px(24.0), a.w - t.px(20.0), t.px(16.0)), Face::Sans, t.pt(12.0), t.dim, &sub);
-        });
+        let res = ui.list(
+            "albums",
+            &mut self.albums_list,
+            list,
+            albums.len(),
+            44.0,
+            |ui, i, selected| {
+                let a = ui.area();
+                let al = &albums[i];
+                let c = if selected { t.text } else { t.item };
+                ui.text_in(
+                    Rect::new(
+                        a.x + t.px(10.0),
+                        a.y + t.px(4.0),
+                        a.w - t.px(20.0),
+                        t.px(20.0),
+                    ),
+                    Face::Sans,
+                    t.pt(15.0),
+                    c,
+                    &al.title,
+                );
+                let count = if al.count == 1 {
+                    "1 photo".to_owned()
+                } else {
+                    format!("{} photos", al.count)
+                };
+                let sub = if al.system {
+                    format!("{count} · Made by Lucina")
+                } else {
+                    count
+                };
+                ui.text_in(
+                    Rect::new(
+                        a.x + t.px(10.0),
+                        a.y + t.px(24.0),
+                        a.w - t.px(20.0),
+                        t.px(16.0),
+                    ),
+                    Face::Sans,
+                    t.pt(12.0),
+                    t.dim,
+                    &sub,
+                );
+            },
+        );
         if albums.is_empty() && matches!(self.albums, Some(Ok(_))) {
             ui.within(list, |ui| {
                 ui.dim("No albums yet.");
@@ -1343,7 +1709,10 @@ impl Gallery {
         }
         if let Some(i) = res.activated {
             let a = &albums[i];
-            self.set_shelf(Shelf::Album { id: a.id.clone(), title: a.title.clone() });
+            self.set_shelf(Shelf::Album {
+                id: a.id.clone(),
+                title: a.title.clone(),
+            });
             return;
         }
         if ui.key(keys::KEY_ESC) || ui.key(keys::KEY_BACKSPACE) {
@@ -1367,15 +1736,45 @@ impl Gallery {
                 ui.modal(420.0, 90.0 + 34.0 * n.min(10) as f32, |ui| {
                     ui.heading("Where the photos come from");
                     let r = ui.area();
-                    let res = ui.list("sources", &mut self.dialog_list, r, n, 32.0, |ui, i, selected| {
-                        let a = ui.area();
-                        let c = if selected { t.text } else { t.item };
-                        let (label, count) = if i == 0 { ("All".to_owned(), all) } else { (list[i - 1].label.clone(), list[i - 1].photos + list[i - 1].videos) };
-                        ui.text_in(Rect::new(a.x + t.px(8.0), a.y, a.w - t.px(80.0), a.h), Face::Sans, t.pt(14.0), c, &label);
-                        ui.text_in(Rect::new(a.right() - t.px(70.0), a.y, t.px(66.0), a.h), Face::Sans, t.pt(12.0), t.dim, &count.to_string());
-                    });
+                    let res = ui.list(
+                        "sources",
+                        &mut self.dialog_list,
+                        r,
+                        n,
+                        32.0,
+                        |ui, i, selected| {
+                            let a = ui.area();
+                            let c = if selected { t.text } else { t.item };
+                            let (label, count) = if i == 0 {
+                                ("All".to_owned(), all)
+                            } else {
+                                (
+                                    list[i - 1].label.clone(),
+                                    list[i - 1].photos + list[i - 1].videos,
+                                )
+                            };
+                            ui.text_in(
+                                Rect::new(a.x + t.px(8.0), a.y, a.w - t.px(80.0), a.h),
+                                Face::Sans,
+                                t.pt(14.0),
+                                c,
+                                &label,
+                            );
+                            ui.text_in(
+                                Rect::new(a.right() - t.px(70.0), a.y, t.px(66.0), a.h),
+                                Face::Sans,
+                                t.pt(12.0),
+                                t.dim,
+                                &count.to_string(),
+                            );
+                        },
+                    );
                     if let Some(i) = res.activated {
-                        chosen = Some(if i == 0 { "all".to_owned() } else { list[i - 1].id.clone() });
+                        chosen = Some(if i == 0 {
+                            "all".to_owned()
+                        } else {
+                            list[i - 1].id.clone()
+                        });
                     }
                     ui.focus("sources");
                     if ui.key(keys::KEY_ESC) {
@@ -1408,12 +1807,31 @@ impl Gallery {
                         ui.dim("Couldn't load the months.");
                     }
                     let r = ui.area();
-                    let res = ui.list("months", &mut self.dialog_list, r, list.len(), 30.0, |ui, i, selected| {
-                        let a = ui.area();
-                        let c = if selected { t.text } else { t.item };
-                        ui.text_in(Rect::new(a.x + t.px(8.0), a.y, a.w - t.px(80.0), a.h), Face::Sans, t.pt(14.0), c, &model::month_label(&list[i].0));
-                        ui.text_in(Rect::new(a.right() - t.px(70.0), a.y, t.px(66.0), a.h), Face::Sans, t.pt(12.0), t.dim, &list[i].1.to_string());
-                    });
+                    let res = ui.list(
+                        "months",
+                        &mut self.dialog_list,
+                        r,
+                        list.len(),
+                        30.0,
+                        |ui, i, selected| {
+                            let a = ui.area();
+                            let c = if selected { t.text } else { t.item };
+                            ui.text_in(
+                                Rect::new(a.x + t.px(8.0), a.y, a.w - t.px(80.0), a.h),
+                                Face::Sans,
+                                t.pt(14.0),
+                                c,
+                                &model::month_label(&list[i].0),
+                            );
+                            ui.text_in(
+                                Rect::new(a.right() - t.px(70.0), a.y, t.px(66.0), a.h),
+                                Face::Sans,
+                                t.pt(12.0),
+                                t.dim,
+                                &list[i].1.to_string(),
+                            );
+                        },
+                    );
                     if let Some(i) = res.activated {
                         chosen = Some(list[i].0.clone());
                     }
@@ -1439,19 +1857,46 @@ impl Gallery {
                 let mut chosen = None;
                 let mut create = false;
                 let mut cancelled = false;
-                let what = if ids.len() == 1 { "1 item".to_owned() } else { format!("{} items", ids.len()) };
+                let what = if ids.len() == 1 {
+                    "1 item".to_owned()
+                } else {
+                    format!("{} items", ids.len())
+                };
                 ui.modal(440.0, 420.0, |ui| {
                     ui.heading("Add to album");
                     ui.dim(&what);
                     let foot = ui.cut_bottom(t.px(84.0));
                     let r = ui.area();
-                    let res = ui.list("album-pick", &mut self.dialog_list, r, albums.len(), 34.0, |ui, i, selected| {
-                        let a = ui.area();
-                        let c = if selected { t.text } else { t.item };
-                        ui.text_in(Rect::new(a.x + t.px(8.0), a.y, a.w - t.px(90.0), a.h), Face::Sans, t.pt(14.0), c, &albums[i].title);
-                        let count = if albums[i].count == 1 { "1 item".to_owned() } else { format!("{} items", albums[i].count) };
-                        ui.text_in(Rect::new(a.right() - t.px(80.0), a.y, t.px(76.0), a.h), Face::Sans, t.pt(12.0), t.dim, &count);
-                    });
+                    let res = ui.list(
+                        "album-pick",
+                        &mut self.dialog_list,
+                        r,
+                        albums.len(),
+                        34.0,
+                        |ui, i, selected| {
+                            let a = ui.area();
+                            let c = if selected { t.text } else { t.item };
+                            ui.text_in(
+                                Rect::new(a.x + t.px(8.0), a.y, a.w - t.px(90.0), a.h),
+                                Face::Sans,
+                                t.pt(14.0),
+                                c,
+                                &albums[i].title,
+                            );
+                            let count = if albums[i].count == 1 {
+                                "1 item".to_owned()
+                            } else {
+                                format!("{} items", albums[i].count)
+                            };
+                            ui.text_in(
+                                Rect::new(a.right() - t.px(80.0), a.y, t.px(76.0), a.h),
+                                Face::Sans,
+                                t.pt(12.0),
+                                t.dim,
+                                &count,
+                            );
+                        },
+                    );
                     if let Some(i) = res.activated {
                         chosen = Some(albums[i].id.clone());
                     }
@@ -1489,7 +1934,14 @@ impl Gallery {
                     self.focus_grid = true;
                 }
             }
-            Dialog::Delete { ids, purge, mut also_device, mut understood, error, busy } => {
+            Dialog::Delete {
+                ids,
+                purge,
+                mut also_device,
+                mut understood,
+                error,
+                busy,
+            } => {
                 let count = ids.len();
                 let devices = {
                     let items = self.items_of(&ids);
@@ -1552,9 +2004,21 @@ impl Gallery {
                 }
                 let also_from_device = also_device && !devices.is_empty();
                 let may = !busy && (!purge || understood);
-                self.dialog = Some(Dialog::Delete { ids: ids.clone(), purge, also_device, understood, error, busy: busy || (confirm && may) });
+                self.dialog = Some(Dialog::Delete {
+                    ids: ids.clone(),
+                    purge,
+                    also_device,
+                    understood,
+                    error,
+                    busy: busy || (confirm && may),
+                });
                 if confirm && may {
-                    self.run_batch(if purge { "purge" } else { "trash" }, ids, None, also_from_device);
+                    self.run_batch(
+                        if purge { "purge" } else { "trash" },
+                        ids,
+                        None,
+                        also_from_device,
+                    );
                 }
             }
         }
@@ -1570,7 +2034,11 @@ pub(crate) fn outline(ui: &mut Ui, r: Rect, w: i32, c: Rgb) {
 
 /// What the viewer asks the worker for, from where it can reach.
 pub(crate) fn patch_job(item: &Item, body: Value) -> Job {
-    Job::Patch { id: item.id.clone(), body, undo: Box::new(item.clone()) }
+    Job::Patch {
+        id: item.id.clone(),
+        body,
+        undo: Box::new(item.clone()),
+    }
 }
 
 pub(crate) fn favorite_body(on: bool) -> Value {

@@ -780,6 +780,65 @@ fn a_sleep_gates_both_sdcc2_branches_and_leaves_the_rcg_alone() {
     );
 }
 
+/// A page of the GCC whose two branches keep answering as enabled and never show `CLK_OFF`, however often they are
+/// written: hardware that does not stop the clock. Counts its own reads, which is how the test below sees the poll
+/// run out.
+#[derive(Default)]
+struct NeverHalts {
+    reads: core::cell::Cell<usize>,
+}
+
+impl Regs for NeverHalts {
+    fn read32(&self, offset: usize) -> u32 {
+        match offset {
+            // `APPS_CBCR` 0x004 and `AHB_CBCR` 0x008: bit 0 set, so `CLK_OFF` (bit 31) never appears.
+            0x004 | 0x008 => {
+                self.reads.set(self.reads.get() + 1);
+                1
+            }
+            _ => 0,
+        }
+    }
+
+    fn write32(&self, _offset: usize, _value: u32) {}
+
+    fn read16(&self, offset: usize) -> u16 {
+        (self.read32(offset) & 0xffff) as u16
+    }
+
+    fn read8(&self, offset: usize) -> u8 {
+        (self.read32(offset) & 0xff) as u8
+    }
+
+    fn write16(&self, offset: usize, value: u16) {
+        self.write32(offset, value as u32);
+    }
+
+    fn write8(&self, offset: usize, value: u8) {
+        self.write32(offset, value as u32);
+    }
+}
+
+#[test]
+fn a_disable_waits_for_clk_off_and_a_branch_that_never_shows_it_only_costs_the_poll() {
+    // Both SDCC2 branches declare `BRANCH_HALT` (`gcc-sc7180.c:1767`, `:1780`), the type `clk_branch_wait` polls in
+    // both directions (`drivers/clk/qcom/clk-branch.c:77-79`), so a disable looks for `CLK_OFF` up to the
+    // `count = 200` of `:80`. A branch that never answers is the `-EBUSY` of `:87-89`, which
+    // `clk_branch2_disable` ignores (`:133-136`): the loop bounds itself, the write is not retried, and the caller
+    // gets the CBCR as it reads.
+    let gcc = NeverHalts::default();
+    let after = soc::disable_clocks(&gcc);
+    assert!(
+        after.running(),
+        "the read-back is what the branch says, so the hook can say it"
+    );
+    assert_eq!(
+        gcc.reads.get(),
+        2 * 2 + 2 * soc::HALT_CHECKS,
+        "one read per write, then the bounded poll of each branch, and nothing after that"
+    );
+}
+
 #[test]
 fn the_wake_votes_the_branches_back_before_it_reports_running() {
     let gcc = GccPage::with(1, 1);

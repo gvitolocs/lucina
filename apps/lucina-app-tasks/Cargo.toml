@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 lucina-app = { path = "../../apps/lucina-app" }
+lucina-glass = { path = "../../apps/lucina-glass" }
 lucina-account = { path = "../../services/lucina-account", features = ["ui"] }
 # The engine (its models, quick add parser and, in the sample and test server, the engine itself). Pinned as
 # lucina-reader pins ink-*; changed only upstream in SecretaryIOS.

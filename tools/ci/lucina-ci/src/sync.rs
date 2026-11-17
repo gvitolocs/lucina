@@ -76,43 +76,95 @@ pub enum GateStep {
     /// Both gates are `success`: `main` may take the commit (if the push is a fast-forward).
     Promote,
     Fail(String),
-    /// A required check never appeared within the grace period (a runner that never started): not a verdict on the commit.
+    /// A required check that never appeared although nothing is running for the commit any more (no run after the grace period, or
+    /// a run that finished without that job): not a verdict on the commit.
     Stuck(String),
+}
+
+/// A workflow run of the commit, as `gh api repos/<repo>/actions/runs?head_sha=<sha>` reports it. A required check is a JOB of such a
+/// run, and the gate job is the last one of its workflow, so the check does not exist before its run ends: this is what tells "not
+/// started yet" apart from "never started".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRun {
+    pub id: String,
+    pub name: String,
+    /// `queued`, `in_progress` or `completed`.
+    pub status: String,
+    /// Empty while the run is not `completed`.
+    pub conclusion: String,
+}
+
+impl WorkflowRun {
+    fn going(&self) -> bool {
+        self.status != "completed"
+    }
+
+    /// `run 43031334439 verus completed success`: what a verdict names, so the owner can open that run.
+    fn describe(&self) -> String {
+        let mut w = format!("run {} {} {}", self.id, self.name, self.status);
+        if !self.conclusion.is_empty() {
+            w.push_str(&format!(" {}", self.conclusion));
+        }
+        w
+    }
 }
 
 /// How long after the push a check that has not appeared yet still counts as "not started" and not as "missing". GitHub registers
 /// the runs a minute or more after the push (seen 2026-11-11: the first poll, 60 s after the push, found none).
 pub const START_GRACE_SECS: u64 = 15 * 60;
 
-/// `since_push_secs`: time since the `sync/` branch was pushed. A red gate fails at once; a gate with no run yet waits inside the
-/// grace period and is a failure after it.
-pub fn gate_step(runs: &[CheckRun], required: &[String], since_push_secs: u64) -> GateStep {
+/// `since_push_secs`: time since the `sync/` branch was pushed. A red gate fails at once, with or without a run going. A check that
+/// has not appeared waits while a workflow run of the commit is queued or going (the gate job is that run's last job: seen
+/// 2026-11-16, the verus matrix ran 16 min and the sync called `verus-gate` "never started" at 15), waits inside the grace period
+/// when no run of the commit is known yet, and is a stall (`Stuck`) only when nothing runs any more: no run for the sha at all, or
+/// runs that finished without ever producing that check. `workflow` may be empty when the caller could not read it: that is the old
+/// behaviour, the grace period and then `Stuck`.
+pub fn gate_step(
+    runs: &[CheckRun],
+    workflow: &[WorkflowRun],
+    required: &[String],
+    since_push_secs: u64,
+) -> GateStep {
     let present = |n: &String| {
         runs.iter()
             .any(|r| &r.name == n && r.app == "github-actions")
     };
     let missing: Vec<&String> = required.iter().filter(|n| !present(n)).collect();
-    if !missing.is_empty() && since_push_secs < START_GRACE_SECS {
-        let seen: Vec<String> = required.iter().filter(|n| present(n)).cloned().collect();
-        if let MergeVerdict::Refuse(w) = merge_verdict(runs, &seen) {
-            return GateStep::Fail(w);
-        }
-        let names: Vec<&str> = missing.iter().map(|n| n.as_str()).collect();
-        return GateStep::Wait(format!("{}: not started yet", names.join(", ")));
+    if missing.is_empty() {
+        return match merge_verdict(runs, required) {
+            MergeVerdict::Pass => GateStep::Promote,
+            MergeVerdict::Pending(w) => GateStep::Wait(w),
+            MergeVerdict::Refuse(w) => GateStep::Fail(w),
+        };
     }
-    if !missing.is_empty() {
-        let seen: Vec<String> = required.iter().filter(|n| present(n)).cloned().collect();
-        if let MergeVerdict::Refuse(w) = merge_verdict(runs, &seen) {
-            return GateStep::Fail(w);
-        }
-        let names: Vec<&str> = missing.iter().map(|n| n.as_str()).collect();
-        return GateStep::Stuck(format!("{}: never started", names.join(", ")));
+    let seen: Vec<String> = required.iter().filter(|n| present(n)).cloned().collect();
+    if let MergeVerdict::Refuse(w) = merge_verdict(runs, &seen) {
+        return GateStep::Fail(w);
     }
-    match merge_verdict(runs, required) {
-        MergeVerdict::Pass => GateStep::Promote,
-        MergeVerdict::Pending(w) => GateStep::Wait(w),
-        MergeVerdict::Refuse(w) => GateStep::Fail(w),
+    let names: Vec<&str> = missing.iter().map(|n| n.as_str()).collect();
+    let names = names.join(", ");
+    // Which run produces which check is not in this data, and reading it costs a call per run: any run going holds the wait, and the
+    // caller's own poll limit bounds it.
+    let going: Vec<String> = workflow
+        .iter()
+        .filter(|w| w.going())
+        .map(WorkflowRun::describe)
+        .collect();
+    if !going.is_empty() {
+        return GateStep::Wait(format!("{}: waiting on {}", names, going.join(", ")));
     }
+    if since_push_secs < START_GRACE_SECS {
+        return GateStep::Wait(format!("{}: not started yet", names));
+    }
+    if workflow.is_empty() {
+        return GateStep::Stuck(format!("{}: never started", names));
+    }
+    let done: Vec<String> = workflow.iter().map(WorkflowRun::describe).collect();
+    GateStep::Stuck(format!(
+        "{}: never started, no job of that name in the run(s) that finished: {}",
+        names,
+        done.join(", ")
+    ))
 }
 
 /// Steps that only set the job up: the runner's container, tools and downloads. A network failure counts only in these.
@@ -328,6 +380,14 @@ mod tests {
     fn req() -> Vec<String> {
         vec!["verus-gate".into(), "rust-gate".into()]
     }
+    fn wf(id: &str, name: &str, status: &str, conclusion: &str) -> WorkflowRun {
+        WorkflowRun {
+            id: id.into(),
+            name: name.into(),
+            status: status.into(),
+            conclusion: conclusion.into(),
+        }
+    }
     fn green() -> Vec<CheckRun> {
         vec![
             run("verus-gate", "completed", "success"),
@@ -510,13 +570,14 @@ mod tests {
 
     #[test]
     fn gate_step_maps_the_verdict() {
-        assert_eq!(gate_step(&green(), &req(), 60), GateStep::Promote);
+        assert_eq!(gate_step(&green(), &[], &req(), 60), GateStep::Promote);
         assert!(matches!(
             gate_step(
                 &[
                     run("verus-gate", "completed", "success"),
                     run("rust-gate", "in_progress", "")
                 ],
+                &[],
                 &req(),
                 60
             ),
@@ -528,37 +589,104 @@ mod tests {
                     run("verus-gate", "completed", "failure"),
                     run("rust-gate", "completed", "success")
                 ],
+                &[],
                 &req(),
                 60
             ),
             GateStep::Fail(_)
         ));
         assert!(matches!(
-            gate_step(&[], &req(), START_GRACE_SECS),
+            gate_step(&[], &[], &req(), START_GRACE_SECS),
             GateStep::Stuck(_)
         ));
     }
 
     #[test]
     fn checks_that_have_not_started_wait_inside_the_grace_period() {
-        assert!(matches!(gate_step(&[], &req(), 60), GateStep::Wait(_)));
+        assert!(matches!(gate_step(&[], &[], &req(), 60), GateStep::Wait(_)));
         let one = [run("verus-gate", "completed", "success")];
-        assert!(matches!(gate_step(&one, &req(), 60), GateStep::Wait(_)));
         assert!(matches!(
-            gate_step(&one, &req(), START_GRACE_SECS),
+            gate_step(&one, &[], &req(), 60),
+            GateStep::Wait(_)
+        ));
+        assert!(matches!(
+            gate_step(&one, &[], &req(), START_GRACE_SECS),
             GateStep::Stuck(_)
         ));
         // After the grace period a red gate is still a failure of the commit, not a stall.
         let red_late = [run("verus-gate", "completed", "failure")];
         assert!(matches!(
-            gate_step(&red_late, &req(), START_GRACE_SECS),
+            gate_step(&red_late, &[], &req(), START_GRACE_SECS),
             GateStep::Fail(_)
         ));
         // A red gate does not wait for the other one.
         let red = [run("verus-gate", "completed", "failure")];
-        assert!(matches!(gate_step(&red, &req(), 60), GateStep::Fail(_)));
+        assert!(matches!(
+            gate_step(&red, &[], &req(), 60),
+            GateStep::Fail(_)
+        ));
         let queued = [run("verus-gate", "queued", "")];
-        assert!(matches!(gate_step(&queued, &req(), 60), GateStep::Wait(_)));
+        assert!(matches!(
+            gate_step(&queued, &[], &req(), 60),
+            GateStep::Wait(_)
+        ));
+    }
+
+    #[test]
+    fn a_gate_check_waits_while_a_workflow_run_of_the_commit_is_going() {
+        // The 2026-11-16 case: verus ran 16 min, `verus-gate` is that run's last job, and at 15 min the sync called it
+        // "never started" and stalled the tip instead of waiting.
+        let going = [wf("1", "verus", "in_progress", "")];
+        let rust_green = [run("rust-gate", "completed", "success")];
+        assert!(matches!(
+            gate_step(&rust_green, &going, &req(), 20 * 60),
+            GateStep::Wait(_)
+        ));
+        // A run that has not taken a runner yet counts too.
+        let queued = [wf("1", "verus", "queued", "")];
+        assert!(matches!(
+            gate_step(&[], &queued, &req(), 20 * 60),
+            GateStep::Wait(_)
+        ));
+        // A check that is red is a verdict on the commit at once, whatever the runs say (d).
+        let red = [
+            run("verus-gate", "completed", "failure"),
+            run("rust-gate", "completed", "success"),
+        ];
+        let done_failed = [wf("2", "verus", "completed", "failure")];
+        assert!(matches!(
+            gate_step(&red, &done_failed, &req(), 20 * 60),
+            GateStep::Fail(_)
+        ));
+        assert!(matches!(
+            gate_step(&red, &going, &req(), 20 * 60),
+            GateStep::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn a_check_no_run_produced_is_stuck_and_names_the_run() {
+        // (b) Nothing was ever registered for the sha, past the grace: the old verdict, with no run to name.
+        match gate_step(&[], &[], &req(), START_GRACE_SECS) {
+            GateStep::Stuck(w) => assert_eq!(w, "verus-gate, rust-gate: never started"),
+            other => panic!("expected a stall, got {other:?}"),
+        }
+        // (c) The run finished green without ever producing the gate job: a stall that names that run.
+        let done = [wf("43031334439", "verus", "completed", "success")];
+        let rust_green = [run("rust-gate", "completed", "success")];
+        match gate_step(&rust_green, &done, &req(), 20 * 60) {
+            GateStep::Stuck(w) => {
+                assert!(w.contains("verus-gate"), "{w}");
+                assert!(w.contains("43031334439"), "{w}");
+                assert!(w.contains("success"), "{w}");
+            }
+            other => panic!("expected a stall, got {other:?}"),
+        }
+        // Inside the grace period a finished run without the check still waits one more poll, as before.
+        assert!(matches!(
+            gate_step(&rust_green, &done, &req(), 60),
+            GateStep::Wait(_)
+        ));
     }
 
     #[test]

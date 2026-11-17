@@ -15,12 +15,13 @@ mod stage;
 
 use std::time::{Duration, Instant};
 
-use lucina_app::gfx::{Face, Rect, Rgb};
+use lucina_app::gfx::{Face, Rect};
 use lucina_app::keys;
+use lucina_app::theme;
 use lucina_app::ui::Input;
 use lucina_app::{App, Ui};
-use lucina_glass::screens::Pointer;
 use lucina_glass::layouts::{DianaTablet, Fortuna, Juno, Layout};
+use lucina_glass::screens::Pointer;
 use lucina_glass::{Canvas, Clock, R};
 
 use stage::{DEMOS, Stage};
@@ -50,7 +51,12 @@ impl Gallery {
             at: (Rect::default(), 1.0),
             playing: None,
             view: 0,
-            variants: vec![Box::new(Juno::new(0.0)), Box::new(DianaTablet::new(0.0, false)), Box::new(DianaTablet::new(0.0, true)), Box::new(Fortuna::new(0.0))],
+            variants: vec![
+                Box::new(Juno::new(0.0)),
+                Box::new(DianaTablet::new(0.0, false)),
+                Box::new(DianaTablet::new(0.0, true)),
+                Box::new(Fortuna::new(0.0)),
+            ],
             shown: None,
         }
     }
@@ -76,13 +82,18 @@ impl Gallery {
                 self.stage.act(start + at, a);
                 next += 1;
             }
-            self.playing = if next < d.steps.len() || now < start + d.dur { Some((i, start, next)) } else { None };
+            self.playing = if next < d.steps.len() || now < start + d.dur {
+                Some((i, start, next))
+            } else {
+                None
+            };
         }
     }
 
     fn to_dp(&self, x: i32, y: i32) -> Option<(f32, f32)> {
         let (r, k) = self.at;
-        r.contains(x, y).then(|| ((x - r.x) as f32 / k, (y - r.y) as f32 / k))
+        r.contains(x, y)
+            .then(|| ((x - r.x) as f32 / k, (y - r.y) as f32 / k))
     }
 }
 
@@ -91,7 +102,8 @@ impl App for Gallery {
 
     fn view(&mut self, ui: &mut Ui) {
         let t = Instant::now();
-        self.clock.advance(t.duration_since(self.last).as_secs_f64());
+        self.clock
+            .advance(t.duration_since(self.last).as_secs_f64());
         self.last = t;
         self.steps();
         let now = self.clock.now();
@@ -103,7 +115,11 @@ impl App for Gallery {
                 keys::KEY_RIGHT => self.stage.go(now, (self.stage.current + 1).min(2)),
                 keys::KEY_LEFT => self.stage.go(now, self.stage.current.saturating_sub(1)),
                 keys::KEY_SPACE => {
-                    if self.clock.is_paused() { self.clock.resume() } else { self.clock.pause() }
+                    if self.clock.is_paused() {
+                        self.clock.resume()
+                    } else {
+                        self.clock.pause()
+                    }
                 }
                 keys::KEY_S => self.clock.rate = if self.clock.rate < 1.0 { 1.0 } else { 0.25 },
                 keys::KEY_V => self.view = (self.view + 1) % (self.variants.len() + 1),
@@ -124,12 +140,23 @@ impl App for Gallery {
         let mut y = list.y + pad;
         if ui.painting() {
             ui.fill(list, th.panel);
-            ui.text_at(list.x + pad, y + th.px(20.0), Face::Bold, th.pt(16.0), th.text, "Glass concept");
+            ui.text_at(
+                list.x + pad,
+                y + th.px(20.0),
+                Face::Bold,
+                th.pt(16.0),
+                th.text,
+                "Glass concept",
+            );
         }
         y += th.px(34.0);
         let names = self.stage.names();
         for (i, n) in names.iter().enumerate() {
-            if ui.button_at(Rect::new(list.x + pad, y, list_w - 2 * pad, row - th.px(4.0)), ("screen", i), n) {
+            if ui.button_at(
+                Rect::new(list.x + pad, y, list_w - 2 * pad, row - th.px(4.0)),
+                ("screen", i),
+                n,
+            ) {
                 self.view = 0;
                 self.stage.go(now, i);
                 self.playing = None;
@@ -138,7 +165,11 @@ impl App for Gallery {
         }
         for i in 0..self.variants.len() {
             let n = self.variants[i].name();
-            if ui.button_at(Rect::new(list.x + pad, y, list_w - 2 * pad, row - th.px(4.0)), ("variant", i), n) {
+            if ui.button_at(
+                Rect::new(list.x + pad, y, list_w - 2 * pad, row - th.px(4.0)),
+                ("variant", i),
+                n,
+            ) {
                 self.view = i + 1;
             }
             y += row;
@@ -148,14 +179,37 @@ impl App for Gallery {
             if y + row > list.bottom() - th.px(40.0) {
                 break;
             }
-            if ui.button_at(Rect::new(list.x + pad, y, list_w - 2 * pad, row - th.px(4.0)), ("demo", i), d.name) {
+            if ui.button_at(
+                Rect::new(list.x + pad, y, list_w - 2 * pad, row - th.px(4.0)),
+                ("demo", i),
+                d.name,
+            ) {
                 self.play(i);
             }
             y += row;
         }
         if ui.painting() {
-            let state = format!("{}{}", if self.clock.is_paused() { "paused" } else { "running" }, if self.clock.rate < 1.0 { ", 1/4 speed" } else { "" });
-            ui.text_at(list.x + pad, list.bottom() - pad, Face::Sans, th.pt(12.0), th.dim, &state);
+            let state = format!(
+                "{}{}",
+                if self.clock.is_paused() {
+                    "paused"
+                } else {
+                    "running"
+                },
+                if self.clock.rate < 1.0 {
+                    ", 1/4 speed"
+                } else {
+                    ""
+                }
+            );
+            ui.text_at(
+                list.x + pad,
+                list.bottom() - pad,
+                Face::Sans,
+                th.pt(12.0),
+                th.dim,
+                &state,
+            );
         }
 
         // The phone, at full height.
@@ -175,7 +229,9 @@ impl App for Gallery {
                 }
             }
             Some(Input::Up(px, py)) => {
-                let (dx, dy) = self.to_dp(px, py).unwrap_or(((px - r.x) as f32 / k, (py - r.y) as f32 / k));
+                let (dx, dy) = self
+                    .to_dp(px, py)
+                    .unwrap_or(((px - r.x) as f32 / k, (py - r.y) as f32 / k));
                 self.stage.pointer(now, Pointer::Up(dx, dy));
             }
             Some(Input::Move(px, py)) => {
@@ -189,11 +245,19 @@ impl App for Gallery {
 
         if ui.painting() && self.view > 0 {
             // Another device, fitted into the space right of the list (whole multiples for the DSi's pixels).
-            ui.fill(Rect::new(list.right(), area.y, area.w - list_w, area.h), Rgb::hex(0x050608));
+            ui.fill(
+                Rect::new(list.right(), area.y, area.w - list_w, area.h),
+                theme::GROUND,
+            );
             let v = &mut self.variants[self.view - 1];
             let (vw, vh, vk) = v.size();
-            let room = ((area.w - list_w - 2 * pad) as f32 / vw as f32).min((area.h - 2 * pad) as f32 / vh as f32);
-            let s = if v.name() == "fortuna" { room.floor().max(1.0) } else { room.min(1.0) };
+            let room = ((area.w - list_w - 2 * pad) as f32 / vw as f32)
+                .min((area.h - 2 * pad) as f32 / vh as f32);
+            let s = if v.name() == "fortuna" {
+                room.floor().max(1.0)
+            } else {
+                room.min(1.0)
+            };
             let (w, h) = ((vw as f32 * s) as u32, (vh as f32 * s) as u32);
             if v.name() == "fortuna" {
                 let mut small = Canvas::new(vw, vh, vk);
@@ -217,15 +281,22 @@ impl App for Gallery {
             let y = area.y + (area.h - h as i32) / 2;
             ui.pixels(Rect::new(x, y, w as i32, h as i32), w as usize, &cv.px);
         } else if ui.painting() {
-            ui.fill(Rect::new(list.right(), area.y, area.w - list_w, area.h), Rgb::hex(0x050608));
-            if self.phone.as_ref().is_none_or(|p| p.w != w as u32 || p.h != h as u32) {
+            ui.fill(
+                Rect::new(list.right(), area.y, area.w - list_w, area.h),
+                theme::GROUND,
+            );
+            if self
+                .phone
+                .as_ref()
+                .is_none_or(|p| p.w != w as u32 || p.h != h as u32)
+            {
                 self.phone = Some(Canvas::new(w as u32, h as u32, k));
             }
             let cv = self.phone.as_mut().expect("phone");
             self.stage.draw(cv, now);
             // Round the phone's corners against the ground.
             let mut frame = Canvas::new(w as u32, h as u32, k);
-            frame.clear(lucina_glass::Color::hex(0x050608));
+            frame.clear(lucina_glass::tokens::color::VOID);
             frame.blit(cv, R::new(0.0, 0.0, 360.0, 800.0), 44.0, 1.0);
             ui.pixels(r, w as usize, &frame.px);
         }
@@ -280,7 +351,11 @@ mod tests {
         for d in DEMOS {
             let f = stage::frames(d, 1.0, 10.0);
             assert!(f.len() >= 2, "{}", d.name);
-            assert!(f.iter().any(|c| c.px != f[0].px) || d.steps.is_empty() && d.name == "live-pill", "{} never moves", d.name);
+            assert!(
+                f.iter().any(|c| c.px != f[0].px) || d.steps.is_empty() && d.name == "live-pill",
+                "{} never moves",
+                d.name
+            );
         }
     }
 }

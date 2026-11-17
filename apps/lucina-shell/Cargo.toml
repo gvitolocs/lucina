@@ -9,12 +9,23 @@ publish.workspace = true
 #   cargo build --release -p lucina-shell --target aarch64-unknown-linux-musl
 # The drawing, the terminal emulator and the key map are plain Rust and are tested on the host.
 
+[features]
+# Replays a `.lgst` recording named by LUCINA_GESTURE_REPLAY instead of reading the pad (src/gesture_feed.rs). A bench path,
+# never in a shipped image, so it stays off by default; docs/design/juno-window-manager.md, section 4b.
+gesture-replay = ["lucina-wm/gesture-replay"]
+
 [dependencies]
 lucina-app = { path = "../../apps/lucina-app" }
 # The home dashboard: the glass concept drawn from real data (src/dash.rs, src/home_feed.rs).
 lucina-glass = { path = "../../apps/lucina-glass" }
 # Idle standby: when the screen goes off and the machine sleeps by itself, and what holds it off (src/standby.rs), Verus-proved.
 lucina-standby = { path = "../../kernel/lucina-standby" }
+# The window manager's rules: the Scene -> compositor-ops mapping (src/wm_scene.rs) turns a space switch or overview into ops.
+lucina-wm-rules = { path = "../../services/lucina-wm-rules" }
+# The gesture session (src/gesture_feed.rs): the rules' controller with its row of spaces, and where the records come from.
+lucina-wm = { path = "../lucina-wm" }
+# The gesture record the device carries, which src/gesture_feed.rs reads through lucina-wm and its tests read from the golden streams.
+lucina-gesture = { path = "../../drivers/lucina-gesture" }
 # The shell's own screen as an AccessKit tree, for Lucina (stage B).
 lucina-ax = { path = "../../services/lucina-ax" }
 # The AccessKit tree and the control socket's JSON lines (src/control.rs).

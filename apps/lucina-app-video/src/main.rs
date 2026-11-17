@@ -32,9 +32,10 @@ use lucina_app::fb::{Fb, GraphicsMode};
 use lucina_app::gfx::{Frame, Text};
 use lucina_app::hold::DisplayHold;
 use lucina_app::input::{self, EV_KEY, EV_SYN, Inputs};
-use lucina_app::keys::{self, Keyboard, Press};
 use lucina_app::intent::{Call, Entity, IntentSpec, Reply, Responder};
-use lucina_app::{App, Face, Rect, Rgb, Ui, input_watch};
+use lucina_app::keys::{self, Keyboard, Press};
+use lucina_app::theme;
+use lucina_app::{App, Face, Rect, Ui, input_watch};
 use lucina_audio_decode::Decoder;
 use lucina_nav as nav;
 use lucina_video::{Clock, Codec, Demuxer, Quality, Scaler, Track};
@@ -64,14 +65,25 @@ const BAR_H: i32 = 48;
 
 /// Where the position, queue and subtitle choice are kept. `/data` when there is one.
 fn state_path() -> PathBuf {
-    let base = if Path::new("/run/lucina/data-ready").exists() { "/data/home/.local/share/lucina-video" } else { "/run/lucina/files/.local/share/lucina-video" };
+    let base = if Path::new("/run/lucina/data-ready").exists() {
+        "/data/home/.local/share/lucina-video"
+    } else {
+        "/run/lucina/files/.local/share/lucina-video"
+    };
     PathBuf::from(base).join("player.json")
 }
 
 fn rss_kib() -> i64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
-        .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:"))?.split_whitespace().nth(1)?.parse().ok())
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))?
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()
+        })
         .unwrap_or(-1)
 }
 
@@ -138,18 +150,39 @@ fn sidecar_cues(path: &Path) -> Vec<Cue> {
     Vec::new()
 }
 
-fn start_session(path: PathBuf, id: String, title: String, demux: Box<dyn Demuxer>, cues: Vec<Cue>, client: Option<lucina_account::Client>, resume_ms: Option<u64>, wake_fd: libc::c_int) -> Result<Session, String> {
+/// Where a session's video comes from: the file or item, the key `media.started` files it under, the words the stage shows.
+struct Source {
+    path: PathBuf,
+    id: String,
+    title: String,
+}
+
+fn start_session(
+    src: Source,
+    demux: Box<dyn Demuxer>,
+    cues: Vec<Cue>,
+    client: Option<lucina_account::Client>,
+    resume_ms: Option<u64>,
+    wake_fd: libc::c_int,
+) -> Result<Session, String> {
     let track = demux.track().clone();
     let codec = track.codec;
-    let reorder = if codec == Codec::H264 { H264_REORDER } else { 0 };
+    let reorder = if codec == Codec::H264 {
+        H264_REORDER
+    } else {
+        0
+    };
     // Stage D: Lucina waits for `media.ended` instead of watching the screen. The subject is the library item or the file.
-    lucina_app::events::emit("media.started").subject(&media_subject(&id)).field("title", title.as_str()).send();
+    lucina_app::events::emit("media.started")
+        .subject(&media_subject(&src.id))
+        .field("title", src.title.as_str())
+        .send();
     Ok(Session {
-        path,
-        id,
+        path: src.path,
+        id: src.id,
         client,
         resume_ms,
-        title,
+        title: src.title,
         track,
         worker: Worker::start(demux, codec, reorder, wake_fd)?,
         codec,
@@ -176,9 +209,24 @@ fn media_subject(id: &str) -> String {
 
 fn open_session(path: &Path, wake_fd: libc::c_int) -> Result<Session, String> {
     let file = File::open(path).map_err(|e| format!("Cannot open this file: {e}"))?;
-    let demux = lucina_video::open(BufReader::with_capacity(256 * 1024, file)).map_err(|e| e.to_string())?;
-    let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let mut session = start_session(path.to_owned(), format!("local:{}", path.display()), title, demux, sidecar_cues(path), None, None, wake_fd)?;
+    let demux = lucina_video::open(BufReader::with_capacity(256 * 1024, file))
+        .map_err(|e| e.to_string())?;
+    let title = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut session = start_session(
+        Source {
+            path: path.to_owned(),
+            id: format!("local:{}", path.display()),
+            title,
+        },
+        demux,
+        sidecar_cues(path),
+        None,
+        None,
+        wake_fd,
+    )?;
     let sound_path = path.to_owned();
     session.open_sound = Some(Arc::new(move || Decoder::open(&sound_path)));
     Ok(session)
@@ -186,7 +234,8 @@ fn open_session(path: &Path, wake_fd: libc::c_int) -> Result<Session, String> {
 
 /// A session on a video of the owner's library.
 fn open_item(id: &str, wake_fd: libc::c_int) -> Result<Session, String> {
-    let client = lucina_account::system::client().ok_or("This laptop is not signed in, so the library is out of reach.")?;
+    let client = lucina_account::system::client()
+        .ok_or("This laptop is not signed in, so the library is out of reach.")?;
     let chosen;
     let id = if id == "newest" {
         chosen = remote::newest_video(&client)?;
@@ -195,10 +244,25 @@ fn open_item(id: &str, wake_fd: libc::c_int) -> Result<Session, String> {
         id
     };
     let plan = remote::plan(&client, id)?;
-    eprintln!("lucina-app-video: library item {id} mode={} hls={}", plan.mode, plan.hls_url.is_some());
+    eprintln!(
+        "lucina-app-video: library item {id} mode={} hls={}",
+        plan.mode,
+        plan.hls_url.is_some()
+    );
     let demux = remote::demuxer(client.clone(), &plan)?;
     let cues = remote::cues(&client, &plan);
-    let mut session = start_session(PathBuf::from(id), id.to_owned(), plan.title.clone(), demux, cues, Some(client.clone()), Some(plan.resume_ms), wake_fd)?;
+    let mut session = start_session(
+        Source {
+            path: PathBuf::from(id),
+            id: id.to_owned(),
+            title: plan.title.clone(),
+        },
+        demux,
+        cues,
+        Some(client.clone()),
+        Some(plan.resume_ms),
+        wake_fd,
+    )?;
     session.open_sound = remote::sound(client, &plan);
     Ok(session)
 }
@@ -207,7 +271,10 @@ impl Session {
     /// The present report for `wait` (stage D): this program draws past the toolkit's `Screen`, so it reports itself, the whole
     /// screen as the rectangle.
     fn report_present(&mut self, w: u32, h: u32) {
-        if self.reported_at.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+        if self
+            .reported_at
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+        {
             return;
         }
         self.reported_at = Some(Instant::now());
@@ -218,7 +285,10 @@ impl Session {
     fn sound(&self) -> Sound {
         // For measuring with nobody at the laptop: the picture follows the wall clock and the speakers stay quiet.
         if std::env::var_os("LUCINA_VIDEO_MUTE").is_some_and(|v| v == "1") {
-            eprintln!("lucina-app-video: muted by LUCINA_VIDEO_MUTE {}", self.title);
+            eprintln!(
+                "lucina-app-video: muted by LUCINA_VIDEO_MUTE {}",
+                self.title
+            );
             return Sound::none();
         }
         match (&self.track.audio, &self.open_sound) {
@@ -227,7 +297,10 @@ impl Session {
                 Sound::from(open.clone())
             }
             (Some(codec), None) => {
-                eprintln!("lucina-app-video: no sound from this source yet: {} codec={codec}", self.title);
+                eprintln!(
+                    "lucina-app-video: no sound from this source yet: {} codec={codec}",
+                    self.title
+                );
                 Sound::none()
             }
             (None, _) => Sound::none(),
@@ -240,7 +313,11 @@ impl Session {
 
     /// Tells the decoding thread to go there, and waits until it has: a local file takes no time, and a remote one is what a seek costs.
     fn seek(&mut self, pts_us: i64, forward: bool) -> Result<i64, String> {
-        self.worker.command(Command::Seek { pts: pts_us, forward, from: self.position_us });
+        self.worker.command(Command::Seek {
+            pts: pts_us,
+            forward,
+            from: self.position_us,
+        });
         loop {
             let mut s = self.worker.lock();
             if let Some(at) = s.landed.take() {
@@ -311,7 +388,11 @@ impl Session {
 
 fn format_time(us: i64) -> String {
     let s = us.max(0) / 1_000_000;
-    if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
 }
 
 /// The engine's answer about where to start, from the file's id.
@@ -320,7 +401,13 @@ fn resume_ms(engine: &mut secretary_player::Engine, id: &str, duration_ms: u64) 
     engine.handle(&cmd)["position_ms"].as_u64().unwrap_or(0)
 }
 
-fn report_position(engine: &mut secretary_player::Engine, id: &str, position_us: i64, duration_ms: u64, playing: bool) -> Value {
+fn report_position(
+    engine: &mut secretary_player::Engine,
+    id: &str,
+    position_us: i64,
+    duration_ms: u64,
+    playing: bool,
+) -> Value {
     let cmd = json!({"cmd": "position", "id": id, "position_ms": position_us.max(0) / 1000, "duration_ms": duration_ms, "playing": playing}).to_string();
     engine.handle(&cmd)
 }
@@ -351,7 +438,13 @@ impl Overlay {
     fn new(w: u32, h: u32) -> Overlay {
         let k = (w as f32 / 1024.0).min(h as f32 / 768.0).max(1.0);
         let bar_h = (BAR_H as f32 * k) as u32;
-        Overlay { text: Text::new(), bar: Frame::new(w, bar_h), k, w: w as i32, h: h as i32 }
+        Overlay {
+            text: Text::new(),
+            bar: Frame::new(w, bar_h),
+            k,
+            w: w as i32,
+            h: h as i32,
+        }
     }
 
     fn bar_height(&self) -> i32 {
@@ -361,7 +454,7 @@ impl Overlay {
     fn draw_bar(&mut self, fb: &mut Fb, s: &Session, paused: bool, quality: Quality) {
         let (w, h) = (self.w, self.bar_height());
         let px = (15.0 * self.k) as u16;
-        self.bar.fill_rect(Rect::new(0, 0, w, h), Rgb::hex(0x10141c));
+        self.bar.fill_rect(Rect::new(0, 0, w, h), theme::BAR);
         let pos = s.position_us;
         let dur = s.track.duration_us;
         let left = format!(
@@ -373,16 +466,34 @@ impl Overlay {
             s.codec.name(),
             s.track.width,
             s.track.height,
-            if quality == Quality::Smooth { "  smooth" } else { "  fast" },
-            if s.stats.dropped > 0 { format!("  {} dropped", s.stats.dropped) } else { String::new() },
+            if quality == Quality::Smooth {
+                "  smooth"
+            } else {
+                "  fast"
+            },
+            if s.stats.dropped > 0 {
+                format!("  {} dropped", s.stats.dropped)
+            } else {
+                String::new()
+            },
         );
         let y = (h - self.text.ascent(Face::Sans, px)) / 2 + self.text.ascent(Face::Sans, px) - 4;
         let clip = self.bar.bounds();
         let line = self.text.fit(Face::Sans, px, &left, w - 24);
-        self.text.draw_clipped(&mut self.bar, clip, 12, y, Face::Sans, px, Rgb::hex(0xe6e8ee), &line);
+        self.text.draw_clipped(
+            &mut self.bar,
+            clip,
+            12,
+            y,
+            Face::Sans,
+            px,
+            theme::ITEM,
+            &line,
+        );
         if let Some(d) = dur.filter(|d| *d > 0) {
             let filled = ((pos.clamp(0, d) as f64 / d as f64) * w as f64) as i32;
-            self.bar.fill_rect(Rect::new(0, 0, filled, 3), Rgb::hex(0x5b8cff));
+            self.bar
+                .fill_rect(Rect::new(0, 0, filled, 3), theme::ACCENT);
         }
         let at = self.h - h;
         for (i, (_, row)) in self.bar.rows(Rect::new(0, 0, w, h)).enumerate() {
@@ -394,7 +505,10 @@ impl Overlay {
     fn cue_band(&self, lines: usize) -> Band {
         let px = (21.0 * self.k) as u16;
         let h = (px as f32 * 1.3) as i32 * lines as i32 + 12;
-        Band { y: self.h - h - (40.0 * self.k) as i32, h }
+        Band {
+            y: self.h - h - (40.0 * self.k) as i32,
+            h,
+        }
     }
 
     /// The cue's lines in white on a dark strip above the bottom of the screen. Only when a cue is on: nothing is paid otherwise.
@@ -403,12 +517,21 @@ impl Overlay {
         let line_h = (px as f32 * 1.3) as i32;
         let Band { y: at, h } = self.cue_band(lines.len());
         let mut f = Frame::new(self.w as u32, h as u32);
-        f.fill_rect(Rect::new(0, 0, self.w, h), Rgb::hex(0x000000));
+        f.fill_rect(Rect::new(0, 0, self.w, h), theme::GROUND);
         let clip = f.bounds();
         for (i, l) in lines.iter().enumerate() {
             let tw = self.text.measure(Face::Sans, px, l);
             let y = 6 + line_h * i as i32 + self.text.ascent(Face::Sans, px);
-            self.text.draw_clipped(&mut f, clip, (self.w - tw).max(0) / 2, y, Face::Sans, px, Rgb::hex(0xffffff), l);
+            self.text.draw_clipped(
+                &mut f,
+                clip,
+                (self.w - tw).max(0) / 2,
+                y,
+                Face::Sans,
+                px,
+                theme::WHITE,
+                l,
+            );
         }
         for (i, (_, row)) in f.rows(Rect::new(0, 0, self.w, h)).enumerate() {
             fb.present_image(0, at + i as i32, self.w as usize, row);
@@ -432,9 +555,20 @@ fn show_message(fb: &mut Fb, overlay: &mut Overlay, title: &str, message: &str) 
     let clip = f.bounds();
     let y0 = overlay.text.ascent(Face::Sans, px) + 8;
     let t = overlay.text.fit(Face::Sans, px, title, w as i32 - 40);
-    overlay.text.draw_clipped(&mut f, clip, 20, y0, Face::Sans, px, Rgb::hex(0xffffff), &t);
+    overlay
+        .text
+        .draw_clipped(&mut f, clip, 20, y0, Face::Sans, px, theme::WHITE, &t);
     let m = overlay.text.fit(Face::Sans, px, message, w as i32 - 40);
-    overlay.text.draw_clipped(&mut f, clip, 20, y0 + (px as i32) * 2, Face::Sans, px, Rgb::hex(0xd0d4dc), &m);
+    overlay.text.draw_clipped(
+        &mut f,
+        clip,
+        20,
+        y0 + (px as i32) * 2,
+        Face::Sans,
+        px,
+        theme::ITEM,
+        &m,
+    );
     for (i, (_, row)) in f.rows(Rect::new(0, 0, w as i32, h as i32)).enumerate() {
         fb.present_image(0, fb.height as i32 * 3 / 8 + i as i32, w as usize, row);
     }
@@ -512,13 +646,18 @@ fn playlist_key(p: Press, pos: usize, count: usize) -> Act {
     }
     let ok = vec![true; count];
     let to = nav::walk(&ok, pos, step);
-    if to == pos { Act::Stay } else { Act::Go(to as i32 - pos as i32) }
+    if to == pos {
+        Act::Stay
+    } else {
+        Act::Go(to as i32 - pos as i32)
+    }
 }
 
 impl Player {
     /// Keeps the shell's screen-off hold equal to "playing": a session is open, not paused, not finished.
     fn update_hold(&mut self, session: Option<&Session>) {
-        let playing = session.is_some_and(|s| holds_screen(true, self.clock.is_paused(), s.finished));
+        let playing =
+            session.is_some_and(|s| holds_screen(true, self.clock.is_paused(), s.finished));
         self.hold.set(playing, "playing video");
     }
 
@@ -526,7 +665,18 @@ impl Player {
     fn poll_keys(&mut self, s: &mut Session, wait: Duration) -> Result<Option<Next>, String> {
         let now = Instant::now();
         input_watch::rescan(self.watch.as_mut(), &mut self.inputs, now);
-        let mut fds: Vec<libc::pollfd> = self.inputs.fds().into_iter().chain(self.watch.as_ref().map(|w| w.fd())).chain([self.wake_r]).map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
+        let mut fds: Vec<libc::pollfd> = self
+            .inputs
+            .fds()
+            .into_iter()
+            .chain(self.watch.as_ref().map(|w| w.fd()))
+            .chain([self.wake_r])
+            .map(|fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
         if !wait.is_zero() {
             let ms = (wait.as_micros().div_ceil(1000)).clamp(1, 100) as i32;
             // SAFETY: `fds` is a valid array for the call. An interrupted poll (SIGTERM) goes round the loop.
@@ -534,7 +684,8 @@ impl Player {
             if fds.last().is_some_and(|f| f.revents & libc::POLLIN != 0) {
                 let mut sink = [0u8; 64];
                 // SAFETY: reads into a live local buffer; the pipe is non-blocking.
-                while unsafe { libc::read(self.wake_r, sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
+                while unsafe { libc::read(self.wake_r, sink.as_mut_ptr().cast(), sink.len()) } > 0 {
+                }
             }
         }
         let mut evs = Vec::new();
@@ -585,12 +736,20 @@ impl Player {
         }
         match p.code {
             keys::KEY_ESC => return Ok(Some(Next::Quit)),
-            keys::KEY_F1 if std::env::var_os("LUCINA_SHELL").is_none() => return Ok(Some(Next::Quit)),
+            keys::KEY_F1 if std::env::var_os("LUCINA_SHELL").is_none() => {
+                return Ok(Some(Next::Quit));
+            }
             KEY_SPACE => {
                 let paused = !self.clock.is_paused();
                 self.clock.set_paused(paused, now);
                 self.update_hold(Some(s));
-                report_position(&mut self.engine, &s.id, s.position_us, s.duration_ms(), !paused);
+                report_position(
+                    &mut self.engine,
+                    &s.id,
+                    s.position_us,
+                    s.duration_ms(),
+                    !paused,
+                );
                 self.show_bar_a_while();
                 self.overlay.draw_bar(&mut self.fb, s, paused, self.quality);
             }
@@ -599,7 +758,11 @@ impl Player {
             KEY_N => return Ok(Some(Next::Move(1))),
             KEY_P => return Ok(Some(Next::Move(-1))),
             KEY_S | KEY_V => {
-                self.quality = if self.quality == Quality::Fast { Quality::Smooth } else { Quality::Fast };
+                self.quality = if self.quality == Quality::Fast {
+                    Quality::Smooth
+                } else {
+                    Quality::Fast
+                };
                 self.show_bar_a_while();
             }
             KEY_I => self.show_bar_a_while(),
@@ -616,10 +779,16 @@ impl Player {
     fn play(&mut self, s: &mut Session) -> Result<Next, String> {
         clear_screen(&mut self.fb);
         let duration_ms = s.duration_ms();
-        let resume = s.resume_ms.unwrap_or_else(|| resume_ms(&mut self.engine, &s.id, duration_ms));
+        let resume = s
+            .resume_ms
+            .unwrap_or_else(|| resume_ms(&mut self.engine, &s.id, duration_ms));
         if resume > 0 {
             let at = s.seek(resume as i64 * 1000, false)?;
-            eprintln!("lucina-app-video: resuming {} at {}", s.title, format_time(at));
+            eprintln!(
+                "lucina-app-video: resuming {} at {}",
+                s.title,
+                format_time(at)
+            );
             self.show_bar_a_while();
         }
         let mut scaler: Option<Scaler> = None;
@@ -631,14 +800,26 @@ impl Player {
                 return Ok(Next::Quit);
             }
             let now = Instant::now();
-            let clock_now = self.clock.is_started().then(|| self.clock.now_us(now)).flatten();
+            let clock_now = self
+                .clock
+                .is_started()
+                .then(|| self.clock.now_us(now))
+                .flatten();
             let (queued, first_pts, eof) = {
                 let mut w = s.worker.lock();
                 if let Some(e) = w.error.take() {
                     return Err(e);
                 }
                 let behind = pace::behind_us(w.queue.first_pts(), clock_now, last_pts, frame_us);
-                let skip = if self.clock.is_paused() { false } else if behind > SKIP_AFTER_US { true } else if behind < SKIP_UNTIL_US { false } else { w.skip_nonref };
+                let skip = if self.clock.is_paused() {
+                    false
+                } else if behind > SKIP_AFTER_US {
+                    true
+                } else if behind < SKIP_UNTIL_US {
+                    false
+                } else {
+                    w.skip_nonref
+                };
                 w.skip_nonref = skip;
                 let state = (w.queue.len(), w.queue.first_pts(), w.eof);
                 w.starving = state.0 < s.reorder + 1;
@@ -672,7 +853,9 @@ impl Player {
                     s.stats.dropped += 1;
                 }
                 Step::Show => {
-                    let Some(pic) = s.worker.lock().queue.pop() else { continue };
+                    let Some(pic) = s.worker.lock().queue.pop() else {
+                        continue;
+                    };
                     s.worker.wake();
                     let pts = pic.pts_us();
                     if clock_now.is_some() && self.clock.follows_sound() {
@@ -683,7 +866,10 @@ impl Player {
                     last_shown = t;
                     s.position_us = pts;
                     // A frame's time from the file: only used to tell when one is too late to show.
-                    if let Some(d) = last_pts.map(|l: i64| pts - l).filter(|d| (1_000..1_000_000).contains(d)) {
+                    if let Some(d) = last_pts
+                        .map(|l: i64| pts - l)
+                        .filter(|d| (1_000..1_000_000).contains(d))
+                    {
                         frame_us = d;
                     }
                     last_pts = Some(pts);
@@ -692,7 +878,12 @@ impl Player {
                     }
                     if !s.first_shown {
                         s.first_shown = true;
-                        eprintln!("lucina-app-video: first frame {} to_frame_ms={} rss_kib={}", s.title, s.started.elapsed().as_millis(), rss_kib());
+                        eprintln!(
+                            "lucina-app-video: first frame {} to_frame_ms={} rss_kib={}",
+                            s.title,
+                            s.started.elapsed().as_millis(),
+                            rss_kib()
+                        );
                     }
                     if self.last_report.elapsed() >= Duration::from_secs(1) {
                         self.last_report = t;
@@ -727,7 +918,13 @@ impl Player {
         }
     }
 
-    fn show(&mut self, s: &mut Session, pic: &Picture, scaler: &mut Option<Scaler>, late_us: i64) -> Result<(), String> {
+    fn show(
+        &mut self,
+        s: &mut Session,
+        pic: &Picture,
+        scaler: &mut Option<Scaler>,
+        late_us: i64,
+    ) -> Result<(), String> {
         if let Picture::Nv12(n) = pic {
             if self.gpu.is_some() {
                 match self.show_by_gpu(s, GpuSource::Nv12(n), n.pts_us, Instant::now()) {
@@ -739,7 +936,9 @@ impl Player {
                         return Ok(());
                     }
                     Err(e) => {
-                        eprintln!("lucina-app-video: the GPU stopped showing pictures, the CPU takes over: {e}");
+                        eprintln!(
+                            "lucina-app-video: the GPU stopped showing pictures, the CPU takes over: {e}"
+                        );
                         self.gpu = None;
                         self.quality = Quality::Fast;
                         clear_screen(&mut self.fb);
@@ -764,7 +963,9 @@ impl Player {
                     return Ok(());
                 }
                 Err(e) => {
-                    eprintln!("lucina-app-video: the GPU stopped showing pictures, the CPU takes over: {e}");
+                    eprintln!(
+                        "lucina-app-video: the GPU stopped showing pictures, the CPU takes over: {e}"
+                    );
                     self.gpu = None;
                     // Bilinear was the GPU's default; on the CPU it costs most of a frame.
                     self.quality = Quality::Fast;
@@ -773,8 +974,15 @@ impl Player {
                 }
             }
         }
-        if scaler.as_ref().is_none_or(|sc| sc.quality != self.quality || sc.source() != (p.w, p.h)) {
-            *scaler = Some(Scaler::new((p.w, p.h), (self.fb.width as usize, self.fb.height as usize), self.quality));
+        if scaler
+            .as_ref()
+            .is_none_or(|sc| sc.quality != self.quality || sc.source() != (p.w, p.h))
+        {
+            *scaler = Some(Scaler::new(
+                (p.w, p.h),
+                (self.fb.width as usize, self.fb.height as usize),
+                self.quality,
+            ));
         }
         let sc = scaler.as_mut().expect("just made");
         sc.render(&p);
@@ -783,11 +991,17 @@ impl Player {
         // The bar's rows are the bar's while it shows.
         let bar_on = self.bar_until.is_some_and(|t| t > t1);
         let pts_ms = (pic.pts_us() / 1000).max(0) as u64;
-        let lines: Vec<String> = subtitles::active(&s.cues, pts_ms).iter().flat_map(|c| c.text.lines().map(str::to_owned).collect::<Vec<_>>()).collect();
+        let lines: Vec<String> = subtitles::active(&s.cues, pts_ms)
+            .iter()
+            .flat_map(|c| c.text.lines().map(str::to_owned).collect::<Vec<_>>())
+            .collect();
         let mut bands = Vec::with_capacity(2);
         if bar_on {
             let h = self.overlay.bar_height();
-            bands.push(Band { y: self.fb.height as i32 - h, h });
+            bands.push(Band {
+                y: self.fb.height as i32 - h,
+                h,
+            });
         }
         if !lines.is_empty() {
             bands.push(self.overlay.cue_band(lines.len()));
@@ -800,7 +1014,11 @@ impl Player {
             }
         }
         self.bands = bands;
-        let limit = if bar_on { (self.fb.height as i32 - self.overlay.bar_height()) as usize } else { usize::MAX };
+        let limit = if bar_on {
+            (self.fb.height as i32 - self.overlay.bar_height()) as usize
+        } else {
+            usize::MAX
+        };
         for (i, row) in sc.out.chunks_exact(dw).enumerate() {
             let y = y0 + i;
             if y >= limit {
@@ -840,7 +1058,13 @@ enum GpuSource<'a> {
 impl Player {
     /// One picture through [`present::GpuPresent`]: the same placing, bar and cues as the CPU path, with the picture drawn by the GPU
     /// before the CPU draws over it.
-    fn show_by_gpu(&mut self, s: &mut Session, src: GpuSource, pts_us: i64, t0: Instant) -> std::io::Result<()> {
+    fn show_by_gpu(
+        &mut self,
+        s: &mut Session,
+        src: GpuSource,
+        pts_us: i64,
+        t0: Instant,
+    ) -> std::io::Result<()> {
         let gpu = self.gpu.as_mut().expect("checked by the caller");
         let (layout, (w, h), crop) = match src {
             GpuSource::Planes(p) => (gpu.upload(p)?, (p.w, p.h), (0, 0)),
@@ -852,11 +1076,17 @@ impl Player {
         let to = Rect::new(x0 as i32, y0 as i32, dw as i32, dh as i32);
         let bar_on = self.bar_until.is_some_and(|t| t > t1);
         let pts_ms = (pts_us / 1000).max(0) as u64;
-        let lines: Vec<String> = subtitles::active(&s.cues, pts_ms).iter().flat_map(|c| c.text.lines().map(str::to_owned).collect::<Vec<_>>()).collect();
+        let lines: Vec<String> = subtitles::active(&s.cues, pts_ms)
+            .iter()
+            .flat_map(|c| c.text.lines().map(str::to_owned).collect::<Vec<_>>())
+            .collect();
         let mut bands = Vec::with_capacity(2);
         if bar_on {
             let h = self.overlay.bar_height();
-            bands.push(Band { y: self.fb.height as i32 - h, h });
+            bands.push(Band {
+                y: self.fb.height as i32 - h,
+                h,
+            });
         }
         if !lines.is_empty() {
             bands.push(self.overlay.cue_band(lines.len()));
@@ -868,10 +1098,18 @@ impl Player {
             }
         }
         self.bands = bands;
-        let limit = if bar_on { self.fb.height as i32 - self.overlay.bar_height() } else { i32::MAX };
+        let limit = if bar_on {
+            self.fb.height as i32 - self.overlay.bar_height()
+        } else {
+            i32::MAX
+        };
         if let Some((from, to)) = present::above(w as u32, h as u32, to, limit) {
             // A crop that does not start at the corner moves the source rectangle, as juno-video-gpu's yuv command takes it.
-            let from = Rect { x: from.x + crop.0 as i32, y: from.y + crop.1 as i32, ..from };
+            let from = Rect {
+                x: from.x + crop.0 as i32,
+                y: from.y + crop.1 as i32,
+                ..from
+            };
             let _ = layout;
             gpu.draw(from, to, self.quality == Quality::Smooth)?;
         }
@@ -906,7 +1144,10 @@ fn expand(args: &[String]) -> Vec<PathBuf> {
                 .flatten()
                 .flatten()
                 .map(|e| e.path())
-                .filter(|f| f.file_name().is_some_and(|n| list::is_video_name(&n.to_string_lossy())))
+                .filter(|f| {
+                    f.file_name()
+                        .is_some_and(|n| list::is_video_name(&n.to_string_lossy()))
+                })
                 .collect();
             files.sort();
             out.extend(files);
@@ -925,7 +1166,8 @@ fn decode_only(args: &[String]) -> i32 {
         eprintln!("usage: lucina-app-video --decode-only <file> [seconds]");
         return 2;
     };
-    let limit = std::time::Duration::from_secs(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(30));
+    let limit =
+        std::time::Duration::from_secs(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(30));
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) => {
@@ -948,7 +1190,11 @@ fn decode_only(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let way = if matches!(dec, decode::Decoder::Venus(_)) { "venus" } else { "cpu" };
+    let way = if matches!(dec, decode::Decoder::Venus(_)) {
+        "venus"
+    } else {
+        "cpu"
+    };
     let cpu0 = cpu_seconds();
     let start = std::time::Instant::now();
     let (mut packets, mut pictures, mut worst_ms) = (0u64, 0u64, 0f64);
@@ -956,7 +1202,9 @@ fn decode_only(args: &[String]) -> i32 {
     let mut out = Vec::new();
     // LUCINA_VIDEO_SEEK_AFTER=<packets>: back to the start after that many, in the same session for the video block; the first picture
     // after it must be the first picture again.
-    let seek_after: Option<u64> = std::env::var("LUCINA_VIDEO_SEEK_AFTER").ok().and_then(|v| v.parse().ok());
+    let seek_after: Option<u64> = std::env::var("LUCINA_VIDEO_SEEK_AFTER")
+        .ok()
+        .and_then(|v| v.parse().ok());
     let mut after_seek: Option<Option<u64>> = None;
     let mut sizes: Vec<(usize, usize)> = Vec::new();
     while start.elapsed() < limit {
@@ -1003,13 +1251,19 @@ fn decode_only(args: &[String]) -> i32 {
                     sizes.push((n.w, n.h));
                 }
                 if after_seek == Some(None) {
-                    after_seek = Some(Some(n.luma_rows().fold(0u64, |a, row| row.iter().fold(a, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(*b))))));
+                    after_seek = Some(Some(n.luma_rows().fold(0u64, |a, row| {
+                        row.iter()
+                            .fold(a, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(*b)))
+                    })));
                 }
             }
             if first.is_none()
                 && let decode::Picture::Nv12(n) = &pic
             {
-                let sum = n.luma_rows().fold(0u64, |a, row| row.iter().fold(a, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(*b))));
+                let sum = n.luma_rows().fold(0u64, |a, row| {
+                    row.iter()
+                        .fold(a, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(*b)))
+                });
                 first = Some((n.w, n.h, sum));
             }
             if first.is_none()
@@ -1017,7 +1271,9 @@ fn decode_only(args: &[String]) -> i32 {
             {
                 let mut sum = 0u64;
                 for row in 0..pl.h {
-                    sum = pl.y[row * pl.y_stride..row * pl.y_stride + pl.w].iter().fold(sum, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(*b)));
+                    sum = pl.y[row * pl.y_stride..row * pl.y_stride + pl.w]
+                        .iter()
+                        .fold(sum, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(*b)));
                 }
                 first = Some((pl.w, pl.h, sum));
             }
@@ -1144,18 +1400,34 @@ fn main() {
         args.push(path.to_owned());
     }
     if args.is_empty() {
-        let home = if Path::new("/run/lucina/data-ready").exists() { "/data/home" } else { "/run/lucina/files" };
+        let home = if Path::new("/run/lucina/data-ready").exists() {
+            "/data/home"
+        } else {
+            "/run/lucina/files"
+        };
         let videos = Path::new(home).join("Videos");
-        let start = if videos.is_dir() { videos } else { PathBuf::from(home) };
+        let start = if videos.is_dir() {
+            videos
+        } else {
+            PathBuf::from(home)
+        };
         lucina_app::run("lucina-app-video", move |_| list::List::new(start));
     }
     if args.first().is_some_and(|a| a == "--decode-only") {
         std::process::exit(decode_only(&args[1..]));
     }
-    let item = args.first().is_some_and(|a| a == "--item").then(|| args.get(1).cloned()).flatten();
+    let item = args
+        .first()
+        .is_some_and(|a| a == "--item")
+        .then(|| args.get(1).cloned())
+        .flatten();
     // `--browse <file>`: started from the list. The playlist is the videos of that file's folder, in the list's order, starting at
     // the file, so that the arrows can step to its neighbours.
-    let browse = args.first().is_some_and(|a| a == "--browse").then(|| args.get(1).map(PathBuf::from)).flatten();
+    let browse = args
+        .first()
+        .is_some_and(|a| a == "--browse")
+        .then(|| args.get(1).map(PathBuf::from))
+        .flatten();
     let (files, first) = match (&item, &browse) {
         (Some(_), _) => (Vec::new(), 0),
         (None, Some(file)) => list::playlist(file),
@@ -1170,9 +1442,18 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let _graphics = if under_shell { None } else { GraphicsMode::enter().ok() };
+    let _graphics = if under_shell {
+        None
+    } else {
+        GraphicsMode::enter().ok()
+    };
     // SAFETY: the handler only sets an atomic.
-    unsafe { libc::signal(libc::SIGTERM, on_sigterm as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            on_sigterm as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        )
+    };
     let (w, h) = (fb.width, fb.height);
     let engine = secretary_player::Engine::open(state_path()).unwrap_or_else(|e| {
         eprintln!("lucina-app-video: positions will not be kept: {e}");
@@ -1181,7 +1462,10 @@ fn main() {
     let mut pipe = [-1; 2];
     // SAFETY: pipe2 fills the two-element array.
     if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
-        eprintln!("lucina-app-video: no pipe: {}", std::io::Error::last_os_error());
+        eprintln!(
+            "lucina-app-video: no pipe: {}",
+            std::io::Error::last_os_error()
+        );
         std::process::exit(1);
     }
     let [wake_r, wake_w] = pipe;
@@ -1203,7 +1487,11 @@ fn main() {
         overlay: Overlay::new(w, h),
         clock: Clock::new(Sound::none()),
         // Bilinear costs the GPU nothing worth counting; on the CPU it takes most of a frame.
-        quality: if gpu.is_some() { Quality::Smooth } else { Quality::Fast },
+        quality: if gpu.is_some() {
+            Quality::Smooth
+        } else {
+            Quality::Fast
+        },
         gpu,
         bar_until: None,
         bands: Vec::new(),
@@ -1214,7 +1502,12 @@ fn main() {
         count: 1,
     };
     if let Some(id) = item {
-        show_message(&mut player.fb, &mut player.overlay, "Opening", "Asking the server for this video.");
+        show_message(
+            &mut player.fb,
+            &mut player.overlay,
+            "Opening",
+            "Asking the server for this video.",
+        );
         match open_item(&id, wake_w) {
             Ok(mut session) => {
                 player.clock = Clock::new(session.sound());
@@ -1222,7 +1515,13 @@ fn main() {
                 let result = player.play(&mut session);
                 player.update_hold(None);
                 session.log_summary(if result.is_err() { "error" } else { "done" });
-                let tick = report_position(&mut player.engine, &session.id, session.position_us, session.duration_ms(), false);
+                let tick = report_position(
+                    &mut player.engine,
+                    &session.id,
+                    session.position_us,
+                    session.duration_ms(),
+                    false,
+                );
                 if let Some(c) = &session.client
                     && let Some(e) = tick.get("entry")
                     && let Err(err) = c.send_json("PUT", &format!("/v1/media/progress/{id}"), e)
@@ -1245,7 +1544,11 @@ fn main() {
     }
     let mut at = first as i64;
     if files.is_empty() {
-        wait_and_say(&mut player, "No videos here", "Nothing to play in what was asked for. Press Escape.");
+        wait_and_say(
+            &mut player,
+            "No videos here",
+            "Nothing to play in what was asked for. Press Escape.",
+        );
         return;
     }
     while (0..files.len() as i64).contains(&at) {
@@ -1254,7 +1557,10 @@ fn main() {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("lucina-app-video: {}: {e}", path.display());
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 wait_and_say(&mut player, &name, &e);
                 if files.len() == 1 {
                     return;
@@ -1286,7 +1592,13 @@ fn main() {
             Err(_) => "error",
         };
         session.log_summary(why);
-        report_position(&mut player.engine, &session.id, session.position_us, session.duration_ms(), false);
+        report_position(
+            &mut player.engine,
+            &session.id,
+            session.position_us,
+            session.duration_ms(),
+            false,
+        );
         match result {
             Ok(Next::Quit) => return,
             Ok(Next::Move(by)) => at += by as i64,
@@ -1308,7 +1620,17 @@ fn wait_and_say(p: &mut Player, title: &str, message: &str) {
         }
         let now = Instant::now();
         input_watch::rescan(p.watch.as_mut(), &mut p.inputs, now);
-        let mut fds: Vec<libc::pollfd> = p.inputs.fds().into_iter().chain(p.watch.as_ref().map(|w| w.fd())).map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
+        let mut fds: Vec<libc::pollfd> = p
+            .inputs
+            .fds()
+            .into_iter()
+            .chain(p.watch.as_ref().map(|w| w.fd()))
+            .map(|fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
         // The earliest of the 120 s limit and the next timed rescan; a device event or the limit always ends the wait.
         let limit = started + Duration::from_secs(120);
         let timeout = p
@@ -1323,7 +1645,10 @@ fn wait_and_say(p: &mut Player, title: &str, message: &str) {
         let mut evs = Vec::new();
         p.inputs.read(&mut evs);
         for (_, ev) in evs.drain(..) {
-            if ev.type_ == EV_KEY && ev.value == 1 && matches!(ev.code, keys::KEY_ESC | keys::KEY_ENTER | KEY_SPACE) {
+            if ev.type_ == EV_KEY
+                && ev.value == 1
+                && matches!(ev.code, keys::KEY_ESC | keys::KEY_ENTER | KEY_SPACE)
+            {
                 return;
             }
         }
@@ -1350,7 +1675,11 @@ mod tests {
     /// The bug QEMU's capture found: a subtitle over the black below a film stayed there for good.
     #[test]
     fn what_stopped_being_drawn_gets_cleared() {
-        let (bar, cue, two) = (Band { y: 1000, h: 80 }, Band { y: 900, h: 50 }, Band { y: 870, h: 80 });
+        let (bar, cue, two) = (
+            Band { y: 1000, h: 80 },
+            Band { y: 900, h: 50 },
+            Band { y: 870, h: 80 },
+        );
         assert_eq!(gone(&[cue], &[]), [cue]);
         assert_eq!(gone(&[bar, cue], &[bar]), [cue]);
         assert_eq!(gone(&[cue], &[cue]), []);

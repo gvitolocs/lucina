@@ -193,6 +193,17 @@ vendored_at = "apps/lucina-glass/fonts/Lato-*.ttf (57-62 KB each, fontTools subs
 reason = "the type of the glass kit and, from restyle step 2, of every app: Regular for label, dim and paragraph, Semibold for headings, at the ty tokens"
 limitations = "203 codepoints: Latin-1 and a little punctuation, no Cyrillic, Greek or symbols (measured with fontTools), so the toolkit keeps a per-glyph DejaVu fallback. The subsets are Modified Versions and still carry the Reserved Font Name \"Lato\" - OFL condition 3; flagged for the owner in docs/research/juno-fonts.md, not settled"
 
+[lato-office]
+url = "http://www.latofonts.com/lato-free-fonts/"
+source = "the same Debian fonts-lato 2.015-1build1 subset as [lato], copied from apps/lucina-glass/fonts/Lato-Regular.ttf"
+license = "OFL-1.1"
+licence_file = "office/fonts/LICENSE-Lato-OFL.txt, sha256 1e6ccc54aa0b0aa4188cda121174f17c... - the identical file to the one beside [lato], copied with it: OFL condition 3 travels with every copy"
+verdict = "adopt"
+sha256 = "office/fonts/Lato-Regular.ttf 036314d2c151d30e... (the same bytes as apps/lucina-glass/fonts/Lato-Regular.ttf, 61952 B)"
+vendored_at = "office/fonts/Lato-Regular.ttf, which office/build.sh puts into office.pkg with the other faces there and apps/lucina-app-office unpacks to /tmp/lucina-office/fonts; office/gpui-juno/src/lib.rs load_package_fonts hands it to the text system, and office/gpui-juno/src/theme.rs UI_FONT_FAMILY names it"
+reason = "the face of the Office chrome - the menus, the ribbon, the status bar, the dialogs - which is what GPUI paints for the .SystemUIFont alias every style of the shell asks for; upstream's own name for it, IBM Plex Sans, is only bundled in its browser build, so the alias resolved to nothing and GPUI fell back to DejaVu Sans. A copy and not a path dependency: office/ is a workspace of its own that does not depend on lucina-glass, and the package must carry what the laptop draws"
+limitations = "only Regular, and only under the family name Lato: the kit's Semibold file is the family Lato Semibold to a font database, so GPUI cannot reach it as a weight of Lato and the chrome has no bold face of the house until a Lato Bold is vendored (docs/design/juno-restyle-office-chrome.md). The 203-codepoint Latin-1 limit and the Reserved Font Name question of [lato] apply here too; what falls outside the subset falls back to DejaVu per glyph, as it did before"
+
 [dejavu]
 url = "https://dejavu-fonts.github.io/"
 rev = "2.37 (the version string in each name table); the files entered the tree with 498139658, no fetch recorded before that"

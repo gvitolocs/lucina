@@ -1776,7 +1776,7 @@ fn tile(ui: &mut Ui, d: &TileData, art: Option<&Image>, r: Rect, selected: bool)
         t.text
     };
     let sub = if d.kind == TileKind::Need {
-        Rgb::hex(0x2a2410)
+        t.panel
     } else {
         t.dim
     };
@@ -1802,7 +1802,7 @@ fn tile(ui: &mut Ui, d: &TileData, art: Option<&Image>, r: Rect, selected: bool)
         let tone = if d.kind == TileKind::Need {
             lucina_app::theme::GROUND.over(fill, 0x30)
         } else {
-            Rgb::hex(0xffffff).over(fill, 0x18)
+            lucina_app::theme::WHITE.over(fill, 0x18)
         };
         ui.fill_round(disc, size / 2, tone);
         let m = monogram(&d.name);

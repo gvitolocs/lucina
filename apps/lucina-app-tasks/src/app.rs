@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use chrono::{Datelike, NaiveDate, Weekday};
 use lucina_account::ui::SignInView;
 use lucina_app::keys;
+use lucina_app::theme;
 use lucina_app::{App, Face, Id, ListState, Rect, Rgb, TextEdit, Theme, Ui};
+use lucina_glass::tokens;
 use secretary_tasks::{Command, DueView, Parsed, SyncStatus, TaskView, View, ViewQuery};
 
 use crate::cache;
@@ -161,8 +163,8 @@ const REPEAT: &str = "↻";
 pub fn priority_color(t: &Theme, p: u8) -> Rgb {
     match p {
         1 => t.danger,
-        2 => Rgb::hex(0xe8912d),
-        3 => Rgb::hex(0x4f7cf0),
+        2 => theme::rgb(tokens::color::WARNING),
+        3 => theme::rgb(tokens::color::SIGNAL),
         _ => t.dim,
     }
 }
@@ -235,8 +237,8 @@ fn due_color(t: &Theme, rel: i64) -> Rgb {
     match rel {
         i64::MIN..=-1 => t.danger,
         0 => t.ok,
-        1 => Rgb::hex(0xe8912d),
-        2..=6 => Rgb::hex(0xa98bf0),
+        1 => theme::rgb(tokens::color::WARNING),
+        2..=6 => t.accent,
         _ => t.dim,
     }
 }
@@ -1315,7 +1317,7 @@ impl Tasks {
                         } else if selected {
                             t.text
                         } else {
-                            Rgb::hex(0xeef0fb)
+                            t.item
                         };
                         ui.text_in(
                             Rect::new(tx, y, tw, t.px(26.0)),
@@ -2002,7 +2004,7 @@ impl App for Tasks {
                     Rect::new(r.x, r.y, r.w - bw - t.px(8.0), r.h),
                     Face::Sans,
                     t.pt(13.0),
-                    Rgb::hex(0xe8912d),
+                    theme::rgb(tokens::color::WARNING),
                     &format!("{}: {}", c.content, c.message),
                 );
                 if ui.button_at(

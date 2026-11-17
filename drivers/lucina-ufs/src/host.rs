@@ -6,8 +6,19 @@
 //! first tries to keep that link and only points the request lists at its own memory. A full reset of a Qualcomm
 //! controller needs its PHY, clocks and regulators brought up again (`ufs_qcom_hce_enable_notify`,
 //! `ufs_qcom_power_up_sequence`), which LucinaOS cannot do yet, so the kernel passes [`ResetPolicy::Never`] there.
+//!
+//! The error handler ([`Host::error_recovery`], and the resume that asks it: [`Host::resume`]) is **not** Linux's
+//! reset-and-restore, and is not claimed to be. Linux finishes the bring-up of a reset device by retuning UniPro and
+//! putting it back on its cached maximum power mode (HS gear, the active data lanes, the terminations, the HS
+//! series), through the DME writes of `ufshcd_change_power_mode` (`ufshcd.c:4594-4623`), reached from
+//! `ufshcd_device_init` at `:8799-8819`. This reset writes no `PA_*` attribute and no descriptor or attribute of the
+//! device at all: it leaves the link on whatever its power-on values are, and says nothing about its speed, so a
+//! recovered link can be slower than the fast link the firmware had left working. The evidence for it is that the
+//! link answers commands, not that it answers them as fast. Because of that `ufs.recover` must stay off on a
+//! Qualcomm controller until link-mode and throughput evidence for this path exists on the hardware; see
+//! [`Options::recover`].
 
-use alloc::vec::Vec;
+use alloc::{format, string::String, vec::Vec};
 use core::fmt;
 
 use crate::{
@@ -269,6 +280,27 @@ impl fmt::Display for Attr {
     }
 }
 
+/// What a resume came to ([`Host::resume`]), for the caller that owns the sleep bookkeeping and the log.
+#[derive(Clone, Debug)]
+pub struct Resume {
+    /// The resume's own call to the error handler succeeded: host and link came back through a bring-up, not
+    /// through the hibern8 exit. False when the exit was enough, when nothing was reset (`Options::recover` off, or
+    /// the handler refused) and for a reset spent inside the proof's own request, which is in the log.
+    pub reset: bool,
+    /// Whether the link must still be taken down for the next sleep and brought back by the next resume: false only
+    /// when an exit or a reset actually raised it. Linux's `hba->uic_link_state`, kept in software.
+    pub hibernating: bool,
+    /// Why the link is not proved, in the words for the log. `None` exactly when the last proof answered.
+    pub failed: Option<String>,
+}
+
+impl Resume {
+    /// Whether a command answered the link as it stands now - the only thing a resume may claim.
+    pub fn proved(&self) -> bool {
+        self.failed.is_none()
+    }
+}
+
 /// Choices for taking over from the firmware.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
@@ -279,6 +311,10 @@ pub struct Options {
     /// way Linux's `ufshcd_err_handler` does. The kernel component sets it from `ufs.recover`: on where a reset is
     /// enough to bring the controller back (a PCI/QEMU one), off on a Qualcomm one, whose HCE enable also needs the
     /// PHY and clock re-power (`ufs_qcom_power_up_sequence`) that this driver does not have.
+    ///
+    /// It stays off on a Qualcomm controller for a second reason, which no hardware test has yet answered: the
+    /// reset does not retune the link ([`Host::error_recovery`]), so a recovered link answers but at an unknown
+    /// speed. Turn it on there only with link-mode and throughput evidence from the laptop.
     pub recover: bool,
 }
 
@@ -342,8 +378,13 @@ pub struct Host<R: Regs, D: DmaArea, C: Clock> {
     /// How many more failed requests get a line in the log.
     request_notes: u32,
     /// [`Self::error_recovery`] attempts since the last request that completed, so a second failure in a row is
-    /// reported instead of resetting the controller again.
+    /// reported instead of resetting the controller again. Inside a [`Self::resume`] the scope budget of
+    /// [`Self::resume_resets`] is consulted as well, and nothing replenishes that one.
     recoveries: u32,
+    /// Resets spent inside the current [`Self::resume`] call: `Some(n)` while that scope is open, `None` outside
+    /// it. The scope is what makes the resume budget whole: a SCSI request that ends replenishes [`Self::recoveries`]
+    /// (`Self::command`) and this one never, so a UNIT ATTENTION answered between two resets cannot reopen it.
+    resume_resets: Option<u32>,
     options: Options,
     /// The controller's lists point at this host's DMA area.
     lists_ours: bool,
@@ -414,6 +455,7 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
             held: 0,
             request_notes: REQUEST_NOTES,
             recoveries: 0,
+            resume_resets: None,
             options,
             lists_ours: false,
             timing: Timing::default(),
@@ -538,8 +580,9 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
 
     /// Keeps the firmware's link: waits for its last requests, reads the link's state, points the lists at our
     /// area, pings the device. Hibernate exit only when the link is hibernating (Linux decides from the TX FSM,
-    /// `ufs_qcom_check_hibern8`), or when its state could not be read and the ping failed; it failing does not end
-    /// the bring-up, because on an active link it has nothing to do. The error returned is the ping's.
+    /// `ufs_qcom_check_hibern8`), or when its state could not be read and the ping failed; only the first of those
+    /// can end the bring-up, since a guessed exit has nothing to do on an active link. The error returned is the
+    /// ping's.
     fn reuse(&mut self) -> Result<(), Error> {
         self.wait_reg(
             regs::UTRLDBR,
@@ -566,7 +609,10 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
         self.make_operational()?;
         let mut result = self.verify_device();
         if result.is_err() && link.tx_fsm.is_none() {
-            self.hibernate_exit()?;
+            // The takeover's own tolerance, and the only place it is: the state could not be read, so the exit here
+            // is a guess at a link that may well already be active. What the caller gets is the ping's error, not a
+            // UIC result of an experiment - which is why this one call swallows the answer ([`Self::hibernate_exit`]).
+            let _ = self.hibernate_exit();
             self.request_notes = REQUEST_NOTES;
             result = self.verify_device();
         }
@@ -709,10 +755,12 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
         Ok(())
     }
 
-    /// DME_HIBER_EXIT, as Linux `ufshcd_uic_pwr_ctrl`: the result, then IS.UHXS and HCS.UPMCRS. Linux requires
-    /// UPMCRS == PWR_LOCAL afterwards and marks the link broken otherwise; here that fails the bring-up, as a
-    /// failed hibernate exit does. Called on the way back from a sleep too (`__ufshcd_wl_resume`, `ufshcd.c:9832`),
-    /// where the caller checks the link with a command of its own afterwards.
+    /// DME_HIBER_EXIT, as Linux `ufshcd_uic_pwr_ctrl`: the result, then IS.UHXS and HCS.UPMCRS. A UIC command the
+    /// controller refuses is returned, as it is there (`-EINVAL`/the timeout of `ufshcd_uic_command`), and so is the
+    /// link-broken answer of UPMCRS != PWR_LOCAL. Called on the way back from a sleep too (`__ufshcd_wl_resume`,
+    /// `ufshcd.c:9832`), where the caller checks the link with a command of its own afterwards. The one place that
+    /// ignores a failed exit is the takeover of the firmware's link ([`Self::reuse`]), where an active link has
+    /// nothing to do and the exit is only a guess.
     pub fn hibernate_exit(&mut self) -> Result<(), Error> {
         self.regs
             .write32(regs::IS, regs::IS_UHXS | regs::IS_UHES | regs::IS_UPMS);
@@ -744,9 +792,98 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
             }
             Err(e) => {
                 self.clock.note(format_args!("hibernate exit: {e}"));
-                Ok(())
+                Err(e)
             }
         }
+    }
+
+    /// The way back from a sleep that took the link to hibern8: the exit, once and then once more, then a command
+    /// that proves the link carries commands again. Linux's `__ufshcd_wl_resume` (`ufshcd.c:9812`), the exit at
+    /// `:9831-9839`.
+    ///
+    /// An exit the controller refused, or a proof that answered nothing, is Linux's `needs_reset`
+    /// (`ufshcd_err_handler`, `:6588-6594`), and that is one [`Self::error_recovery`] (`:7721-7766`) - the bring-up
+    /// that starts the link from nothing, after which the proof decides again. The recovery is asked once for the
+    /// whole resume, and the budget it spends is this call's own ([`Self::resume_resets`]): shared by the recovery
+    /// asked here and by every recovery a proof's request spends through [`Self::execute`], and replenished by
+    /// nothing that happens inside the wake - not even a request that completed with a retryable status, which is
+    /// what the ordinary per-burst counter would have taken as a fresh try. One reset per wake, and the scope closes
+    /// on the way out, so ordinary I/O afterwards is back to the per-burst rule. With [`Options::recover`] off the
+    /// handler declines and touches nothing.
+    ///
+    /// The answer is what the resume achieved, never whether the sleep is allowed to have happened: a resume has no
+    /// failure path that turns around, because a laptop that wakes with its root file system asleep is worse than
+    /// one whose disk reports errors.
+    pub fn resume(&mut self, lun: u8) -> Resume {
+        self.resume_resets = Some(0);
+        let r = self.resume_inner(lun);
+        self.resume_resets = None;
+        r
+    }
+
+    fn resume_inner(&mut self, lun: u8) -> Resume {
+        let mut hibernating = true;
+        let mut exit = self.hibernate_exit();
+        if let Err(why) = exit {
+            self.clock
+                .note(format_args!("resume: hibern8 exit: {why}: trying again"));
+            self.clock.delay_us(10_000);
+            exit = self.hibernate_exit();
+        }
+        if exit.is_ok() {
+            hibernating = false;
+        }
+        let mut failed = match exit {
+            Ok(()) => self
+                .prove(lun)
+                .err()
+                .map(|e| format!("TEST UNIT READY: {e}")),
+            Err(why) => Some(format!("hibern8 exit: {why}")),
+        };
+        let mut reset = false;
+        if let Some(why) = failed {
+            match self.error_recovery() {
+                Ok(()) => {
+                    reset = true;
+                    hibernating = false;
+                    // The bring-up started the link from nothing, so it is up whatever the exit did; the proof
+                    // decides whether the disk is believed.
+                    failed = self
+                        .prove(lun)
+                        .err()
+                        .map(|e| format!("TEST UNIT READY: {e}"));
+                }
+                Err(why2) => failed = Some(format!("{why}, recovery {why2}")),
+            }
+        }
+        Resume {
+            reset,
+            hibernating,
+            failed,
+        }
+    }
+
+    /// TEST UNIT READY on `lun`, read-only: the proof that the link carries commands again. Linux needs none,
+    /// because its queues simply restart; here the disk is the root file system and the screen may be the only
+    /// witness.
+    ///
+    /// It is retried as every other SCSI command is ([`RW_RETRIES`], bounded by [`retryable`]) because the first
+    /// thing a device answers after a link came back, and after the reset that dropped the tags it was holding, is
+    /// a UNIT ATTENTION - `0x28/0x00` "not ready to ready transition, medium may have changed", which the SCSI layer
+    /// of Linux requeues (`sd.c`, `SD_MAX_RETRIES`) and never reports as an error. Refusing a resume over one of
+    /// those would be a failure the disk never said. The status codes that are not attention (a device still busy
+    /// on its way back) are retried for the same reason; anything else is the answer.
+    fn prove(&mut self, lun: u8) -> Result<(), Error> {
+        let cdb = scsi::test_unit_ready();
+        let mut result = self.scsi(lun, &cdb, DataDir::None, &[]);
+        for _ in 0..RW_RETRIES {
+            if !retryable(&result) {
+                break;
+            }
+            self.clock.delay_us(10_000);
+            result = self.scsi(lun, &cdb, DataDir::None, &[]);
+        }
+        result
     }
 
     /// The UIC error registers. They clear when read, so `ufs=probe` does not look at them.
@@ -859,16 +996,27 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
     ///
     /// Once, not five times: Linux loops `MAX_HOST_RESET_RETRIES` (`:81`, used at `:7727`), but a second reset of a
     /// controller that did not answer the first is the same bet again, and here the caller is a file system on the
-    /// machine's only disk. A reset that is tried and fails answers as Linux's last failure does
-    /// (`UFSHCD_STATE_ERROR`, `:7763-7768`): the host is dead, the error goes up, nothing hangs. With
-    /// `Options::recover` off there is no error handler at all, as before this existed: the call declines, touches
-    /// nothing of the controller and leaves the host exactly as the caller found it.
+    /// machine's only disk. The counting depends on who asked: outside a [`Self::resume`] it is attempts since the
+    /// last request that completed ([`Self::recoveries`], so ordinary I/O gets a fresh try after a burst that
+    /// worked); inside one it is attempts spent in that call ([`Self::resume_resets`]), which nothing that happens
+    /// during the resume replenishes, so a wake cannot reset twice. A reset that is tried and fails answers as
+    /// Linux's last failure does (`UFSHCD_STATE_ERROR`, `:7763-7768`): the host is dead, the error goes up, nothing
+    /// hangs. With `Options::recover` off there is no error handler at all, as before this existed: the call
+    /// declines, touches nothing of the controller and leaves the host exactly as the caller found it.
     ///
     /// Not here: `ufshcd_scale_clks` (`:7698`), the clock vote around the reset, and the writes of
     /// `ufshcd_probe_hba` past the initialization - `ufshcd_set_active_icc_lvl`, `ufshcd_configure_wb`,
     /// `ufshcd_configure_auto_hibern8` (`:8874-8884`). The first is a resource-manager vote (patch 1354, `// 1354:`
     /// below); the others are descriptor and attribute writes this driver never sends, bring-up included, so a
     /// recovered link is left exactly as a brought-up one is: the device's own power-on values.
+    ///
+    /// And not here, the point that keeps this from being called reset-and-restore: the power mode Linux puts the
+    /// link back on. `ufshcd_device_init` ends at `:8799-8819` with a DME_PAFICKUPDRD/DME_SET of the cached maximum
+    /// power mode through `ufshcd_change_power_mode` (`:4594-4623`) - the HS gear, the active data and unipro lanes,
+    /// the terminations, the HS series-in-datasheet. This reset writes no `PA_*` attribute at all, so the link comes
+    /// up on its power-on values and may be slower than what the firmware had left. The recovery proves that the link
+    /// answers, never that it answers as fast: read [`Options::recover`] before it is turned on for a Qualcomm
+    /// controller.
     pub fn error_recovery(&mut self) -> Result<(), Error> {
         if !self.options.recover {
             self.clock.note(format_args!(
@@ -876,14 +1024,27 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
             ));
             return Err(Error::Dead);
         }
-        if self.recoveries >= RECOVER_ATTEMPTS {
+        // Two budgets, and the line says which one refused. A resume spends both at once, so the ordinary one still
+        // answers for a wake whose resets were never interrupted by a completed request, and the scope one catches
+        // the case a completed retryable status would otherwise have opened again.
+        let spent = if self.recoveries >= RECOVER_ATTEMPTS {
+            Some("since a request worked")
+        } else if self.resume_resets.unwrap_or(0) >= RECOVER_ATTEMPTS {
+            Some("in this resume")
+        } else {
+            None
+        };
+        if let Some(budget) = spent {
             self.dead = true;
             self.clock.note(format_args!(
-                "recovery: already reset once since a request worked: not again"
+                "recovery: already reset once {budget}: not again"
             ));
             return Err(Error::Dead);
         }
         self.recoveries += 1;
+        if let Some(n) = self.resume_resets.as_mut() {
+            *n += 1;
+        }
         let began = self.clock.now_us();
         // The request in slot 0 is what Linux completes here (`ufshcd_complete_requests`, `:7694`). `abort` has
         // already rung UTRLCLR for a timeout, so this only gives the slot a moment before the controller goes down;
@@ -1331,6 +1492,53 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
         self.command(lun, cdb, dir, data, false).map(|_| ())
     }
 
+    /// One SCSI request, with the error handler behind it: the first execution and the replay of a recovered link
+    /// are treated the same way, and the answer is the request's own error, never a wait.
+    ///
+    /// The replay is Linux's requeue of the requests a host reset dropped (`ufshcd_complete_requests`,
+    /// `ufshcd.c:7694`, and the SCSI layer starting them over) and keeps everything the failed request had: the same
+    /// LUN, the same task tag, the same buffers. That is the boundary [`crate::write_rule`] holds for a replay too -
+    /// a command is allowed for the LUN it was written for, and recovery never moves a request to another unit.
+    ///
+    /// A failure of either attempt ends the request in the same place: the note, and for a command that did not end
+    /// the host marked dead with its buffers quarantined. A replay matters here as much as the first attempt: the
+    /// reset dropped the tag the device may still hold, so a second timeout is the same device uncertain about the
+    /// one tag this driver uses, and a later request must not hand it out again.
+    fn execute(
+        &mut self,
+        upiu: &[u8; UPIU_HEADER_AND_TSF],
+        dir: DataDir,
+        data: &[DataSegment],
+        timeout_us: u64,
+    ) -> Result<(), Error> {
+        let mut replayed = false;
+        loop {
+            let Err(e) = self.exec(upiu, dir, data, timeout_us) else {
+                return Ok(());
+            };
+            self.note_request(&e);
+            if self.options.recover && needs_recovery(&e) && !replayed {
+                // The error handler, once per request: a recovery that is refused or fails leaves the host dead and
+                // answers the request's own error.
+                match self.error_recovery() {
+                    Ok(()) => {
+                        replayed = true;
+                        continue;
+                    }
+                    Err(_) => return Err(e),
+                }
+            }
+            if matches!(e, Error::Timeout(_)) {
+                // The device may still hold task tag 0, and there is no task management to abort it - whether this
+                // was the first execution or the replay after a reset.
+                self.dead = true;
+                self.clock
+                    .note(format_args!("a SCSI command timed out: no more requests"));
+            }
+            return Err(e);
+        }
+    }
+
     /// [`Self::scsi`], which fails a short transfer unless `short_ok`; with `short_ok` it returns the residual count
     /// (bytes not moved; 0 when the device set the overflow flag, whose count means nothing).
     fn command(
@@ -1362,29 +1570,10 @@ impl<R: Regs, D: DmaArea, C: Clock> Host<R, D, C> {
         } else {
             SCSI_TIMEOUT_US
         };
-        let mut result = self.exec(&upiu, dir, data, timeout);
-        if let Err(e) = result {
-            self.note_request(&e);
-            if self.options.recover && needs_recovery(&e) {
-                // The error handler, once: host and link reset, then this command sent again - Linux's requeue of
-                // the requests a host reset dropped (`ufshcd_complete_requests`, `ufshcd.c:7694`, and the SCSI layer
-                // starting them over). A recovery that is refused or fails leaves the host dead, and the caller
-                // gets the request's own error: an I/O error, never a wait.
-                result = match self.error_recovery() {
-                    Ok(()) => self.exec(&upiu, dir, data, timeout),
-                    Err(_) => Err(e),
-                };
-            } else if matches!(e, Error::Timeout(_)) {
-                // `ufs.recover=off`, and a request that did not end: the device may still hold task tag 0, and
-                // there is no task management to abort it.
-                self.dead = true;
-                self.clock
-                    .note(format_args!("a SCSI command timed out: no more requests"));
-                result = Err(e);
-            }
-        }
+        let result = self.execute(&upiu, dir, data, timeout);
         result?;
         // A request that ended, however it got there, ends the failure burst: the next one may be reset once again.
+        // Not inside a resume, where the whole call shares one budget that no completed request opens again.
         self.recoveries = 0;
         let rsp = upiu::parse_command_response(&self.read_response())?;
         if rsp.response != 0 {

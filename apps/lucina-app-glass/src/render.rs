@@ -10,9 +10,9 @@
 
 use std::path::Path;
 
-use lucina_glass::tokens::color;
 use lucina_glass::layouts::{DianaTablet, Fortuna, Juno, Layout};
-use lucina_glass::{Canvas, Color, Font, R, Type};
+use lucina_glass::tokens::color;
+use lucina_glass::{Canvas, Font, R, Type};
 
 use crate::stage::{self, DEMOS, SETTLED, Stage};
 
@@ -25,7 +25,9 @@ fn save(cv: &Canvas, path: &Path) -> std::io::Result<()> {
 
 /// Six frames side by side, `gap` px apart on carbon.
 fn strip(frames: &[Canvas]) -> Canvas {
-    let picks: Vec<&Canvas> = (0..6).map(|i| &frames[(i * (frames.len() - 1)) / 5]).collect();
+    let picks: Vec<&Canvas> = (0..6)
+        .map(|i| &frames[(i * (frames.len() - 1)) / 5])
+        .collect();
     let gap = 12;
     let (fw, fh) = (picks[0].w, picks[0].h);
     let mut out = Canvas::new(fw * 6 + gap * 7, fh + gap * 2, 1.0);
@@ -34,7 +36,8 @@ fn strip(frames: &[Canvas]) -> Canvas {
         let x = gap + i as u32 * (fw + gap);
         for y in 0..fh {
             let dst = ((gap + y) * out.w + x) as usize;
-            out.px[dst..dst + fw as usize].copy_from_slice(&f.px[(y * fw) as usize..((y + 1) * fw) as usize]);
+            out.px[dst..dst + fw as usize]
+                .copy_from_slice(&f.px[(y * fw) as usize..((y + 1) * fw) as usize]);
         }
     }
     out
@@ -53,15 +56,34 @@ fn sheet(strips: &[(&str, &str, Canvas)], ty: &mut Type) -> Canvas {
         .collect();
     let total: u32 = scaled.iter().map(|s| s.h + label).sum::<u32>() + 40;
     let mut out = Canvas::new(width, total, 2.0);
-    out.clear(Color::hex(0x08090b));
+    out.clear(color::VOID);
     let mut y = 20u32;
     for ((name, what, _), s) in strips.iter().zip(&scaled) {
-        ty.draw(&mut out, Font::Mono, 13.0, 1.0, 12.0, (y + 26) as f32 / 2.0, color::LIVE, &name.to_uppercase());
-        ty.draw(&mut out, Font::Regular, 13.0, 0.0, 12.0, (y + 56) as f32 / 2.0, color::INK_2, what);
+        ty.draw(
+            &mut out,
+            Font::Mono,
+            13.0,
+            1.0,
+            12.0,
+            (y + 26) as f32 / 2.0,
+            color::LIVE,
+            &name.to_uppercase(),
+        );
+        ty.draw(
+            &mut out,
+            Font::Regular,
+            13.0,
+            0.0,
+            12.0,
+            (y + 56) as f32 / 2.0,
+            color::INK_2,
+            what,
+        );
         y += label;
         for row in 0..s.h {
             let dst = ((y + row) * width) as usize;
-            out.px[dst..dst + width as usize].copy_from_slice(&s.px[(row * width) as usize..((row + 1) * width) as usize]);
+            out.px[dst..dst + width as usize]
+                .copy_from_slice(&s.px[(row * width) as usize..((row + 1) * width) as usize]);
         }
         y += s.h;
     }
@@ -86,9 +108,14 @@ pub fn run(dir: &Path, only: Option<&str>) -> std::io::Result<()> {
     }
     // Half size, side by side.
     let mut over = Canvas::new(3 * 540 + 4 * 40, 1200 + 80, 1.0);
-    over.clear(Color::hex(0x0b0c0f));
+    over.clear(color::VOID);
     for (i, s) in shots.iter().enumerate() {
-        over.blit(s, R::new(40.0 + i as f32 * 580.0, 40.0, 540.0, 1200.0), 46.0, 1.0);
+        over.blit(
+            s,
+            R::new(40.0 + i as f32 * 580.0, 40.0, 540.0, 1200.0),
+            46.0,
+            1.0,
+        );
     }
     save(&over, &dir.join("overview.png"))?;
     // The icons, 9 to a row.
@@ -99,12 +126,25 @@ pub fn run(dir: &Path, only: Option<&str>) -> std::io::Result<()> {
     for (i, icon) in all.iter().enumerate() {
         let (x, y) = ((i % 9) as f32 * 96.0 + 48.0, (i / 9) as f32 * 96.0 + 40.0);
         lucina_glass::icons::draw(&mut sheet_cv, *icon, x, y, 40.0, color::INK);
-        stage.ty.draw_centered(&mut sheet_cv, Font::Mono, 8.0, 0.0, x, y + 42.0, color::INK_3, &format!("{icon:?}"));
+        stage.ty.draw_centered(
+            &mut sheet_cv,
+            Font::Mono,
+            8.0,
+            0.0,
+            x,
+            y + 42.0,
+            color::INK_3,
+            &format!("{icon:?}"),
+        );
     }
     save(&sheet_cv, &dir.join("icons.png"))?;
     // The other devices.
-    let mut variants: Vec<Box<dyn Layout>> =
-        vec![Box::new(Juno::new(0.0)), Box::new(DianaTablet::new(0.0, false)), Box::new(DianaTablet::new(0.0, true)), Box::new(Fortuna::new(0.0))];
+    let mut variants: Vec<Box<dyn Layout>> = vec![
+        Box::new(Juno::new(0.0)),
+        Box::new(DianaTablet::new(0.0, false)),
+        Box::new(DianaTablet::new(0.0, true)),
+        Box::new(Fortuna::new(0.0)),
+    ];
     for v in &mut variants {
         let (w, h, vk) = v.size();
         let mut cv = Canvas::new(w, h, vk);
@@ -131,7 +171,12 @@ pub fn run(dir: &Path, only: Option<&str>) -> std::io::Result<()> {
         }
         let t = std::time::Instant::now();
         let frames = stage::frames(d, k, 30.0);
-        eprintln!("demo {}: {} frames, {} ms", d.name, frames.len(), t.elapsed().as_millis());
+        eprintln!(
+            "demo {}: {} frames, {} ms",
+            d.name,
+            frames.len(),
+            t.elapsed().as_millis()
+        );
         for (i, f) in frames.iter().enumerate() {
             save(f, &dir.join(format!("anim/{}/f{i:03}.png", d.name)))?;
         }

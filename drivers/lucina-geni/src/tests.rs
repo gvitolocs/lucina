@@ -1090,11 +1090,17 @@ fn the_last_user_clears_only_its_own_vote_bit() {
     // Keyboard SE (bit 22) with the touchpad SE (bit 26) and a wrapper clock (bit 19) still voted on the same register.
     let mut r = branch(1 << 31, (1 << 22) | (1 << 26) | (1 << 19), None);
     let (off, cbcr, vote) = gcc::disable_branch(&mut r, &se_branch());
-    assert_eq!(off, gcc::BranchOff::Cleared { wait_us: 10 });
+    // clk-branch.c:75-76: a voted disable is answered with udelay(10), not with a poll of CLK_OFF (:77-79).
+    assert_eq!(
+        off,
+        gcc::BranchOff::Cleared {
+            wait_us: 10,
+            stuck: false
+        }
+    );
     assert_eq!(vote, (1 << 26) | (1 << 19), "the others keep their vote");
     assert_eq!(cbcr, 1 << 31);
     assert_eq!(r.writes, 1);
-    // clk-branch.c:74-75: a voted disable is answered with udelay(10), not with a poll of CLK_OFF.
     assert_eq!(
         gcc::disable_branch(&mut r, &se_branch()).0,
         gcc::BranchOff::WasOff,
@@ -1106,19 +1112,265 @@ fn the_last_user_clears_only_its_own_vote_bit() {
 #[test]
 fn a_gated_or_skipped_branch_earns_no_wait() {
     // The slave AHB of a wrapper can sit in hardware gated mode: CLK_OFF says nothing, so Linux does not look
-    // (clk_branch_in_hwcg_mode comes first in clk_branch_wait, clk-branch.c:68-72).
+    // (clk_branch_in_hwcg_mode, :17-27, and the skip test come before any wait, clk-branch.c:72-73).
     let mut gated = se_branch();
     gated.hwcg_bit = Some(1);
     let mut r = branch(2, 1 << 22, None);
     assert_eq!(
         gcc::disable_branch(&mut r, &gated).0,
-        gcc::BranchOff::Cleared { wait_us: 0 }
+        gcc::BranchOff::Cleared {
+            wait_us: 0,
+            stuck: false
+        }
     );
     let mut skip = se_branch();
     skip.halt = gcc::Halt::Skip;
     let mut r = branch(1 << 31, 1 << 22, None);
     assert_eq!(
         gcc::disable_branch(&mut r, &skip).0,
-        gcc::BranchOff::Cleared { wait_us: 0 }
+        gcc::BranchOff::Cleared {
+            wait_us: 0,
+            stuck: false
+        }
+    );
+}
+
+// --------------------------------------------- patch 1363: the halt types the vote registers never showed
+
+/// A branch that is not voted: every `BRANCH_HALT` row of `gcc-sc7180.c` gives `enable_reg`, `halt_reg` and where
+/// it has one `hwcg_reg` as the same CBCR, so one register answers the enable bit, the halt and the gating.
+/// `after_write` is what hardware leaves there once the write is done; `None` leaves the written value itself.
+struct Cbcr {
+    now: u32,
+    after_write: Option<u32>,
+    writes: u32,
+}
+
+impl Cbcr {
+    fn on(now: u32, after_write: Option<u32>) -> Self {
+        Cbcr {
+            now,
+            after_write,
+            writes: 0,
+        }
+    }
+}
+
+impl Regs for Cbcr {
+    fn read32(&mut self, _offset: usize) -> u32 {
+        self.now
+    }
+
+    fn write32(&mut self, _offset: usize, value: u32) {
+        self.writes += 1;
+        self.now = self.after_write.unwrap_or(value);
+    }
+}
+
+/// The shape of `gcc_sdcc2_apps_clk` (`gcc-sc7180.c:1778-1794`: `halt_reg` 0x14004 at `:1779`,
+/// `.halt_check = BRANCH_HALT` at `:1780`, `enable_reg` the same register with mask `BIT(0)` at `:1782-1783`),
+/// `gcc_usb30_prim_master_clk` (0xf010, `:1950-1951`) and `gcc_ufs_phy_axi_clk` (0x77038, `:1844-1845`):
+/// `BRANCH_HALT`, `clk_branch2_ops`, their own CBCR as every register, bit 0 as the enable mask.
+const PLAIN: gcc::Branch = gcc::Branch {
+    cbcr: 0,
+    vote: 0,
+    vote_bit: 0,
+    halt: gcc::Halt::Plain,
+    hwcg_bit: None,
+};
+
+#[test]
+fn a_plain_branch_waits_for_clk_off_on_the_way_down_instead_of_ten_microseconds() {
+    // `clk-branch.c:77-79` takes a `BRANCH_HALT` check into the poll in both directions, and the 10 µs of `:75-76`
+    // needs `voted`, which this type does not have. On the way down the poll looks for `CLK_OFF` to appear (`:59`).
+    let mut r = Cbcr::on(1, Some(1 << 31));
+    let (off, cbcr, _vote) = gcc::disable_branch(&mut r, &PLAIN);
+    assert_eq!(
+        off,
+        gcc::BranchOff::Cleared {
+            wait_us: 0,
+            stuck: false
+        }
+    );
+    assert_eq!(
+        cbcr,
+        1 << 31,
+        "the same register is the halt check and the vote"
+    );
+    assert_eq!(r.writes, 1);
+    // A branch that never shows `CLK_OFF` is Linux's `WARN` and `-EBUSY` (`:87-89`), which `clk_branch2_disable`
+    // ignores (`:133-136`) and `disable_branch` hands over as `stuck`: said, not retried, and not a refused sleep.
+    let mut r = Cbcr::on(1, Some(1));
+    assert_eq!(
+        gcc::disable_branch(&mut r, &PLAIN).0,
+        gcc::BranchOff::Cleared {
+            wait_us: 0,
+            stuck: true
+        },
+        "the bit is clear and the branch still reads running"
+    );
+}
+
+#[test]
+fn a_plain_branch_is_polled_on_the_way_up_like_a_voted_one() {
+    // The enable direction is the check of `:54-58` whatever the vote: `CLK_OFF` clear, or the NOC FSM on (`:57`).
+    let mut r = Cbcr::on(1, None);
+    assert_eq!(
+        gcc::enable_branch(&mut r, &PLAIN).0,
+        gcc::BranchState::Running,
+        "running already: `clk_enable_regmap` still sets the bit (`:100-103`), and here it is set"
+    );
+    assert_eq!(r.writes, 0);
+    let mut r = Cbcr::on(1 << 31, Some(1));
+    assert_eq!(
+        gcc::enable_branch(&mut r, &PLAIN).0,
+        gcc::BranchState::VotedOn,
+        "off, and running since the bit"
+    );
+    assert_eq!(r.writes, 1);
+    // Hardware that leaves it halted: the `WARN` of `:87-89`, which the caller answers as off.
+    let mut r = Cbcr::on(1 << 31, Some(1 << 31));
+    assert_eq!(
+        gcc::enable_branch(&mut r, &PLAIN).0,
+        gcc::BranchState::StaysOff
+    );
+    let mut r = Cbcr::on(u32::MAX, None);
+    assert_eq!(
+        gcc::enable_branch(&mut r, &PLAIN).0,
+        gcc::BranchState::StaysOff,
+        "all ones is a read that failed, not a clock with `CLK_OFF` clear"
+    );
+}
+
+#[test]
+fn the_enable_polarity_reads_clk_off_the_other_way_in_both_directions() {
+    // `BRANCH_HALT_ENABLE` (`clk-branch.h:33`, pol: 0 = halt) is `clk_branch2_check_halt`'s `invert` (`:47`), used
+    // at `:56` for enabling and `:59` for disabling, and `clk_branch_wait` polls it in either direction (`:77`).
+    // No clock of `gcc-sc7180.c` declares it; the type is here because the helper answers what the code says.
+    let enable = gcc::Branch {
+        halt: gcc::Halt::Enable,
+        ..PLAIN
+    };
+    // Running means `CLK_OFF` set here, the opposite of the plain row above.
+    let mut r = Cbcr::on(1 | (1 << 31), None);
+    assert_eq!(
+        gcc::enable_branch(&mut r, &enable).0,
+        gcc::BranchState::Running
+    );
+    let mut r = Cbcr::on(1, Some(1));
+    assert_eq!(
+        gcc::enable_branch(&mut r, &enable).0,
+        gcc::BranchState::StaysOff,
+        "`CLK_OFF` clear is halted for this polarity, so the poll runs out"
+    );
+    // Down: stopped means `CLK_OFF` clear, so the poll passes where a `BRANCH_HALT` branch would time out.
+    let mut r = Cbcr::on(1 | (1 << 31), Some(0));
+    assert_eq!(
+        gcc::disable_branch(&mut r, &enable).0,
+        gcc::BranchOff::Cleared {
+            wait_us: 0,
+            stuck: false
+        }
+    );
+    let mut r = Cbcr::on(1 | (1 << 31), Some(1 << 31));
+    assert_eq!(
+        gcc::disable_branch(&mut r, &enable).0,
+        gcc::BranchOff::Cleared {
+            wait_us: 0,
+            stuck: true
+        },
+        "the bit is clear but `CLK_OFF` still up is running for this polarity"
+    );
+}
+
+#[test]
+fn a_delayed_branch_waits_ten_microseconds_and_looks_at_nothing() {
+    // `BRANCH_HALT_DELAY` (`clk-branch.h:35`): "No bit to check; just delay". The delay test (`:75-76`) comes
+    // before the poll of `:77-79`, so a branch that reads halted forever is still taken as on - which is why the
+    // caller must wait before touching the block. `gcc_aggre_ufs_phy_axi_clk` (`gcc-sc7180.c:824-828`) is the row
+    // of the sleep tables that declares it.
+    let delay = gcc::Branch {
+        halt: gcc::Halt::Delay,
+        ..PLAIN
+    };
+    let mut r = Cbcr::on(1 << 31, None);
+    let (state, cbcr, vote) = gcc::enable_branch(&mut r, &delay);
+    assert_eq!(
+        state,
+        gcc::BranchState::Delayed { wait_us: 10 },
+        "not `StaysOff`: the halt register is not read for this type"
+    );
+    assert!(state.is_on());
+    assert_eq!(
+        state.wait_us(),
+        10,
+        "the 10 µs of `:76` is the caller's to wait"
+    );
+    assert_eq!(
+        vote,
+        (1 << 31) | 1,
+        "the bit was still set, CLK_OFF notwithstanding"
+    );
+    assert_eq!(cbcr, vote, "one register");
+    // On the way down: the same wait, and no `stuck` answer, because nothing is looked at.
+    let mut r = Cbcr::on(1, Some(1));
+    assert_eq!(
+        gcc::disable_branch(&mut r, &delay).0,
+        gcc::BranchOff::Cleared {
+            wait_us: 10,
+            stuck: false
+        },
+        "`CLK_OFF` never appeared and that is not a failure for this type"
+    );
+    // `clk_branch_in_hwcg_mode` is tested before the delay (`:72-73`), so a gated branch of this type waits for
+    // nothing at all.
+    let gated = gcc::Branch {
+        hwcg_bit: Some(1),
+        ..delay
+    };
+    let mut r = Cbcr::on((1 << 31) | 3, None);
+    assert_eq!(
+        gcc::enable_branch(&mut r, &gated).0,
+        gcc::BranchState::NotCheckable,
+        "hardware gated: `clk_branch_wait` returns before `:75`"
+    );
+    let mut r = Cbcr::on(3, None);
+    assert_eq!(
+        gcc::disable_branch(&mut r, &gated).0,
+        gcc::BranchOff::Cleared {
+            wait_us: 0,
+            stuck: false
+        }
+    );
+}
+
+#[test]
+fn a_halt_check_of_a_branch_that_is_not_voted_waits_for_nothing_on_the_way_up() {
+    // The 10 µs of `:75-76` is only for `BRANCH_HALT_DELAY` and for a voted clock going down; `Halt::wait_us` is
+    // where each type says so, and the plain check of `gcc_cfg_noc_usb3_prim_axi_clk` (`:948-950`) is polled
+    // instead of waited (`:77-79`).
+    assert_eq!(gcc::Halt::Plain.wait_us(true), 0);
+    assert_eq!(
+        gcc::Halt::Plain.wait_us(false),
+        0,
+        "polled in both directions"
+    );
+    assert_eq!(gcc::Halt::Enable.wait_us(false), 0);
+    assert_eq!(
+        gcc::Halt::Voted.wait_us(true),
+        0,
+        "a voted enable polls too"
+    );
+    assert_eq!(gcc::Halt::Voted.wait_us(false), 10);
+    assert_eq!(gcc::Halt::Delay.wait_us(true), 10);
+    assert_eq!(gcc::Halt::Delay.wait_us(false), 10);
+    assert_eq!(gcc::Halt::Skip.wait_us(false), 0);
+    assert_eq!(
+        gcc::disable_branch(&mut Cbcr::on(1, Some(1 << 31)), &PLAIN).0,
+        gcc::BranchOff::Cleared {
+            wait_us: 0,
+            stuck: false
+        },
+        "a polled disable owes no delay: `:75` needs `voted`"
     );
 }
