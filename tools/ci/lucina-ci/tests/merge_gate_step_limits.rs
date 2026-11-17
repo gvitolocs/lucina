@@ -146,8 +146,8 @@ fn merge_gate_prints_each_step_s_own_limit_and_keeps_180_for_the_rest() {
         "the table's step passed: {out}"
     );
     assert!(
-        step_line(&out, "unit-tests-tools-ci-lucina-ci").contains("/ 300s"),
-        "unit-tests is at the table's 300: {}",
+        step_line(&out, "unit-tests-tools-ci-lucina-ci").contains("/ 360s"),
+        "unit-tests is at the table's 360: {}",
         step_line(&out, "unit-tests-tools-ci-lucina-ci")
     );
     assert!(
