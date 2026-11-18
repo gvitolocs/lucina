@@ -198,13 +198,25 @@ fn outside_cgroup(one: &str) -> String {
     )
 }
 
-/// The same for a process group, which is what `setsid` leaves.
+/// The same for a process group, which is what `setsid` leaves. `setsid --fork` takes a moment to leave the group (the
+/// fork, the `setsid(2)`, the exec), and a count taken inside that moment sees the sleeper still in the step's own
+/// group (GATE-11). So this observes before it judges: it polls, for up to 5 s, until exactly one process matches `one`
+/// and that one stands in a group other than the step's (an empty read of `stat`, from a process that exited meanwhile, is
+/// no group at all), and says whether that ever happened in `gate03-setsid-wait`.
 fn outside_group(one: &str) -> String {
     format!(
-        "me=$(ps -o pgid= -p $$ | tr -d ' '); n=0\n\
-         for p in $(pgrep -f '{one}$'); do\n\
-         \t[ \"$(awk '{{print $5}}' /proc/$p/stat 2>/dev/null)\" != \"$me\" ] && n=$((n+1))\n\
+        "me=$(ps -o pgid= -p $$ | tr -d ' '); n=0; w=timeout; i=0\n\
+         while [ $i -lt 50 ]; do\n\
+         \tn=0; all=0\n\
+         \tfor p in $(pgrep -f '{one}$'); do\n\
+         \t\tall=$((all+1))\n\
+         \t\tg=$(awk '{{print $5}}' /proc/$p/stat 2>/dev/null)\n\
+         \t\t[ -n \"$g\" ] && [ \"$g\" != \"$me\" ] && n=$((n+1))\n\
+         \tdone\n\
+         \tif [ $n -ge 1 ] && [ $all -eq 1 ]; then w=ok; break; fi\n\
+         \tsleep 0.1; i=$((i+1))\n\
          done\n\
+         echo \"gate03-setsid-wait: $w\"\n\
          echo \"gate03-othergroup: $n\"\n"
     )
 }
@@ -606,11 +618,21 @@ fn work_handed_to_a_new_session_is_gone_at_its_deadline() {
     let _markers = Markers(vec![detached.clone(), plain.clone()]);
     let counts = format!("{}\n{}", counted(&detached, 1), counted(&plain, 1));
     let body = format!(
-        "setsid {detached} &\n{plain} &\n{}\n{counts}\n",
+        // `setsid --fork` (util-linux, on buildhost and on GitHub's ubuntu): the sleeper is a forked child that always has a
+        // session of its own, whether or not the shell made the job a group leader.
+        "setsid --fork {detached} &\n{plain} &\n{}\n{counts}\n",
         outside_group(&detached),
     );
     let case = setup("session", &body);
     let (_code, out) = run(&case, LIMIT_S, false);
+    // Observe before judging (GATE-11): the step waited, up to 5 s, until the sleeper stood in a group other than the
+    // step's. If that never happened (or the step was cut off before it said so), nothing was judged, and that is a
+    // failure here — never a pass.
+    assert_eq!(
+        echoed(&out, "gate03-setsid-wait: ").as_deref(),
+        Some("ok"),
+        "setsid did not take effect within 5 s: nothing was judged: {out}"
+    );
     assert!(
         scoped(&out),
         "the cgroup route needs a cgroup of its own to walk: {}",
