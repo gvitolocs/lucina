@@ -1,9 +1,13 @@
 //! `LUCINA_APP_SAMPLE=1`: a small made-up library in the process, in the real server's JSON (a test compares the two), so an app can be
 //! seen and tested with no account. The pictures are painted here, or read from `LUCINA_SAMPLE_PHOTOS`: `<n>-s.jpg` and `<n>-l.jpg`, the
 //! real server's two sizes, so that a test image can run real JPEGs through the real decoder.
+//!
+//! [`Fake::imported`] is the other shape: the library the real-engine fixture of `lucina-app-gallery` seeds, with the sample tiles
+//! of a folder named here instead of in the environment, so that the gallery's server-backed test is answered in the process.
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +17,11 @@ use serde_json::{Value, json};
 use crate::media::{Connect, Media, MediaError};
 
 const DAY_MS: i64 = 86_400_000;
+
+/// A ThumbHash of a real picture, base64 as `/v1/media` sends it: twenty-one bytes, the same one
+/// `lucina-app-gallery`'s own model test decodes. `Fake` does not work hashes out — a photo it serves
+/// with a ThumbHash carries this one, so that an app's placeholder path runs the real decoder.
+const SAMPLE_THUMBHASH: &str = "k+cFHYr5eJdrY3aeeph2ezQK8teJ";
 
 #[derive(Clone)]
 struct Photo {
@@ -32,6 +41,8 @@ struct Photo {
     device: Option<&'static str>,
     source: &'static str,
     camera: Option<&'static str>,
+    /// The server's ThumbHash of the tile, base64 as `/v1/media` sends it. `None` where it has none yet.
+    thumbhash: Option<String>,
 }
 
 #[derive(Clone)]
@@ -55,7 +66,8 @@ struct State {
     files: Vec<File>,
     albums: Vec<(String, String)>,
     next_album: u32,
-    photos_dir: Option<String>,
+    /// The folder of sample tiles: `<n>-s.jpg` and `<n>-l.jpg`, served instead of a painted picture.
+    photos_dir: Option<PathBuf>,
     photo_files: u32,
 }
 
@@ -73,26 +85,236 @@ pub struct Fake {
     pub rate_limited: Arc<AtomicBool>,
 }
 
-const FILES: &[(&str, &str, u64, &str, &str, &str, &str, Option<&str>, bool, &str)] = &[
-    ("Lezioni", "syllabus.pdf", 182_000, "file", "application/pdf", "pdf", "pdf", None, true, "the course plan and the exam dates"),
-    ("Lezioni", "thesis-draft.docx", 512_000, "file", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "document", "office", None, false, "chapter one"),
-    ("Lezioni", "budget.xlsx", 48_000, "file", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "spreadsheet", "office", None, false, ""),
-    ("Lezioni", "defence.pptx", 8_400_000, "file", "application/vnd.openxmlformats-officedocument.presentationml.presentation", "presentation", "office", None, false, ""),
-    ("Lezioni", "whiteboard.jpg", 2_400_000, "photo", "image/jpeg", "image", "image", None, true, ""),
-    ("Lezioni", "lecture-recording.mp4", 640_000_000, "video", "video/mp4", "video", "video", None, true, ""),
-    ("Lezioni", "voice-note.m4a", 3_100_000, "audio", "audio/mp4", "audio", "audio", None, false, ""),
-    ("Lezioni", "Digital Forensics/notes.md", 6_400, "file", "text/markdown", "text", "text", Some("Markdown"), false, "timeline of a disk image"),
-    ("Lezioni", "Digital Forensics/carve.rs", 2_100, "file", "text/x-rust", "code", "code", Some("Rust"), false, "fn carve"),
-    ("Lezioni", "Digital Forensics/disk-images.zip", 91_000_000, "file", "application/zip", "archive", "archive", None, false, ""),
-    ("Lezioni", "Compilers/parser.py", 9_800, "file", "text/x-python", "code", "code", Some("Python"), false, "def parse"),
-    ("Lezioni", "Compilers/exam-2025.pdf", 340_000, "file", "application/pdf", "pdf", "pdf", None, true, "grammar question"),
-    ("CraftIT", "invoices-2026.xlsx", 77_000, "file", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "spreadsheet", "office", None, false, ""),
-    ("CraftIT", "readme.txt", 900, "file", "text/plain", "text", "text", Some("Plain Text"), false, "where everything is"),
-    ("CraftIT", "firmware.bin", 2_000_000, "file", "application/octet-stream", "other", "none", None, false, ""),
+/// One file of the made-up Drive, as `FILES` writes it: folder, path, bytes, kind, mime, doc type,
+/// preview, language, whether it has a thumbnail, and a word a search of its text answers with.
+type Seed = (
+    &'static str,
+    &'static str,
+    u64,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    bool,
+    &'static str,
+);
+
+const FILES: &[Seed] = &[
+    (
+        "Lezioni",
+        "syllabus.pdf",
+        182_000,
+        "file",
+        "application/pdf",
+        "pdf",
+        "pdf",
+        None,
+        true,
+        "the course plan and the exam dates",
+    ),
+    (
+        "Lezioni",
+        "thesis-draft.docx",
+        512_000,
+        "file",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "document",
+        "office",
+        None,
+        false,
+        "chapter one",
+    ),
+    (
+        "Lezioni",
+        "budget.xlsx",
+        48_000,
+        "file",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "spreadsheet",
+        "office",
+        None,
+        false,
+        "",
+    ),
+    (
+        "Lezioni",
+        "defence.pptx",
+        8_400_000,
+        "file",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "presentation",
+        "office",
+        None,
+        false,
+        "",
+    ),
+    (
+        "Lezioni",
+        "whiteboard.jpg",
+        2_400_000,
+        "photo",
+        "image/jpeg",
+        "image",
+        "image",
+        None,
+        true,
+        "",
+    ),
+    (
+        "Lezioni",
+        "lecture-recording.mp4",
+        640_000_000,
+        "video",
+        "video/mp4",
+        "video",
+        "video",
+        None,
+        true,
+        "",
+    ),
+    (
+        "Lezioni",
+        "voice-note.m4a",
+        3_100_000,
+        "audio",
+        "audio/mp4",
+        "audio",
+        "audio",
+        None,
+        false,
+        "",
+    ),
+    (
+        "Lezioni",
+        "Digital Forensics/notes.md",
+        6_400,
+        "file",
+        "text/markdown",
+        "text",
+        "text",
+        Some("Markdown"),
+        false,
+        "timeline of a disk image",
+    ),
+    (
+        "Lezioni",
+        "Digital Forensics/carve.rs",
+        2_100,
+        "file",
+        "text/x-rust",
+        "code",
+        "code",
+        Some("Rust"),
+        false,
+        "fn carve",
+    ),
+    (
+        "Lezioni",
+        "Digital Forensics/disk-images.zip",
+        91_000_000,
+        "file",
+        "application/zip",
+        "archive",
+        "archive",
+        None,
+        false,
+        "",
+    ),
+    (
+        "Lezioni",
+        "Compilers/parser.py",
+        9_800,
+        "file",
+        "text/x-python",
+        "code",
+        "code",
+        Some("Python"),
+        false,
+        "def parse",
+    ),
+    (
+        "Lezioni",
+        "Compilers/exam-2025.pdf",
+        340_000,
+        "file",
+        "application/pdf",
+        "pdf",
+        "pdf",
+        None,
+        true,
+        "grammar question",
+    ),
+    (
+        "CraftIT",
+        "invoices-2026.xlsx",
+        77_000,
+        "file",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "spreadsheet",
+        "office",
+        None,
+        false,
+        "",
+    ),
+    (
+        "CraftIT",
+        "readme.txt",
+        900,
+        "file",
+        "text/plain",
+        "text",
+        "text",
+        Some("Plain Text"),
+        false,
+        "where everything is",
+    ),
+    (
+        "CraftIT",
+        "firmware.bin",
+        2_000_000,
+        "file",
+        "application/octet-stream",
+        "other",
+        "none",
+        None,
+        false,
+        "",
+    ),
 ];
 
 fn iso(ms: i64) -> String {
     dates::to_iso(ms)
+}
+
+/// The sample tiles in a folder: how many `<n>-s.jpg` it holds, which is how many photos it stands for.
+fn sample_tiles(dir: &Path) -> u32 {
+    std::fs::read_dir(dir).map_or(0, |r| {
+        r.flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with("-s.jpg"))
+            .count() as u32
+    })
+}
+
+fn library_files(now_ms: i64) -> Vec<File> {
+    FILES
+        .iter()
+        .enumerate()
+        .map(|(i, f)| File {
+            id: format!("itm_file{i:04}"),
+            folder: f.0,
+            path: f.1,
+            size: f.2,
+            kind: f.3,
+            mime: f.4,
+            doc_type: f.5,
+            preview: f.6,
+            language: f.7,
+            thumb: f.8,
+            snippet_words: f.9,
+            modified_ms: now_ms - (i as i64 + 1) * 3 * DAY_MS,
+        })
+        .collect()
 }
 
 impl Fake {
@@ -109,7 +331,11 @@ impl Fake {
                 _ => (Some("iphone16"), "phone-ios", Some("Apple iPhone 16e")),
             };
             list.push(Photo {
-                title: format!("IMG_{:04}.{}", 1000 + i, if i % 23 == 11 { "MOV" } else { "HEIC" }),
+                title: format!(
+                    "IMG_{:04}.{}",
+                    1000 + i,
+                    if i % 23 == 11 { "MOV" } else { "HEIC" }
+                ),
                 seed: i,
                 kind: if i % 23 == 11 { "video" } else { "photo" },
                 taken_ms,
@@ -120,40 +346,85 @@ impl Fake {
                 caption: None,
                 trashed_at: None,
                 archived: false,
-                albums: if i % 4 == 0 { vec!["alb_holiday".to_owned()] } else { Vec::new() },
+                albums: if i % 4 == 0 {
+                    vec!["alb_holiday".to_owned()]
+                } else {
+                    Vec::new()
+                },
                 device,
                 source,
                 camera,
+                thumbhash: None,
                 id,
             });
         }
-        let files = FILES
-            .iter()
-            .enumerate()
-            .map(|(i, f)| File {
-                id: format!("itm_file{i:04}"),
-                folder: f.0,
-                path: f.1,
-                size: f.2,
-                kind: f.3,
-                mime: f.4,
-                doc_type: f.5,
-                preview: f.6,
-                language: f.7,
-                thumb: f.8,
-                snippet_words: f.9,
-                modified_ms: now_ms - (i as i64 + 1) * 3 * DAY_MS,
+        let photos_dir = std::env::var_os("LUCINA_SAMPLE_PHOTOS").map(PathBuf::from);
+        let photo_files = photos_dir.as_deref().map_or(0, sample_tiles);
+        Fake::with_photos(now_ms, list, photos_dir, photo_files)
+    }
+
+    /// The library the real-engine fixture of `lucina-app-gallery` seeds, in the process: six photos
+    /// `p0.png`..`p5.png` of the hour before `now_ms` (`p4` portrait), every one imported from
+    /// `phone-test` into the album Holiday and every one with a ThumbHash. Their two sizes are the JPEGs
+    /// of `tiles`, `<n>-s.jpg` and `<n>-l.jpg` for n in 0..6, served the way the server serves them, so
+    /// the real decoder reads real bytes with no server and no port. Panics when that folder is not all
+    /// there: a fixture that cannot be set up is an error, never a quiet skip.
+    pub fn imported(now_ms: i64, tiles: &Path) -> Fake {
+        let missing: Vec<String> = (0..6u32)
+            .flat_map(|i| [format!("{i}-s.jpg"), format!("{i}-l.jpg")])
+            .filter(|name| !tiles.join(name).is_file())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "no sample tiles to serve in {}: {}",
+            tiles.display(),
+            missing.join(", ")
+        );
+        let n = sample_tiles(tiles);
+        assert_eq!(
+            n,
+            6,
+            "the six seeded photos need exactly six `-s.jpg` tiles in {}, {n} are here",
+            tiles.display()
+        );
+        let list = (0..6u32)
+            .map(|i| Photo {
+                id: format!("itm_p{i}"),
+                seed: i,
+                kind: "photo",
+                taken_ms: now_ms - i as i64 * 600_000,
+                width: if i == 4 { 480 } else { 800 },
+                height: if i == 4 { 640 } else { 600 },
+                favorite: false,
+                rotation: 0,
+                title: format!("p{i}.png"),
+                caption: None,
+                trashed_at: None,
+                archived: false,
+                albums: vec!["alb_holiday".to_owned()],
+                device: None,
+                source: "phone-test",
+                camera: None,
+                thumbhash: Some(SAMPLE_THUMBHASH.to_owned()),
             })
             .collect();
-        let photos_dir = std::env::var("LUCINA_SAMPLE_PHOTOS").ok();
-        let photo_files = photos_dir.as_deref().map_or(0, |d| {
-            std::fs::read_dir(d).map_or(0, |r| r.flatten().filter(|e| e.file_name().to_string_lossy().ends_with("-s.jpg")).count() as u32)
-        });
+        Fake::with_photos(now_ms, list, Some(tiles.to_path_buf()), n)
+    }
+
+    fn with_photos(
+        now_ms: i64,
+        photos: Vec<Photo>,
+        photos_dir: Option<PathBuf>,
+        photo_files: u32,
+    ) -> Fake {
         Fake {
             state: Arc::new(Mutex::new(State {
-                photos: list,
-                files,
-                albums: vec![("alb_holiday".into(), "Holiday".into()), ("alb_scans".into(), "Scans".into())],
+                photos,
+                files: library_files(now_ms),
+                albums: vec![
+                    ("alb_holiday".into(), "Holiday".into()),
+                    ("alb_scans".into(), "Scans".into()),
+                ],
                 next_album: 0,
                 photos_dir,
                 photo_files,
@@ -186,7 +457,11 @@ impl Fake {
 }
 
 fn not_found() -> MediaError {
-    MediaError::Refused { status: 404, code: "not_found".into(), message: "not found".into() }
+    MediaError::Refused {
+        status: 404,
+        code: "not_found".into(),
+        message: "not found".into(),
+    }
 }
 
 fn split_query(path: &str) -> (&str, HashMap<String, String>) {
@@ -204,12 +479,13 @@ fn unescape(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
         }
         out.push(if b[i] == b'+' { b' ' } else { b[i] });
         i += 1;
@@ -241,7 +517,7 @@ fn photo_json(p: &Photo) -> Value {
         "live_pair": null,
         "mime": if video { "video/quicktime" } else { "image/heic" },
         "origin": {"filename": p.title, "folder": null, "imported_from": null},
-        "place": if p.seed % 3 == 0 { json!({"name": "Aarhus", "admin1": "Central Jutland", "admin2": null, "country": "Denmark", "lat": 56.16, "lon": 10.2}) } else { Value::Null },
+        "place": if p.seed.is_multiple_of(3) { json!({"name": "Aarhus", "admin1": "Central Jutland", "admin2": null, "country": "Denmark", "lat": 56.16, "lon": 10.2}) } else { Value::Null },
         "poster_url": null,
         "rotation": p.rotation,
         "size": 2_400_000 + p.seed as u64 * 1000,
@@ -250,7 +526,7 @@ fn photo_json(p: &Photo) -> Value {
         "taken_at": iso(p.taken_ms),
         "thumb_state": "ready",
         "thumb_url": null,
-        "thumbhash": null,
+        "thumbhash": p.thumbhash.clone(),
         "title": p.title,
         "trash_expires_at": p.trashed_at.as_ref().map(|_| "2030-01-01T00:00:00.000Z"),
         "trashed_at": p.trashed_at,
@@ -277,7 +553,10 @@ fn file_json(f: &File, snippet: Option<&str>) -> Value {
     let name = f.path.rsplit('/').next().unwrap_or(f.path);
     let dir = f.path.rfind('/').map_or("", |i| &f.path[..i]);
     let ext = crate::drive::ext_of(name);
-    let texty = matches!(f.doc_type, "text" | "code" | "pdf" | "document" | "spreadsheet" | "presentation");
+    let texty = matches!(
+        f.doc_type,
+        "text" | "code" | "pdf" | "document" | "spreadsheet" | "presentation"
+    );
     let mut v = json!({
         "album": f.folder,
         "albums": [],
@@ -358,8 +637,18 @@ impl State {
             .filter(|p| p.archived == q.contains_key("archived"))
             .filter(|p| !q.contains_key("favorite") || p.favorite)
             .filter(|p| q.get("album").is_none_or(|a| p.albums.contains(a)))
-            .filter(|p| q.get("origin").is_none_or(|o| o == "all" || *o == origin_of(p)))
-            .filter(|p| words.as_ref().is_none_or(|w| p.title.to_lowercase().contains(w) || p.caption.as_ref().is_some_and(|c| c.to_lowercase().contains(w))))
+            .filter(|p| {
+                q.get("origin")
+                    .is_none_or(|o| o == "all" || *o == origin_of(p))
+            })
+            .filter(|p| {
+                words.as_ref().is_none_or(|w| {
+                    p.title.to_lowercase().contains(w)
+                        || p.caption
+                            .as_ref()
+                            .is_some_and(|c| c.to_lowercase().contains(w))
+                })
+            })
             .collect()
     }
 
@@ -387,12 +676,22 @@ impl State {
                 .filter(|(f, _)| q.get("album").is_none_or(|a| a == f.folder))
                 .collect();
             let total = matches.len();
-            let page: Vec<Value> = matches.iter().skip(start).take(limit).map(|(f, s)| file_json(f, *s)).collect();
+            let page: Vec<Value> = matches
+                .iter()
+                .skip(start)
+                .take(limit)
+                .map(|(f, s)| file_json(f, *s))
+                .collect();
             let next = (start + page.len() < total).then(|| (start + page.len()).to_string());
             return json!({"items": page, "next_cursor": next, "total": total});
         }
         let matches = self.gallery_items(q);
-        let page: Vec<Value> = matches.iter().skip(start).take(limit).map(|p| photo_json(p)).collect();
+        let page: Vec<Value> = matches
+            .iter()
+            .skip(start)
+            .take(limit)
+            .map(|p| photo_json(p))
+            .collect();
         let next = (start + page.len() < matches.len()).then(|| (start + page.len()).to_string());
         json!({"albums": [], "items": page, "next_cursor": next, "total": matches.len()})
     }
@@ -400,11 +699,19 @@ impl State {
     fn browse(&self, q: &HashMap<String, String>) -> Value {
         let folder = q.get("folder").cloned().unwrap_or_default();
         let path = q.get("path").cloned().unwrap_or_default();
-        let prefix = if path.is_empty() { String::new() } else { format!("{path}/") };
+        let prefix = if path.is_empty() {
+            String::new()
+        } else {
+            format!("{path}/")
+        };
         let words = q.get("q").map(|w| w.to_lowercase());
         let mut names: Vec<(String, String, u64, u64)> = Vec::new();
         let mut files: Vec<(&File, Option<&str>)> = Vec::new();
-        for f in self.files.iter().filter(|f| f.folder == folder && f.path.starts_with(&prefix)) {
+        for f in self
+            .files
+            .iter()
+            .filter(|f| f.folder == folder && f.path.starts_with(&prefix))
+        {
             if q.get("type").is_some_and(|t| t != f.doc_type) {
                 continue;
             }
@@ -428,7 +735,10 @@ impl State {
                 },
             }
         }
-        let sort = q.get("sort").map_or(if words.is_some() { "modified" } else { "name" }, String::as_str);
+        let sort = q.get("sort").map_or(
+            if words.is_some() { "modified" } else { "name" },
+            String::as_str,
+        );
         let default_asc = matches!(sort, "name" | "type");
         let asc = q.get("order").map_or(default_asc, |o| o == "asc");
         match sort {
@@ -444,7 +754,12 @@ impl State {
         let total = files.len();
         let limit: usize = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(200);
         let start: usize = q.get("offset").and_then(|c| c.parse().ok()).unwrap_or(0);
-        let page: Vec<Value> = files.iter().skip(start).take(limit).map(|(f, s)| file_json(f, *s)).collect();
+        let page: Vec<Value> = files
+            .iter()
+            .skip(start)
+            .take(limit)
+            .map(|(f, s)| file_json(f, *s))
+            .collect();
         let next = (start + page.len() < total).then_some(start + page.len());
         let mut crumbs = vec![json!({"name": folder, "path": ""})];
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -480,7 +795,13 @@ impl State {
         let count = |p: &Photo| (p.kind == "photo", p.kind == "video");
         let (mut photos, mut videos) = (0, 0);
         let mut by: Vec<(String, &str, &str, u32, u32)> = vec![
-            ("device:iphone16".into(), "The owner's iPhone", "iphone", 0, 0),
+            (
+                "device:iphone16".into(),
+                "The owner's iPhone",
+                "iphone",
+                0,
+                0,
+            ),
             ("chat".into(), "Chat & shares", "chat", 0, 0),
             ("lucina".into(), "Lucina", "lucina", 0, 0),
         ];
@@ -512,7 +833,11 @@ impl State {
     }
 
     fn album_json(&self, id: &str, title: &str) -> Value {
-        let of: Vec<&Photo> = self.photos.iter().filter(|p| p.albums.iter().any(|a| a == id) && p.trashed_at.is_none()).collect();
+        let of: Vec<&Photo> = self
+            .photos
+            .iter()
+            .filter(|p| p.albums.iter().any(|a| a == id) && p.trashed_at.is_none())
+            .collect();
         json!({"count": of.len(), "cover_item": of.first().map(|p| p.id.clone()), "created_at": "2026-01-01T00:00:00.000Z", "id": id, "system_key": null, "title": title, "updated_at": "2026-01-01T00:00:00.000Z"})
     }
 
@@ -526,15 +851,31 @@ impl State {
             "items/months" => return Ok(self.months(&q)),
             "sources" => return Ok(self.sources()),
             "albums" => {
-                let albums: Vec<Value> = self.albums.iter().map(|(i, t)| self.album_json(i, t)).collect();
+                let albums: Vec<Value> = self
+                    .albums
+                    .iter()
+                    .map(|(i, t)| self.album_json(i, t))
+                    .collect();
                 return Ok(json!({"albums": albums}));
             }
-            "items/search" => return Err(MediaError::Refused { status: 503, code: "unavailable".into(), message: "smart search is off".into() }),
-            "embeddings/status" => return Ok(json!({"enabled": false, "indexed": 0, "pending": 0, "total": 0})),
+            "items/search" => {
+                return Err(MediaError::Refused {
+                    status: 503,
+                    code: "unavailable".into(),
+                    message: "smart search is off".into(),
+                });
+            }
+            "embeddings/status" => {
+                return Ok(json!({"enabled": false, "indexed": 0, "pending": 0, "total": 0}));
+            }
             _ => {}
         }
         if let Some(id) = tail.strip_prefix("albums/") {
-            let (i, t) = self.albums.iter().find(|a| a.0 == id).ok_or_else(not_found)?;
+            let (i, t) = self
+                .albums
+                .iter()
+                .find(|a| a.0 == id)
+                .ok_or_else(not_found)?;
             return Ok(self.album_json(i, t));
         }
         let rest = tail.strip_prefix("items/").ok_or_else(not_found)?;
@@ -542,10 +883,19 @@ impl State {
         match what {
             "" => match self.photos.iter().find(|x| x.id == id) {
                 Some(x) => Ok(photo_json(x)),
-                None => self.files.iter().find(|f| f.id == id).map(|f| file_json(f, None)).ok_or_else(not_found),
+                None => self
+                    .files
+                    .iter()
+                    .find(|f| f.id == id)
+                    .map(|f| file_json(f, None))
+                    .ok_or_else(not_found),
             },
             "details" => {
-                let x = self.photos.iter().find(|x| x.id == id).ok_or_else(not_found)?;
+                let x = self
+                    .photos
+                    .iter()
+                    .find(|x| x.id == id)
+                    .ok_or_else(not_found)?;
                 Ok(json!({
                     "category": null,
                     "exif": x.camera.map(|_| json!({"make": "Apple", "model": "iPhone 16e", "lens": "iPhone 16e back camera 4.2mm f/1.6", "iso": 64, "exposure_s": 0.004, "f_number": 1.6, "focal_mm": 4.2, "offset": "+01:00"})),
@@ -554,13 +904,25 @@ impl State {
                 }))
             }
             "text" => {
-                let f = self.files.iter().find(|f| f.id == id).ok_or_else(not_found)?;
+                let f = self
+                    .files
+                    .iter()
+                    .find(|f| f.id == id)
+                    .ok_or_else(not_found)?;
                 Ok(sample_text(f))
             }
             "archive" => {
-                let f = self.files.iter().find(|f| f.id == id).ok_or_else(not_found)?;
+                let f = self
+                    .files
+                    .iter()
+                    .find(|f| f.id == id)
+                    .ok_or_else(not_found)?;
                 if f.doc_type != "archive" {
-                    return Err(MediaError::Refused { status: 415, code: "unsupported".into(), message: "not an archive".into() });
+                    return Err(MediaError::Refused {
+                        status: 415,
+                        code: "unsupported".into(),
+                        message: "not an archive".into(),
+                    });
                 }
                 Ok(json!({
                     "format": "zip",
@@ -591,13 +953,20 @@ impl State {
             let op = body["op"].as_str().unwrap_or("");
             let album = body["album"].as_str().map(str::to_owned);
             let mut done = Vec::new();
-            for id in body["ids"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            for id in body["ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
                 if op == "purge" {
                     self.photos.retain(|x| x.id != id);
                     done.push(id.to_owned());
                     continue;
                 }
-                let Some(x) = self.photos.iter_mut().find(|x| x.id == id) else { continue };
+                let Some(x) = self.photos.iter_mut().find(|x| x.id == id) else {
+                    continue;
+                };
                 match op {
                     "trash" => x.trashed_at = Some("2026-11-02T10:00:00.000Z".into()),
                     "restore" => x.trashed_at = None,
@@ -606,14 +975,20 @@ impl State {
                     "archive" => x.archived = true,
                     "unarchive" => x.archived = false,
                     "album_add" => {
-                        if let Some(a) = &album {
-                            if !x.albums.contains(a) {
-                                x.albums.push(a.clone());
-                            }
+                        if let Some(a) = &album
+                            && !x.albums.contains(a)
+                        {
+                            x.albums.push(a.clone());
                         }
                     }
                     "album_remove" => x.albums.retain(|a| Some(a) != album.as_ref()),
-                    _ => return Err(MediaError::Refused { status: 400, code: "bad".into(), message: "unknown op".into() }),
+                    _ => {
+                        return Err(MediaError::Refused {
+                            status: 400,
+                            code: "bad".into(),
+                            message: "unknown op".into(),
+                        });
+                    }
                 }
                 done.push(id.to_owned());
             }
@@ -621,7 +996,11 @@ impl State {
         }
         let id = tail.strip_prefix("items/").ok_or_else(not_found)?;
         if method == "PATCH" {
-            let x = self.photos.iter_mut().find(|x| x.id == id).ok_or_else(not_found)?;
+            let x = self
+                .photos
+                .iter_mut()
+                .find(|x| x.id == id)
+                .ok_or_else(not_found)?;
             if let Some(f) = body["favorite"].as_bool() {
                 x.favorite = f;
             }
@@ -643,14 +1022,25 @@ impl State {
         let (p, q) = split_query(path);
         let tail = p.strip_prefix("/v1/media/items/").ok_or_else(not_found)?;
         let (id, what) = tail.split_once('/').ok_or_else(not_found)?;
-        let large = what == "poster" || q.get("size").is_some_and(|s| s.parse::<u32>().unwrap_or(0) > 512);
+        let large = what == "poster"
+            || q.get("size")
+                .is_some_and(|s| s.parse::<u32>().unwrap_or(0) > 512);
         let (seed, w, h, rot) = match self.photos.iter().find(|x| x.id == id) {
             Some(x) => {
                 let portrait = x.height > x.width;
-                (x.seed, if portrait { 3 } else { 4 }, if portrait { 4 } else { 3 }, x.rotation)
+                (
+                    x.seed,
+                    if portrait { 3 } else { 4 },
+                    if portrait { 4 } else { 3 },
+                    x.rotation,
+                )
             }
             None => {
-                let i = self.files.iter().position(|f| f.id == id).ok_or_else(not_found)?;
+                let i = self
+                    .files
+                    .iter()
+                    .position(|f| f.id == id)
+                    .ok_or_else(not_found)?;
                 if !self.files[i].thumb && what != "original" {
                     return Err(not_found());
                 }
@@ -659,10 +1049,18 @@ impl State {
         };
         let _ = rot;
         if let (Some(dir), n @ 1..) = (&self.photos_dir, self.photo_files) {
-            let file = format!("{dir}/{}-{}.jpg", seed % n, if large { "l" } else { "s" });
-            return std::fs::read(file).map_err(|_| not_found());
+            return std::fs::read(dir.join(format!(
+                "{}-{}.jpg",
+                seed % n,
+                if large { "l" } else { "s" }
+            )))
+            .map_err(|_| not_found());
         }
-        let (pw, ph) = if large { (w * 240, h * 240) } else { (w * 80, h * 80) };
+        let (pw, ph) = if large {
+            (w * 240, h * 240)
+        } else {
+            (w * 80, h * 80)
+        };
         Ok(painted(seed, pw, ph))
     }
 }
@@ -712,7 +1110,10 @@ pub fn painted(seed: u32, w: u32, h: u32) -> Vec<u8> {
     let sky_low = hsv((hue + 40.0) % 360.0, 0.3, 1.0);
     let hill_a = hsv((hue + 150.0) % 360.0, 0.55, 0.55);
     let hill_b = hsv((hue + 170.0) % 360.0, 0.6, 0.35);
-    let (sun_x, sun_y) = (0.2 + ((s * 0.37).sin() + 1.0) * 0.3, 0.2 + ((s * 0.71).cos() + 1.0) * 0.1);
+    let (sun_x, sun_y) = (
+        0.2 + ((s * 0.37).sin() + 1.0) * 0.3,
+        0.2 + ((s * 0.71).cos() + 1.0) * 0.1,
+    );
     let phase = s * 0.9;
     let mut rgb = Vec::with_capacity(w as usize * h as usize * 3);
     for y in 0..h {
@@ -727,7 +1128,11 @@ pub fn painted(seed: u32, w: u32, h: u32) -> Vec<u8> {
                 hill_a
             } else {
                 let d = ((fx - sun_x) * w as f32 / h as f32).powi(2) + (fy - sun_y).powi(2);
-                if d < 0.006 { [255, 240, 200] } else { mix(sky_top, sky_low, fy / far.max(0.01)) }
+                if d < 0.006 {
+                    [255, 240, 200]
+                } else {
+                    mix(sky_top, sky_low, fy / far.max(0.01))
+                }
             };
             rgb.extend_from_slice(&c);
         }
@@ -762,7 +1167,11 @@ fn hsv(h: f32, s: f32, v: f32) -> [u8; 3] {
         4 => (x, 0.0, c),
         _ => (c, 0.0, x),
     };
-    [((r + m) * 255.0) as u8, ((g + m) * 255.0) as u8, ((b + m) * 255.0) as u8]
+    [
+        ((r + m) * 255.0) as u8,
+        ((g + m) * 255.0) as u8,
+        ((b + m) * 255.0) as u8,
+    ]
 }
 
 impl Media for Fake {
@@ -785,11 +1194,336 @@ impl Media for Fake {
         self.lock().send(method, path, body)
     }
 
-    fn download(&mut self, path: &str, out: &mut dyn Write, progress: &mut dyn FnMut(u64) -> bool) -> Result<u64, MediaError> {
+    fn download(
+        &mut self,
+        path: &str,
+        out: &mut dyn Write,
+        progress: &mut dyn FnMut(u64) -> bool,
+    ) -> Result<u64, MediaError> {
         self.check()?;
-        let bytes = self.lock().picture(path).or_else(|_| Ok::<_, MediaError>(b"sample file from the made-up library\n".to_vec()))?;
-        out.write_all(&bytes).map_err(|e| MediaError::Offline(e.to_string()))?;
+        let bytes = self
+            .lock()
+            .picture(path)
+            .or_else(|_| Ok::<_, MediaError>(b"sample file from the made-up library\n".to_vec()))?;
+        out.write_all(&bytes)
+            .map_err(|e| MediaError::Offline(e.to_string()))?;
         progress(bytes.len() as u64);
         Ok(bytes.len() as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_790_000_000_000;
+
+    /// A folder of this test's own, holding the six pairs of sample tiles with bytes that say which one
+    /// they are: the serving is what is checked here, not the decoding, which the gallery's own fixtures
+    /// and the real decoder take care of.
+    fn tiles(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("lucina-fake-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&d).ok();
+        assert_eq!(write_tiles(&d, 6), 6);
+        d
+    }
+
+    /// `n` pairs of tiles in `d`, as [`sample_tiles`] counts them: what came back, since the folder may hold more.
+    fn write_tiles(d: &Path, n: u32) -> u32 {
+        std::fs::create_dir_all(d).unwrap();
+        for i in 0..n {
+            std::fs::write(
+                d.join(format!("{i}-s.jpg")),
+                format!("small tile {i}").as_bytes(),
+            )
+            .unwrap();
+            std::fs::write(
+                d.join(format!("{i}-l.jpg")),
+                format!("large tile {i}").as_bytes(),
+            )
+            .unwrap();
+        }
+        sample_tiles(d)
+    }
+
+    fn item(m: &mut dyn Media, id: &str) -> Value {
+        m.get(&format!("/v1/media/items/{id}"))
+            .unwrap_or_else(|e| panic!("{id}: {}", e.text()))
+    }
+
+    /// A tile as served: the whole of it, which is what [`tiles`] wrote.
+    fn assert_tile(bytes: &[u8], want: &str) {
+        assert_eq!(bytes, want.as_bytes());
+    }
+
+    fn batch(m: &mut dyn Media, body: Value) -> Value {
+        m.send("POST", "/v1/media/items/batch", &body)
+            .unwrap_or_else(|e| panic!("batch: {}", e.text()))
+    }
+
+    #[test]
+    fn the_imported_library_is_the_six_photos_the_engine_fixture_seeds() {
+        let d = tiles("shape");
+        let mut m = (Fake::imported(NOW, &d).connect())().unwrap();
+        let page = m
+            .get("/v1/media/items?scope=gallery&origin=all&kind=photo%2Cvideo&limit=200")
+            .unwrap();
+        assert_eq!(page["total"].as_u64(), Some(6), "{page}");
+        assert!(page["next_cursor"].is_null(), "six fit in one page: {page}");
+        let ids: Vec<&str> = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            ["itm_p0", "itm_p1", "itm_p2", "itm_p3", "itm_p4", "itm_p5"]
+        );
+        let titles: Vec<&str> = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            titles,
+            ["p0.png", "p1.png", "p2.png", "p3.png", "p4.png", "p5.png"]
+        );
+        // Every one of them in the album the import named, and every one of them with a ThumbHash.
+        for i in page["items"].as_array().unwrap() {
+            assert_eq!(i["albums"].as_array().unwrap().len(), 1, "{i}");
+            assert!(!i["thumbhash"].as_str().unwrap_or("").is_empty(), "{i}");
+            assert!(!i["urls"]["thumb"].as_str().unwrap_or("").is_empty(), "{i}");
+        }
+        assert!(
+            m.get("/v1/media/albums?scope=gallery").unwrap()["albums"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["title"] == "Holiday")
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn an_imported_photo_carries_a_thumbhash_and_a_sample_photo_does_not() {
+        let d = tiles("hash");
+        let mut m = (Fake::imported(NOW, &d).connect())().unwrap();
+        assert_eq!(
+            item(&mut *m, "itm_p0")["thumbhash"].as_str(),
+            Some(SAMPLE_THUMBHASH)
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+        // The made-up library of `Fake::new` stays as it was: no ThumbHash, so nothing in front of a tile.
+        let mut s = (Fake::new(NOW, 4).connect())().unwrap();
+        assert!(item(&mut *s, "itm_sample00000")["thumbhash"].is_null());
+    }
+
+    #[test]
+    fn the_two_sizes_come_from_the_sample_tiles() {
+        let d = tiles("sizes");
+        let mut m = (Fake::imported(NOW, &d).connect())().unwrap();
+        // The tile is the small one of its own seed, the 1024 form the large one of the same seed.
+        let served = |m: &mut dyn Media, path: &str| m.bytes(path, 1 << 20).unwrap();
+        assert_tile(
+            &served(&mut *m, "/v1/media/items/itm_p3/thumb?size=256&v=1"),
+            "small tile 3",
+        );
+        assert_tile(
+            &served(&mut *m, "/v1/media/items/itm_p3/thumb?size=1024&v=1"),
+            "large tile 3",
+        );
+        // A rendition the server takes for the grid, `/r/preview` with no size, is the small tile; `poster` is not.
+        assert_tile(
+            &served(&mut *m, "/v1/media/items/itm_p0/r/preview?v=1"),
+            "small tile 0",
+        );
+        assert_tile(
+            &served(&mut *m, "/v1/media/items/itm_p5/poster?v=1"),
+            "large tile 5",
+        );
+        // Six seeds, six pairs: each photo gets its own picture and not its neighbour's.
+        for i in 0..6u32 {
+            assert_tile(
+                &served(
+                    &mut *m,
+                    &format!("/v1/media/items/itm_p{i}/thumb?size=256&v=1"),
+                ),
+                &format!("small tile {i}"),
+            );
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_library_without_sample_files_is_painted_as_it_always_was() {
+        let mut m = (Fake::new(NOW, 2).connect())().unwrap();
+        let b = m
+            .bytes(
+                "/v1/media/items/itm_sample00000/thumb?size=256&v=1",
+                1 << 20,
+            )
+            .unwrap();
+        assert_eq!(&b[1..4], *b"PNG", "a painted picture of {} bytes", b.len());
+    }
+
+    #[test]
+    #[should_panic(expected = "no sample tiles to serve")]
+    fn a_tile_folder_that_is_not_there_is_an_error_and_not_a_skip() {
+        Fake::imported(NOW, &std::env::temp_dir().join("lucina-fake-nothing-here"));
+    }
+
+    #[test]
+    #[should_panic(expected = "no sample tiles to serve in")]
+    fn five_pairs_of_tiles_do_not_stand_for_six_photos() {
+        let d = tiles("short");
+        // The sixth photo of the library has nothing of its own to answer with: named, and refused.
+        std::fs::remove_file(d.join("5-s.jpg")).unwrap();
+        std::fs::remove_file(d.join("5-l.jpg")).unwrap();
+        let _ = Fake::imported(NOW, &d);
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly six")]
+    fn a_seventh_pair_of_tiles_is_refused_by_count() {
+        let d = std::env::temp_dir().join(format!("lucina-fake-seven-{}", std::process::id()));
+        std::fs::remove_dir_all(&d).ok();
+        assert_eq!(write_tiles(&d, 7), 7);
+        let _ = Fake::imported(NOW, &d);
+    }
+
+    #[test]
+    fn trashing_a_photo_says_when_it_expires_and_restoring_it_forgets_it() {
+        let mut m = (Fake::imported(NOW, &tiles("trash")).connect())().unwrap();
+        batch(&mut *m, json!({"op": "trash", "ids": ["itm_p1"]}));
+        let gone = item(&mut *m, "itm_p1");
+        assert!(!gone["trashed_at"].is_null(), "{gone}");
+        assert_eq!(
+            gone["trash_expires_at"].as_str().unwrap(),
+            "2030-01-01T00:00:00.000Z"
+        );
+        // Out of the library, and the Trash shelf is the one place it is still listed.
+        let page = m
+            .get("/v1/media/items?scope=gallery&origin=all&kind=photo%2Cvideo&limit=200")
+            .unwrap();
+        assert_eq!(page["total"].as_u64(), Some(5), "{page}");
+        let bin = m
+            .get("/v1/media/items?scope=gallery&kind=photo%2Cvideo&trashed=true&limit=200")
+            .unwrap();
+        assert_eq!(bin["items"].as_array().unwrap().len(), 1, "{bin}");
+        batch(&mut *m, json!({"op": "restore", "ids": ["itm_p1"]}));
+        let back = item(&mut *m, "itm_p1");
+        assert!(back["trashed_at"].is_null(), "{back}");
+        assert!(back["trash_expires_at"].is_null(), "{back}");
+    }
+
+    #[test]
+    fn an_album_made_by_post_holds_the_photo_added_to_it() {
+        let mut m = (Fake::imported(NOW, &tiles("album")).connect())().unwrap();
+        let made = m
+            .send("POST", "/v1/media/albums", &json!({"title": "Made here"}))
+            .unwrap();
+        let id = made["id"].as_str().unwrap().to_owned();
+        assert_eq!(made["title"].as_str(), Some("Made here"));
+        batch(
+            &mut *m,
+            json!({"op": "album_add", "ids": ["itm_p2"], "album": id}),
+        );
+        let photo = item(&mut *m, "itm_p2");
+        assert_eq!(photo["albums"], json!(["alb_holiday", id]), "{photo}");
+        assert!(
+            m.get("/v1/media/albums?scope=gallery").unwrap()["albums"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["id"] == id)
+        );
+        assert_eq!(
+            m.get(&format!("/v1/media/albums/{id}")).unwrap()["count"].as_u64(),
+            Some(1)
+        );
+        // Added twice, it is in it once.
+        batch(
+            &mut *m,
+            json!({"op": "album_add", "ids": ["itm_p2"], "album": id}),
+        );
+        assert_eq!(
+            item(&mut *m, "itm_p2")["albums"].as_array().unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_favourite_and_a_rotation_the_server_keeps_are_read_back() {
+        let mut m = (Fake::imported(NOW, &tiles("patch")).connect())().unwrap();
+        m.send(
+            "PATCH",
+            "/v1/media/items/itm_p0",
+            &json!({"favorite": true, "rotation": 90}),
+        )
+        .unwrap();
+        let v = item(&mut *m, "itm_p0");
+        assert_eq!(
+            (v["favorite"].as_bool(), v["rotation"].as_u64()),
+            (Some(true), Some(90)),
+            "{v}"
+        );
+        // And the favourites shelf is the one that says so.
+        let page = m
+            .get("/v1/media/items?scope=gallery&kind=photo%2Cvideo&favorite=true&limit=200")
+            .unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 1, "{page}");
+    }
+
+    #[test]
+    fn the_details_answer_names_the_original_file() {
+        let mut m = (Fake::imported(NOW, &tiles("details")).connect())().unwrap();
+        let body = m.get("/v1/media/items/itm_p4/details").unwrap();
+        assert_eq!(
+            body["item"]["origin"]["filename"].as_str(),
+            Some("p4.png"),
+            "{body}"
+        );
+        assert_eq!(body["item"]["id"].as_str(), Some("itm_p4"));
+        assert!(body["people"].is_array(), "{body}");
+    }
+
+    #[test]
+    fn the_months_answer_counts_the_imported_library() {
+        let mut m = (Fake::imported(NOW, &tiles("months")).connect())().unwrap();
+        let months = m
+            .get("/v1/media/items/months?origin=all&kind=photo%2Cvideo")
+            .unwrap();
+        let list = months["months"].as_array().unwrap();
+        assert!(!list.is_empty(), "{months}");
+        assert_eq!(
+            list.iter()
+                .map(|x| x["count"].as_u64().unwrap())
+                .sum::<u64>(),
+            6,
+            "{months}"
+        );
+    }
+
+    #[test]
+    fn a_word_hits_the_one_photo_it_names() {
+        let mut m = (Fake::imported(NOW, &tiles("words")).connect())().unwrap();
+        let page = m
+            .get("/v1/media/items?scope=gallery&origin=all&kind=photo%2Cvideo&q=p3&limit=200")
+            .unwrap();
+        let items = page["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{page}");
+        assert_eq!(items[0]["id"].as_str(), Some("itm_p3"));
+        // The server's smart search is off here, which is what the app reads as "words from now on".
+        assert_eq!(
+            m.get("/v1/media/items/search?scope=gallery&q=p3")
+                .unwrap_err(),
+            MediaError::Refused {
+                status: 503,
+                code: "unavailable".into(),
+                message: "smart search is off".into()
+            }
+        );
     }
 }

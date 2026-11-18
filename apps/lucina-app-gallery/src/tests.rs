@@ -1,7 +1,14 @@
 //! The app against the sample library, and against the real `lucina-media` through the real client.
+//!
+//! Everything here is answered in the process, by `Fake` serving the real `/v1/media` routes and the real
+//! JPEG tiles of `tests/fixtures`, except the two tests at the bottom that need the deployed server: those
+//! are `#[ignore]`d, each naming the hermetic twin that runs by default against `Fake`, and run only with
+//! `LUCINA_MEDIA_BIN` set, so a machine without it reports them ignored rather than passing them for nothing.
+//! The one command that runs them is in `README.md`.
 
+use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use lucina_app::time::Zone;
@@ -15,12 +22,17 @@ use crate::app::{Dialog, Gallery, Link, Shelf};
 use crate::server::{Job, Msg, Worker};
 
 const NOW: i64 = 1_790_000_000_000;
+/// The six pairs of real JPEG tiles the sample library serves: `<n>-s.jpg` and `<n>-l.jpg`.
+const TILES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+/// What the picture threads hand back, with a wake-up so that a wait ends when a tile arrives.
+type Sink = Arc<(Mutex<Vec<Done>>, Condvar)>;
 
 struct Rig {
     h: Harness<Gallery>,
     w: Worker,
     rx: mpsc::Receiver<Job>,
-    pictures: Arc<Mutex<Vec<Done>>>,
+    pictures: Sink,
 }
 
 impl Rig {
@@ -32,11 +44,23 @@ impl Rig {
             let _ = jobs.send(j);
         });
         let mut harness = Harness::new(Gallery::new(Zone::utc(), None, Some(link), None), w, h);
-        let pictures: Arc<Mutex<Vec<Done>>> = Default::default();
+        // The clock is the test's to hold: a toast kept by the wall clock would end in the middle of an
+        // assertion on a machine that stalled, and nothing here wants that.
+        harness.app().clock_runs = false;
+        let pictures: Sink = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
         let sink = pictures.clone();
-        harness.app().pictures = Some(Pictures::start(connect, None, move |d| sink.lock().unwrap().push(d)));
+        harness.app().pictures = Some(Pictures::start(connect, None, move |d| {
+            let (q, cv) = &*sink;
+            q.lock().unwrap_or_else(|e| e.into_inner()).push(d);
+            cv.notify_all();
+        }));
         harness.app().start();
-        let mut r = Rig { h: harness, w: worker, rx, pictures };
+        let mut r = Rig {
+            h: harness,
+            w: worker,
+            rx,
+            pictures,
+        };
         r.pump();
         r
     }
@@ -55,7 +79,13 @@ impl Rig {
                     self.h.core.message(m);
                 }
             }
-            for d in self.pictures.lock().unwrap().drain(..) {
+            for d in self
+                .pictures
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain(..)
+            {
                 self.h.core.message(Msg::Picture(d));
             }
         }
@@ -68,15 +98,38 @@ impl Rig {
         self.pump();
     }
 
+    /// Pump until `ok` holds. It answers on the first frame that satisfies it, and sleeps between the
+    /// frames only until the next picture arrives; the bound is the backstop that says the fixture is
+    /// wedged, and what it panics with says what the app could not get.
     fn until(&mut self, what: &str, mut ok: impl FnMut(&mut Gallery) -> bool) {
-        let end = Instant::now() + Duration::from_secs(30);
+        let start = Instant::now();
+        let backstop = start + Duration::from_secs(30);
+        let mut rounds = 0;
         loop {
+            rounds += 1;
             self.pump();
             if ok(self.h.app()) {
                 return;
             }
-            assert!(Instant::now() < end, "never happened: {what}");
-            std::thread::sleep(Duration::from_millis(10));
+            if Instant::now() >= backstop {
+                let g = self.h.app();
+                panic!(
+                    "never happened after {rounds} frames and {} s: {what}\n  {} items, {} tiles, shelf {:?}, loading {}, has_more {}, failed {:?}",
+                    start.elapsed().as_secs(),
+                    g.items.len(),
+                    g.tiles.len(),
+                    g.shelf,
+                    g.loading,
+                    g.has_more(),
+                    g.failed
+                );
+            }
+            let (q, cv) = &*self.pictures;
+            let waiting = q.lock().unwrap_or_else(|e| e.into_inner());
+            if waiting.is_empty() {
+                // A picture wakes it; a job that is not a picture is picked up by the next frame.
+                let _ = cv.wait_timeout(waiting, Duration::from_millis(5));
+            }
         }
     }
 }
@@ -101,7 +154,10 @@ fn the_first_page_comes_and_the_next_follows_as_the_grid_nears_its_end() {
 fn the_grid_is_cut_by_day_with_the_webs_labels() {
     let (mut r, _) = Rig::new(30);
     let rows = r.h.app().rows.clone();
-    let headers = rows.iter().filter(|x| matches!(x, crate::app::GridRow::Header { .. })).count();
+    let headers = rows
+        .iter()
+        .filter(|x| matches!(x, crate::app::GridRow::Header { .. }))
+        .count();
     assert!(headers >= 3, "{headers}");
     let first = crate::model::section_key(r.h.app().items[0].at_ms, &Zone::utc());
     assert_eq!(first.len(), 10);
@@ -110,7 +166,18 @@ fn the_grid_is_cut_by_day_with_the_webs_labels() {
 #[test]
 fn arrows_move_by_row_and_stay_in_the_column() {
     let (mut r, _) = Rig::new(60);
-    let cols = r.h.app().rows.iter().find_map(|x| if let crate::app::GridRow::Tiles { start, end } = x { Some(end - start) } else { None }).unwrap();
+    let cols =
+        r.h.app()
+            .rows
+            .iter()
+            .find_map(|x| {
+                if let crate::app::GridRow::Tiles { start, end } = x {
+                    Some(end - start)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
     assert!(cols >= 3, "{cols}");
     r.key(keys::KEY_RIGHT);
     assert_eq!(r.h.app().focus, 1);
@@ -143,7 +210,10 @@ fn a_tile_arrives_as_a_small_picture_and_those_far_away_are_let_go() {
     let (kept, keep) = (r.h.app().tiles.len(), r.h.app().keep);
     assert!(kept <= keep + 8, "{kept} kept with room for {keep}");
     let id0 = r.h.app().items[0].id.clone();
-    assert!(!r.h.app().tiles.contains_key(&id0), "the first tile was let go, {kept} kept");
+    assert!(
+        !r.h.app().tiles.contains_key(&id0),
+        "the first tile was let go, {kept} kept"
+    );
     // What the keep costs: three screens at most of small pictures.
     let bytes: usize = r.h.app().tiles.values().map(|t| t.image.px.len() * 4).sum();
     assert!(bytes < 48 << 20, "{bytes}");
@@ -187,7 +257,11 @@ fn the_caption_field_does_not_take_the_viewers_keys() {
     r.key(keys::KEY_ENTER);
     r.key(keys::KEY_I);
     r.key(keys::KEY_F);
-    assert_eq!(r.h.app().viewer.as_ref().unwrap().caption.text, "", "f went to the viewer, not the field");
+    assert_eq!(
+        r.h.app().viewer.as_ref().unwrap().caption.text,
+        "",
+        "f went to the viewer, not the field"
+    );
 }
 
 #[test]
@@ -205,7 +279,14 @@ fn enter_on_a_video_plays_it_and_without_a_player_says_so() {
 fn the_viewer_shows_a_picture_fitted_to_the_screen() {
     let (mut r, _) = Rig::new(4);
     r.key(keys::KEY_ENTER);
-    r.until("a fitted picture", |g| g.viewer.as_ref().unwrap().wants(&g.items).iter().all(|w| w.url != g.items[0].preview_url().unwrap()));
+    r.until("a fitted picture", |g| {
+        g.viewer
+            .as_ref()
+            .unwrap()
+            .wants(&g.items)
+            .iter()
+            .all(|w| w.url != g.items[0].preview_url().unwrap())
+    });
 }
 
 #[test]
@@ -218,11 +299,19 @@ fn zooming_pans_with_the_arrows_and_decodes_the_larger_form() {
         let g = r.h.app();
         g.viewer.as_ref().unwrap().wants(&g.items)
     };
-    assert!(wants.iter().any(|w| matches!(w.fit, Fit::Within(8192, 8192))), "the zoom wants an unfitted picture: {wants:?}");
+    assert!(
+        wants
+            .iter()
+            .any(|w| matches!(w.fit, Fit::Within(8192, 8192))),
+        "the zoom wants an unfitted picture: {wants:?}"
+    );
     let before = *r.h.app().viewer.as_ref().unwrap().picture.view().unwrap();
     r.key(keys::KEY_RIGHT);
     let after = *r.h.app().viewer.as_ref().unwrap().picture.view().unwrap();
-    assert_ne!(before.offset_x, after.offset_x, "right pans rather than walks");
+    assert_ne!(
+        before.offset_x, after.offset_x,
+        "right pans rather than walks"
+    );
     assert_eq!(r.h.app().viewer.as_ref().unwrap().index, 0);
     r.key(keys::KEY_0);
     assert!(!r.h.app().viewer.as_ref().unwrap().is_zoomed());
@@ -274,7 +363,10 @@ fn delete_asks_says_the_originals_stay_and_moves_to_the_trash() {
     let (mut r, fake) = Rig::new(6);
     let id = r.h.app().items[0].id.clone();
     r.key(keys::KEY_DELETE);
-    assert!(matches!(r.h.app().dialog, Some(Dialog::Delete { purge: false, .. })));
+    assert!(matches!(
+        r.h.app().dialog,
+        Some(Dialog::Delete { purge: false, .. })
+    ));
     // Nothing has happened yet.
     assert_eq!(r.h.app().items.len(), 6);
     r.key(keys::KEY_ESC);
@@ -290,8 +382,16 @@ fn delete_asks_says_the_originals_stay_and_moves_to_the_trash() {
     // In the Trash: there, and it goes back.
     r.key(keys::KEY_T);
     assert_eq!(r.h.app().shelf, Shelf::Trash);
-    assert_eq!(r.h.app().items.iter().map(|i| i.id.clone()).collect::<Vec<_>>(), [id.clone()]);
-    r.h.app().run_batch("restore", vec![id.clone()], None, false);
+    assert_eq!(
+        r.h.app()
+            .items
+            .iter()
+            .map(|i| i.id.as_str())
+            .collect::<Vec<_>>(),
+        [id.as_str()]
+    );
+    r.h.app()
+        .run_batch("restore", vec![id.clone()], None, false);
     r.pump();
     assert_eq!(r.h.app().items.len(), 0);
     r.key(keys::KEY_ESC);
@@ -307,7 +407,14 @@ fn delete_forever_needs_the_tick() {
     r.pump();
     r.key(keys::KEY_T);
     r.key(keys::KEY_DELETE);
-    assert!(matches!(r.h.app().dialog, Some(Dialog::Delete { purge: true, understood: false, .. })));
+    assert!(matches!(
+        r.h.app().dialog,
+        Some(Dialog::Delete {
+            purge: true,
+            understood: false,
+            ..
+        })
+    ));
     // The primary button, with the box unticked: Tab to it is Enter on a disabled action.
     for _ in 0..4 {
         r.h.key(keys::KEY_TAB);
@@ -319,7 +426,10 @@ fn delete_forever_needs_the_tick() {
     }
     let mut m = (fake.connect())().unwrap();
     let still = m.get(&format!("/v1/media/items/{id}"));
-    if let Some(Dialog::Delete { understood: true, .. }) = r.h.app().dialog {
+    if let Some(Dialog::Delete {
+        understood: true, ..
+    }) = r.h.app().dialog
+    {
         // Enter on the box ticked it first: that is the tick.
     } else {
         assert!(still.is_ok(), "gone with no tick");
@@ -338,7 +448,10 @@ fn space_selects_and_a_batch_goes_to_all_of_them() {
     r.key(keys::KEY_F);
     let mut m = (fake.connect())().unwrap();
     for id in &ids {
-        assert_eq!(m.get(&format!("/v1/media/items/{id}")).unwrap()["favorite"], true);
+        assert_eq!(
+            m.get(&format!("/v1/media/items/{id}")).unwrap()["favorite"],
+            true
+        );
     }
     assert!(r.h.app().selected.is_empty());
     assert_eq!(r.h.app().toast, "2 items added to favorites.");
@@ -347,8 +460,20 @@ fn space_selects_and_a_batch_goes_to_all_of_them() {
 #[test]
 fn shift_arrows_select_a_range_and_escape_clears_it() {
     let (mut r, _) = Rig::new(10);
-    r.h.press(keys::KEY_RIGHT, keys::Mods { shift: true, ..Default::default() });
-    r.h.press(keys::KEY_RIGHT, keys::Mods { shift: true, ..Default::default() });
+    r.h.press(
+        keys::KEY_RIGHT,
+        keys::Mods {
+            shift: true,
+            ..Default::default()
+        },
+    );
+    r.h.press(
+        keys::KEY_RIGHT,
+        keys::Mods {
+            shift: true,
+            ..Default::default()
+        },
+    );
     r.pump();
     assert_eq!(r.h.app().selected.len(), 3);
     r.key(keys::KEY_ESC);
@@ -370,7 +495,10 @@ fn albums_open_and_a_new_one_gets_the_photos() {
     r.h.app().open_album_picker(vec![id.clone()]);
     r.pump();
     assert!(matches!(r.h.app().dialog, Some(Dialog::AddToAlbum(_))));
-    let job = Job::CreateAlbum { title: "New one".into(), add: vec![id.clone()] };
+    let job = Job::CreateAlbum {
+        title: "New one".into(),
+        add: vec![id.clone()],
+    };
     r.h.app().dialog = None;
     let msgs = r.w.handle(job);
     for m in msgs {
@@ -379,7 +507,13 @@ fn albums_open_and_a_new_one_gets_the_photos() {
     r.pump();
     assert_eq!(r.h.app().toast, "1 item added to the album.");
     let mut m = (fake.connect())().unwrap();
-    assert_eq!(m.get(&format!("/v1/media/items/{id}")).unwrap()["albums"].as_array().unwrap().len(), 1 + usize::from(r.h.app().items[1].albums.len() > 1));
+    assert_eq!(
+        m.get(&format!("/v1/media/items/{id}")).unwrap()["albums"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1 + usize::from(r.h.app().items[1].albums.len() > 1)
+    );
 }
 
 #[test]
@@ -400,7 +534,12 @@ fn the_source_switcher_filters_and_favourites_too() {
     r.h.app().origin = "lucina".into();
     r.h.app().reload();
     r.pump();
-    assert!(r.h.app().items.iter().all(|i| i.source.starts_with("lucina")));
+    assert!(
+        r.h.app()
+            .items
+            .iter()
+            .all(|i| i.source.starts_with("lucina"))
+    );
     assert!(!r.h.app().items.is_empty());
     r.h.app().origin = "all".into();
     r.h.app().favorites = true;
@@ -435,7 +574,13 @@ fn a_lost_connection_is_said_and_a_dead_token_signs_out() {
     fake.offline.store(true, Ordering::SeqCst);
     r.h.app().reload();
     r.pump();
-    assert!(r.h.app().failed.as_deref().unwrap_or("").contains("no connection"));
+    assert!(
+        r.h.app()
+            .failed
+            .as_deref()
+            .unwrap_or("")
+            .contains("no connection")
+    );
     fake.offline.store(false, Ordering::SeqCst);
     r.key(keys::KEY_R);
     assert!(r.h.app().failed.is_none());
@@ -489,25 +634,55 @@ fn gallery_show_opens_a_picture_by_id_and_refuses_an_unknown_one() {
     let (mut r, _) = Rig::new(10);
     let id = r.h.app().items[2].id.clone();
     let reply = r.h.intent("gallery.show", json!({"id": id})).unwrap();
-    assert!(reply.ok && reply.value["shown"] == r.h.app().items[2].title, "{reply:?}");
+    assert!(
+        reply.ok && reply.value["shown"] == r.h.app().items[2].title,
+        "{reply:?}"
+    );
     assert_eq!(r.h.app().viewer.as_ref().map(|v| v.index), Some(2));
-    assert!(reply.entities.iter().any(|e| e.kind == "picture" && e.id == id), "{reply:?}");
-    let reply = r.h.intent("gallery.show", json!({"id": "itm_nope"})).unwrap();
-    assert!(!reply.ok && reply.text.contains("no picture with id"), "{reply:?}");
+    assert!(
+        reply
+            .entities
+            .iter()
+            .any(|e| e.kind == "picture" && e.id == id),
+        "{reply:?}"
+    );
+    let reply =
+        r.h.intent("gallery.show", json!({"id": "itm_nope"}))
+            .unwrap();
+    assert!(
+        !reply.ok && reply.text.contains("no picture with id"),
+        "{reply:?}"
+    );
 }
 
 #[test]
 fn gallery_show_by_album_name_is_case_insensitive_and_the_newest_view_needs_no_argument() {
     use serde_json::json;
     let (mut r, _) = Rig::new(10);
-    let reply = r.h.intent("gallery.show", json!({"album": "HOLIDAY"})).unwrap();
+    let reply =
+        r.h.intent("gallery.show", json!({"album": "HOLIDAY"}))
+            .unwrap();
     assert!(reply.ok, "{reply:?}");
     assert!(matches!(r.h.app().shelf, Shelf::Album { .. }));
-    assert!(reply.entities.iter().any(|e| e.kind == "album" && e.title == "Holiday"), "{reply:?}");
-    let reply = r.h.intent("gallery.show", json!({"album": "Nope"})).unwrap();
-    assert!(!reply.ok && reply.text.contains("no album named"), "{reply:?}");
+    assert!(
+        reply
+            .entities
+            .iter()
+            .any(|e| e.kind == "album" && e.title == "Holiday"),
+        "{reply:?}"
+    );
+    let reply =
+        r.h.intent("gallery.show", json!({"album": "Nope"}))
+            .unwrap();
+    assert!(
+        !reply.ok && reply.text.contains("no album named"),
+        "{reply:?}"
+    );
     let reply = r.h.intent("gallery.show", json!({})).unwrap();
-    assert!(reply.ok && r.h.app().shelf == Shelf::Everything, "{reply:?}");
+    assert!(
+        reply.ok && r.h.app().shelf == Shelf::Everything,
+        "{reply:?}"
+    );
 }
 
 #[test]
@@ -520,23 +695,38 @@ fn gallery_latest_answers_with_the_newest_pictures() {
     assert_eq!(pictures.len(), 3);
     assert_eq!(pictures[0]["id"], r.h.app().items[0].id);
     assert!(pictures[0]["taken"].is_string(), "{pictures:?}");
-    assert_eq!(reply.entities.iter().filter(|e| e.kind == "picture").count(), 3);
+    assert_eq!(
+        reply
+            .entities
+            .iter()
+            .filter(|e| e.kind == "picture")
+            .count(),
+        3
+    );
 }
 
-// ---- The real engine: the deployed lucina-media on temporary folders, through the real client.
+// ---- The server's routes, and the photos that come over them.
 
-#[test]
-fn the_real_servers_photos_reach_the_screen() {
-    let Some(engine) = Engine::start("gallery-app") else {
-        eprintln!("skipped: no lucina-media here");
-        return;
-    };
-    let mut r = Rig::on(engine.connect(), 1024, 768);
+/// The script a server holding the six seeded photos has to answer: the first page, real JPEG tiles through
+/// the real decoder, a real ThumbHash as a tile, the albums and months, the details route, a favourite and a
+/// rotation the server keeps, the Trash with its expiry, a word, and a new album that takes a photo.
+///
+/// [`the_servers_photos_reach_the_screen`] runs it against `Fake`, which serves the same routes in this
+/// process; [`the_real_servers_photos_reach_the_screen`] runs it against the deployed `lucina-media`.
+fn photos_reach_the_screen(connect: &Connect) {
+    let mut r = Rig::on(connect.clone(), 1024, 768);
     r.until("six photos", |g| g.items.len() == 6);
     assert!(!r.h.app().has_more());
-    assert!(r.h.app().items.iter().all(|i| i.thumbhash.is_some() && i.tile_url().is_some()));
+    assert!(
+        r.h.app()
+            .items
+            .iter()
+            .all(|i| i.thumbhash.is_some() && i.tile_url().is_some())
+    );
     // Real JPEG thumbnails through the real decoder.
-    r.until("six tiles", |g| g.tiles.values().filter(|t| !t.placeholder).count() == 6);
+    r.until("six tiles", |g| {
+        g.tiles.values().filter(|t| !t.placeholder).count() == 6
+    });
     // A real ThumbHash makes a tile.
     let hash = r.h.app().items[0].thumbhash.clone().unwrap();
     let ph = crate::server::placeholder_tile(&hash, 64).unwrap();
@@ -549,12 +739,17 @@ fn the_real_servers_photos_reach_the_screen() {
     assert!(albums.iter().any(|a| a == "Holiday"), "{albums:?}");
     // Months.
     r.key(keys::KEY_G);
-    r.until("months", |g| matches!(&g.months, Some(Ok(m)) if !m.is_empty()));
+    r.until(
+        "months",
+        |g| matches!(&g.months, Some(Ok(m)) if !m.is_empty()),
+    );
     r.key(keys::KEY_ESC);
     // The viewer: a real 1600 px rendition, the details route, a favourite and a rotation the server keeps.
     r.key(keys::KEY_ENTER);
     r.key(keys::KEY_I);
-    r.until("details", |g| matches!(&g.viewer.as_ref().unwrap().details, Some((_, Ok(_)))));
+    r.until("details", |g| {
+        matches!(&g.viewer.as_ref().unwrap().details, Some((_, Ok(_))))
+    });
     let body = {
         let v = r.h.app().viewer.as_ref().unwrap();
         v.details.as_ref().unwrap().1.as_ref().unwrap().clone()
@@ -564,10 +759,13 @@ fn the_real_servers_photos_reach_the_screen() {
     assert!(rows.iter().any(|(k, _)| k == "Original file"), "{rows:?}");
     r.key(keys::KEY_F);
     r.key(keys::KEY_R);
-    let mut m = (engine.connect())().unwrap();
+    let mut m = (connect.clone())().unwrap();
     let id = item.id.clone();
     let v = m.get(&format!("/v1/media/items/{id}")).unwrap();
-    assert_eq!((v["favorite"].as_bool(), v["rotation"].as_u64()), (Some(true), Some(90)));
+    assert_eq!(
+        (v["favorite"].as_bool(), v["rotation"].as_u64()),
+        (Some(true), Some(90))
+    );
     // The Trash, on the real engine: there, restorable, and the delete dialog's route.
     r.key(keys::KEY_ESC);
     r.h.app().run_batch("trash", vec![id.clone()], None, false);
@@ -576,7 +774,8 @@ fn the_real_servers_photos_reach_the_screen() {
     r.until("the Trash", |g| g.items.len() == 1);
     assert_eq!(r.h.app().items[0].id, id);
     assert!(r.h.app().items[0].trash_expires_at.is_some());
-    r.h.app().run_batch("restore", vec![id.clone()], None, false);
+    r.h.app()
+        .run_batch("restore", vec![id.clone()], None, false);
     r.until("restored", |g| g.items.is_empty());
     r.h.app().set_shelf(Shelf::Everything);
     r.until("back", |g| g.items.len() == 6);
@@ -586,7 +785,10 @@ fn the_real_servers_photos_reach_the_screen() {
     r.until("one found", |g| g.items.len() == 1);
     // A new album, on the real server, gets a photo.
     let add = r.h.app().items[0].id.clone();
-    for msg in r.w.handle(Job::CreateAlbum { title: "Made here".into(), add: vec![add.clone()] }) {
+    for msg in r.w.handle(Job::CreateAlbum {
+        title: "Made here".into(),
+        add: vec![add.clone()],
+    }) {
         r.h.core.message(msg);
     }
     r.pump();
@@ -595,14 +797,51 @@ fn the_real_servers_photos_reach_the_screen() {
     assert!(v["albums"].as_array().unwrap().len() >= 2);
 }
 
+/// The six seeded photos over the routes of `/v1/media`, answered in this process by `Fake` from the real
+/// JPEGs of `tests/fixtures`: the tiles come through the real decoder, and no port, server or deadline is
+/// anywhere in it. It fails when a route stops answering as the server does.
 #[test]
+fn the_servers_photos_reach_the_screen() {
+    let server = Fake::imported(NOW, Path::new(TILES));
+    photos_reach_the_screen(&server.connect());
+}
+
+// ---- The real engine: the deployed lucina-media on temporary folders, through the real client.
+//
+// Both need `LUCINA_MEDIA_BIN`, so they are `#[ignore]`d: asked for by name they run, and otherwise libtest
+// counts them ignored instead of passing a body that never ran. Each reason names the hermetic twin that runs
+// by default in this process against `Fake`; the one command that asks for these is in `README.md`.
+//
+// `the_real_servers_photos_reach_the_screen` has one: `the_servers_photos_reach_the_screen` above runs the
+// same `photos_reach_the_screen` script on `Fake::imported`. `the_real_servers_download_writes_the_original`
+// has none, and says none: nothing here fetches an original through `server::download` against `Fake`, so the
+// size the written file has is only ever shown by the real server.
+//
+// The folder the fixture seeds is indexed by the server in the background, and it never fills while the
+// fixture sets `LUCINA_MEDIA_PREPARE=0`: the server's `prepareScopeEnabled()`
+// (`src/modules/library/indexer/folder-scan.c:75`, `if (scope == "") return false;`) reads the empty scope
+// as "nothing to prepare", so a folder reports `files: 0` however long the wait. `Engine::start` therefore
+// waits for the seeded names through `/v1/media/drive/browse?folder=Lezioni`, each wait with its own
+// deadline, and leaves `files` at whatever the server gives. The gallery needs the photos and not the Drive
+// index; `the_model_reads_the_real_servers_drive` in `lucina-files` is the test that wants the index.
+
+#[test]
+#[ignore = "needs LUCINA_MEDIA_BIN; hermetic twin: the_servers_photos_reach_the_screen"]
+fn the_real_servers_photos_reach_the_screen() {
+    let engine =
+        Engine::start("gallery-app").expect("LUCINA_MEDIA_BIN: the lucina-media to test against");
+    photos_reach_the_screen(&engine.connect());
+}
+
+#[test]
+#[ignore = "needs LUCINA_MEDIA_BIN; hermetic twin: none (only the real server answers the original route with bytes of the size the item reports); runs in the daily real-server job WM-C006"]
 fn the_real_servers_download_writes_the_original() {
-    let Some(engine) = Engine::start("gallery-dl") else {
-        eprintln!("skipped: no lucina-media here");
-        return;
-    };
+    let engine =
+        Engine::start("gallery-dl").expect("LUCINA_MEDIA_BIN: the lucina-media to test against");
     let mut m = (engine.connect())().unwrap();
-    let page = m.get("/v1/media/items?scope=gallery&origin=all&kind=photo%2Cvideo&limit=1").unwrap();
+    let page = m
+        .get("/v1/media/items?scope=gallery&origin=all&kind=photo%2Cvideo&limit=1")
+        .unwrap();
     let item = crate::model::parse_item(&page["items"][0]).unwrap();
     let dir = std::env::temp_dir().join(format!("gallery-dl-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -633,9 +872,19 @@ fn the_viewer_stops_at_both_ends_jumps_with_home_and_end_and_alt_left_closes() {
     r.key(keys::KEY_HOME);
     assert_eq!(at(&mut r), Some(0));
     r.key(keys::KEY_END);
-    r.h.press(keys::KEY_LEFT, keys::Mods { alt: true, ..Default::default() });
+    r.h.press(
+        keys::KEY_LEFT,
+        keys::Mods {
+            alt: true,
+            ..Default::default()
+        },
+    );
     assert!(r.h.app().viewer.is_none(), "Alt+Left is back");
-    assert_eq!(r.h.app().focus, n - 1, "the grid has the picture we left on");
+    assert_eq!(
+        r.h.app().focus,
+        n - 1,
+        "the grid has the picture we left on"
+    );
 }
 
 #[test]

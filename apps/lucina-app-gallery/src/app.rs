@@ -27,6 +27,10 @@ pub type Link = Box<dyn FnMut(Job)>;
 pub const FIRST_PAGE: u32 = 200;
 pub const SEEK_PAGE: u32 = 500;
 const DEBOUNCE: Duration = Duration::from_millis(300);
+/// How long a toast is said for, in `Gallery::now_ms`: six seconds. `now_ms` is a frame's reading of the
+/// wall clock (`dates::now_ms`), so a step of the system clock shortens or lengthens the toast that is
+/// already out there once; accepted for a toast of six seconds.
+const TOAST_MS: i64 = 6_000;
 /// All fetched pictures, tiles and previews, on `/data`.
 const CACHE_LIMIT: u64 = 2 << 30;
 
@@ -123,10 +127,14 @@ pub struct Gallery {
     pub picker: Option<FilePicker>,
     download: Option<Item>,
     pub toast: String,
-    toast_until: Option<Instant>,
+    /// When `now_ms` passes this the toast goes. It is the app's clock and not the wall: a test holds it
+    /// (`clock_runs`) so that a stalled machine cannot expire a toast in the middle of an assertion.
+    toast_until_ms: Option<i64>,
     focus_grid: bool,
     focus_search: bool,
     pub(crate) now_ms: i64,
+    /// Whether each frame takes the wall clock into `now_ms`. `false` only for a test that drives time itself.
+    pub(crate) clock_runs: bool,
     /// Tiles decoded at most: three screens. A number the first draw works out from the screen.
     pub keep: usize,
     /// Intents whose answer waits for the server, answered from `message`.
@@ -201,10 +209,11 @@ impl Gallery {
             picker: None,
             download: None,
             toast: String::new(),
-            toast_until: None,
+            toast_until_ms: None,
             focus_grid: true,
             focus_search: false,
             now_ms: dates::now_ms(),
+            clock_runs: true,
             keep: 180,
             pending: Vec::new(),
         }
@@ -501,7 +510,7 @@ impl Gallery {
 
     pub(crate) fn say(&mut self, s: String) {
         self.toast = s;
-        self.toast_until = Some(Instant::now() + Duration::from_secs(6));
+        self.toast_until_ms = Some(self.now_ms + TOAST_MS);
     }
 
     pub(crate) fn run_batch(
@@ -842,6 +851,11 @@ impl App for Gallery {
     }
 
     fn view(&mut self, ui: &mut Ui) {
+        // The app's clock, once a frame: what a toast and an expiry are measured against. A test that holds
+        // the clock turns `clock_runs` off, and then `now_ms` is the test's own.
+        if self.clock_runs {
+            self.now_ms = dates::now_ms();
+        }
         if let Some(view) = &mut self.sign_in {
             ui.header("Gallery");
             ui.pad(14.0);
@@ -1149,13 +1163,12 @@ impl Gallery {
         self.toolbar(ui);
         ui.pad(4.0);
         // The shelf's own line, the selection, what happened.
-        if let Some(until) = self.toast_until {
-            let now = Instant::now();
-            if now >= until {
+        if let Some(until) = self.toast_until_ms {
+            if self.now_ms >= until {
                 self.toast.clear();
-                self.toast_until = None;
+                self.toast_until_ms = None;
             } else {
-                ui.wake_after(until - now);
+                ui.wake_after(Duration::from_millis((until - self.now_ms) as u64));
             }
         }
         let title = match &self.shelf {
