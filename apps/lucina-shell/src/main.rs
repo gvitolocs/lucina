@@ -31,6 +31,7 @@
 extern crate eyra;
 
 mod app_groups;
+mod app_link;
 mod apps;
 mod ax;
 mod backdrop;
