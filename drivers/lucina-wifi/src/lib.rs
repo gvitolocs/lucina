@@ -38,6 +38,7 @@ use lucina_wifi_mac::{
     ChannelWidth, Credentials, GroupCipher, HwCaps, JoinInfo, Output, PeerHt, PeerInfo, PhyMode,
     RxFrame, RxMeta, ScanLeg, Security, Station, StationState,
     mlme::{use_11b, wmm_default},
+    scan::SCAN_RESULT_EXPIRE_MS,
 };
 
 /// `IEEE80211_HT_MAX_AMPDU_FACTOR`.
@@ -197,6 +198,39 @@ fn hex(data: &[u8]) -> String {
     out
 }
 
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len() / 2)
+        .map(|i| u8::from_str_radix(text.get(i * 2..i * 2 + 2)?, 16).ok())
+        .collect()
+}
+
+/// What a `connect` line of `/dev/lucina-wifi` carries after the word itself. Not `Debug`: it holds the passphrase.
+pub struct ConnectArgs {
+    pub ssid: Vec<u8>,
+    pub secret: Vec<u8>,
+    /// The channel the network was last on, in MHz.
+    pub freq_mhz: Option<u16>,
+}
+
+/// `<SSID in hex> <passphrase or PSK in hex> [frequency in MHz]`. The frequency is optional, so the two-field form of older
+/// tools stays valid; one that is not a number is not a command.
+pub fn parse_connect<'a>(mut words: impl Iterator<Item = &'a str>) -> Option<ConnectArgs> {
+    let ssid = unhex(words.next()?)?;
+    let secret = unhex(words.next()?)?;
+    let freq_mhz = match words.next() {
+        None => None,
+        Some(word) => Some(word.parse::<u16>().ok().filter(|f| *f != 0)?),
+    };
+    Some(ConnectArgs {
+        ssid,
+        secret,
+        freq_mhz,
+    })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Wait {
     None,
@@ -223,6 +257,8 @@ pub struct Wifi<P: Platform> {
     legs: VecDeque<ScanLeg>,
     ssids: Vec<Vec<u8>>,
     scanning: bool,
+    /// The running scan is the one-channel leg of a join: if it hears nothing, a full sweep follows.
+    directed: bool,
     pending: Option<Pending>,
     ssid: Vec<u8>,
     join_freq: u32,
@@ -258,6 +294,7 @@ impl<P: Platform> Wifi<P> {
             legs: VecDeque::new(),
             ssids: Vec::new(),
             scanning: false,
+            directed: false,
             pending: None,
             ssid: Vec::new(),
             join_freq: 0,
@@ -341,9 +378,19 @@ impl<P: Platform> Wifi<P> {
         self.begin_scan(None);
     }
 
-    /// Scans for `ssid` and joins the best BSS. `secret` is a passphrase or 64 hex digits, empty for an open network.
-    /// `entropy` is 32 random bytes.
-    pub fn connect(&mut self, ssid: &[u8], secret: &[u8], entropy: [u8; 32]) {
+    /// Joins `ssid`, the best BSS of it. `secret` is a passphrase or 64 hex digits, empty for an open network. `entropy` is
+    /// 32 random bytes. `freq_mhz` is the channel it was last on, if known.
+    ///
+    /// The order is wpa_supplicant's over cfg80211: a BSS heard within `IEEE80211_SCAN_RESULT_EXPIRE` (`net/wireless/scan.c`)
+    /// is joined at once; else, with a channel, one directed scan of that channel; else (or if that hears nothing) a sweep of
+    /// every channel with the SSID in the probes.
+    pub fn connect(
+        &mut self,
+        ssid: &[u8],
+        secret: &[u8],
+        entropy: [u8; 32],
+        freq_mhz: Option<u16>,
+    ) {
         if self.fatal {
             return;
         }
@@ -360,13 +407,28 @@ impl<P: Platform> Wifi<P> {
             creds,
             entropy,
         });
-        if !self.scanning {
+        if self.scanning {
+            // A sweep is on its way and the network is already known: the sweep is no reason to wait. `ath10k_scan_abort`
+            // ends it, and its `ScanDone` finds no leg left and hands the join to the station.
+            if self.heard_recently(ssid) {
+                self.legs.clear();
+                self.directed = false;
+                let _ = self.driver.stop_scan();
+            }
+            return;
+        }
+        if self.heard_recently(ssid) {
+            self.join_pending();
+        } else if !freq_mhz.is_some_and(|freq| self.begin_directed(ssid, freq)) {
             self.begin_scan(Some(ssid.to_vec()));
         }
     }
 
     pub fn disconnect(&mut self) {
         self.pending = None;
+        // The flag says what the running scan is for, and its join is gone with the pending one. Left set, the scan's end
+        // would take a later join's sweep for the one leg of this one and sweep the bands again for nothing.
+        self.directed = false;
         if let Some(station) = self.station.as_mut() {
             station.disconnect();
         }
@@ -456,17 +518,70 @@ impl<P: Platform> Wifi<P> {
 
     fn scan_finished(&mut self) {
         self.scanning = false;
-        let now = self.now;
+        let directed = core::mem::take(&mut self.directed);
         let Some(station) = self.station.as_mut() else {
             return;
         };
         station.scan_done();
+        // The one channel heard nothing: the network moved, or the remembered channel is wrong. A full sweep knows.
+        if directed
+            && let Some(ssid) = self.pending.as_ref().map(|p| p.ssid.clone())
+            && !self.heard_recently(&ssid)
+        {
+            self.begin_scan(Some(ssid));
+            return;
+        }
+        self.join_pending();
+    }
+
+    /// Hands the waiting join to the station, which picks the best BSS in its table.
+    fn join_pending(&mut self) {
+        let now = self.now;
+        let Some(station) = self.station.as_mut() else {
+            return;
+        };
         if let Some(p) = self.pending.take() {
             self.ssid = p.ssid.clone();
             if let Err(err) = station.connect(&p.ssid, p.creds, p.entropy, now) {
                 self.failed = Some(format!("connect: {err:?}"));
             }
+            self.pull_outputs();
         }
+    }
+
+    /// Whether the table holds a BSS of `ssid` younger than `IEEE80211_SCAN_RESULT_EXPIRE`: `cfg80211_get_bss` ignores older.
+    fn heard_recently(&self, ssid: &[u8]) -> bool {
+        self.station.as_ref().is_some_and(|s| {
+            s.scan_results().iter().any(|b| {
+                b.ssid == ssid
+                    && b.is_ess()
+                    && self.now.saturating_sub(b.last_seen_ms) < SCAN_RESULT_EXPIRE_MS
+            })
+        })
+    }
+
+    /// A scan of one channel with `ssid` in the probes (an `NL80211_CMD_TRIGGER_SCAN` with one frequency and one SSID). False,
+    /// with nothing started, if the station is not up or the regulatory rules give no such channel.
+    fn begin_directed(&mut self, ssid: &[u8], freq: u16) -> bool {
+        let now = self.now;
+        let Some(station) = self.station.as_mut() else {
+            return false;
+        };
+        let mut req = station.start_scan(Some(ssid), now);
+        for leg in &mut req.legs {
+            leg.channels.retain(|c| c.freq_mhz == freq);
+        }
+        req.legs.retain(|leg| !leg.channels.is_empty());
+        if req.legs.is_empty() {
+            station.scan_done();
+            return false;
+        }
+        self.ssids = req.ssids;
+        self.legs = req.legs.into();
+        self.scanning = true;
+        self.directed = true;
+        self.next_leg();
+        true
     }
 
     /// One pass: the driver's events, the station's clock, the outputs. Call often: the driver polls here.
@@ -628,6 +743,7 @@ impl<P: Platform> Wifi<P> {
                 self.wait = Wait::None;
                 self.outbox.clear();
                 self.scanning = false;
+                self.directed = false;
                 self.legs.clear();
                 self.pending = None;
                 if let Some(s) = self.station.as_mut() {
@@ -845,10 +961,10 @@ impl<P: Platform> Wifi<P> {
         None
     }
 
-    /// The text `/dev/lucina-wifi` reads, one `key value` per line.
-    pub fn status(&self) -> String {
-        let mut out = String::new();
-        let state = match self.station.as_ref().map(Station::state) {
+    /// The word on the status's first line. The owner of the status text publishes it the moment this changes: whoever reads
+    /// it waits for a state, and a state that shows late is a wait that lasts as long.
+    pub fn state(&self) -> &'static str {
+        match self.station.as_ref().map(Station::state) {
             None => "starting",
             Some(_) if self.scanning => "scanning",
             Some(StationState::Idle) if self.pending.is_some() => "scanning",
@@ -860,7 +976,13 @@ impl<P: Platform> Wifi<P> {
                 | StationState::Handshaking,
             ) => "connecting",
             Some(StationState::Connected) => "connected",
-        };
+        }
+    }
+
+    /// The text `/dev/lucina-wifi` reads, one `key value` per line.
+    pub fn status(&self) -> String {
+        let mut out = String::new();
+        let state = self.state();
         let _ = writeln!(out, "state {state}");
         let _ = writeln!(out, "mac {}", hex(&self.mac));
         let _ = writeln!(
@@ -878,6 +1000,11 @@ impl<P: Platform> Wifi<P> {
         }
         if !self.ssid.is_empty() {
             let _ = writeln!(out, "ssid {}", hex(&self.ssid));
+        }
+        // The channel the join ended on: what a tool asks for when it joins this network again, so that the next join needs
+        // one leg rather than a sweep.
+        if state == "connected" && self.join_freq != 0 {
+            let _ = writeln!(out, "freq {}", self.join_freq);
         }
         if let Some(station) = self.station.as_ref() {
             for bss in station.scan_results() {

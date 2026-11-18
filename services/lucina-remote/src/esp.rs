@@ -35,6 +35,72 @@ const DATA_FAILED: &str = "/run/lucina/data-failed";
 const DATA_FILE: &str = "/data/lucina/wifi.cfg";
 const DATA_NEW: &str = "/data/lucina/wifi.new";
 
+/// What the saved file holds: `psk=`, and if known `ssid=` and `freq=` (the channel in MHz it was last joined on, so that the
+/// next join looks there first and needs no sweep). One per line; a file from before `freq=` has none, and a line that is not
+/// known is ignored.
+///
+/// `Debug` is written by hand, and prints no part of the passphrase: a derived one would show it in a panic message, in an
+/// `unwrap` of anything that holds this, and in whatever log prints the value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Credentials {
+    pub ssid: Option<Vec<u8>>,
+    pub psk: Vec<u8>,
+    pub freq_mhz: Option<u16>,
+}
+
+impl core::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "Credentials {{ ssid: {}, psk: \"<redacted>\", freq_mhz: {:?} }}",
+            match &self.ssid {
+                Some(ssid) => String::from_utf8_lossy(ssid).into_owned(),
+                None => "none".to_string(),
+            },
+            self.freq_mhz
+        )
+    }
+}
+
+impl Credentials {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let (mut ssid, mut psk, mut freq_mhz) = (None, None, None);
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("ssid=") {
+                ssid = Some(v.as_bytes().to_vec()).filter(|s| !s.is_empty());
+            } else if let Some(v) = line.strip_prefix("psk=") {
+                psk = Some(v.as_bytes().to_vec());
+            } else if let Some(v) = line.strip_prefix("freq=") {
+                freq_mhz = v.trim().parse::<u16>().ok().filter(|f| *f != 0);
+            }
+        }
+        match psk {
+            Some(psk) if !psk.is_empty() => Ok(Self {
+                ssid,
+                psk,
+                freq_mhz,
+            }),
+            _ => Err("the credentials need a psk= line".to_string()),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"psk=");
+        out.extend_from_slice(&self.psk);
+        out.push(b'\n');
+        if let Some(ssid) = &self.ssid {
+            out.extend_from_slice(b"ssid=");
+            out.extend_from_slice(ssid);
+            out.push(b'\n');
+        }
+        if let Some(freq) = self.freq_mhz {
+            out.extend_from_slice(format!("freq={freq}\n").as_bytes());
+        }
+        out
+    }
+}
+
 /// Whether /data is where the credentials live on this boot. `Err` while it is still coming up.
 fn data_in_use() -> Result<bool, String> {
     if !Path::new(DATA_EXPECTED).exists() {
@@ -315,4 +381,135 @@ pub fn forget() -> Result<bool, String> {
     }
     fs::remove_file(&file).map_err(|e| hint(format!("{file}: {e}")))?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every shape a secret takes once it reaches text: as it is, as the decimal list a derived `Debug` prints for a `Vec<u8>`,
+    /// and in hex. A test that refuses a secret in a text refuses it in all of these, since any one of them is a leak.
+    fn secret_forms(secret: &[u8]) -> Vec<(&'static str, String)> {
+        let decimal = |sep: &str| {
+            secret
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(sep)
+        };
+        let hex = |upper: bool| {
+            secret
+                .iter()
+                .map(|byte| {
+                    if upper {
+                        format!("{byte:02X}")
+                    } else {
+                        format!("{byte:02x}")
+                    }
+                })
+                .collect()
+        };
+        vec![
+            (
+                "the bytes as they are",
+                String::from_utf8_lossy(secret).into_owned(),
+            ),
+            ("a list of decimals", decimal(", ")),
+            ("a list of decimals run together", decimal(",")),
+            ("hex", hex(false)),
+            ("hex in capitals", hex(true)),
+        ]
+    }
+
+    /// The whole point of the hand-written `Debug`: nothing that formats these shows the passphrase.
+    #[test]
+    fn no_format_of_the_credentials_shows_the_passphrase() {
+        let creds = Credentials {
+            ssid: Some(b"test-net-d".to_vec()),
+            psk: b"fake-pass-no-shown".to_vec(),
+            freq_mhz: Some(2437),
+        };
+        // What a panic or a failed assertion prints around it. `to_bytes` is the other thing: it is the file, and the file is
+        // plaintext by the owner's decision, so it holds the passphrase and is not checked here.
+        // The passphrase is refused before anything is asked of the name, so that a `Debug` derived instead of the hand-written
+        // one fails here, on the secret, and not merely on the name it would print as a list of decimals.
+        for (what, text) in [
+            ("the value", format!("{creds:?}")),
+            ("a reference to it", format!("{:?}", Some(&creds))),
+            (
+                "a result that carries it",
+                format!("{:?}", Ok::<_, String>(creds.clone())),
+            ),
+            (
+                "a result that failed and carries it",
+                format!("{:?}", Err::<(), Credentials>(creds.clone())),
+            ),
+            ("a list of them", format!("{:?}", vec![creds.clone()])),
+        ] {
+            for (form, shown) in secret_forms(&creds.psk) {
+                assert!(
+                    !text.contains(&shown),
+                    "{what} shows the passphrase as {form}: {text}"
+                );
+            }
+        }
+        let shown = format!("{creds:?}");
+        assert!(shown.contains("test-net-d"), "{shown}");
+        assert!(shown.contains("2437"), "{shown}");
+        assert!(!shown.contains("no-shown"), "{shown}");
+    }
+
+    #[test]
+    fn the_name_and_the_channel_are_optional_and_the_passphrase_is_not() {
+        let old = Credentials::parse("psk=fake-pass-optional\n").unwrap();
+        assert_eq!((old.ssid, old.freq_mhz), (None, None));
+        let named = Credentials::parse("ssid=test-net-a\npsk=fake-pass-optional\n").unwrap();
+        assert_eq!(named.ssid.unwrap(), b"test-net-a");
+        assert_eq!(named.freq_mhz, None);
+        let full =
+            Credentials::parse("psk=fake-pass-optional\nssid=test-net-a\nfreq=5260\n").unwrap();
+        assert_eq!(full.freq_mhz, Some(5260));
+        assert!(Credentials::parse("ssid=test-net-a\nfreq=5260\n").is_err());
+    }
+
+    #[test]
+    fn a_channel_that_is_not_one_is_ignored() {
+        for bad in ["freq=\n", "freq=0\n", "freq=fast\n", "freq=70000\n"] {
+            let c = Credentials::parse(&format!("psk=fake-pass-channel\n{bad}")).unwrap();
+            assert_eq!(c.freq_mhz, None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_file_round_trips_with_and_without_the_name_and_the_channel() {
+        for (ssid, freq_mhz) in [
+            (None, None),
+            (Some(b"test-net-b".to_vec()), None),
+            (Some(b"test-net-b".to_vec()), Some(2437)),
+        ] {
+            let saved = Credentials {
+                ssid,
+                psk: b"fake-pass-roundtrip".to_vec(),
+                freq_mhz,
+            };
+            let text = String::from_utf8(saved.to_bytes()).unwrap();
+            assert_eq!(Credentials::parse(&text).unwrap(), saved, "{text}");
+        }
+        let old = Credentials::parse("psk=fake-pass-roundtrip\nssid=test-net-b\n").unwrap();
+        assert_eq!(
+            old.to_bytes(),
+            b"psk=fake-pass-roundtrip\nssid=test-net-b\n"
+        );
+    }
+
+    #[test]
+    fn a_line_that_is_not_known_is_ignored() {
+        let c =
+            Credentials::parse("hw_mode=g\npsk=fake-pass-unknown\nssid=test-net-c\nfreq=2412\n")
+                .unwrap();
+        assert_eq!(
+            (c.ssid.unwrap(), c.freq_mhz),
+            (b"test-net-c".to_vec(), Some(2412))
+        );
+    }
 }

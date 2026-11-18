@@ -599,7 +599,7 @@ impl Rig {
 
     fn connect_with(&mut self, pass: &[u8], entropy: [u8; 32]) {
         self.keep_secret(&entropy);
-        self.wifi.connect(SSID, pass, entropy);
+        self.wifi.connect(SSID, pass, entropy, None);
     }
 
     #[track_caller]
@@ -1021,7 +1021,7 @@ fn an_open_network_has_no_keys_and_no_protection() {
         ..ApCfg::default()
     });
     assert!(r.wifi.status().lines().all(|l| !l.starts_with("bss")));
-    r.wifi.connect(SSID, b"", [1; 32]);
+    r.wifi.connect(SSID, b"", [1; 32], None);
     r.wait_link();
     // the port opens with the association; the four conf_tx ahead of peer_assoc take a few credits
     assert!(r.run_until(200, |r| r.count(id::VDEV_UP) == 1));
@@ -1402,7 +1402,7 @@ fn an_ap_that_stays_quiet_on_a_wrong_passphrase_times_the_handshake_out() {
 fn a_passphrase_that_cannot_be_one_is_refused_without_repeating_it() {
     let mut r = Rig::up(ApCfg::default());
     r.keep_secret(b"tiny");
-    r.wifi.connect(SSID, b"tiny", [1; 32]);
+    r.wifi.connect(SSID, b"tiny", [1; 32], None);
     assert!(r.failed().is_some());
     assert_eq!(r.state(), "idle");
     assert!(!r.wifi.status().contains("tiny"));
@@ -1421,6 +1421,187 @@ fn a_network_that_is_not_there_ends_in_a_failure() {
     assert_eq!(r.state(), "idle");
     r.cfg.on_air = true;
     r.reconnect_works(2);
+}
+
+// ---- 4b. joining without a redundant sweep --------------------------------------------------------------------------
+
+/// The channels of one `WMI_START_SCAN` command.
+fn scan_channels(c: &WmiCmd) -> Vec<u32> {
+    c.tlv()[1].1.chunks(4).map(|b| word(b, 0)).collect()
+}
+
+/// The SSID the one `WMI_START_SCAN` command probed for.
+fn probe_ssid(c: &WmiCmd) -> Vec<u8> {
+    let t = c.tlv();
+    t[2].1[4..4 + word(&t[2].1, 0) as usize].to_vec()
+}
+
+impl Rig {
+    /// A join asked with the channel the network was last on, when one is known.
+    fn connect_on(&mut self, freq: Option<u16>) {
+        self.keep_secret(&[0x42; 32]);
+        self.wifi.connect(SSID, PASSPHRASE, [0x42; 32], freq);
+    }
+}
+
+#[test]
+fn a_sweep_in_progress_does_not_hold_up_the_join_of_a_network_just_heard() {
+    let mut r = Rig::up(ApCfg::default());
+    r.wifi.scan();
+    r.run(30);
+    assert_eq!(r.scans.len(), 2);
+    // A second sweep that the firmware never finishes by itself: the join must not wait for it.
+    r.auto_scan = false;
+    r.wifi.scan();
+    r.run(10);
+    assert_eq!(r.state(), "scanning");
+    assert_eq!(r.scans.len(), 3);
+    r.connect_on(None);
+    r.wait_link();
+    assert_eq!(r.count(id::STOP_SCAN), 1, "the sweep was stopped");
+    assert_eq!(r.scans.len(), 3, "and its other leg never started");
+}
+
+#[test]
+fn the_state_word_is_idle_the_moment_the_sweep_is_over() {
+    let mut r = Rig::up(ApCfg::default());
+    r.wifi.scan();
+    let mut over = false;
+    for _ in 0..200 {
+        r.tick();
+        let status = r.wifi.status();
+        let first = status.lines().next().unwrap_or_default();
+        assert_eq!(first, format!("state {}", r.wifi.state()));
+        if first == "state idle" {
+            over = true;
+            // The table is complete when the word says so: a reader that stops on `idle` must see every network.
+            assert!(
+                status.lines().any(|line| line.starts_with("bss ")),
+                "{status}"
+            );
+            break;
+        }
+    }
+    assert!(over, "{}", r.wifi.status());
+}
+
+#[test]
+fn a_network_heard_a_moment_ago_is_joined_with_no_scan() {
+    let mut r = Rig::up(ApCfg::default());
+    r.wifi.scan();
+    r.run(30);
+    assert_eq!(r.scans.len(), 2);
+    r.connect_on(None);
+    assert_eq!(r.state(), "connecting", "{}", r.wifi.status());
+    r.wait_link();
+    assert_eq!(r.scans.len(), 2, "no scan for a join");
+    assert!(
+        r.wifi.status().lines().any(|l| l == "freq 2437"),
+        "{}",
+        r.wifi.status()
+    );
+}
+
+#[test]
+fn results_older_than_the_expiry_are_scanned_again() {
+    let mut r = Rig::up(ApCfg::default());
+    r.wifi.scan();
+    r.run(30);
+    assert_eq!(r.scans.len(), 2);
+    // IEEE80211_SCAN_RESULT_EXPIRE is 30 s
+    r.run(31_000);
+    r.connect_on(None);
+    assert_eq!(r.state(), "scanning");
+    r.wait_link();
+    assert_eq!(r.scans.len(), 4, "a full sweep with the name in it");
+    assert_eq!(probe_ssid(&r.scans[2]), SSID);
+}
+
+#[test]
+fn a_known_channel_is_one_directed_leg_and_then_the_join() {
+    let mut r = Rig::up(ApCfg::default());
+    r.connect_on(Some(2437));
+    assert_eq!(r.state(), "scanning");
+    r.wait_link();
+    assert_eq!(r.scans.len(), 1);
+    assert_eq!(scan_channels(&r.scans[0]), vec![2437]);
+    assert_eq!(probe_ssid(&r.scans[0]), SSID);
+}
+
+#[test]
+fn a_known_channel_that_hears_nothing_falls_back_to_the_full_sweep() {
+    let mut r = Rig::up(ApCfg::default());
+    // the network moved: it is on channel 6, not 1
+    r.connect_on(Some(2412));
+    assert_eq!(r.state(), "scanning");
+    r.wait_link();
+    assert_eq!(r.scans.len(), 3, "one channel, then both bands");
+    assert_eq!(scan_channels(&r.scans[0]), vec![2412]);
+    assert!(scan_channels(&r.scans[1]).len() > 1);
+    assert_eq!(probe_ssid(&r.scans[1]), SSID);
+    assert_eq!(probe_ssid(&r.scans[2]), SSID);
+}
+
+#[test]
+fn a_channel_the_rules_do_not_have_is_a_full_sweep() {
+    let mut r = Rig::up(ApCfg::default());
+    r.connect_on(Some(9999));
+    r.wait_link();
+    assert_eq!(r.scans.len(), 2);
+    assert!(scan_channels(&r.scans[0]).len() > 1);
+}
+
+#[test]
+fn a_directed_leg_a_sleep_abandoned_is_not_taken_for_a_later_sweep() {
+    let mut r = Rig::up(ApCfg {
+        on_air: false,
+        ..ApCfg::default()
+    });
+    r.connect_on(Some(2412));
+    // The sleep takes the legs away and the join with them; the abort is still on its way when the join is asked again.
+    r.wifi.suspend_quiesce();
+    r.connect_on(Some(2412));
+    assert!(
+        r.run_until(500, |r| r.failed().is_some()),
+        "{}",
+        r.wifi.status()
+    );
+    assert_eq!(
+        r.scans.len(),
+        1,
+        "the aborted leg only: its end joins, it starts no sweep of the bands"
+    );
+}
+
+#[test]
+fn a_connect_line_has_an_optional_channel() {
+    let fake = "fake-pass-connect-line";
+    let line = format!("{} {}", hex(SSID), hex(fake.as_bytes()));
+    let with = |extra: &str| {
+        lucina_wifi::parse_connect(format!("{line}{extra}").split_ascii_whitespace())
+            .unwrap_or_else(|| panic!("not a connect line: {line}{extra}"))
+    };
+    let old = with("");
+    assert_eq!(
+        (old.ssid.as_slice(), old.secret.as_slice()),
+        (SSID, fake.as_bytes())
+    );
+    assert_eq!(old.freq_mhz, None);
+    assert_eq!(with(" 5260").freq_mhz, Some(5260));
+    let none = |extra: &str| {
+        lucina_wifi::parse_connect(format!("{line}{extra}").split_ascii_whitespace()).is_none()
+    };
+    assert!(none(" fast"), "a channel that is not a number");
+    assert!(none(" 0"), "no channel is 0 MHz");
+    assert!(none(" 70000"), "no channel is over a u16");
+    assert!(
+        lucina_wifi::parse_connect(core::iter::once(hex(SSID).as_str())).is_none(),
+        "a passphrase is not optional"
+    );
+    assert!(
+        lucina_wifi::parse_connect("6d6 6661".split_ascii_whitespace()).is_none(),
+        "hex comes in pairs"
+    );
 }
 
 // ---- 5. the link goes away ---------------------------------------------------------------------------------------------
@@ -1880,7 +2061,7 @@ fn a_scan_the_firmware_refuses_or_never_ends_finishes_anyway() {
 #[test]
 fn connecting_before_the_firmware_is_ready_does_not_stick() {
     let mut r = Rig::with(ApCfg::default(), Rig::model_cfg());
-    r.wifi.connect(SSID, PASSPHRASE, [1; 32]);
+    r.wifi.connect(SSID, PASSPHRASE, [1; 32], None);
     assert_eq!(r.failed().unwrap(), "the firmware is not ready");
     r.boot();
     r.run(100);
@@ -1908,7 +2089,7 @@ fn assert_dead(r: &mut Rig) {
     // what comes afterwards has nowhere to go, and says so
     r.wifi.scan();
     assert_eq!(r.state(), "idle");
-    r.wifi.connect(SSID, PASSPHRASE, [1; 32]);
+    r.wifi.connect(SSID, PASSPHRASE, [1; 32], None);
     assert_eq!(r.state(), "idle");
     assert!(r.failed().is_some());
     r.wifi.disconnect();
@@ -2272,7 +2453,7 @@ fn garbage_from_the_firmware_breaks_nothing() {
             }
             if i == 250 {
                 r.wifi.scan();
-                r.wifi.connect(SSID, PASSPHRASE, [9; 32]);
+                r.wifi.connect(SSID, PASSPHRASE, [9; 32], None);
             }
             r.tick();
             while r.wifi.pop_rx().is_some() {}
