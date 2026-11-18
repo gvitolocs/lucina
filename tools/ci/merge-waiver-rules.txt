@@ -1,0 +1,10 @@
+# Which merge-waiver rules the check-fast diffgate step forwards to diffgate (docs/ci/SHIFT-LEFT.md, finding GATE-01).
+# One rule name per line; a line that starts with # is a comment, blank lines are ignored.
+#
+# ADDING A RULE HERE IS A GATE CHANGE: the file lives under tools/ci/, which .lucina/pipeline.toml lists in gate_files, so a
+# merge that adds a line needs the coordinator's `--allow gate-change="<why>"`. A name here only says that a waiver of that
+# rule is one diffgate may act on: the reason travels unchanged and diffgate still counts the refusals itself.
+#
+# Only rule names diffgate knows. `gate-change` and `spec-change` are the merge tool's own decisions, not diffgate rules, and
+# forwarding one would fail the call ("--allow: unknown rule"), so they stay out and their waivers are reported as not forwarded.
+skipped-test

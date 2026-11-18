@@ -1656,6 +1656,257 @@ impl Drop for FastEnd {
     }
 }
 
+/// The merge waivers of the job that runs this gate (LA-C014): `lagent merge --allow rule=reason` writes
+/// `<job dir>/waivers.jsonl` — one JSON object per line with exactly the four string fields `rule`, `reason`, `by`, `job` —
+/// and names it in `LAGENT_WAIVERS_FILE` for its gate commands. The variable is set only when the job was given at least one
+/// `--allow`, so an ordinary run of this loop reads nothing. Why: the merge gate waived its refusals and the `diffgate` step
+/// of `check-fast --merge-gate` refused the very same lines again with "0 waived" (finding GATE-01, job_4ee819df2427).
+const WAIVERS_FILE_ENV: &str = "LAGENT_WAIVERS_FILE";
+/// Which waiver rules the `diffgate` step forwards: one name per line, `#` comments (tools/ci/merge-waiver-rules.txt).
+/// Data and not a constant here because adding a rule is a gate change a human reads, like every other file of `tools/ci/`.
+const WAIVER_RULES_FILE: &str = "tools/ci/merge-waiver-rules.txt";
+/// The fields of a waivers line, all four of them strings and nothing else.
+const WAIVER_FIELDS: [&str; 4] = ["rule", "reason", "by", "job"];
+
+/// One waiver of this merge: its rule and the reason exactly as `lagent merge --allow` was given it.
+struct Waiver {
+    rule: String,
+    reason: String,
+}
+
+fn json_skip_ws(b: &[char], i: &mut usize) {
+    while b.get(*i).is_some_and(|c| c.is_ascii_whitespace()) {
+        *i += 1;
+    }
+}
+
+/// The four hex digits of a `\u` escape (read past the `u`), a surrogate pair joined as JSON says it must.
+fn json_codepoint(b: &[char], i: &mut usize) -> Result<char, String> {
+    let hex4 = |i: &mut usize| -> Result<u32, String> {
+        let d: String = b
+            .get(*i..*i + 4)
+            .ok_or("\\u needs four hex digits")?
+            .iter()
+            .collect();
+        let v = u32::from_str_radix(&d, 16).map_err(|_| "\\u needs four hex digits")?;
+        *i += 4;
+        Ok(v)
+    };
+    let hi = hex4(i)?;
+    if !(0xd800..0xdc00).contains(&hi) {
+        return char::from_u32(hi).ok_or_else(|| "\\u names no character".to_string());
+    }
+    if b.get(*i) != Some(&'\\') || b.get(*i + 1) != Some(&'u') {
+        return Err("a high surrogate needs its low pair".into());
+    }
+    *i += 2;
+    let lo = hex4(i)?;
+    if !(0xdc00..0xe000).contains(&lo) {
+        return Err("a high surrogate needs its low pair".into());
+    }
+    char::from_u32(0x10000 + (hi - 0xd800) * 0x400 + (lo - 0xdc00))
+        .ok_or_else(|| "\\u names no character".to_string())
+}
+
+/// One JSON string at `i`: the six short escapes, a backslash-u codepoint, and no raw control character.
+fn json_string(b: &[char], i: &mut usize) -> Result<String, String> {
+    if b.get(*i) != Some(&'"') {
+        return Err("not a string".into());
+    }
+    *i += 1;
+    let mut out = String::new();
+    loop {
+        let Some(&c) = b.get(*i) else {
+            return Err("unterminated string".into());
+        };
+        *i += 1;
+        match c {
+            '"' => return Ok(out),
+            '\\' => {
+                let Some(&e) = b.get(*i) else {
+                    return Err("unterminated escape".into());
+                };
+                *i += 1;
+                match e {
+                    '"' => out.push('"'),
+                    '\\' => out.push('\\'),
+                    '/' => out.push('/'),
+                    'b' => out.push('\u{8}'),
+                    'f' => out.push('\u{c}'),
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    'u' => out.push(json_codepoint(b, i)?),
+                    _ => return Err(format!("unknown escape \\{e}")),
+                }
+            }
+            c if (c as u32) < 0x20 => return Err("an unescaped control character".into()),
+            c => out.push(c),
+        }
+    }
+}
+
+/// One flat JSON object whose every value is a string, as pairs in the order written. A number, a nested object or array, a
+/// missing colon, a trailing comma or text after the closing brace is an error: what this gate cannot read exactly it does
+/// not act on.
+fn json_object(b: &[char], i: &mut usize) -> Result<Vec<(String, String)>, String> {
+    json_skip_ws(b, i);
+    if b.get(*i) != Some(&'{') {
+        return Err("not a JSON object".into());
+    }
+    *i += 1;
+    let mut out = Vec::new();
+    json_skip_ws(b, i);
+    if b.get(*i) == Some(&'}') {
+        *i += 1;
+        return Ok(out);
+    }
+    loop {
+        json_skip_ws(b, i);
+        let k = json_string(b, i).map_err(|e| format!("field name: {e}"))?;
+        json_skip_ws(b, i);
+        if b.get(*i) != Some(&':') {
+            return Err(format!("`{k}` has no value after its name"));
+        }
+        *i += 1;
+        json_skip_ws(b, i);
+        if b.get(*i) != Some(&'"') {
+            return Err(format!("the value of `{k}` is not a string"));
+        }
+        let v = json_string(b, i)?;
+        out.push((k, v));
+        json_skip_ws(b, i);
+        match b.get(*i) {
+            Some(',') => *i += 1,
+            Some('}') => {
+                *i += 1;
+                return Ok(out);
+            }
+            _ => {
+                return Err(format!(
+                    "`{}` after a field, expected `,` or `}}`",
+                    b.get(*i).map_or("end".into(), |c| c.to_string())
+                ));
+            }
+        }
+    }
+}
+
+/// One waivers line: an object of exactly the four string fields, with a reason that says something.
+fn parse_waiver_line(line: &str) -> Result<Waiver, String> {
+    let b: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    let pairs = json_object(&b, &mut i)?;
+    json_skip_ws(&b, &mut i);
+    if i != b.len() {
+        return Err("text after the closing `}`".into());
+    }
+    let names: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+    for f in WAIVER_FIELDS {
+        if !names.contains(&f) {
+            return Err(format!("no `{f}` field"));
+        }
+    }
+    if pairs.len() != WAIVER_FIELDS.len() {
+        return Err(format!(
+            "{} fields where a waivers line holds {}",
+            pairs.len(),
+            WAIVER_FIELDS.len()
+        ));
+    }
+    let field = |f: &str| {
+        pairs
+            .iter()
+            .find(|(k, _)| k == f)
+            .map_or(String::new(), |(_, v)| v.clone())
+    };
+    let reason = field("reason");
+    if reason.trim().is_empty() {
+        return Err("`reason` is empty".into());
+    }
+    Ok(Waiver {
+        rule: field("rule"),
+        reason,
+    })
+}
+
+/// The rules whose waivers reach diffgate (`WAIVER_RULES_FILE`). A list that cannot be read forwards nothing, which leaves
+/// every waiver unused and every refusal refused: the safe direction for a gate.
+fn forwarded_waiver_rules(root: &Path) -> Vec<String> {
+    fs::read_to_string(root.join(WAIVER_RULES_FILE))
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The waivers this merge job was given: `None` when `LAGENT_WAIVERS_FILE` is not set, which is every run that is not a
+/// merge with an allow and leaves the step exactly as it was; `Err` when it is set but is not the file the merge job writes.
+/// Every line is read or none is, so a file with one bad line waives nothing.
+fn merge_waivers() -> Result<Option<Vec<Waiver>>, String> {
+    let Some(p) = std::env::var_os(WAIVERS_FILE_ENV) else {
+        return Ok(None);
+    };
+    let p = PathBuf::from(p);
+    let text =
+        fs::read_to_string(&p).map_err(|e| format!("{} cannot be read: {e}", p.display()))?;
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let w =
+            parse_waiver_line(line).map_err(|e| format!("{} line {}: {e}", p.display(), n + 1))?;
+        out.push(w);
+    }
+    if out.is_empty() {
+        return Err(format!("{} holds no waiver line", p.display()));
+    }
+    Ok(Some(out))
+}
+
+/// The diffgate call of the step and the one line it prints about the merge waivers. A forwarded reason is passed through
+/// unchanged, so diffgate's counted form `RULE=N:reason` reaches it byte for byte; the quotes are the shell's problem
+/// (`shell_quote`), since the step runs its command through `bash -c`.
+fn diffgate_with_waivers(base: &str, waivers: &[Waiver], rules: &[String]) -> (String, String) {
+    let mut cmd = format!("diffgate --repo . --base {base}");
+    let (fwd, kept): (Vec<&Waiver>, Vec<&Waiver>) =
+        waivers.iter().partition(|w| rules.contains(&w.rule));
+    for w in &fwd {
+        cmd.push_str(&format!(
+            " --allow {}",
+            shell_quote(&format!("{}={}", w.rule, w.reason))
+        ));
+    }
+    let fwd_list = if fwd.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({})",
+            fwd.iter()
+                .map(|w| format!("{}: {}", w.rule, w.reason))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    };
+    let kept_list = if kept.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({})",
+            kept.iter()
+                .map(|w| w.rule.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let summary = format!(
+        "diffgate waivers: {} forwarded{fwd_list}, {} not forwarded{kept_list}",
+        fwd.len(),
+        kept.len()
+    );
+    (cmd, summary)
+}
+
 /// `check-fast [--base REF] [--proofs] [--all-proofs] [--mutants] [--no-build]`
 fn cmd_check_fast(a: &Args) -> Result<i32, String> {
     let root = repo_root()?;
@@ -1762,14 +2013,38 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
     };
 
     if tool_exists("diffgate") {
-        step(
-            "diffgate",
-            &format!("diffgate --repo . --base {base}"),
-            "script",
-            60,
-            &none,
-            &mut failed,
-        )?;
+        // With no LAGENT_WAIVERS_FILE the command is the plain one this step has always run (finding GATE-01).
+        match merge_waivers() {
+            Ok(None) => step(
+                "diffgate",
+                &format!("diffgate --repo . --base {base}"),
+                "script",
+                60,
+                &none,
+                &mut failed,
+            )?,
+            Ok(Some(ws)) => {
+                let (cmd, summary) =
+                    diffgate_with_waivers(&base, &ws, &forwarded_waiver_rules(&root));
+                println!("{summary}");
+                step("diffgate", &cmd, "script", 60, &none, &mut failed)?;
+            }
+            // A waivers file this step cannot read exactly is not a reason to waive nothing quietly: the step fails,
+            // diffgate never runs, and the message says which line of which file is what.
+            Err(e) => step(
+                "diffgate",
+                &format!(
+                    "echo {} >&2; exit 1",
+                    shell_quote(&format!(
+                        "diffgate waivers: {e}: refusing, nothing is waived"
+                    ))
+                ),
+                "script",
+                60,
+                &none,
+                &mut failed,
+            )?,
+        }
     } else {
         skipped.push("diffgate: not installed here".into());
     }
@@ -2298,5 +2573,249 @@ mod tests {
         let r = parse_runs("verus-gate\tcompleted\tsuccess\tgithub-actions\nbad line\n");
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].conclusion, "success");
+    }
+
+    // ---- the merge waivers of a gate job (finding GATE-01). The file is the one `lagent merge` writes, byte for byte:
+    // {"rule":"...","reason":"...","by":"...","job":"job_..."} per line. LAGENT_WAIVERS_FILE is process-wide, so what a unit
+    // test can judge is the reading of one line and the command it makes; tests/merge_gate_waivers.rs runs the real step.
+
+    /// One waivers line as the merge job writes it, with `by` and `job` from job_4ee819df2427 of the failing merge. The
+    /// reason is JSON-escaped the way its writer escapes it, quotes included.
+    fn waiver_line(rule: &str, reason: &str) -> String {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        format!(
+            "{{\"rule\":\"{}\",\"reason\":\"{}\",\"by\":\"nez@nez_opt\",\"job\":\"job_4ee819df2427\"}}",
+            esc(rule),
+            esc(reason)
+        )
+    }
+
+    /// The real allow of job_4ee819df2427 (line 9 of its log), which its diffgate step then refused with "0 waived" (line 160).
+    const GAL_REASON: &str = "real-server variants kept as #[ignore = needs LUCINA_MEDIA_BIN], reported ignored not \
+                              passed; the same assertions run against the in-process Fake; the ignored variants run in a \
+                              scheduled non-gating job; WM-C004 / GAL-01; coordinator allow 2026-11-17";
+
+    fn rules(skipped: bool) -> Vec<String> {
+        if skipped {
+            vec!["skipped-test".to_string()]
+        } else {
+            vec![]
+        }
+    }
+
+    /// The repository this test file sits in: the rules list is data, so the tests read the real one.
+    fn this_repo() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .to_path_buf()
+    }
+
+    #[test]
+    fn a_waivers_line_of_the_four_string_fields_is_read() {
+        let w = parse_waiver_line(&waiver_line("skipped-test", GAL_REASON)).unwrap();
+        assert_eq!(w.rule, "skipped-test");
+        assert_eq!(w.reason, GAL_REASON, "the reason is kept as it was given");
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_json_object_is_refused() {
+        for (bad, what) in [
+            ("", "an empty line"),
+            ("not json", "plain text"),
+            ("[\"rule\"]", "an array"),
+            ("{\"rule\":\"a\" ", "an object with no closing brace"),
+            ("{}{\"rule\":\"a\"}", "text before the object"),
+        ] {
+            assert!(
+                parse_waiver_line(bad).is_err(),
+                "{what}: {bad:?} was taken for a waiver"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_missing_one_of_the_four_fields_is_refused() {
+        for missing in WAIVER_FIELDS {
+            let line = match missing {
+                "rule" => "{\"reason\":\"why\",\"by\":\"nez@nez_opt\",\"job\":\"job_1\"}",
+                "reason" => "{\"rule\":\"skipped-test\",\"by\":\"nez@nez_opt\",\"job\":\"job_1\"}",
+                "by" => "{\"rule\":\"skipped-test\",\"reason\":\"why\",\"job\":\"job_1\"}",
+                _ => "{\"rule\":\"skipped-test\",\"reason\":\"why\",\"by\":\"nez@nez_opt\"}",
+            };
+            let e = parse_waiver_line(line)
+                .err()
+                .unwrap_or_else(|| panic!("{missing} was not asked for"));
+            assert!(
+                e.contains(missing),
+                "{e} names the field that is gone: {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_that_is_not_a_string_is_refused() {
+        for bad in [
+            "{\"rule\":\"skipped-test\",\"reason\":\"why\",\"by\":null,\"job\":\"job_1\"}",
+            "{\"rule\":\"skipped-test\",\"reason\":7,\"by\":\"nez\",\"job\":\"job_1\"}",
+            "{\"rule\":[\"skipped-test\"],\"reason\":\"why\",\"by\":\"nez\",\"job\":\"job_1\"}",
+            "{\"rule\":\"skipped-test\",\"reason\":\"why\",\"by\":{\"n\":\"nez\"},\"job\":\"job_1\"}",
+            "{\"rule\":\"skipped-test\",\"reason\":\"why\",\"by\":true,\"job\":\"job_1\"}",
+        ] {
+            assert!(
+                parse_waiver_line(bad).is_err(),
+                "a non-string value was taken: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_extra_or_a_repeated_field_is_refused() {
+        for bad in [
+            "{\"rule\":\"skipped-test\",\"reason\":\"why\",\"by\":\"nez\",\"job\":\"job_1\",\"gate\":\"g\"}",
+            "{\"rule\":\"skipped-test\",\"rule\":\"other\",\"reason\":\"why\",\"by\":\"nez\",\"job\":\"job_1\"}",
+        ] {
+            assert!(
+                parse_waiver_line(bad).is_err(),
+                "a fifth field was taken: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_or_blank_reason_is_refused() {
+        for reason in ["", " ", "     "] {
+            let e = parse_waiver_line(&waiver_line("skipped-test", reason))
+                .err()
+                .unwrap_or_else(|| panic!("a reason of {reason:?} says nothing and was taken"));
+            assert!(e.contains("reason"), "{e}");
+        }
+    }
+
+    /// The counted form of diffgate (`RULE=N:reason`) arrives byte for byte, quotes, brackets and semicolons included.
+    #[test]
+    fn a_counted_waiver_is_forwarded_with_its_reason_unchanged() {
+        let reason = "7:seven tests are #[ignore = \"slow\"]; see a/b";
+        let w = parse_waiver_line(&waiver_line("skipped-test", reason)).unwrap();
+        assert_eq!(
+            w.reason, reason,
+            "the escapes of the file are the reason's own characters"
+        );
+        let (cmd, summary) = diffgate_with_waivers("abc123", &[w], &rules(true));
+        assert_eq!(
+            cmd,
+            "diffgate --repo . --base abc123 --allow 'skipped-test=7:seven tests are #[ignore = \"slow\"]; see a/b'"
+        );
+        assert_eq!(
+            summary,
+            format!("diffgate waivers: 1 forwarded (skipped-test: {reason}), 0 not forwarded")
+        );
+    }
+
+    #[test]
+    fn an_uncounted_waiver_is_forwarded_with_its_reason_unchanged() {
+        let w = parse_waiver_line(&waiver_line("skipped-test", GAL_REASON)).unwrap();
+        let (cmd, summary) = diffgate_with_waivers("2ef62d3b", &[w], &rules(true));
+        assert!(
+            cmd.starts_with("diffgate --repo . --base 2ef62d3b --allow 'skipped-test=")
+                && cmd.ends_with("'"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains(GAL_REASON),
+            "the reason is passed through unchanged: {cmd}"
+        );
+        assert_eq!(
+            summary,
+            format!("diffgate waivers: 1 forwarded (skipped-test: {GAL_REASON}), 0 not forwarded")
+        );
+    }
+
+    /// `gate-change` and `spec-change` are the merge tool's decisions, not rules diffgate knows: forwarding one would fail
+    /// the call with "--allow: unknown rule".
+    #[test]
+    fn a_rule_that_is_not_on_the_list_is_not_forwarded() {
+        let ws = [
+            parse_waiver_line(&waiver_line(
+                "gate-change",
+                "tools/ci/ of the merge; coordinator allow",
+            ))
+            .unwrap(),
+            parse_waiver_line(&waiver_line(
+                "spec-change",
+                "a statement moved; coordinator allow",
+            ))
+            .unwrap(),
+        ];
+        let (cmd, summary) =
+            diffgate_with_waivers("abc123", &ws, &forwarded_waiver_rules(&this_repo()));
+        assert_eq!(
+            cmd, "diffgate --repo . --base abc123",
+            "the plain command, as today"
+        );
+        assert_eq!(
+            summary,
+            "diffgate waivers: 0 forwarded, 2 not forwarded (gate-change, spec-change)"
+        );
+    }
+
+    /// The list is data: whatever it names is forwarded, so a rule added later is covered by this test and needs no code.
+    #[test]
+    fn every_rule_of_the_forwarding_list_is_forwarded() {
+        let list = forwarded_waiver_rules(&this_repo());
+        assert!(!list.is_empty(), "{WAIVER_RULES_FILE} reads as empty");
+        for r in &list {
+            let reason = "5:five of them; the coordinator allow of today";
+            let w = parse_waiver_line(&waiver_line(r, reason)).unwrap();
+            let (cmd, summary) = diffgate_with_waivers("abc123", &[w], &list);
+            assert_eq!(
+                cmd,
+                format!("diffgate --repo . --base abc123 --allow '{r}={reason}'"),
+                "{r} is on the list but not forwarded as itself"
+            );
+            assert_eq!(
+                summary,
+                format!("diffgate waivers: 1 forwarded ({r}: {reason}), 0 not forwarded")
+            );
+        }
+    }
+
+    #[test]
+    fn the_forwarding_list_holds_skipped_test_and_nothing_else_today() {
+        assert_eq!(
+            forwarded_waiver_rules(&this_repo()),
+            vec!["skipped-test".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_list_that_is_not_there_forwards_nothing() {
+        let w = parse_waiver_line(&waiver_line("skipped-test", "the reason")).unwrap();
+        let (cmd, summary) = diffgate_with_waivers(
+            "abc123",
+            &[w],
+            &forwarded_waiver_rules(Path::new("/nonexistent-root")),
+        );
+        assert_eq!(cmd, "diffgate --repo . --base abc123");
+        assert_eq!(
+            summary,
+            "diffgate waivers: 0 forwarded, 1 not forwarded (skipped-test)"
+        );
+    }
+
+    /// The whole line of the log, forwarded and refused in the same call: one count for each side.
+    #[test]
+    fn the_summary_line_counts_both_sides_of_the_list() {
+        let ws = [
+            parse_waiver_line(&waiver_line("skipped-test", GAL_REASON)).unwrap(),
+            parse_waiver_line(&waiver_line("gate-change", "tools/ci/; coordinator allow")).unwrap(),
+        ];
+        let (cmd, summary) = diffgate_with_waivers("38d67292", &ws, &rules(true));
+        assert_eq!(cmd.matches(" --allow ").count(), 1, "{cmd}");
+        assert_eq!(
+            summary,
+            format!(
+                "diffgate waivers: 1 forwarded (skipped-test: {GAL_REASON}), 1 not forwarded (gate-change)"
+            )
+        );
     }
 }
