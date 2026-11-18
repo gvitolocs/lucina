@@ -1,10 +1,16 @@
-# The CI launcher (docs/ci/VERUS.md). Its own workspace and no dependencies, so that it builds in seconds on a clean runner
-# and adds nothing to the root Cargo.lock.
+# The CI launcher (docs/ci/VERUS.md). Its own workspace, so it builds in seconds and adds nothing to the root Cargo.lock.
+# The one dependency is `libc`, for exactly one call: `kill(2)` in `runner.rs`. The deadline kill may not need a fork,
+# because a step that has taken every task slot of its scope (`TasksMax=256`, GATE-03) has none left to start
+# `/bin/kill` in — and a kill whose failure is thrown away is a kill that looks delivered (PF-R024). The version is the
+# one the root workspace already holds, 0.2.191, so nothing is audited that was not audited before.
 [package]
 name = "lucina-ci"
 version = "0.1.0"
 edition = "2024"
 publish = false
+
+[dependencies]
+libc = "0.2"
 
 [workspace]
 

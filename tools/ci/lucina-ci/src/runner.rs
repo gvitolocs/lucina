@@ -1,10 +1,15 @@
 //! Runs one proof unit in its own cgroup v2 scope. The outer process (outside the cap) starts `systemd-run --scope`; the inner
-//! process, inside the scope, checks that the cap really applies, runs the unit and reads the scope's own counters.
+//! process, inside the scope, checks that the cap really applies, runs the unit and reads the scope's own counters. A step that
+//! cannot get a scope runs as the leader of its own process group instead, and its deadline kill then takes the group and
+//! nothing else (GATE-03).
 
 use crate::verdict::{self, Facts, Outcome};
 use std::fs;
+use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -186,6 +191,27 @@ fn read_trim(p: &Path) -> Option<String> {
     fs::read_to_string(p).ok().map(|s| s.trim().to_string())
 }
 
+/// `LUCINA_CI_NO_SCOPE=1`: start every step with no systemd scope at all. Production never sets it. It is the switch the
+/// tests drive the scope-less fallback with, because the fallback is the branch GATE-03 is about and a test that waits for
+/// a machine without systemd is not a test. Where no scope is had the step still leads its own process group and still
+/// meets its deadline.
+pub const NO_SCOPE_ENV: &str = "LUCINA_CI_NO_SCOPE";
+/// The unit name `run_unit` asks systemd for, so the cgroup whose directory starts with this is one this launcher made
+/// for this step and may signal by pid. Anything else is a cgroup the check shares with whatever started it.
+const SCOPE_OUR_PREFIX: &str = "lucina-ci-";
+/// The grace a step gets to leave on its own after the deadline's SIGTERM, before everything of it is SIGKILLed. One named
+/// constant because it is the whole of what the runner ever *waits* beside a limit: the wait ends at
+/// `limit + KILL_GRACE_S + KILL_SLACK_S` and never at the step's own length (GATE-03: a limit that does not stop the step
+/// is not a limit). The time the gate prints for the step is a little more than that, because the clock the check stamps
+/// starts before the scope is asked for and stops after the last round of the kill: `runner_kill_scope.rs` allows 4 s of
+/// that, which is what it measures here.
+pub const KILL_GRACE_S: u64 = 5;
+/// How long the SIGKILL rounds keep coming after the grace before the step is reported anyway. Nothing is waited on past
+/// this bound: at it the step is reported as past its limit with whatever of it was still there counted in `detail`.
+const KILL_SLACK_S: u64 = 2;
+/// How often the wait loop looks at the step, at its counters and at its clock.
+const TICK: Duration = Duration::from_millis(250);
+
 fn own_cgroup() -> Result<PathBuf, String> {
     let t = fs::read_to_string("/proc/self/cgroup").map_err(|e| e.to_string())?;
     let line = t
@@ -203,25 +229,281 @@ fn oom_kills(cg: &Path) -> u64 {
         .sum()
 }
 
-fn kill_cgroup_except_self(cg: &Path) {
-    let me = std::process::id().to_string();
-    for _ in 0..20 {
-        let pids: Vec<String> = fs::read_to_string(cg.join("cgroup.procs"))
-            .unwrap_or_default()
-            .lines()
-            .filter(|p| *p != me)
-            .map(str::to_string)
-            .collect();
-        if pids.is_empty() {
-            return;
-        }
-        let _ = Command::new("kill")
-            .arg("-9")
-            .args(&pids)
-            .stderr(Stdio::null())
-            .status();
-        sleep(Duration::from_millis(100));
+/// This process's parent and its own process group, read from `/proc` because forking `ps` is the one thing a step that
+/// filled its own `TasksMax` cannot do. The deadline kill never aims at either. Kept after the first read: neither can
+/// change while this process lives, and a SIGKILL round screens a pid list of them.
+fn own_ids() -> Option<(u32, u32)> {
+    static IDS: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+    *IDS.get_or_init(|| {
+        let t = fs::read_to_string("/proc/self/stat").ok()?;
+        // `pid (comm) state ppid pgid ...`: `comm` holds spaces and parentheses, so the fields count from after the last `)`.
+        let mut f = t.rsplit(") ").next()?.split_whitespace();
+        let _state = f.next()?;
+        let ppid = f.next()?.parse().ok()?;
+        let pgid = f.next()?.parse().ok()?;
+        Some((ppid, pgid))
+    })
+}
+
+fn own_pgid() -> Option<u32> {
+    own_ids().map(|(_, pgid)| pgid)
+}
+
+/// The process that started this one — the launcher, or `systemd-run`, which shares this process's group anyway.
+fn own_ppid() -> Option<u32> {
+    own_ids().map(|(ppid, _)| ppid)
+}
+
+/// Whether the deadline kill may aim at `target`. Never: pid 0, which `kill` reads as *this* process's group; pid 1, init;
+/// a negative target, which is a whole group and only ever built from a pid that passed here; this process, which has a
+/// report to write; this process's group, which holds the check and the other steps (the launcher we were started by is in
+/// it too); and this process's parent. Everything else the step's group or cgroup tree names is the step's own.
+fn signalable(target: u32) -> bool {
+    target > 1
+        && target != std::process::id()
+        && Some(target) != own_pgid()
+        && Some(target) != own_ppid()
+}
+
+/// What one round of the deadline kill could not deliver. Every signal of every round goes through here, because a kill
+/// whose failure is thrown away is a kill that looks delivered: that is exactly how job_ecf8a642f3c8's 180 s limit became
+/// 310.1 s of waiting on a step nothing had stopped (GATE-03, and PF-R024 §6 on the `let _ =` this replaces).
+#[derive(Default)]
+struct Miss {
+    processes: u32,
+    why: Option<String>,
+    cgroups: u32,
+    cgroup_why: Option<String>,
+}
+
+impl Miss {
+    fn is_empty(&self) -> bool {
+        self.processes == 0 && self.cgroups == 0
     }
+
+    fn add_process(&mut self, why: String) {
+        self.processes += 1;
+        self.why.get_or_insert(why);
+    }
+
+    fn add_cgroup(&mut self, n: u32, why: Option<String>) {
+        self.cgroups += n;
+        if let Some(w) = why {
+            self.cgroup_why.get_or_insert(w);
+        }
+    }
+
+    /// The clause the step's failure line ends with: empty when the round reached everything, which is the normal case and
+    /// the only one worth a line of its own when it is not.
+    fn line(&self) -> String {
+        let mut parts = Vec::new();
+        if self.processes > 0 {
+            parts.push(format!(
+                "the deadline kill could not reach {} processes: {}",
+                self.processes,
+                self.why.clone().unwrap_or_default()
+            ));
+        }
+        if self.cgroups > 0 {
+            parts.push(format!(
+                "{} of the step's `cgroup.kill` writes were refused: {}",
+                self.cgroups,
+                self.cgroup_why.clone().unwrap_or_default()
+            ));
+        }
+        parts.join("; ")
+    }
+}
+
+/// One `kill(2)`: the signal goes straight to the kernel, so a step that has filled its scope's `TasksMax=256` cannot stop
+/// it by leaving no free task slot for `/bin/kill` to be forked into. `Ok` also covers a target that is already gone
+/// (`ESRCH`): there is nothing left to reach. Any other errno is a delivery that did not happen and is reported.
+fn kill_now(target: i32, sig: i32) -> Result<(), String> {
+    debug_assert!(
+        signalable(target.unsigned_abs()),
+        "the deadline kill never aims at pid 0, 1 or -1, nor at this process, its own group or its parent"
+    );
+    // SAFETY: `kill(2)` takes two plain integers (a pid, or the negation of a process group id, and a signal number) and
+    // touches no memory of the caller, so there is nothing to alias, dereference or unalign. `target` comes from
+    // `signalable`, which refuses 0, 1, this pid, this group and this parent, and `sig` is a libc signal constant.
+    if unsafe { libc::kill(target, sig) } == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(e.to_string())
+}
+
+/// Every pid in `cg` and in every cgroup under it, without this process. A step's own child can `mkdir` inside its
+/// delegated scope and move a grandchild into it (measured on buildhost), which drops that grandchild from the scope's own
+/// `cgroup.procs` for good: the walk has to descend.
+fn subtree_pids(cg: &Path) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut dirs = vec![cg.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        out.extend(
+            fs::read_to_string(d.join("cgroup.procs"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|p| p.trim().parse::<u32>().ok()),
+        );
+        if let Ok(rd) = fs::read_dir(&d) {
+            dirs.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+        }
+    }
+    out.retain(|p| signalable(*p));
+    out
+}
+
+/// SIGKILL of a whole subtree, through `cgroup.kill`: no fork, no pid list, nothing to miss, and every thread of every
+/// process rather than only the leaders a pid names. It is written only to cgroups UNDER the step's, never to the step's
+/// own: that file kills every process of the cgroup, this launcher among them, and the launcher has a report to write.
+/// Returns how many of those writes the kernel refused and the first refusal's reason, because a scope that is not
+/// delegated to this user refuses them all and the round then reached nothing (PF-R024 §1, last paragraph).
+fn kill_subtrees(cg: &Path, miss: &mut Miss) {
+    let mut dirs = vec![cg.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for p in rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+            let f = p.join("cgroup.kill");
+            if let Err(e) = fs::write(&f, b"1\n") {
+                miss.add_cgroup(1, Some(format!("{e} ({})", f.display())));
+            }
+            dirs.push(p);
+        }
+    }
+}
+
+/// The name of the one child cgroup `gather_into_kill` moves the step's processes into. A dot would keep systemd from
+/// reading it as a unit of its own, but a hidden name is a name a human never finds in an `ls`, so it is written out.
+const KILL_PEN: &str = "killed-at-the-deadline";
+
+/// SIGKILL of the step's own cgroup without forking anything: move every process of it except this one into one child
+/// cgroup and write `cgroup.kill` there. This is how the deadline still bites when the step has filled its own `TasksMax`
+/// and `/bin/kill` cannot be started at all — measured 2026-11-18: with `TasksMax=256` in force (check-fast sets
+/// `LUCINA_CI_CPU_QUOTA`, which asks for it) an 8 s limit recorded 15.9 s, because the old kill discarded the failed fork
+/// and the loop then only waited. `Err(reason)` when the machine will not allow it — a scope not delegated to this user, a
+/// kernel without `cgroup.kill` — which is reported, not swallowed: those are exactly the cases where the signals by group
+/// and by pid are all there is, and an operator reading the failure line should see that the cgroup route was refused.
+fn gather_into_kill(cg: &Path) -> Result<(), String> {
+    let me = std::process::id().to_string();
+    let procs = fs::read_to_string(cg.join("cgroup.procs")).unwrap_or_default();
+    let others: Vec<&str> = procs.lines().filter(|p| *p != me).collect();
+    let pen = cg.join(KILL_PEN);
+    if others.is_empty() && !pen.exists() {
+        // Nothing to gather, and no cgroup made on the way: a step that ends inside its deadline leaves the scope exactly
+        // as it found it.
+        return Ok(());
+    }
+    // The pen is made once and used by every round after that, so "it is already there" is not a refusal.
+    let made = fs::create_dir(&pen).or_else(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            Ok(())
+        } else {
+            Err(e)
+        }
+    });
+    if let Err(e) = made.and_then(|()| {
+        for p in others {
+            // `cgroup.kill` of the pen does not reach a process that will not be moved, so one that refuses to move is left
+            // in the scope for the pid signal of the caller to take.
+            let _ = fs::write(pen.join("cgroup.procs"), format!("{p}\n"));
+        }
+        fs::write(pen.join("cgroup.kill"), b"1\n")
+    }) {
+        return Err(format!("{e} ({})", pen.display()));
+    }
+    Ok(())
+}
+
+/// Signal the process group `pgid` and every pid of the step's tree with `sig`, one `kill(2)` each: no fork, so the round
+/// lands inside a scope that has no task slot left, and every refusal is counted in `miss` instead of discarded. The group
+/// goes first and on its own: it is the only thing that reaches a process the step handed to a nested
+/// `systemd-run --scope`, which lands in a SIBLING scope outside this cgroup tree (measured on buildhost) and is therefore
+/// invisible to every pid list.
+fn signal(pgid: u32, pids: &[u32], sig: i32, miss: &mut Miss) {
+    // The group only ever as a negative target, and only after the screen: `kill(0)` is *this* process's group, which
+    // is the check itself, and `signalable` is what keeps 0, 1, self, self's group and the parent out.
+    if let Ok(g) = i32::try_from(pgid)
+        && signalable(pgid)
+        && let Err(e) = kill_now(-g, sig)
+    {
+        miss.add_process(format!("{e} (the group of {pgid})"));
+    }
+    for p in pids {
+        if let Ok(pid) = i32::try_from(*p)
+            && signalable(*p)
+            && let Err(e) = kill_now(pid, sig)
+        {
+            miss.add_process(format!("{e} (pid {p})"));
+        }
+    }
+}
+
+/// Where one step's processes are, and the two ways to reach them. `cg` is the step's own scope and `None` when the step
+/// got no scope: a scope-less launcher stands in the cgroup of whatever started the check — the session, the agent, the
+/// other steps — so the group is then the only thing this step owns and the only thing the kill may aim at (GATE-03
+/// Part 1b: the old kill read the launcher's own cgroup, and everything else in it would have been SIGKILLed).
+struct Step {
+    cg: Option<PathBuf>,
+    pgid: u32,
+}
+
+impl Step {
+    /// The pids of the step that this process may signal — the whole tree, less everything `signalable` refuses.
+    fn pids(&self) -> Vec<u32> {
+        self.cg.as_ref().map_or_else(Vec::new, |c| subtree_pids(c))
+    }
+
+    /// The deadline's first blow: leave the step the chance to clean up after itself.
+    fn terminate(&self) -> Miss {
+        let mut miss = Miss::default();
+        signal(self.pgid, &self.pids(), libc::SIGTERM, &mut miss);
+        miss
+    }
+
+    /// The deadline's second blow and every round after it: the group, the pids, and the whole cgroup tree of the step.
+    /// The group goes first because it is the only one of these that reaches a process the step handed to a nested
+    /// `systemd-run --scope`, which lives in a SIBLING cgroup and answers to no signal of ours that walks the tree. None of
+    /// it forks: the old kill was `/bin/kill` (a task slot the step had none of) whose failure was discarded (`let _ =`),
+    /// which is how an 8 s limit measured 15.9 s here and job_ecf8a642f3c8's 180 s limit measured 310.1 s. What a round
+    /// could not deliver comes back in the `Miss` and is reported.
+    fn kill(&self) -> Miss {
+        let mut miss = Miss::default();
+        signal(self.pgid, &self.pids(), libc::SIGKILL, &mut miss);
+        if let Some(cg) = &self.cg {
+            kill_subtrees(cg, &mut miss);
+            if let Err(e) = gather_into_kill(cg) {
+                miss.add_cgroup(1, Some(e));
+            }
+        }
+        miss
+    }
+
+    /// The scope's counters, read once.
+    fn current(&self) -> Option<u64> {
+        self.cg
+            .as_ref()
+            .and_then(|c| read_trim(&c.join("memory.current")))
+            .and_then(|s| s.parse().ok())
+    }
+
+    fn peak_file(&self) -> Option<u64> {
+        self.cg
+            .as_ref()
+            .and_then(|c| read_trim(&c.join("memory.peak")))
+            .and_then(|s| s.parse().ok())
+    }
+
+    fn oom_kills(&self) -> u64 {
+        self.cg.as_deref().map(oom_kills).unwrap_or_default()
+    }
+}
+
+fn env_flag(k: &str) -> bool {
+    std::env::var(k).is_ok_and(|v| v == "1")
 }
 
 pub fn json_escape(s: &str) -> String {
@@ -403,33 +685,62 @@ pub fn inner(args: &[String]) -> i32 {
         Outcome::Infra.exit_code()
     };
     let mut m = Measured::default();
+    let note = |m: &mut Measured, s: String| {
+        m.detail = if m.detail.is_empty() {
+            s
+        } else {
+            format!("{}; {s}", m.detail)
+        };
+    };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     m.disk_start = disk_free(&cwd).unwrap_or(0);
     m.disk_min = m.disk_start;
 
-    // The cap is checked, not assumed.
-    let cg = match own_cgroup() {
-        Ok(c) => c,
-        Err(e) => return infra(&mut m, e),
+    // The cap is checked, not assumed, and what the check proves is that this process stands in the scope `run_unit`
+    // asked systemd for: `cgroup.kill` and a kill by pid reach every process in that cgroup, so it may only be aimed at a
+    // cgroup that holds nothing but this step. A step that got no scope stands in the cgroup of whatever started the
+    // check, and there neither the cap nor the pid kill applies: its process group is all it owns and all the kill may
+    // take (GATE-03 Part 1b).
+    let step_cg = if env_flag(NO_SCOPE_ENV) {
+        note(
+            &mut m,
+            "no scope: the step ran uncapped, its own process group takes the deadline kill".into(),
+        );
+        None
+    } else {
+        let cg = match own_cgroup() {
+            Ok(c) => c,
+            Err(e) => return infra(&mut m, e),
+        };
+        if !cg
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with(SCOPE_OUR_PREFIX))
+        {
+            return infra(
+                &mut m,
+                format!("not a scope of this runner: {}", cg.display()),
+            );
+        }
+        let max = read_trim(&cg.join("memory.max")).unwrap_or_default();
+        if max != spec.cap_bytes.to_string() {
+            return infra(
+                &mut m,
+                format!(
+                    "cap not applied: memory.max is {max:?}, wanted {} in {}",
+                    spec.cap_bytes,
+                    cg.display()
+                ),
+            );
+        }
+        let swap = read_trim(&cg.join("memory.swap.max")).unwrap_or_default();
+        if !swap.is_empty() && swap != "0" {
+            return infra(
+                &mut m,
+                format!("swap not capped: memory.swap.max is {swap:?}"),
+            );
+        }
+        Some(cg)
     };
-    let max = read_trim(&cg.join("memory.max")).unwrap_or_default();
-    if max != spec.cap_bytes.to_string() {
-        return infra(
-            &mut m,
-            format!(
-                "cap not applied: memory.max is {max:?}, wanted {} in {}",
-                spec.cap_bytes,
-                cg.display()
-            ),
-        );
-    }
-    let swap = read_trim(&cg.join("memory.swap.max")).unwrap_or_default();
-    if !swap.is_empty() && swap != "0" {
-        return infra(
-            &mut m,
-            format!("swap not capped: memory.swap.max is {swap:?}"),
-        );
-    }
 
     fs::create_dir_all(&spec.out).ok();
     let log_path = Path::new(&spec.out).join(format!("{}.log", spec.file_stem()));
@@ -441,25 +752,36 @@ pub fn inner(args: &[String]) -> i32 {
     };
     let start = Instant::now();
     let deadline = Duration::from_secs(spec.timeout_s);
-    // setsid: the unit has its own process group, so a timeout can take all of it at once.
-    let mut cmd = Command::new("setsid");
-    cmd.args(["--wait", "bash", "-c", &spec.command])
+    let bound = deadline + Duration::from_secs(KILL_GRACE_S + KILL_SLACK_S);
+    // The step leads a process group of its own, which is what the `setsid --wait` wrapper was here for: the runner now
+    // holds that group id itself instead of hiding the step behind a wrapper it cannot signal through.
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(&spec.command)
         .env("VERUS", &spec.verus)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log2));
+        .stderr(Stdio::from(log2))
+        .process_group(0);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return infra(&mut m, format!("cannot start: {e}")),
     };
+    let step = Step {
+        cg: step_cg,
+        pgid: child.id(),
+    };
     let mut ticks = 0u64;
+    // What the LAST round could not deliver. Every round repeats the whole kill, so what matters to an operator is the
+    // state at the moment the runner gives up, not the count of rounds that failed on the way to it.
+    let mut miss = Miss::default();
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break Some(s),
             Ok(None) => {}
             Err(_) => break None,
         }
-        if let Some(c) = read_trim(&cg.join("memory.current")).and_then(|s| s.parse::<u64>().ok()) {
+        if let Some(c) = step.current() {
             m.peak = m.peak.max(c);
         }
         ticks += 1;
@@ -468,23 +790,59 @@ pub fn inner(args: &[String]) -> i32 {
         {
             m.disk_min = m.disk_min.min(d);
             if d < MIN_DISK_FREE && !m.timed_out {
+                // The one detail that stays first: `outcome != verified` reads this line to tell a full disk from a
+                // failure of the tree, so it is written as it always was, not appended to anything.
                 m.detail = format!("disk nearly full: {d} bytes free");
-                kill_cgroup_except_self(&cg);
+                miss = step.kill();
             }
         }
-        if start.elapsed() > deadline && !m.timed_out {
+        let e = start.elapsed();
+        if e > deadline + Duration::from_secs(KILL_GRACE_S) {
+            // Past the grace the step is killed, and killed again every round until nothing of it is left or the bound
+            // passes. The old kill fired once, on a list it read once, and the loop then simply went on waiting.
+            m.timed_out = true; // a step past the grace was past its deadline first
+            miss = step.kill();
+            if e > bound {
+                let left = step.pids().len();
+                if left > 0 {
+                    note(
+                        &mut m,
+                        format!("{left} of the step's processes were still there at the bound"),
+                    );
+                }
+                break None;
+            }
+        } else if e > deadline && !m.timed_out {
             m.timed_out = true;
-            kill_cgroup_except_self(&cg);
+            miss = step.terminate();
         }
-        sleep(Duration::from_millis(250));
+        sleep(TICK);
     };
-    kill_cgroup_except_self(&cg);
+    let final_miss = step.kill();
+    if !final_miss.is_empty() {
+        miss = final_miss;
+    }
+    if !miss.is_empty() {
+        // A kill that did not reach its target is said out loud, in the log the gate prints for a step that failed, and in
+        // the report's detail. Silence here is how GATE-03 read for as long as it did: the step looked stopped because
+        // nothing was ever said about the kill that had not stopped it.
+        let line = format!("lucina-ci: {}: {}\n", spec.unit, miss.line());
+        note(&mut m, miss.line());
+        if let Ok(mut f) = fs::OpenOptions::new().append(true).open(&log_path) {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
     m.duration_s = start.elapsed().as_secs_f64();
     m.exit_code = status.and_then(|s| s.code()).unwrap_or(137);
-    if let Some(p) = read_trim(&cg.join("memory.peak")).and_then(|s| s.parse::<u64>().ok()) {
+    if let Some(p) = step.peak_file() {
         m.peak = m.peak.max(p);
     }
-    m.oom = oom_kills(&cg);
+    m.oom = step.oom_kills();
+    if let Some(cg) = &step.cg {
+        // The pen is this launcher's own to tidy, and an empty child cgroup left in the scope is one systemd has to chase
+        // when the scope is collected. It fails while something of the step is still in there, which the report already says.
+        let _ = fs::remove_dir(cg.join(KILL_PEN));
+    }
     let text = fs::read_to_string(&log_path).unwrap_or_default();
     (m.verified, m.errors) = verdict::parse_results(&text);
     let mut outcome = verdict::classify(&Facts {
@@ -563,31 +921,59 @@ fn scope_prefix() -> Result<Vec<String>, String> {
 }
 
 /// Runs one unit under its own capped scope; the report always exists afterwards. Returns the outcome's exit code.
+///
+/// Every step is meant to get its own scope, and where it cannot get one (no systemd user manager, no passwordless sudo,
+/// or `LUCINA_CI_NO_SCOPE`) a check-fast step is still run — uncapped, as the leader of its own process group, which is
+/// then what the deadline kills. It was not so before GATE-03: `scope_prefix()?` aborted the whole check instead, and the
+/// fallback that the fix adds must never be read as a way to skip a cap a machine can afford.
 pub fn run_unit(spec: &Spec) -> Result<i32, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut c = scope_prefix()?;
-    c.push(format!(
-        "--unit=lucina-ci-{}-{}",
-        std::process::id(),
-        spec.file_stem().replace(['_', '.'], "-")
-    ));
-    c.push("--property=MemoryAccounting=yes".into());
-    c.push(format!("--property=MemoryMax={}", spec.cap_bytes));
-    c.push("--property=MemorySwapMax=0".into());
-    // Otherwise the kernel kills the whole scope, this launcher included, and the report loses its numbers.
-    c.push("--property=OOMPolicy=continue".into());
-    if let Ok(q) = std::env::var("LUCINA_CI_CPU_QUOTA") {
-        c.push(format!("--property=CPUQuota={q}"));
-        c.push("--property=TasksMax=256".into());
-    }
-    c.push("--".into());
-    c.push(exe.display().to_string());
-    c.push("__inner".into());
-    c.extend(spec.to_args());
-    let status = Command::new(&c[0])
-        .args(&c[1..])
+    let scope = if env_flag(NO_SCOPE_ENV) {
+        Err(format!("{NO_SCOPE_ENV} is set, so no scope is asked for"))
+    } else {
+        scope_prefix()
+    };
+    let (mut cmd, launcher) = match scope {
+        Ok(prefix) => {
+            let mut c = prefix;
+            c.push(format!(
+                "--unit=lucina-ci-{}-{}",
+                std::process::id(),
+                spec.file_stem().replace(['_', '.'], "-")
+            ));
+            c.push("--property=MemoryAccounting=yes".into());
+            c.push(format!("--property=MemoryMax={}", spec.cap_bytes));
+            c.push("--property=MemorySwapMax=0".into());
+            // Otherwise the kernel kills the whole scope, this launcher included, and the report loses its numbers.
+            c.push("--property=OOMPolicy=continue".into());
+            if let Ok(q) = std::env::var("LUCINA_CI_CPU_QUOTA") {
+                c.push(format!("--property=CPUQuota={q}"));
+                c.push("--property=TasksMax=256".into());
+            }
+            c.push("--".into());
+            c.push(exe.display().to_string());
+            c.push("__inner".into());
+            c.extend(spec.to_args());
+            let mut cmd = Command::new(&c[0]);
+            cmd.args(&c[1..]);
+            (cmd, c[0].clone())
+        }
+        Err(why) => {
+            if spec.group != "fast" {
+                // A proof unit's numbers mean nothing without the cap and the counters of a scope it did not get, so a
+                // proof run still stops here rather than report an uncapped unit as if it were a capped one.
+                return Err(why);
+            }
+            let mut c = Command::new(&exe);
+            c.arg("__inner").args(spec.to_args()).env(NO_SCOPE_ENV, "1");
+            // The inner starts the step as the leader of a group of its own, so this group holds the step and nothing
+            // else: not the check, not the session, not the other steps (GATE-03 Part 1b).
+            (c, exe.display().to_string())
+        }
+    };
+    let status = cmd
         .status()
-        .map_err(|e| format!("cannot start {}: {e}", c[0]))?;
+        .map_err(|e| format!("cannot start {launcher}: {e}"))?;
     let code = status.code().unwrap_or(137);
     let report = Path::new(&spec.out).join(format!("{}.json", spec.file_stem()));
     if !report.exists() {
@@ -599,7 +985,7 @@ pub fn run_unit(spec: &Spec) -> Result<i32, String> {
         };
         let m = Measured {
             exit_code: code,
-            detail: "the launcher inside the scope died before it could report".into(),
+            detail: "the launcher of the step died before it could report".into(),
             ..Default::default()
         };
         write_report(spec, &m, outcome)?;
@@ -630,6 +1016,203 @@ pub fn report_field(json: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn the_deadline_bounds_the_time_a_step_may_record() {
+        // `tests/runner_kill_scope.rs` judges a step's recorded time against `limit + grace + slack` and cannot name
+        // these (an integration test sees the binary, not the module), so the numbers are written there. Pinned here,
+        // where they live: a change to either is a change that test has to be told about.
+        assert_eq!(KILL_GRACE_S, 5);
+        assert_eq!(KILL_SLACK_S, 2);
+        // The two moments the wait loop compares the step's clock against, built as it builds them: a grace of zero
+        // would leave a step nothing to clean up with, and a bound that is not later than the end of the grace would
+        // report a step before its kill rounds had a chance.
+        let deadline = Duration::from_secs(4);
+        let grace_end = deadline + Duration::from_secs(KILL_GRACE_S);
+        let bound = deadline + Duration::from_secs(KILL_GRACE_S + KILL_SLACK_S);
+        assert!(
+            grace_end > deadline,
+            "no grace leaves a step nothing to clean up with"
+        );
+        assert!(
+            bound > grace_end,
+            "the bound should not be looser than the grace it is counted from"
+        );
+    }
+
+    #[test]
+    fn the_group_of_this_process_is_the_one_the_kill_never_aims_at() {
+        // `signal` refuses a group signal aimed at this process's own group: the deadline must not kill the check that
+        // enforces it. The number comes out of `/proc/self/stat`, where the `comm` field can hold spaces and
+        // parentheses, so it is compared with what the kernel tells a shell about the very same process.
+        let o = Command::new("sh")
+            .args(["-c", "ps -o pgid= -p $$"])
+            .output()
+            .unwrap();
+        let said: u32 = String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("`ps -o pgid=` said {:?}: {e}", o.stdout));
+        assert_eq!(own_pgid(), Some(said));
+    }
+
+    /// A duration no other process on the machine carries, for the tests below that signal real processes.
+    fn marker(k: u32) -> String {
+        format!("{}99{}", std::process::id(), k)
+    }
+
+    struct Sweep(String);
+
+    impl Drop for Sweep {
+        fn drop(&mut self) {
+            let _ = Command::new("pkill")
+                .args(["-KILL", "-f", &format!("sleep {}$", self.0)])
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+
+    #[test]
+    fn the_screen_refuses_every_target_that_would_kill_the_check_itself() {
+        // GATE-03's one hard rule about the killer: pid 0 is *this* process's group, pid 1 is init, a negative target is a
+        // whole group, and this pid, this group and this parent are the check, its launcher and whatever started that.
+        // The screen is what `kill_now`'s debug assertion runs on, so these are not style points.
+        assert!(!signalable(0), "pid 0 is this process's own group");
+        assert!(!signalable(1), "pid 1 is init");
+        assert!(
+            !signalable(std::process::id()),
+            "this pid is the report writer"
+        );
+        assert!(
+            !signalable(own_pgid().expect("this process has a group")),
+            "this group holds the check and the other steps"
+        );
+        assert!(
+            !signalable(own_ppid().expect("this process has a parent")),
+            "the launcher that started this one is never the step's"
+        );
+        // And it is a screen, not a refusal of everything: no kernel pid reaches this high (`/proc/sys/kernel/pid_max` is
+        // 4194304 on buildhost, the ceiling the kernel allows), so nothing real is being hidden behind it.
+        assert!(signalable(2_000_000_000));
+    }
+
+    #[test]
+    fn kill_2_reaches_a_live_process_and_a_gone_one_is_no_failure() {
+        // The syscall route, proven on a real target: no `/bin/kill` is forked, the signal lands, and a pid that is
+        // already gone answers `ESRCH`, which the deadline reads as delivered — there is nothing left to reach.
+        let m = marker(1);
+        let _sweep = Sweep(m.clone());
+        assert!(
+            kill_now(i32::MAX, libc::SIGKILL).is_ok(),
+            "a target that does not exist is not a failed delivery"
+        );
+        let mut child = Command::new("sleep")
+            .arg(&m)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        assert!(
+            kill_now(pid, libc::SIGKILL).is_ok(),
+            "a signal to a process of this user must be delivered"
+        );
+        let s = child.wait().unwrap();
+        assert_eq!(
+            s.signal(),
+            Some(9),
+            "the step's process was not SIGKILLed: {s:?}"
+        );
+    }
+
+    #[test]
+    fn a_refused_signal_is_a_failed_delivery_and_says_why() {
+        // The arm `Miss` exists for: a `kill(2)` that did not deliver answers with a reason, and the reason reaches the
+        // report instead of being discarded with the status of a forked program. A signal number the kernel does not
+        // know is the refusal this test can cause on purpose, on a target of its own, without touching another user's
+        // process — where a target that is gone answers `ESRCH`, which is NOT a failed delivery.
+        let m = marker(3);
+        let _sweep = Sweep(m.clone());
+        let mut child = Command::new("sleep")
+            .arg(&m)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let e = kill_now(pid, 999)
+            .expect_err("a signal number outside the kernel's table cannot be delivered, and must not look delivered");
+        assert!(e.contains("Invalid argument"), "{e}");
+        assert!(
+            kill_now(i32::MAX, libc::SIGTERM).is_ok(),
+            "nothing there to reach is a delivered deadline, not a refused one"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn one_signal_to_the_group_takes_everything_the_group_holds() {
+        // The route GATE-03 is really about: work the step hands to a nested `systemd-run --scope` stands in a SIBLING
+        // cgroup, so no walk of this step's tree names it and only a group signal reaches it. Here the same shape without
+        // systemd: a shell in a group of its own, holding a child that inherited that group.
+        let m = marker(2);
+        let _sweep = Sweep(m.clone());
+        let mut child = Command::new("bash")
+            .args(["-c", &format!("sleep {m} & wait")])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pgid = i32::try_from(child.id()).unwrap();
+        let mut seen: u32 = 0;
+        for _ in 0..40 {
+            let o = Command::new("pgrep")
+                .args(["-fc", &format!("sleep {m}$")])
+                .output()
+                .unwrap();
+            seen = String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            if seen >= 1 {
+                break;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            seen, 1,
+            "the shell never got its backgrounded sleeper up: {m}"
+        );
+        assert!(
+            kill_now(-pgid, libc::SIGKILL).is_ok(),
+            "the group signal is the one the deadline relies on"
+        );
+        let s = child.wait().unwrap();
+        assert_eq!(
+            s.signal(),
+            Some(9),
+            "the group leader never took the SIGKILL the group was sent"
+        );
+        for _ in 0..40 {
+            if survivors(&format!("sleep {m}$")).is_empty() {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "one SIGKILL to the process group left {} of its members standing",
+            survivors(&format!("sleep {m}$")).len()
+        );
+    }
+
+    fn survivors(pat: &str) -> Vec<u32> {
+        let o = Command::new("pgrep").args(["-f", pat]).output().unwrap();
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .filter(|p: &u32| *p != std::process::id())
+            .collect()
+    }
 
     #[test]
     fn the_rlimit_table_selects_by_unit_name() {
