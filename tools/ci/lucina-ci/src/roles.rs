@@ -23,6 +23,8 @@
 //! Attribution uses two further streams, not fingerprints (`FileClass::author_code` and `author_proof`, src/authorship.rs): the CODE
 //! STREAM is the program rustc reads when the verifier is off, and the PROOF STREAM is what only the verifier reads plus the statement
 //! text and the tags. Equal across a commit on the code side = nobody wrote code there; equal on both = the commit is neutral.
+//! One decided exception (ROLES-03): a code delta that only permutes the path list inside ONE `#[derive(...)]` attribute is no code
+//! change either, and the walk names every commit it spares that way (`src/authorship.rs`, `derive_order_only`).
 //! A closed `proof!`/`proof_with!` block with the exact `#[cfg(verus_keep_ghost)]` gate directly in front of it leaves the code stream
 //! with its gate (`ghost_gate`, `attr_pass`): rustc reads neither, and the block does not split an exec run either. An ungated block,
 //! one behind another attribute, one whose delimiters never close, or one in a file that brought its own `proof` macro, is proof text
@@ -3403,6 +3405,11 @@ pub fn check(i: &CheckIn) -> Outcome {
     for n in &i.authors.notes {
         o.notes.push(n.clone());
     }
+    // Every commit the walk spared as a derive-order permutation is named, with the unit it was spared FOR (ROLES-03): an
+    // allowance that is not listed is an allowance that cannot be audited.
+    for (c, u) in &i.authors.neutrals {
+        o.notes.push(authorship::neutral_line(c, u));
+    }
     if !i.authors.merge_unreadable.is_empty() {
         let list = i.authors.merge_unreadable.join(", ");
         if i.merge_gate {
@@ -3675,6 +3682,12 @@ pub fn authors_report(name: &str, w: &authorship::Walk, base: &str) -> String {
                 a.source.label(),
                 if a.in_range { "range" } else { "history" }
             ));
+        }
+    }
+    // What the walk did NOT credit as code, with the reason and the full hash (ROLES-03).
+    for (c, u) in &w.neutrals {
+        if u == name {
+            s.push_str(&format!("{}\n", authorship::neutral_line(c, u)));
         }
     }
     for (label, code) in [("CodeAuthors", true), ("ProofAuthors", false)] {
@@ -8191,7 +8204,7 @@ pub fn f(x: u32) -> (r: u32) ensures r == g(Used { a: x }) { x }
     }
 
     #[test]
-    fn a_builder_rewrapping_a_tagged_derive_is_code_the_provers_record_still_covers_it() {
+    fn a_builder_rewrapping_a_tagged_derive_is_neutral_and_the_provers_record_still_covers_it() {
         let (d, base) = omit_repo("omit-rewrap");
         // the same tokens, laid out as the shipped code likes: Verus never reads the line, so no fingerprint of the prover moves
         put_rules(
@@ -8204,10 +8217,13 @@ pub fn f(x: u32) -> (r: u32) ensures r == g(Used { a: x }) { x }
             Some("Claude Sonnet 5.5"),
         );
         let (o, info) = omit_rec(&d, &base, "statement", FABLE, SON);
+        // ROLES-03 (D:dc-f3ec226a3064): a rewrap that only permutes the path list inside ONE `#[derive(..)]` and moves nothing
+        // else is layout, so it is no code credit; the commit that wrote the code is the only one left, and the prover's record
+        // still covers the unit.
         assert_eq!(
             info.exec,
-            vec![vec![SON.to_string()], vec![SON.to_string()]],
-            "both builder commits wrote code: {:?}",
+            vec![vec![SON.to_string()]],
+            "the rewrap wrote no code, only the commit that wrote the unit is credited: {:?}",
             info.exec
         );
         assert_eq!(info.proof.len(), 1, "{:?}", info.proof);

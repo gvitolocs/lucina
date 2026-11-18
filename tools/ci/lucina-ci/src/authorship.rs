@@ -3,6 +3,14 @@
 //! One rule (`CodeAuthors(U) ∩ ProofAuthors(U) = ∅`), decided by ONE walk of `LB..HEAD` that compares the two token streams of every
 //! file version (docs/ci/PROOF-ROLES.md). Registration, formatting, comments, doc comments and pure moves touch no stream and are
 //! therefore neutral by construction; what rustc compiles is the code side and what only the verifier reads is the proof side.
+//!
+//! One further case is neutral by decision and not by construction: a code delta that only permutes the path list inside ONE
+//! `#[derive(...)]` attribute of one unit (`derive_order_only`, ROLES-03) - same names, same count, order only, and nothing else
+//! moved for that unit in that commit, in code or in proof: one list for the whole commit, not one per file. It is allowed because
+//! reordering a derive list is what rustfmt does to the same bytes: the program
+//! rustc compiles is the same set of derives. Nothing else is neutral: `#[cfg(..)]`, `#[cfg_attr(..)]` and `#[allow(..)]` lists are
+//! not derives and stay where the classification puts them. Every commit the rule spares is named in the report
+//! (`neutral: derive-order-only <full hash> <unit>`), because an allowance nobody can list is an allowance nobody audited.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -25,11 +33,15 @@ const ZERO: &str = "0000000000000000000000000000000000000000";
 
 /// The two streams of one file version, as 64-bit hashes. `ok` is false for a version that cannot be classified: the comparison
 /// then counts on BOTH sides (fail closed: nobody can show what the commit moved).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Streams {
     pub code: u64,
     pub proof: u64,
     pub ok: bool,
+    /// One hash per `#[derive(...)]` path list of the code stream, in order of appearance: the WHOLE stream with only that list put
+    /// in canonical order (`derive_variants`). Empty for an unclassifiable version, a model file, and a file whose compiled program
+    /// derives nothing.
+    pub derive: Vec<u64>,
 }
 
 /// An absent file: empty streams.
@@ -37,6 +49,7 @@ const ABSENT: Streams = Streams {
     code: 0,
     proof: 0,
     ok: true,
+    derive: Vec::new(),
 };
 
 impl Streams {
@@ -49,6 +62,106 @@ impl Streams {
     }
 }
 
+/// The hash of one code stream: the tokens joined by a space; an empty stream hashes to 0, the hash of an absent file.
+fn code_hash(v: &[String]) -> u64 {
+    if v.is_empty() { 0 } else { fnv1a(&v.join(" ")) }
+}
+
+/// The path lists of every `#[derive(...)]` of a code stream, as `(lo, hi)` token ranges (the tokens between the parentheses), in
+/// order of appearance. Only the `#[derive(` spelling opens a list: the `derive` of `#[cfg_attr(f, derive(X))]` sits behind another
+/// name, and a `cfg` or `any` list is a different decision, so neither is a derive here and both stay as the classification made them.
+/// A stream whose attribute never closes yields nothing: a permutation of an unclosed list is nobody's formatting.
+fn derive_lists(v: &[String]) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut k = 0usize;
+    while k + 3 < v.len() {
+        if v[k] == "#" && v[k + 1] == "[" && v[k + 2] == "derive" && v[k + 3] == "(" {
+            let lo = k + 4;
+            let mut d = 1i32;
+            let mut m = lo;
+            while m < v.len() {
+                match v[m].as_str() {
+                    "(" | "[" | "{" => d += 1,
+                    ")" | "]" | "}" => {
+                        d -= 1;
+                        if d == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                m += 1;
+            }
+            if d != 0 {
+                break;
+            }
+            out.push((lo, m));
+            k = m + 1;
+            continue;
+        }
+        k += 1;
+    }
+    out
+}
+
+/// `v` with the path list at `lo..hi` put in canonical order: its comma-separated entries sorted by their own text, every token
+/// outside the list left exactly where it stands. Two versions of a file share this on one list exactly when the list holds the same
+/// names the same number of times in a different order, which is what "the order changed" means and nothing more.
+fn canonical_list(v: &[String], lo: usize, hi: usize) -> Vec<String> {
+    let mut entries: Vec<Vec<String>> = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    let mut d = 0i32;
+    for x in &v[lo..hi] {
+        match x.as_str() {
+            "(" | "[" | "{" => d += 1,
+            ")" | "]" | "}" => d -= 1,
+            "," if d == 0 => {
+                entries.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(x.clone());
+    }
+    entries.push(cur);
+    entries.sort();
+    let mut out: Vec<String> = v[..lo].to_vec();
+    for (i, e) in entries.iter().enumerate() {
+        if i > 0 {
+            out.push(",".to_string());
+        }
+        out.extend(e.iter().cloned());
+    }
+    out.extend(v[hi..].iter().cloned());
+    out
+}
+
+/// The canonical code stream of a version, one hash per `#[derive(...)]`: the whole stream with ONLY that attribute's path list
+/// reordered. Every other token and every other derive list stands as it is in each of these, so two versions agreeing on entry `i`
+/// says the two differ nowhere but in the order of the `i`th list. Two lists reordered match on no entry at all, which is the limit the
+/// decision draws: one attribute, not a file tidy-up (ROLES-03).
+fn derive_variants(v: &[String]) -> Vec<u64> {
+    derive_lists(v)
+        .into_iter()
+        .map(|(lo, hi)| code_hash(&canonical_list(v, lo, hi)))
+        .collect()
+}
+
+/// Whether a code delta is the neutral case of ROLES-03: the two code streams differ, and they differ only by a permutation of the
+/// path list inside ONE `#[derive(...)]`. A version that cannot be classified is not neutral (fail closed, as in `Streams::diff`).
+pub fn derive_order_only(a: &Streams, b: &Streams) -> bool {
+    a.ok && b.ok
+        && a.code != b.code
+        && a.derive.len() == b.derive.len()
+        && a.derive.iter().zip(b.derive.iter()).any(|(x, y)| x == y)
+}
+
+/// The report line naming one commit the walk treated as neutral under the derive-order rule: the FULL hash and the unit it was
+/// neutral for, so the allowance can be read back commit by commit (ROLES-03).
+pub fn neutral_line(commit: &str, unit: &str) -> String {
+    format!("neutral: derive-order-only {commit} {unit}")
+}
+
 /// The streams of one file version. A file of a model unit is proof alone: the whole normalised text, as the freeze fingerprints it.
 pub fn streams(path: &str, src: &str, model: bool) -> Streams {
     if model {
@@ -57,6 +170,7 @@ pub fn streams(path: &str, src: &str, model: bool) -> Streams {
             code: 0,
             proof: if t.trim().is_empty() { 0 } else { fnv1a(&t) },
             ok: true,
+            derive: Vec::new(),
         };
     }
     let c = roles::classify(path, src);
@@ -65,21 +179,19 @@ pub fn streams(path: &str, src: &str, model: bool) -> Streams {
             code: !0,
             proof: !0,
             ok: false,
+            derive: Vec::new(),
         };
     }
     // an empty side hashes to 0, the hash of an absent file: creating a file empty authors nothing
     Streams {
-        code: if c.author_code.is_empty() {
-            0
-        } else {
-            fnv1a(&c.author_code.join(" "))
-        },
+        code: code_hash(&c.author_code),
         proof: if c.author_proof.trim().is_empty() {
             0
         } else {
             fnv1a(&c.author_proof)
         },
         ok: true,
+        derive: derive_variants(&c.author_code),
     }
 }
 
@@ -153,6 +265,9 @@ pub struct Walk {
     pub contradictions: Vec<(String, String)>,
     /// A merge whose authorship could not be read at all: neither the automatic merge nor a comparison with any parent.
     pub merge_unreadable: Vec<String>,
+    /// A commit whose change to one unit the walk passed over as a derive-order permutation only: (full commit id, unit), sorted.
+    /// The report names every one of them (`neutral_line`, ROLES-03).
+    pub neutrals: Vec<(String, String)>,
     pub commits: usize,
     pub blobs: usize,
     pub secs: f64,
@@ -636,7 +751,30 @@ impl Drop for Batch {
     }
 }
 
+/// The cache column of `Streams::derive`: the hashes as hex, comma separated, `-` when the version holds no derive.
+fn write_derives(v: &[u64]) -> String {
+    if v.is_empty() {
+        return "-".to_string();
+    }
+    v.iter()
+        .map(|x| format!("{x:016x}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `None` for a column that is not a list of hex hashes: a line the reader does not understand is not read, the version is
+/// classified again.
+fn parse_derives(s: &str) -> Option<Vec<u64>> {
+    if s == "-" {
+        return Some(Vec::new());
+    }
+    s.split(',')
+        .map(|x| u64::from_str_radix(x, 16).ok())
+        .collect()
+}
+
 /// The streams of the file versions the walk reads, with the persistent cache of `check-fast` (never read at the merge gate).
+/// One line per version: `path<TAB>oid<TAB>code<TAB>proof<TAB>m|r<TAB>derives`.
 struct Streams_ {
     mem: HashMap<(String, String, bool), Streams>,
     dirty: bool,
@@ -658,7 +796,7 @@ impl Streams_ {
         {
             for l in text.lines() {
                 let f: Vec<&str> = l.split('\t').collect();
-                if f.len() != 5 {
+                if f.len() != 6 {
                     continue;
                 }
                 let Some(code) = u64::from_str_radix(f[2], 16).ok() else {
@@ -667,12 +805,16 @@ impl Streams_ {
                 let Some(proof) = u64::from_str_radix(f[3], 16).ok() else {
                     continue;
                 };
+                let Some(derive) = parse_derives(f[5]) else {
+                    continue;
+                };
                 s.mem.insert(
                     (f[0].to_string(), f[1].to_string(), f[4] == "m"),
                     Streams {
                         code,
                         proof,
                         ok: f[2] != "error",
+                        derive,
                     },
                 );
             }
@@ -696,8 +838,9 @@ impl Streams_ {
                 ("error".to_string(), "error".to_string())
             };
             out.push_str(&format!(
-                "{path}\t{oid}\t{code}\t{proof}\t{}\n",
-                if *model { "m" } else { "r" }
+                "{path}\t{oid}\t{code}\t{proof}\t{}\t{}\n",
+                if *model { "m" } else { "r" },
+                write_derives(&s.derive)
             ));
         }
         let _ = std::fs::write(p, out);
@@ -716,7 +859,7 @@ impl Streams_ {
         };
         let key = (path.to_string(), oid.to_string(), model);
         if let Some(s) = self.mem.get(&key) {
-            return (*s, None);
+            return (s.clone(), None);
         }
         let src = bd.content(oid);
         let s = match &src {
@@ -731,10 +874,11 @@ impl Streams_ {
                     code: !0,
                     proof: !0,
                     ok: false,
+                    derive: Vec::new(),
                 }
             }
         };
-        self.mem.insert(key, s);
+        self.mem.insert(key, s.clone());
         self.dirty = true;
         (s, src)
     }
@@ -1159,6 +1303,8 @@ pub fn walk(
             let (mut code, mut proof) = (false, false);
             // code a copy match took off this commit: it stays with a STRONG copier (review 5, B4/B4r), see below
             let mut copied_code = false;
+            // the files of this unit whose code delta was only a derive-order permutation (ROLES-03)
+            let mut derive_only = 0usize;
             let mut paths: Vec<String> = Vec::new();
             for d in touched {
                 let after = sc.of(&d.path, d.after.as_deref(), model, &mut bd).0;
@@ -1198,20 +1344,35 @@ pub fn walk(
                     if after.diff(&own).0 {
                         copied_code = true;
                     }
-                    olds.push(after);
+                    olds.push(after.clone());
                 } else {
                     olds.push(sc.of(d.old_path(), d.before.as_deref(), model, &mut bd).0);
                 }
                 if olds.is_empty() {
                     olds.push(ABSENT);
                 }
-                let (dc, dp) = olds
+                let (mut dc, dp) = olds
                     .iter()
                     .map(|x| after.diff(x))
                     .fold((true, true), |a, x| (a.0 && x.0, a.1 && x.1));
+                // ROLES-03: inside ONE `#[derive(...)]` the order of the path list is the same program rustc compiles, so a delta
+                // that changes nothing else is layout, like formatting. A conflicted path is read against every parent, and every
+                // one of those readings must be spared the same way: a merge that could have taken a real code change from one
+                // parent and reordered a derive is not that.
+                if dc && olds.iter().all(|x| derive_order_only(&after, x)) {
+                    dc = false;
+                    derive_only += 1;
+                }
                 code |= dc;
                 proof |= dp;
                 paths.push(d.path.clone());
+            }
+            // ROLES-03 draws the line at ONE list for the WHOLE commit and at NOTHING ELSE moving for the unit. The per-file
+            // reading above cannot see either total, so a second list - in another file of the unit, or a second one in the same
+            // file - and any proof text this commit moved are put back here: the commit authors code for the unit, as it did
+            // before the decision (review 1 and 2, PF-R036).
+            if derive_only > 0 && (derive_only > 1 || proof) {
+                code = true;
             }
             let (models, source, contra) = res.models(&c.id, &c.msg);
             // A copy match may ADD the source's author to the unit's code credit; it never REMOVES the credit of the commit judged
@@ -1220,6 +1381,15 @@ pub fn walk(
             // that copies still authors nothing (K1), so only strong copiers keep the credit.
             if copied_code && !code && models.iter().any(|m| roles::class(m) == "strong") {
                 code = true;
+            }
+            // Named only for the case the decision actually grants: ONE file of the unit changed nothing but the order inside ONE
+            // derive list, and NOTHING else moved for the unit in this commit. The gate above already turned a second list and any
+            // proof text back into code, so `!code` carries both; `!proof` is written out so the reading does not depend on order.
+            if derive_only == 1 && !code && !proof {
+                let e = (c.id.clone(), u.unit.clone());
+                if !w.neutrals.contains(&e) {
+                    w.neutrals.push(e);
+                }
             }
             if !code && !proof {
                 continue;
@@ -1261,8 +1431,385 @@ pub fn walk(
         w.notes
             .push(format!("`{p}`: the object {} is not in this repository, so its version is read as a change on both sides of every model that touched it", short(&o)));
     }
+    // grouped by unit, then by commit: the report lists the spared commits of one unit together (ROLES-03)
+    w.neutrals.sort();
     sc.flush();
     w.blobs = bd.n;
     w.secs = t0.elapsed().as_secs_f64();
     Ok(w)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ModelResolver, Walk, code_authors, derive_lists, derive_order_only, proof_authors, streams,
+        walk,
+    };
+    use crate::roles::{self, Cutoff, Fp, UnitFp};
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    const UNIT: &str = "shipped/x/rules";
+    const FILE: &str = "crates/x/src/rules.rs";
+    /// A second file of the same unit, for the case of one derive reordered in each of two files (review 1).
+    const FILE2: &str = "crates/x/src/loop.rs";
+    const LOOP: &str =
+        "#[derive(Clone, Copy, Debug, PartialEq)]\npub struct L {\n    pub n: u32,\n}\n";
+    const DERIVE: &str = "#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]";
+    const DERIVE_SWAPPED: &str = "#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]";
+
+    /// `#[derive(..)]` on a compiled line, above the struct and the fn that reads it.
+    fn rules(derive: &str, tail: &str) -> String {
+        format!(
+            "{derive}\npub struct S {{\n    pub a: u32,\n}}\n\npub fn get(s: S) -> u32 {{\n    s.a\n}}\n{tail}"
+        )
+    }
+
+    /// A throwaway repository. Its directory is gone when the test ends, panic included.
+    struct Repo(PathBuf);
+
+    impl Repo {
+        fn new(tag: &str) -> Repo {
+            let d = std::env::temp_dir()
+                .join(format!("lucina-authorship-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&d);
+            fs::create_dir_all(&d).unwrap();
+            let r = Repo(d);
+            r.git(&["init", "-q", "-b", "main"]);
+            r
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let o = Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                    // a lane session runs its checks with `core.hooksPath` in GIT_CONFIG_KEY_0 and its hook stamps a
+                    // `Co-Authored-By` trailer on EVERY commit, the fixture's too; the fixture names its own model and
+                    // needs no help from the machine it runs on
+                    "-c",
+                    "core.hooksPath=",
+                ])
+                .args(args)
+                .current_dir(&self.0)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+
+        fn write(&self, rel: &str, text: &str) {
+            let p = self.0.join(rel);
+            if let Some(d) = p.parent() {
+                fs::create_dir_all(d).unwrap();
+            }
+            fs::write(p, text).unwrap();
+        }
+
+        /// One commit with the model in a trailer, which is what `models(C)` reads (roles 1.3).
+        fn commit(&self, msg: &str, model: &str) -> String {
+            self.git(&["add", "-A"]);
+            self.git(&[
+                "commit",
+                "-q",
+                "-m",
+                msg,
+                "-m",
+                &format!("Co-Authored-By: {model} <noreply@lane.invalid>"),
+            ]);
+            self.git(&["rev-parse", "HEAD"])
+        }
+    }
+
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// One unit, whose code is Sonnet's: `lb` is the lower bound of the walk, `base` the commit that wrote the unit.
+    struct Scene {
+        d: Repo,
+        lb: String,
+        base: String,
+    }
+
+    impl Scene {
+        fn new(tag: &str, text: &str) -> Scene {
+            let d = Repo::new(tag);
+            d.write("README", "x\n");
+            let lb = d.commit("lb", "Claude Opus 5.5");
+            d.write(FILE, text);
+            let base = d.commit("the shipped unit", "Claude Sonnet 5.5");
+            Scene { d, lb, base }
+        }
+
+        fn walk(&self) -> Walk {
+            let units = vec![UnitFp {
+                unit: UNIT.to_string(),
+                group: "g".to_string(),
+                kind: "shipped".to_string(),
+                files: vec![FILE.to_string(), FILE2.to_string()],
+                fp: Some(Fp {
+                    stmt: String::new(),
+                    proof: String::new(),
+                    exec: String::new(),
+                    data: String::new(),
+                }),
+                counts: [0; 3],
+                stmt_count: 0,
+                stmt_keys: vec![],
+            }];
+            walk(
+                &self.d.0,
+                &self.base,
+                &units,
+                &Cutoff {
+                    commit: self.lb.clone(),
+                    units: vec![],
+                    exempt: Vec::new(),
+                },
+                &BTreeMap::new(),
+                &ModelResolver::default(),
+                None,
+            )
+            .expect("the walk reads the fixture")
+        }
+    }
+
+    /// The rule of ROLES-03, end to end: Fable 5.2 reorders one derive list and later writes the unit's proof text. The reorder is
+    /// no code, so the prover of that proof is not a code author of the unit and the one rule holds; and the spared commit is named.
+    #[test]
+    fn a_derive_reorder_alone_is_neutral_and_named() {
+        let s = Scene::new("reorder", &rules(DERIVE, ""));
+        s.d.write(FILE, &rules(DERIVE_SWAPPED, ""));
+        let reorder = s.d.commit("rustfmt touched the order", "Claude Fable 5.2");
+        s.d.write(FILE, &rules(DERIVE_SWAPPED, "//@ the order is layout\n"));
+        s.d.commit("the proof note", "Claude Fable 5.2");
+        let w = s.walk();
+        let ua = w.authors(UNIT);
+        assert!(
+            ua.commits.iter().all(|a| a.commit != reorder),
+            "a commit that changed no stream is not an authoring commit: {:?}",
+            ua.commits
+        );
+        assert_eq!(
+            w.neutrals,
+            vec![(reorder.clone(), UNIT.to_string())],
+            "the spared commit is named with its full hash"
+        );
+        let code = code_authors(ua);
+        assert!(
+            code.contains_key("claude-sonnet-5-5"),
+            "the code Sonnet wrote is still Sonnet's: {code:?}"
+        );
+        assert!(
+            !code.contains_key("claude-fable-5-2"),
+            "the reorder wrote no code: {code:?}"
+        );
+        assert!(
+            proof_authors(ua).contains_key("claude-fable-5-2"),
+            "the proof note is Fable's: {:?}",
+            proof_authors(ua)
+        );
+        let r = roles::authors_report(UNIT, &w, &s.base);
+        assert!(
+            r.contains(&format!("neutral: derive-order-only {reorder} {UNIT}")),
+            "{r}"
+        );
+        assert!(
+            r.contains("Clash\tnone"),
+            "the prover is no code author: {r}"
+        );
+    }
+
+    /// A derive that gains a name is a different program: the commit is code.
+    #[test]
+    fn a_derive_that_gains_a_name_is_code() {
+        let s = Scene::new("added", &rules(DERIVE, ""));
+        s.d.write(
+            FILE,
+            &rules(
+                "#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]",
+                "",
+            ),
+        );
+        let c = s.d.commit("now it hashes", "Claude Fable 5.2");
+        let w = s.walk();
+        assert!(w.neutrals.is_empty(), "a new name is not a permutation");
+        let ua = w.authors(UNIT);
+        let a = ua
+            .commits
+            .iter()
+            .find(|x| x.commit == c)
+            .expect("the commit is credited");
+        assert!(a.code, "{a:?}");
+        assert!(
+            code_authors(ua).contains_key("claude-fable-5-2"),
+            "and its author is a code author"
+        );
+    }
+
+    /// A `cfg` list is gate text, not a derive: reordering `any(..)` is not the spared case, whatever it is otherwise read as.
+    #[test]
+    fn a_reorder_inside_a_cfg_gate_is_not_the_derive_case() {
+        let base = "#[cfg(any(feature = \"a\", feature = \"b\"))]\npub struct S { pub a: u32 }\n";
+        let after = "#[cfg(any(feature = \"b\", feature = \"a\"))]\npub struct S { pub a: u32 }\n";
+        let s = Scene::new("cfg", base);
+        s.d.write(FILE, after);
+        let c = s.d.commit("the cfg list reordered", "Claude Fable 5.2");
+        let w = s.walk();
+        assert!(
+            w.neutrals.is_empty(),
+            "only a `#[derive(..)]` list is ever permuted for free"
+        );
+        let ua = w.authors(UNIT);
+        let a = ua
+            .commits
+            .iter()
+            .find(|x| x.commit == c)
+            .expect("the gate is somebody's edit and is credited");
+        assert!(!a.code, "a cfg gate is not the compiled program: {a:?}");
+        assert!(a.proof, "{a:?}");
+    }
+
+    /// One derive reordered and anything else moved in the same commit: the commit stays code for the unit.
+    #[test]
+    fn a_derive_reorder_with_another_change_in_the_commit_is_code() {
+        let s = Scene::new("mixed", &rules(DERIVE, ""));
+        s.d.write(
+            FILE,
+            &rules(DERIVE_SWAPPED, "").replace("    s.a\n", "    s.a + 1\n"),
+        );
+        let c = s.d.commit("reordered and rewrote", "Claude Fable 5.2");
+        let w = s.walk();
+        assert!(
+            w.neutrals.is_empty(),
+            "one derive and one more token is not the spared case"
+        );
+        let ua = w.authors(UNIT);
+        let a = ua.commits.iter().find(|x| x.commit == c).unwrap();
+        assert!(a.code, "{a:?}");
+    }
+
+    /// The decision spares ONE attribute: a commit that tidies two derive lists is code.
+    #[test]
+    fn two_derive_lists_reordered_in_one_commit_is_code() {
+        let base = "#[derive(Clone, Copy, Debug, PartialEq)]\npub struct S {\n    pub a: u32,\n}\n\n#[derive(Clone, Copy, Debug, PartialEq)]\npub struct T {\n    pub b: u32,\n}\n";
+        let after = "#[derive(Copy, Clone, Debug, PartialEq)]\npub struct S {\n    pub a: u32,\n}\n\n#[derive(Copy, Clone, Debug, PartialEq)]\npub struct T {\n    pub b: u32,\n}\n";
+        let s = Scene::new("two", base);
+        s.d.write(FILE, after);
+        let c = s.d.commit("both derives in order", "Claude Fable 5.2");
+        let w = s.walk();
+        assert!(w.neutrals.is_empty(), "two attributes are not one");
+        let ua = w.authors(UNIT);
+        let a = ua.commits.iter().find(|x| x.commit == c).unwrap();
+        assert!(a.code, "{a:?}");
+    }
+
+    /// The limit is ONE list for the whole commit, not one per file: a tidy-up that reorders one derive in each of two files of
+    /// the unit is code and is not named (review 1, PF-R036).
+    #[test]
+    fn a_derive_reorder_in_two_files_of_one_unit_is_code() {
+        let s = Scene::new("two-files", &rules(DERIVE, ""));
+        s.d.write(FILE2, LOOP);
+        s.d.commit("the unit gains its second file", "Claude Sonnet 5.5");
+        s.d.write(FILE, &rules(DERIVE_SWAPPED, ""));
+        s.d.write(FILE2, &LOOP.replace("Debug, PartialEq", "PartialEq, Debug"));
+        let c =
+            s.d.commit("one derive per file, both reordered", "Claude Fable 5.2");
+        let w = s.walk();
+        assert!(
+            w.neutrals.is_empty(),
+            "two lists in two files are not the one attribute the decision grants"
+        );
+        let ua = w.authors(UNIT);
+        let a = ua
+            .commits
+            .iter()
+            .find(|x| x.commit == c)
+            .expect("the commit is credited, not dropped");
+        assert!(a.code, "{a:?}");
+        assert!(
+            code_authors(ua).contains_key("claude-fable-5-2"),
+            "and its author is a code author: {:?}",
+            code_authors(ua)
+        );
+    }
+
+    /// Nothing else may move for the unit in that commit, proof text included: the prover who reorders a derive and edits a proof
+    /// line in ONE commit stays a code author of that unit (review 2, PF-R036). The same two edits in two commits are the spared
+    /// case, which is what `a_derive_reorder_alone_is_neutral_and_named` builds.
+    #[test]
+    fn a_derive_reorder_beside_a_proof_line_in_the_same_commit_is_code() {
+        let s = Scene::new("reorder-proof", &rules(DERIVE, ""));
+        s.d.write(FILE, &rules(DERIVE_SWAPPED, "//@ the order is layout\n"));
+        let c =
+            s.d.commit("the reorder and the note at once", "Claude Fable 5.2");
+        let w = s.walk();
+        assert!(
+            w.neutrals.is_empty(),
+            "proof text moved by the same commit unmakes the spare"
+        );
+        let ua = w.authors(UNIT);
+        let a = ua
+            .commits
+            .iter()
+            .find(|x| x.commit == c)
+            .expect("the commit is credited, not dropped");
+        assert!(a.code, "{a:?}");
+        assert!(a.proof, "{a:?}");
+        assert!(
+            code_authors(ua).contains_key("claude-fable-5-2"),
+            "the prover of that line is a code author of the unit: {:?}",
+            code_authors(ua)
+        );
+    }
+
+    /// What the streams themselves say: one compiled derive is one canonical variant, and a list behind another attribute is no
+    /// derive at all.
+    #[test]
+    fn only_a_derive_of_the_code_stream_opens_a_path_list() {
+        let a = streams(FILE, &rules(DERIVE, ""), false);
+        let b = streams(FILE, &rules(DERIVE_SWAPPED, ""), false);
+        assert!(a.ok && b.ok, "both fixtures classify");
+        assert_ne!(a.code, b.code, "the order is a token rustc reads");
+        assert_eq!(a.derive, b.derive, "the order is all that moved");
+        assert_eq!(
+            a.derive.len(),
+            1,
+            "one compiled derive: one canonical variant"
+        );
+        assert!(
+            derive_order_only(&a, &b),
+            "and the pair is the spared case: {:?} vs {:?}",
+            a.derive,
+            b.derive
+        );
+        assert!(
+            derive_lists(&["#".into(), "[".into(), "cfg".into(), "(".into(), ")".into()])
+                .is_empty(),
+            "a cfg list never opens a derive"
+        );
+        let gated = streams(
+            FILE,
+            "#[cfg_attr(feature = \"a\", derive(Clone, Copy))]\npub struct S { pub a: u32 }\n",
+            false,
+        );
+        assert!(
+            gated.derive.is_empty(),
+            "a derive behind `cfg_attr` is gate text, not a compiled list: {:?}",
+            gated.derive
+        );
+    }
 }
