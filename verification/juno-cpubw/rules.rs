@@ -10,7 +10,13 @@
 //      a pair some OPP has (their `ensures`);
 //   6. the L3 row never goes down as the peak goes up (`the_l3_row_is_monotone`, over the shipped `l3_rate_hz` and `l3_index`);
 //   7. the specs give Linux's numbers on worked examples (`the_votes_are_linuxs`, `the_l3_rows_are_linuxs`,
-//      `the_l3_rates_are_linuxs`), so a formula changed in a function and its spec alike (scale, buswidth, channels, units) fails.
+//      `the_l3_rates_are_linuxs`), so a formula changed in a function and its spec alike (scale, buswidth, channels, units) fails;
+//      `the_laptops_votes_are_linuxs` and `the_laptops_top_pair_through_the_specs` do it on the laptop's own cmd-db units;
+//   and `the_keepalive_test_is_linuxs`: `bcm_votes` tests the clamped AMC vote, Linux the unclamped one; the two agree;
+//   `the_keepalive_forces_amc_and_wake_only` states the bucket rule over the fields; `the_command_is_the_clamped_stored_vote` and
+//   `the_wake_sleep_test_on_commands` relate the commands to Linux's stored votes (bcm-voter.c:331-334), and
+//   `the_wake_sleep_case_happens` shows the one divergent case is reachable on the laptop's MC0, and `the_mask_path_never_diverges`
+//   that the mask path has none; `the_aggregate_is_the_largest_term`: the BCM's aggregate is the largest per-node term.
 // The lemmas state the properties over the nodes themselves, so a bug planted in a function and its spec alike still fails here
 // (verification/juno-cpubw/mutants.sh).
 #![feature(proc_macro_hygiene)]
@@ -281,7 +287,7 @@ proof fn the_votes_are_linuxs()
         // sc7180.dtsi CPU OPP pairs, DDR cell on MC0 (ebi) and SH0 (qns_llcc), avg 0 (no opp-avg-kBps).
         // With tests.rs's unit 1000 the lowest pair (1200000, 4800000) is cut: 1200000 * 4 / 4 * 1000 / 1000 > 0x3fff.
         vote_y_spec(aux_spec(1000, 1000), seq![ebi_spec(0, 1_200_000)]) == 0x3fff,
-        // With a unit of 1_000_000 (illustrative; the laptop's cmd-db unit is not recorded in the repo):
+        // With a unit of 1_000_000 (illustrative; the laptop's own units are in the_laptops_votes_are_linuxs below):
         // 1200000 * 4 / 4 * 1000 / 1e6 = 1200 on MC0, 1200000 * 4 / 16 * 1000 / 1e6 = 300 on SH0;
         // the top pair (8532000, 23347200): 8532000 on MC0 -> 8532, on SH0 8532000 * 4 / 16 = 2133000 -> 2133.
         vote_y_spec(aux_spec(1_000_000, 1000), seq![ebi_spec(0, 1_200_000)]) == 1200,
@@ -306,6 +312,282 @@ proof fn the_votes_are_linuxs()
     assert(vote_y_spec(aux_spec(1_000_000, 1000), seq![ebi_spec(0, 8_532_000)]) == 8532) by (compute_only);
     assert(vote_y_spec(aux_spec(1_000_000, 1000), seq![llcc_spec(0, 8_532_000)]) == 2133) by (compute_only);
     assert(vote_x_spec(aux_spec(1_000_000, 1000), seq![ebi_spec(0, 8_532_000)]) == 0) by (compute_only);
+}
+
+/// The aggregates are never negative (each step takes the max with the previous one, which starts at 0).
+proof fn the_aggregates_are_non_negative(aux: BcmAux, nodes: Seq<NodeReq>, n: int)
+    ensures
+        agg_avg_spec(aux, nodes, n) >= 0,
+        agg_peak_spec(aux, nodes, n) >= 0,
+    decreases n,
+{
+    if n > 0 {
+        the_aggregates_are_non_negative(aux, nodes, n - 1);
+    }
+}
+
+/// 2. bcm-voter.c:118-119 tests the AMC vote BEFORE tcs_cmd_gen's clamp (`bcm_div(agg * vote_scale, unit) == 0`); `bcm_votes` states
+/// the test over the clamped vote (`forced_spec`). The two tests agree on every input: the clamp sends 0 to 0 and nothing else to 0.
+proof fn the_keepalive_test_is_linuxs(aux: BcmAux, nodes: Seq<NodeReq>)
+    ensures
+        (vote_x_spec(aux, nodes) == 0)
+            == (div_spec(agg_avg_spec(aux, nodes, nodes.len() as int) * scale_spec(aux), aux.unit as int) == 0),
+        (vote_y_spec(aux, nodes) == 0)
+            == (div_spec(agg_peak_spec(aux, nodes, nodes.len() as int) * scale_spec(aux), aux.unit as int) == 0),
+        forced_spec(aux, nodes, true) == (div_spec(agg_avg_spec(aux, nodes, nodes.len() as int) * scale_spec(aux), aux.unit as int) == 0
+            && div_spec(agg_peak_spec(aux, nodes, nodes.len() as int) * scale_spec(aux), aux.unit as int) == 0),
+{
+    let n = nodes.len() as int;
+    the_aggregates_are_non_negative(aux, nodes, n);
+    let s = scale_spec(aux);
+    vstd::arithmetic::mul::lemma_mul_nonnegative(agg_avg_spec(aux, nodes, n), s);
+    vstd::arithmetic::mul::lemma_mul_nonnegative(agg_peak_spec(aux, nodes, n), s);
+    if aux.unit > 0 {
+        vstd::arithmetic::div_mod::lemma_div_pos_is_pos(agg_avg_spec(aux, nodes, n) * s, aux.unit as int);
+        vstd::arithmetic::div_mod::lemma_div_pos_is_pos(agg_peak_spec(aux, nodes, n) * s, aux.unit as int);
+    }
+}
+
+/// The LAPTOP's own cmd-db aux data (Galaxy Book Go, read 2026-11-11, evidence/juno-power/cmd-db-bcm-units-2026-11-11.txt):
+/// MC0 unit 2050000 width 16 (vcd 0), SH0 unit 1100000 width 16 (vcd 1). sc7180.c sets no vote_scale on either BCM, so
+/// icc-rpmh.c:183-184 makes it 1000 (vote_scale 0 here).
+pub open spec fn laptop_mc0_spec() -> BcmAux {
+    BcmAux { unit: 2_050_000, width: 16, vote_scale: 0 }
+}
+
+pub open spec fn laptop_sh0_spec() -> BcmAux {
+    BcmAux { unit: 1_100_000, width: 16, vote_scale: 0 }
+}
+
+/// 7. The votes on the LAPTOP's cmd-db units, worked by hand from bcm-voter.c:102-115 and tcs_cmd_gen (bcm-voter.c:140-144), for
+/// sc7180.dtsi's CPU DDR cells (avg 0: the OPPs have no opp-avg-kBps), ebi on MC0 and qns_llcc on SH0:
+/// - top pair, 8532000 kBps: MC0 peak term bcm_div(8532000 * 16, 4) = 34128000, vote bcm_div(34128000 * 1000, 2050000) = 16647,
+///   cut to 16383 (0x3fff); SH0 term 8532000 * 16 / 16 = 8532000, vote 8532000000 / 1100000 = 7756 (7756.36);
+/// - lowest pair, 1200000 kBps: MC0 term 4800000, vote 4800000000 / 2050000 = 2341 (2341.46); SH0 term 1200000,
+///   vote 1200000000 / 1100000 = 1090 (1090.9);
+/// - x is 0 on both: no avg from the CPU path.
+/// The laptop's kernel sent, at the top pair, MC0 (x, y) = (2, 16383) and SH0 (2, 7756) (/proc/lucina-rpmh): the y numbers agree;
+/// x = 2 is other voters' avg on the same BCMs, which this per-path computation does not include.
+proof fn the_laptops_votes_are_linuxs()
+    ensures
+        agg_peak_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], 1) == 34_128_000,
+        div_spec(34_128_000int * 1000, 2_050_000) == 16647,
+        vote_y_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)]) == 0x3fff,
+        vote_x_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)]) == 0,
+        vote_y_spec(laptop_sh0_spec(), seq![llcc_spec(0, 8_532_000)]) == 7756,
+        vote_x_spec(laptop_sh0_spec(), seq![llcc_spec(0, 8_532_000)]) == 0,
+        vote_y_spec(laptop_mc0_spec(), seq![ebi_spec(0, 1_200_000)]) == 2341,
+        vote_y_spec(laptop_sh0_spec(), seq![llcc_spec(0, 1_200_000)]) == 1090,
+{
+    assert(agg_peak_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], 1) == 34_128_000) by (compute);
+    assert(div_spec(34_128_000int * 1000, 2_050_000) == 16647) by (compute);
+    assert(vote_y_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)]) == 0x3fff) by (compute);
+    assert(vote_x_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)]) == 0) by (compute);
+    assert(vote_y_spec(laptop_sh0_spec(), seq![llcc_spec(0, 8_532_000)]) == 7756) by (compute);
+    assert(vote_x_spec(laptop_sh0_spec(), seq![llcc_spec(0, 8_532_000)]) == 0) by (compute);
+    assert(vote_y_spec(laptop_mc0_spec(), seq![ebi_spec(0, 1_200_000)]) == 2341) by (compute);
+    assert(vote_y_spec(laptop_sh0_spec(), seq![llcc_spec(0, 1_200_000)]) == 1090) by (compute);
+}
+
+/// 7. What the shipped `bcm_votes` and `bcm_mask_vote` return there: their `ensures` say the result IS `bucket_vote_spec` and
+/// `mask_vote_spec` (lib.rs), so these values are the functions' results for these inputs (an exec call here would be code, which
+/// the prover does not write). MC0 and SH0 have keepalive (sc7180.c:1247-1259): with the top pair in AMC and WAKE and nothing in
+/// SLEEP, AMC is not idle, so nothing is forced: (0, 16383), (0, 16383), (0, 0) on MC0, (0, 7756), (0, 7756), (0, 0) on SH0. MC0's
+/// stored vote (Linux's `bcm->vote_y`) is 16647, above the command. ACV (enable_mask BIT(3) = 8, no keepalive; its unit 1 and
+/// width 0 are unused by bcm_aggregate_mask) on the same ebi request: (0, 8).
+proof fn the_laptops_top_pair_through_the_specs()
+    ensures
+        bucket_vote_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], seq![ebi_spec(0, 8_532_000)], true, 0) == (0int, 0x3fffint),
+        bucket_vote_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], seq![ebi_spec(0, 8_532_000)], true, 1) == (0int, 0x3fffint),
+        bucket_vote_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], Seq::<NodeReq>::empty(), true, 2) == (0int, 0int),
+        bucket_vote_spec(laptop_sh0_spec(), seq![llcc_spec(0, 8_532_000)], seq![llcc_spec(0, 8_532_000)], true, 0) == (0int, 7756int),
+        bucket_vote_spec(laptop_sh0_spec(), seq![llcc_spec(0, 8_532_000)], seq![llcc_spec(0, 8_532_000)], true, 1) == (0int, 7756int),
+        bucket_vote_spec(laptop_sh0_spec(), seq![llcc_spec(0, 8_532_000)], Seq::<NodeReq>::empty(), true, 2) == (0int, 0int),
+        stored_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], seq![ebi_spec(0, 8_532_000)], true, 1) == (0int, 16647int),
+        mask_vote_spec(8, seq![ebi_spec(0, 8_532_000)], false) == (0u32, 8u32),
+{
+    assert(bucket_vote_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], seq![ebi_spec(0, 8_532_000)], true, 0) == (0int, 0x3fffint)) by (compute);
+    assert(bucket_vote_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], seq![ebi_spec(0, 8_532_000)], true, 1) == (0int, 0x3fffint)) by (compute);
+    assert(bucket_vote_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], Seq::<NodeReq>::empty(), true, 2) == (0int, 0int)) by (compute);
+    assert(bucket_vote_spec(laptop_sh0_spec(), seq![llcc_spec(0, 8_532_000)], seq![llcc_spec(0, 8_532_000)], true, 0) == (0int, 7756int)) by (compute);
+    assert(bucket_vote_spec(laptop_sh0_spec(), seq![llcc_spec(0, 8_532_000)], seq![llcc_spec(0, 8_532_000)], true, 1) == (0int, 7756int)) by (compute);
+    assert(bucket_vote_spec(laptop_sh0_spec(), seq![llcc_spec(0, 8_532_000)], Seq::<NodeReq>::empty(), true, 2) == (0int, 0int)) by (compute);
+    assert(stored_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], seq![ebi_spec(0, 8_532_000)], true, 1) == (0int, 16647int)) by (compute);
+    let top = seq![ebi_spec(0, 8_532_000)];
+    assert(top[0].req.peak_kbps != 0);
+    assert(exists|i: int| 0 <= i < top.len() && (top[i].req.avg_kbps != 0 || top[i].req.peak_kbps != 0));
+}
+
+/// 2. Linux's keepalive rule as `bcm_votes` states it, over the fields: forced (the AMC bucket's own vote (0, 0) on a keepalive
+/// BCM) sets AMC and WAKE to (1, 1); SLEEP is always its own vote; unforced, every bucket is its own vote. A change of the bucket
+/// test in `bucket_vote_spec` (and the code alike) fails here.
+proof fn the_keepalive_forces_amc_and_wake_only(aux: BcmAux, amc: Seq<NodeReq>, own: Seq<NodeReq>, keepalive: bool)
+    ensures
+        bucket_vote_spec(aux, amc, own, keepalive, 2) == (vote_x_spec(aux, own), vote_y_spec(aux, own)),
+        keepalive && vote_x_spec(aux, amc) == 0 && vote_y_spec(aux, amc) == 0 ==>
+            bucket_vote_spec(aux, amc, own, keepalive, 0) == (1int, 1int) && bucket_vote_spec(aux, amc, own, keepalive, 1) == (1int, 1int),
+        !(keepalive && vote_x_spec(aux, amc) == 0 && vote_y_spec(aux, amc) == 0) ==>
+            bucket_vote_spec(aux, amc, own, keepalive, 0) == (vote_x_spec(aux, own), vote_y_spec(aux, own))
+            && bucket_vote_spec(aux, amc, own, keepalive, 1) == (vote_x_spec(aux, own), vote_y_spec(aux, own)),
+{
+}
+
+/// Every per-node term is non-negative (unsigned fields; `bcm_div` of non-negatives).
+proof fn the_terms_are_non_negative(aux: BcmAux, nd: NodeReq)
+    ensures
+        avg_term_spec(aux, nd) >= 0,
+        peak_term_spec(aux, nd) >= 0,
+{
+    vstd::arithmetic::mul::lemma_mul_nonnegative(nd.req.avg_kbps as int, aux.width as int);
+    vstd::arithmetic::mul::lemma_mul_nonnegative(nd.req.peak_kbps as int, aux.width as int);
+    vstd::arithmetic::mul::lemma_mul_nonnegative(nd.buswidth as int, nd.channels as int);
+    if nd.buswidth as int * nd.channels as int > 0 {
+        vstd::arithmetic::div_mod::lemma_div_pos_is_pos(nd.req.avg_kbps as int * aux.width as int, nd.buswidth as int * nd.channels as int);
+    }
+    if nd.buswidth > 0 {
+        vstd::arithmetic::div_mod::lemma_div_pos_is_pos(nd.req.peak_kbps as int * aux.width as int, nd.buswidth as int);
+    }
+}
+
+/// 2. `bcm_aggregate`'s `max` (bcm-voter.c:104, 108): over the first `n` nodes the aggregate is at least every node's term and is
+/// one of them; with no node it is 0 (the arrays start at {0}, bcm-voter.c:96-97). A BCM that took the smallest term, or ignored a
+/// node, fails here.
+proof fn the_aggregate_is_the_largest_term(aux: BcmAux, nodes: Seq<NodeReq>, n: int)
+    requires
+        0 <= n <= nodes.len(),
+    ensures
+        forall|j: int| 0 <= j < n ==> agg_avg_spec(aux, nodes, n) >= avg_term_spec(aux, #[trigger] nodes[j]),
+        forall|j: int| 0 <= j < n ==> agg_peak_spec(aux, nodes, n) >= peak_term_spec(aux, #[trigger] nodes[j]),
+        n == 0 ==> agg_avg_spec(aux, nodes, n) == 0 && agg_peak_spec(aux, nodes, n) == 0,
+        n > 0 ==> exists|j: int| 0 <= j < n && agg_avg_spec(aux, nodes, n) == avg_term_spec(aux, nodes[j]),
+        n > 0 ==> exists|j: int| 0 <= j < n && agg_peak_spec(aux, nodes, n) == peak_term_spec(aux, nodes[j]),
+    decreases n,
+{
+    if n > 0 {
+        the_aggregate_is_the_largest_term(aux, nodes, n - 1);
+        the_terms_are_non_negative(aux, nodes[n - 1]);
+        let pa = agg_avg_spec(aux, nodes, n - 1);
+        let pp = agg_peak_spec(aux, nodes, n - 1);
+        if n == 1 {
+            assert(agg_avg_spec(aux, nodes, n) == avg_term_spec(aux, nodes[0]));
+            assert(agg_peak_spec(aux, nodes, n) == peak_term_spec(aux, nodes[0]));
+        } else {
+            if pa >= avg_term_spec(aux, nodes[n - 1]) {
+                let j = choose|j: int| 0 <= j < n - 1 && pa == avg_term_spec(aux, nodes[j]);
+                assert(0 <= j < n && agg_avg_spec(aux, nodes, n) == avg_term_spec(aux, nodes[j]));
+            } else {
+                assert(agg_avg_spec(aux, nodes, n) == avg_term_spec(aux, nodes[n - 1]));
+            }
+            if pp >= peak_term_spec(aux, nodes[n - 1]) {
+                let j = choose|j: int| 0 <= j < n - 1 && pp == peak_term_spec(aux, nodes[j]);
+                assert(0 <= j < n && agg_peak_spec(aux, nodes, n) == peak_term_spec(aux, nodes[j]));
+            } else {
+                assert(agg_peak_spec(aux, nodes, n) == peak_term_spec(aux, nodes[n - 1]));
+            }
+        }
+        assert forall|j: int| 0 <= j < n implies agg_avg_spec(aux, nodes, n) >= avg_term_spec(aux, #[trigger] nodes[j]) by {
+            if j < n - 1 {}
+        }
+        assert forall|j: int| 0 <= j < n implies agg_peak_spec(aux, nodes, n) >= peak_term_spec(aux, #[trigger] nodes[j]) by {
+            if j < n - 1 {}
+        }
+    }
+}
+
+/// 2. The mask path (bcm_aggregate_mask, bcm-voter.c:72-87): every number `mask_vote_spec` gives is 0 or the mask; idle and not
+/// forced it is (0, 0), forced (mask, mask). With a mask of at most VOTE_MAX the clamp of the command is the identity, so the
+/// WAKE-vs-SLEEP test on commands is Linux's test on the stored pair (bcm-voter.c:331-334): the mask path never diverges.
+proof fn the_mask_path_never_diverges(m: u32, wake: Seq<NodeReq>, sleep: Seq<NodeReq>, kw: bool, ks: bool)
+    requires
+        m <= VOTE_MAX,
+    ensures
+        mask_vote_spec(m, wake, kw).0 <= m && mask_vote_spec(m, wake, kw).1 <= m,
+        min_spec(VOTE_MAX as int, mask_vote_spec(m, wake, kw).0 as int) == mask_vote_spec(m, wake, kw).0 as int,
+        min_spec(VOTE_MAX as int, mask_vote_spec(m, wake, kw).1 as int) == mask_vote_spec(m, wake, kw).1 as int,
+        (mask_vote_spec(m, wake, kw) != mask_vote_spec(m, sleep, ks))
+            == ((min_spec(VOTE_MAX as int, mask_vote_spec(m, wake, kw).0 as int), min_spec(VOTE_MAX as int, mask_vote_spec(m, wake, kw).1 as int))
+                != (min_spec(VOTE_MAX as int, mask_vote_spec(m, sleep, ks).0 as int), min_spec(VOTE_MAX as int, mask_vote_spec(m, sleep, ks).1 as int))),
+        mask_vote_spec(8, Seq::<NodeReq>::empty(), false) == (0u32, 0u32),
+        mask_vote_spec(8, Seq::<NodeReq>::empty(), true) == (8u32, 8u32),
+{
+}
+
+/// A clamp loses only above the cap: two non-negative numbers equal after `min(VOTE_MAX, _)` are equal, or both at least VOTE_MAX.
+proof fn the_clamp_is_injective_below_the_cap(a: int, b: int)
+    requires
+        0 <= a,
+        0 <= b,
+    ensures
+        min_spec(VOTE_MAX as int, a) == min_spec(VOTE_MAX as int, b) ==> a == b || (a >= VOTE_MAX && b >= VOTE_MAX),
+        a == b ==> min_spec(VOTE_MAX as int, a) == min_spec(VOTE_MAX as int, b),
+{
+}
+
+proof fn the_raw_votes_are_non_negative(aux: BcmAux, own: Seq<NodeReq>)
+    ensures
+        raw_vote_spec(agg_avg_spec(aux, own, own.len() as int), aux) >= 0,
+        raw_vote_spec(agg_peak_spec(aux, own, own.len() as int), aux) >= 0,
+{
+    let n = own.len() as int;
+    the_aggregates_are_non_negative(aux, own, n);
+    let s = scale_spec(aux);
+    vstd::arithmetic::mul::lemma_mul_nonnegative(agg_avg_spec(aux, own, n), s);
+    vstd::arithmetic::mul::lemma_mul_nonnegative(agg_peak_spec(aux, own, n), s);
+    if aux.unit > 0 {
+        vstd::arithmetic::div_mod::lemma_div_pos_is_pos(agg_avg_spec(aux, own, n) * s, aux.unit as int);
+        vstd::arithmetic::div_mod::lemma_div_pos_is_pos(agg_peak_spec(aux, own, n) * s, aux.unit as int);
+    }
+}
+
+/// 2. The command of each bucket is the clamp of Linux's stored vote (`tcs_cmd_gen`, bcm-voter.c:140-144, applied by
+/// `tcs_list_gen` at bcm-voter.c:178-179 to `bcm->vote_x/vote_y`), forcing included.
+proof fn the_command_is_the_clamped_stored_vote(aux: BcmAux, amc: Seq<NodeReq>, own: Seq<NodeReq>, keepalive: bool, i: int)
+    ensures
+        stored_spec(aux, amc, own, keepalive, i).0 >= 0,
+        stored_spec(aux, amc, own, keepalive, i).1 >= 0,
+        bucket_vote_spec(aux, amc, own, keepalive, i).0 == min_spec(VOTE_MAX as int, stored_spec(aux, amc, own, keepalive, i).0),
+        bucket_vote_spec(aux, amc, own, keepalive, i).1 == min_spec(VOTE_MAX as int, stored_spec(aux, amc, own, keepalive, i).1),
+{
+    the_keepalive_test_is_linuxs(aux, amc);
+    the_raw_votes_are_non_negative(aux, own);
+}
+
+/// 2. bcm-voter.c:331-334 keeps a BCM's WAKE and SLEEP commands when its STORED WAKE and SLEEP votes differ. Deciding on the
+/// commands instead (what `bcm_votes` returns) gives: commands that differ always mean stored votes that differ; stored votes
+/// that differ with equal commands happen only when, in x or y, the two stored votes differ and are both at least VOTE_MAX.
+/// That is the one case where a caller deciding on commands drops a write Linux makes (lib.rs, the caller obligations).
+proof fn the_wake_sleep_test_on_commands(aux: BcmAux, amc: Seq<NodeReq>, wake: Seq<NodeReq>, sleep: Seq<NodeReq>, keepalive: bool)
+    ensures
+        bucket_vote_spec(aux, amc, wake, keepalive, 1) != bucket_vote_spec(aux, amc, sleep, keepalive, 2)
+            ==> stored_spec(aux, amc, wake, keepalive, 1) != stored_spec(aux, amc, sleep, keepalive, 2),
+        stored_spec(aux, amc, wake, keepalive, 1) != stored_spec(aux, amc, sleep, keepalive, 2)
+            && bucket_vote_spec(aux, amc, wake, keepalive, 1) == bucket_vote_spec(aux, amc, sleep, keepalive, 2) ==> (
+            (stored_spec(aux, amc, wake, keepalive, 1).0 != stored_spec(aux, amc, sleep, keepalive, 2).0
+                && stored_spec(aux, amc, wake, keepalive, 1).0 >= VOTE_MAX && stored_spec(aux, amc, sleep, keepalive, 2).0 >= VOTE_MAX)
+            || (stored_spec(aux, amc, wake, keepalive, 1).1 != stored_spec(aux, amc, sleep, keepalive, 2).1
+                && stored_spec(aux, amc, wake, keepalive, 1).1 >= VOTE_MAX && stored_spec(aux, amc, sleep, keepalive, 2).1 >= VOTE_MAX)),
+{
+    the_command_is_the_clamped_stored_vote(aux, amc, wake, keepalive, 1);
+    the_command_is_the_clamped_stored_vote(aux, amc, sleep, keepalive, 2);
+    let w = stored_spec(aux, amc, wake, keepalive, 1);
+    let z = stored_spec(aux, amc, sleep, keepalive, 2);
+    the_clamp_is_injective_below_the_cap(w.0, z.0);
+    the_clamp_is_injective_below_the_cap(w.1, z.1);
+}
+
+/// The case is real: the laptop's MC0 with the top pair in WAKE (stored y 16647) and 9000000 kBps in SLEEP (stored y 17560) has
+/// stored votes that differ and equal commands (0, 16383).
+proof fn the_wake_sleep_case_happens()
+    ensures
+        stored_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], seq![ebi_spec(0, 8_532_000)], true, 1)
+            != stored_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], seq![ebi_spec(0, 9_000_000)], true, 2),
+        bucket_vote_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], seq![ebi_spec(0, 8_532_000)], true, 1)
+            == bucket_vote_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], seq![ebi_spec(0, 9_000_000)], true, 2),
+{
+    assert(stored_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], seq![ebi_spec(0, 9_000_000)], true, 2) == (0int, 17560int)) by (compute);
+    assert(stored_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], seq![ebi_spec(0, 8_532_000)], true, 1) == (0int, 16647int)) by (compute);
+    assert(bucket_vote_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], seq![ebi_spec(0, 9_000_000)], true, 2) == (0int, 0x3fffint)) by (compute);
+    assert(bucket_vote_spec(laptop_mc0_spec(), seq![ebi_spec(0, 8_532_000)], seq![ebi_spec(0, 8_532_000)], true, 1) == (0int, 0x3fffint)) by (compute);
 }
 
 /// 7. `l3_index`'s spec on tests.rs's LUT (sc7180 L3 rows 300, 576, 768, 1017.6 MHz): osm-l3.c:141-144, the first entry >= rate

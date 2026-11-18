@@ -127,7 +127,8 @@ try "the keepalive mask forgotten (code)" '    if keepalive {
     }' '    if false {
         return (enable_mask, enable_mask);
     }'
-# The same bugs in the code and its spec alike: only the lemmas over the fields can refuse them.
+# The same bugs in the code and its spec alike: the function's own spec cannot refuse them; the lemmas over the fields and the
+# worked values of rules.rs do, and so may another function's ensures that uses the spec (the clamp: bcm_vote's VOTE_MAX bound).
 try "both: the clamp removed" \
     '    if v > VOTE_MAX as u128 {
         VOTE_MAX' '    if v > 0xffff_ffff {
@@ -181,6 +182,50 @@ try "both: the L3 rate 0 above u64, which breaks the row's monotonicity" \
 try "both: nothing asked still votes 1" \
     'num != 0 && num < base' 'num < base' \
     'num != 0 && num < base' 'num < base'
+# Gaps found by the 604c67f0d review: the bucket rule of bcm_votes co-mutated with its spec, opp_bw's first match, l3_index's
+# empty LUT. The two `both` ones are refused by the_keepalive_forces_amc_and_wake_only (and by
+# the_command_is_the_clamped_stored_vote, which relates bucket_vote_spec to stored_spec).
+try "both: the keepalive forces SLEEP too" \
+    '        r[1] = (1, 1);
+    }' '        r[1] = (1, 1);
+        r[2] = (1, 1);
+    }' \
+    'if i < 2 && forced_spec(aux, amc, keepalive) { (1, 1) }' 'if i < 3 && forced_spec(aux, amc, keepalive) { (1, 1) }'
+try "both: the keepalive leaves WAKE alone" \
+    '        r[1] = (1, 1);' '        r[1] = r[1];' \
+    'if i < 2 && forced_spec(aux, amc, keepalive) { (1, 1) }' 'if i < 1 && forced_spec(aux, amc, keepalive) { (1, 1) }'
+try "the last OPP of equal frequencies instead of the first (code)" \
+    'if table[i].khz == khz {' 'if table[i].khz == khz && (i + 1 >= table.len() || table[i + 1].khz != khz) {'
+try "an empty LUT gives row 0 (code)" '    if lut_hz.is_empty() {
+        return None;' '    if lut_hz.is_empty() {
+        return Some(0);'
+# Five mutants placed outside every pinned input of rules.rs, so that the worked values do not refuse them. The harness proves
+# that each mutant is refused, not which proof owns the refusal.
+try "both: the clamp lifted to 32 bits above 2^32" \
+    '    if v > VOTE_MAX as u128 {' '    if v > 0xffff_ffff {
+        0xffff_ffff
+    } else if v > VOTE_MAX as u128 {' \
+    '    min_spec(VOTE_MAX as int, div_spec(agg * scale_spec(aux), aux.unit as int))' '    if div_spec(agg * scale_spec(aux), aux.unit as int) > 0xffff_ffff { 0xffff_ffff } else { min_spec(VOTE_MAX as int, div_spec(agg * scale_spec(aux), aux.unit as int)) }'
+try "both: a small vote rounds to 2 over a base above 4e9, which breaks monotonicity" \
+    '    } else if num != 0 && num < base {
+        1
+    } else {' '    } else if num != 0 && num < base {
+        if base > 4_000_000_000 { 2 } else { 1 }
+    } else {' \
+    '    } else if num != 0 && num < base {
+        1
+    } else {' '    } else if num != 0 && num < base {
+        if base > 4_000_000_000 { 2 } else { 1 }
+    } else {'
+try "both: the BCM takes the smallest peak term after the first node" \
+    '        if peak > agg_peak {' '        if (i == 0 && peak > agg_peak) || (i > 0 && peak < agg_peak) {' \
+    '    if n <= 0 { 0 } else { max_spec(agg_peak_spec(aux, nodes, n - 1), peak_term_spec(aux, nodes[n - 1])) }' '    if n <= 0 { 0 } else if n == 1 { max_spec(agg_peak_spec(aux, nodes, n - 1), peak_term_spec(aux, nodes[n - 1])) } else { min_spec(agg_peak_spec(aux, nodes, n - 1), peak_term_spec(aux, nodes[n - 1])) }'
+try "both: the first index at > instead of >= for rates of 4e9 Hz and above" \
+    'if lut_hz[i] >= rate_hz {' 'if lut_hz[i] > rate_hz || (lut_hz[i] == rate_hz && rate_hz < 4_000_000_000) {' \
+    '} else if lut[n - 1] >= rate {' '} else if lut[n - 1] > rate || (lut[n - 1] == rate && rate < 4_000_000_000) {'
+try "both: nothing asked still votes 1 over a base above 4e9" \
+    'num != 0 && num < base' '(num != 0 || base > 4_000_000_000) && num < base' \
+    'num != 0 && num < base' '(num != 0 || base > 4_000_000_000) && num < base'
 echo "$refused of $total refused"
 echo "mutants: $refused refused by verification, $weak refused without a verification run"
 if [ "${MUTANTS_STRICT:-0}" = "1" ] && [ "$weak" -gt 0 ]; then exit 1; fi
