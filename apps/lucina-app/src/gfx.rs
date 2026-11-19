@@ -791,6 +791,93 @@ fn font_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
+/// How far below a system font root a directory is still searched. One reaches Debian's and Ubuntu's
+/// `truetype/dejavu`; two reaches a vendor that nests once more. No further: a font tree is shallow,
+/// and the roots include `$HOME`, where a deep walk would cost a window start far too much.
+const FACE_SEARCH_DEPTH: u32 = 2;
+
+/// The roots of the desktop font tree, whose faces live in a subdirectory of their own: Debian and
+/// Ubuntu's `fonts-dejavu-core` installs into `truetype/dejavu`, Fedora splits the same family over
+/// `dejavu-sans-fonts` and `dejavu-sans-mono-fonts`. Empty on the device, where Juno's image keeps
+/// the faces flat in [`FONT_DIR`] and [`LATO_DIR`], which [`font_dirs`] already lists.
+fn system_font_roots() -> Vec<std::path::PathBuf> {
+    #[cfg(target_env = "musl")]
+    return Vec::new();
+    #[cfg(not(target_env = "musl"))]
+    {
+        let home = std::env::var_os("HOME");
+        // XDG: an unset or empty `XDG_DATA_HOME` means the default, not the current directory.
+        let data = match std::env::var_os("XDG_DATA_HOME").filter(|d| !d.is_empty()) {
+            Some(d) => Some(std::path::PathBuf::from(d)),
+            None => home
+                .as_deref()
+                .map(|h| std::path::Path::new(h).join(".local/share")),
+        };
+        let mut roots = vec![
+            std::path::PathBuf::from("/usr/share/fonts"),
+            std::path::PathBuf::from("/usr/local/share/fonts"),
+        ];
+        if let Some(d) = data {
+            roots.push(d.join("fonts"));
+        }
+        if let Some(h) = home {
+            roots.push(std::path::PathBuf::from(h).join(".fonts"));
+        }
+        roots
+    }
+}
+
+/// Reads `dir` once: whether it holds one of `names`, and its subdirectories. An entry that is a
+/// symlink is not a subdirectory here — `file_type` is the entry's own, not what it points at — so a
+/// font tree that links its roots to itself cannot lead the search in a circle.
+fn scan_font_dir(dir: &std::path::Path, names: &[&str]) -> (bool, Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (false, Vec::new());
+    };
+    let mut holds = false;
+    let mut subdirs = Vec::new();
+    for e in entries.flatten() {
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            subdirs.push(e.path());
+        } else if names.iter().any(|n| e.file_name() == *n) {
+            holds = true;
+        }
+    }
+    (holds, subdirs)
+}
+
+/// The directories a [`Text`] loads its faces from, in the order to try: the explicit `dirs` first,
+/// unchanged and winning, then the directories at depth 1 to [`FACE_SEARCH_DEPTH`] below `roots`
+/// that hold at least one of `names`, per root and shallowest first. Every face is then picked out
+/// of this list on its own, so the faces may come from different directories — which is how Fedora
+/// ships DejaVu. Each directory of each root is read once, for every face together.
+fn face_dirs(
+    dirs: &[std::path::PathBuf],
+    roots: &[std::path::PathBuf],
+    names: &[&str],
+) -> Vec<std::path::PathBuf> {
+    let mut out = dirs.to_vec();
+    for root in roots {
+        // Depth counts below the root, so a face loose in a root is not a candidate: the root's own
+        // listing is read for the directories under it only.
+        let mut level = scan_font_dir(root, names).1;
+        for depth in 1..=FACE_SEARCH_DEPTH {
+            let mut next = Vec::new();
+            for dir in level {
+                let (holds, subdirs) = scan_font_dir(&dir, names);
+                if holds {
+                    out.push(dir);
+                }
+                if depth < FACE_SEARCH_DEPTH {
+                    next.extend(subdirs);
+                }
+            }
+            level = next;
+        }
+    }
+    out
+}
+
 struct Glyph {
     /// Offset of the bitmap's top-left corner from the pen position on the baseline (y down).
     left: i32,
@@ -886,11 +973,19 @@ impl Text {
     /// When the fonts are not installed (scripts/gui-initramfs.sh puts them in the image).
     pub fn new() -> Text {
         let dirs = font_dirs();
+        let roots = system_font_roots();
+        let search = face_dirs(&dirs, &roots, &ALL_SLOTS.map(|s| s.file()));
+        // On the device nothing is searched beyond `dirs`, and the message says so as it always did.
+        let searched = if roots.is_empty() {
+            format!("{dirs:?}")
+        } else {
+            format!("{dirs:?} nor under {roots:?}")
+        };
         let load = |name: &str| {
-            let bytes = dirs
+            let bytes = search
                 .iter()
                 .find_map(|d| load_font(d, name))
-                .unwrap_or_else(|| panic!("font {name} not found in {dirs:?}"));
+                .unwrap_or_else(|| panic!("font {name} not found in {searched}"));
             FontRef::new(bytes).unwrap_or_else(|e| panic!("font {name}: {e}"))
         };
         Text {
@@ -1467,5 +1562,103 @@ mod tests {
         assert_eq!(img[0], 0); // outline (black) at the tip
         assert_eq!(img[(6 * w + 2) as usize], 0xffffff);
         assert_eq!(img[(w - 1) as usize], off.0); // off the frame
+    }
+
+    use std::path::PathBuf;
+
+    /// A folder under `$TMPDIR`, made empty and gone when the test ends — however it ends, so a
+    /// failed assert leaves no folder behind for the next run to trip on.
+    struct Tmp(PathBuf);
+
+    impl Tmp {
+        fn new(who: &str) -> Tmp {
+            let d =
+                std::env::temp_dir().join(format!("lucina-gfx-font-{who}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            Tmp(d)
+        }
+
+        /// A stand-in face at `rel` below the folder. The search reads listings only and never
+        /// opens these bytes, so a name is all a face has to be. Its directory is returned.
+        fn face(&self, rel: &str) -> PathBuf {
+            let p = self.0.join(rel);
+            let dir = p.parent().unwrap().to_path_buf();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&p, b"no font here").unwrap();
+            dir
+        }
+
+        /// `face_dirs` over the three DejaVu names with this folder as its only system root and no
+        /// explicit directory in front of it.
+        fn searched_as_root(&self) -> Vec<PathBuf> {
+            let roots = [self.0.clone()];
+            face_dirs(&[], &roots, &DEJAVU)
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The directory `Text::new` would take `name` from: the first of `dirs` that holds it.
+    fn loads_from(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
+        dirs.iter().find(|d| d.join(name).is_file()).cloned()
+    }
+
+    const DEJAVU: [&str; 3] = [
+        "DejaVuSans.ttf",
+        "DejaVuSans-Bold.ttf",
+        "DejaVuSansMono.ttf",
+    ];
+
+    #[test]
+    fn faces_are_found_split_across_the_distributions_directories() {
+        let root = Tmp::new("split");
+        // Fedora's shape: the sans and the mono of DejaVu in one directory each. Debian's: nested.
+        let sans = root.face("dejavu-sans-fonts/DejaVuSans.ttf");
+        let mono = root.face("dejavu-sans-mono-fonts/DejaVuSansMono.ttf");
+        let bold = root.face("truetype/dejavu/DejaVuSans-Bold.ttf");
+        let dirs = root.searched_as_root();
+        assert_eq!(loads_from(&dirs, "DejaVuSans.ttf"), Some(sans));
+        assert_eq!(loads_from(&dirs, "DejaVuSans-Bold.ttf"), Some(bold));
+        assert_eq!(loads_from(&dirs, "DejaVuSansMono.ttf"), Some(mono));
+    }
+
+    #[test]
+    fn a_face_at_depth_three_is_not_searched() {
+        let root = Tmp::new("depth");
+        let bold = root.face("truetype/dejavu/DejaVuSans-Bold.ttf"); // depth 2: searched
+        root.face("a/b/c/DejaVuSans.ttf"); // depth 3: not
+        let dirs = root.searched_as_root();
+        assert_eq!(loads_from(&dirs, "DejaVuSans-Bold.ttf"), Some(bold));
+        assert_eq!(loads_from(&dirs, "DejaVuSans.ttf"), None);
+    }
+
+    #[test]
+    fn an_explicit_directory_wins_over_a_system_root() {
+        let (explicit, root) = (Tmp::new("explicit"), Tmp::new("wins"));
+        let mine = explicit.face("DejaVuSans.ttf");
+        let theirs = root.face("truetype/dejavu/DejaVuSans.ttf");
+        let dirs = face_dirs(
+            std::slice::from_ref(&mine),
+            std::slice::from_ref(&root.0),
+            &DEJAVU,
+        );
+        assert!(dirs.contains(&theirs), "the root is searched too");
+        assert_eq!(loads_from(&dirs, "DejaVuSans.ttf"), Some(mine));
+    }
+
+    #[test]
+    fn a_directory_symlink_is_not_walked() {
+        let root = Tmp::new("symlink");
+        let real = root.face("dejavu/DejaVuSans.ttf");
+        // The two links that would lead the walk back into the root and out of it again.
+        std::os::unix::fs::symlink(&root.0, root.0.join("itself")).unwrap();
+        std::os::unix::fs::symlink(root.0.parent().unwrap(), root.0.join("above")).unwrap();
+        let dirs = root.searched_as_root();
+        assert_eq!(dirs, [real]);
     }
 }
