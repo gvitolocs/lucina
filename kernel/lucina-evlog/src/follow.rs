@@ -9,6 +9,7 @@ use serde_json::json;
 
 use crate::bucket;
 use crate::event::{Channel, Event, Level, LogLine};
+use crate::keys;
 use crate::providers::{self, id};
 use crate::record;
 use crate::rules;
@@ -57,12 +58,23 @@ pub struct Follower {
     exe: HashMap<i64, String>,
     seen: HashMap<String, rules::Gate>,
     pub boot: Option<u32>,
+    /// The event log's epoch of `boot` (patch 1370).
+    pub epoch: u32,
 }
 
 impl Follower {
     pub fn new(boot: Option<u32>) -> Follower {
         Follower {
             boot,
+            ..Default::default()
+        }
+    }
+
+    /// A follower of a boot in an epoch of the event log (patch 1370).
+    pub fn in_epoch(boot: Option<u32>, epoch: u32) -> Follower {
+        Follower {
+            boot,
+            epoch,
             ..Default::default()
         }
     }
@@ -83,7 +95,8 @@ impl Follower {
     fn stamp(&self, mut e: Event, now_ms: i64) -> Event {
         e.time_ms = Some(now_ms);
         e.boot = self.boot;
-        e.activity = self.boot.map(|b| format!("boot:{b}"));
+        e.epoch = self.epoch;
+        e.activity = self.boot.map(|b| keys::activity(self.epoch, b));
         e
     }
 

@@ -158,6 +158,9 @@ pub struct Event {
     /// The saved log's boot counter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot: Option<u32>,
+    /// The event log's epoch of that counter (patch 1370): 0 for everything from before, see [`crate::epoch`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub epoch: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uptime_ms: Option<u64>,
     /// The kernel build that was running (`build:` of a crash record, or `/proc/version`).
@@ -185,6 +188,14 @@ pub struct Event {
     /// Where the raw text is, while it still is: `/sys/fs/pstore/dmesg-lucina-3`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// The record's full text, kept in the event log's directory (`records/<key>.txt`, see [`crate::record_text`]) until the
+    /// 4 MiB of such files are full and it is the oldest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_file: Option<String>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Event {
@@ -206,6 +217,7 @@ impl Event {
             time_ms: None,
             time_estimated: false,
             boot: None,
+            epoch: 0,
             uptime_ms: None,
             build: None,
             activity: None,
@@ -217,6 +229,7 @@ impl Event {
             fields: BTreeMap::new(),
             log: Vec::new(),
             source: None,
+            text_file: None,
         }
     }
 

@@ -386,16 +386,21 @@ pub fn read_dir_events(dir: &Path) -> Vec<Event> {
 /// ingest or `backfill-boot`): the start plus the event's uptime, marked estimated. The log is append-only, so what was read
 /// in before the time was known is completed when it is read.
 pub fn fill_times(events: &mut [Event]) {
-    let starts: Vec<(u32, i64)> = events
+    // A boot's start dates only the events of its own epoch (patch 1370): boot 3 after the counter started over is not boot 3 before.
+    let starts: Vec<(u32, u32, i64)> = events
         .iter()
         .filter(|e| e.provider == providers::KERNEL_POWER && e.id == providers::id::BOOT_STARTED)
-        .filter_map(|e| Some((e.boot?, e.time_ms?)))
+        .filter_map(|e| Some((e.epoch, e.boot?, e.time_ms?)))
         .collect();
     for e in events.iter_mut().filter(|e| e.time_ms.is_none()) {
         let (Some(b), Some(up)) = (e.boot, e.uptime_ms) else {
             continue;
         };
-        if let Some(&(_, start)) = starts.iter().rev().find(|(sb, _)| *sb == b) {
+        if let Some(&(_, _, start)) = starts
+            .iter()
+            .rev()
+            .find(|(se, sb, _)| *sb == b && *se == e.epoch)
+        {
             e.time_ms = Some(start + up as i64);
             e.time_estimated = true;
         }
@@ -453,23 +458,23 @@ impl Filter {
         if self.boot.is_some() && self.boot != e.boot {
             return false;
         }
-        if let Some(since) = self.since_ms {
-            if e.time_ms.is_none_or(|t| t < since) {
-                return false;
-            }
+        if let Some(since) = self.since_ms
+            && e.time_ms.is_none_or(|t| t < since)
+        {
+            return false;
         }
-        if let Some(until) = self.until_ms {
-            if e.time_ms.is_none_or(|t| t >= until) {
-                return false;
-            }
+        if let Some(until) = self.until_ms
+            && e.time_ms.is_none_or(|t| t >= until)
+        {
+            return false;
         }
         if self.after_record.is_some_and(|r| e.record <= r) {
             return false;
         }
-        if let Some(b) = &self.bucket {
-            if e.bucket.as_ref().is_none_or(|x| &x.id != b) {
-                return false;
-            }
+        if let Some(b) = &self.bucket
+            && e.bucket.as_ref().is_none_or(|x| &x.id != b)
+        {
+            return false;
         }
         if let Some(text) = &self.text {
             let hay = format!(

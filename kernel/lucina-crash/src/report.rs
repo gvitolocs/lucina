@@ -20,6 +20,8 @@ pub enum Kind {
     RequestedReset = 6,
     /// The modem DSP failed (its watchdog fired or it raised its fatal bit) and said why; the boot went on (patch 1057).
     Modem = 7,
+    /// The saved log's region could not be used and was laid out afresh; the text says why (patch 1372).
+    RegionRestarted = 8,
 }
 
 impl Kind {
@@ -32,6 +34,7 @@ impl Kind {
             Kind::UnexplainedReset => "unexplained reset",
             Kind::RequestedReset => "requested reset",
             Kind::Modem => "modem",
+            Kind::RegionRestarted => "region restarted",
         }
     }
 
@@ -45,6 +48,7 @@ impl Kind {
             Kind::UnexplainedReset => "Unexplained reset",
             Kind::RequestedReset => "Requested reset",
             Kind::Modem => "Modem failure",
+            Kind::RegionRestarted => "Saved log restarted",
         }
     }
 
@@ -57,6 +61,7 @@ impl Kind {
             5 => Kind::UnexplainedReset,
             6 => Kind::RequestedReset,
             7 => Kind::Modem,
+            8 => Kind::RegionRestarted,
             _ => return None,
         })
     }
@@ -384,14 +389,20 @@ impl After {
     /// What happens next, as the crash screen's footer says it: short, with the countdown.
     pub fn write_short_status(&self, w: &mut dyn Write, seconds_left: Option<u32>) -> fmt::Result {
         match *self {
-            After::Restart { seconds } => write!(w, "Restarting in {} s", seconds_left.unwrap_or(seconds)),
+            After::Restart { seconds } => {
+                write!(w, "Restarting in {} s", seconds_left.unwrap_or(seconds))
+            }
             After::StayAsked => write!(w, "Staying here (lucina.panic=0)"),
             After::StayLoop { crashes, seconds } => write!(
                 w,
                 "Crashed {crashes} times in a row. Restarting anyway in {} s; a key keeps this screen",
                 seconds_left.unwrap_or(seconds)
             ),
-            After::Held { seconds } => write!(w, "A key holds this screen for {} s", seconds_left.unwrap_or(seconds)),
+            After::Held { seconds } => write!(
+                w,
+                "A key holds this screen for {} s",
+                seconds_left.unwrap_or(seconds)
+            ),
             After::PowerOff => write!(w, "Powering off"),
         }
     }
@@ -497,9 +508,18 @@ mod tests {
             After::decide(Some(5), None, true, Some(0)),
             Restart { seconds: 5 }
         );
-        assert_eq!(After::decide(Some(5), None, false, None), Restart { seconds: 5 });
-        assert_eq!(After::decide(None, None, true, None), Restart { seconds: 30 });
-        assert_eq!(After::decide(None, None, false, Some(1)), Restart { seconds: 30 });
+        assert_eq!(
+            After::decide(Some(5), None, false, None),
+            Restart { seconds: 5 }
+        );
+        assert_eq!(
+            After::decide(None, None, true, None),
+            Restart { seconds: 30 }
+        );
+        assert_eq!(
+            After::decide(None, None, false, Some(1)),
+            Restart { seconds: 30 }
+        );
         assert_eq!(After::decide(None, None, false, None), PowerOff);
         assert_eq!(After::decide(Some(0), None, true, Some(9)), StayAsked);
         assert_eq!(After::decide(Some(0), None, false, None), StayAsked);
@@ -548,16 +568,32 @@ mod tests {
         let mut out = [0u8; 256];
         let mut f = facts(None, &[]);
         f.reason = "Heap allocation error, layout = Layout {\n    size: 0x200000,\n    align: 8 (1 << 3),\n}";
-        assert_eq!(text(|w| f.write_headline(w), &mut out), "Kernel panic: heap allocation of 2 MiB failed");
+        assert_eq!(
+            text(|w| f.write_headline(w), &mut out),
+            "Kernel panic: heap allocation of 2 MiB failed"
+        );
         f.reason = "Heap allocation error, layout = Layout { size: 262144, align: 1 }";
-        assert_eq!(text(|w| f.write_headline(w), &mut out), "Kernel panic: heap allocation of 256 KiB failed");
+        assert_eq!(
+            text(|w| f.write_headline(w), &mut out),
+            "Kernel panic: heap allocation of 256 KiB failed"
+        );
         f.reason = "Heap allocation error, layout = Layout { size: 0x1800, align: 8 }";
-        assert_eq!(text(|w| f.write_headline(w), &mut out), "Kernel panic: heap allocation of 6 KiB failed");
+        assert_eq!(
+            text(|w| f.write_headline(w), &mut out),
+            "Kernel panic: heap allocation of 6 KiB failed"
+        );
         f.reason = "Heap allocation error, layout = Layout { size: 0x1880, align: 8 }";
-        assert_eq!(text(|w| f.write_headline(w), &mut out), "Kernel panic: heap allocation of 6.1 KiB failed");
+        assert_eq!(
+            text(|w| f.write_headline(w), &mut out),
+            "Kernel panic: heap allocation of 6.1 KiB failed"
+        );
         f.reason = "Heap allocation error, layout = Layout { size: 24, align: 8 }";
-        assert_eq!(text(|w| f.write_headline(w), &mut out), "Kernel panic: heap allocation of 24 bytes failed");
-        f.reason = "called `Option::unwrap()` on a `None` value at kernel/core/src/syscall/arch/arm.rs:8";
+        assert_eq!(
+            text(|w| f.write_headline(w), &mut out),
+            "Kernel panic: heap allocation of 24 bytes failed"
+        );
+        f.reason =
+            "called `Option::unwrap()` on a `None` value at kernel/core/src/syscall/arch/arm.rs:8";
         assert_eq!(
             text(|w| f.write_headline(w), &mut out),
             "Kernel panic: called `Option::unwrap()` on a `None` value at kernel/core/src/syscall/arch/arm.rs:8"
@@ -569,9 +605,15 @@ mod tests {
             "Soft lockup: CPU 2 is stuck, perhaps with interrupts off: its watchdog thread did not run for 20 s"
         );
         f.reason = "";
-        assert_eq!(text(|w| f.write_headline(w), &mut out), "Soft lockup: (no reason given)");
+        assert_eq!(
+            text(|w| f.write_headline(w), &mut out),
+            "Soft lockup: (no reason given)"
+        );
         f.reason = "Heap allocation error, layout = (cut";
-        assert_eq!(text(|w| f.write_headline(w), &mut out), "Soft lockup: Heap allocation error, layout = (cut");
+        assert_eq!(
+            text(|w| f.write_headline(w), &mut out),
+            "Soft lockup: Heap allocation error, layout = (cut"
+        );
     }
 
     #[test]
@@ -591,10 +633,28 @@ mod tests {
             text(|w| unsaved.write_footer(w, "Powering off", false), &mut out),
             "uptime 61.2 s | Powering off | full record: the serial console"
         );
-        let looped = After::StayLoop { crashes: 3, seconds: 300 };
-        assert!(text(|w| looped.write_short_status(w, None), &mut status).starts_with("Crashed 3 times in a row. Restarting anyway in 300 s"));
-        assert_eq!(text(|w| After::StayAsked.write_short_status(w, None), &mut status), "Staying here (lucina.panic=0)");
-        assert!(text(|w| After::Held { seconds: 3600 }.write_short_status(w, None), &mut status).starts_with("A key holds this screen"));
+        let looped = After::StayLoop {
+            crashes: 3,
+            seconds: 300,
+        };
+        assert!(
+            text(|w| looped.write_short_status(w, None), &mut status)
+                .starts_with("Crashed 3 times in a row. Restarting anyway in 300 s")
+        );
+        assert_eq!(
+            text(
+                |w| After::StayAsked.write_short_status(w, None),
+                &mut status
+            ),
+            "Staying here (lucina.panic=0)"
+        );
+        assert!(
+            text(
+                |w| After::Held { seconds: 3600 }.write_short_status(w, None),
+                &mut status
+            )
+            .starts_with("A key holds this screen")
+        );
     }
 
     #[test]

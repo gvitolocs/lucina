@@ -9,6 +9,14 @@
 
 /// Bytes before the first record: the header, the state, and room.
 pub const FIRST_ZONE: usize = 4096;
+/// The epoch block (patch 1370): three copies of a tag, an id and a checksum, each with its Reed-Solomon parity, in the first
+/// zone's free bytes. The header takes 0..96 and the state 128..516 (two protected copies of 24 bytes), so 1024 is free
+/// and far from both. store.rs checks at compile time that the three copies end below [`FIRST_ZONE`].
+pub const EPOCH_AT: usize = 1024;
+/// Bytes from one copy of the epoch block to the next: 16 of data and 170 of parity, rounded up.
+pub const EPOCH_COPY: usize = 192;
+/// Copies of the epoch block.
+pub const EPOCH_COPIES: usize = 3;
 /// Record slots.
 pub const RECORDS: usize = 8;
 /// The smallest region the store takes.

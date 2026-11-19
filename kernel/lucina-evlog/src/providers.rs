@@ -38,6 +38,7 @@ pub mod id {
     pub const SOFT_LOCKUP: u32 = 1002;
     pub const WATCHDOG_BARK: u32 = 1003;
     pub const USER_WATCHDOG: u32 = 1004;
+    pub const REGION_RESTARTED: u32 = 1005;
     // Juno-Kernel-Live
     pub const KERNEL_WARNING: u32 = 141;
     pub const MODEM_FAILED: u32 = 331;
@@ -240,6 +241,15 @@ pub const DEFS: &[Def] = &[
         channel: Channel::System,
         windows: "EventLog 104, 1102",
         meaning: "someone cleared the event log",
+    },
+    Def {
+        provider: CRASH,
+        id: id::REGION_RESTARTED,
+        name: "Saved crash log started over",
+        level: Level::Warning,
+        channel: Channel::System,
+        windows: "none",
+        meaning: "the saved log's RAM region could not be used (new, wiped, overwritten, or laid out again by an older kernel) and was started over, so the records it held are lost; the summary says why",
     },
     Def {
         provider: EVENTLOG,

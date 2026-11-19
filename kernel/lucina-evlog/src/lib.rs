@@ -10,19 +10,23 @@
 //! - [`ingest`]: what a boot reads in: the saved crash log and the PMIC's reasons, once.
 //! - [`export`]: the log in words and in one JSON, for people and agents (CLI, lucina-devd's `reliability` tool).
 //! - [`follow`]: the running system's events and kernel errors as they happen, with repeats folded.
+//! - [`epoch`], [`keys`]: which epoch of the log a status belongs to when the saved log's boot counter starts over, and the keys that carry it.
 //! - [`rules`]: the PMIC reason choice, the warning gate and retention's drop count, Verus-checked as shipped.
 //! - [`sample`]: a made-up log from real records, for the app and tests.
 //! - [`timeline`]: Reliability Monitor's days, categories and the stability index, with its formula shown.
 
 pub mod analyze;
 pub mod bucket;
+pub mod epoch;
 pub mod event;
 pub mod export;
 pub mod follow;
 pub mod ingest;
+pub mod keys;
 pub mod pon;
 pub mod providers;
 pub mod record;
+pub mod record_text;
 pub mod rules;
 pub mod sample;
 pub mod store;

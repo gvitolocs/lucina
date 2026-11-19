@@ -342,6 +342,8 @@ pub struct Status {
     pub last_boot: String,
     /// The format the saved log had before this boot moved it to the current one, if it did.
     pub format_upgraded_from: Option<u32>,
+    /// The saved log's epoch id (patch 1370): the boot number counts within it. `None` from a kernel that says none, or a bad value.
+    pub epoch: Option<u64>,
     pub saved: Vec<Saved>,
 }
 
@@ -361,6 +363,12 @@ impl Status {
                     status.crashes_in_a_row = value.parse().unwrap_or(0);
                 }
                 (Some("last_boot"), Some(value)) => status.last_boot = value.to_string(),
+                (Some("epoch"), Some(value)) => {
+                    status.epoch = (value.len() == 16
+                        && value.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .then(|| u64::from_str_radix(value, 16).ok())
+                    .flatten();
+                }
                 (Some("format_upgraded_from"), Some(value)) => {
                     status.format_upgraded_from = value.parse().ok();
                 }
@@ -581,6 +589,24 @@ mod tests {
         assert_eq!(s.saved[0].kind, "unexplained reset");
         assert_eq!(s.saved[1].reason, "boom at x.rs:1");
         assert_eq!((s.saved[1].slot, s.saved[1].len), (1, 900));
+    }
+
+    #[test]
+    fn the_epoch_line_is_read() {
+        assert_eq!(Status::parse(STATUS).epoch, None);
+        let s = Status::parse("boot 4\nepoch 00000000deadbeef\nlast_boot clean\n");
+        assert_eq!(s.epoch, Some(0xdead_beef));
+        let s = Status::parse("boot 4\nepoch fedcba9876543210\n");
+        assert_eq!(s.epoch, Some(0xfedc_ba98_7654_3210));
+        for bad in [
+            "epoch",
+            "epoch zz",
+            "epoch 123",
+            "epoch +000000000000001",
+            "epoch 00000000deadbeef0",
+        ] {
+            assert_eq!(Status::parse(bad).epoch, None, "{bad}");
+        }
     }
 
     #[test]

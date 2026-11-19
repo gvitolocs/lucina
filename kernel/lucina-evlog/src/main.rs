@@ -10,7 +10,7 @@
 //! lucina-evlog timeline [--days N]    the days with their stability index and counts (Reliability Monitor)
 //! lucina-evlog problems               the crash buckets: what keeps happening, how often, since when
 //! lucina-evlog report [--days N]      everything an agent needs in one JSON: today's index, days, problems, recent failures
-//! lucina-evlog backfill-boot <boot> <unix ms> [--source S] [--pon LINE]   a boot's start the log missed
+//! lucina-evlog backfill-boot <boot> <unix ms> [--epoch N] [--source S] [--pon LINE]   a boot's start the log missed
 //! lucina-evlog import <status> <dump> a pstore status file and a `=== record <slot>` dump taken elsewhere
 //! lucina-evlog clear [--by WHO]       forgets every event, and says so in the log
 //! ```
@@ -229,7 +229,7 @@ fn main() -> ExitCode {
             for rec in &r.added {
                 if let Some(e) = events.iter().find(|e| e.record == *rec) {
                     // Only how the boot before this one ended: older records read in late are history, not news for the screen.
-                    if e.level <= Level::Error && r.boot.is_some_and(|b| e.boot == Some(b.wrapping_sub(1))) {
+                    if e.level <= Level::Error && e.epoch == r.epoch && r.boot.is_some_and(|b| e.boot == Some(b.wrapping_sub(1))) {
                         // The kernel log, so the saved log and the console carry it too.
                         let line = format!("lucina-evlog: #{} {}\n", e.record, e.summary);
                         let _ = fs::OpenOptions::new().write(true).open("/dev/kmsg").and_then(|mut k| io::Write::write_all(&mut k, line.as_bytes()));
@@ -240,12 +240,12 @@ fn main() -> ExitCode {
                 }
             }
             if a.json {
-                println!("{}", json!({"boot": r.boot, "added": r.added, "known": r.known, "pon_found": r.pon_found}));
+                println!("{}", json!({"boot": r.boot, "epoch": r.epoch, "added": r.added, "known": r.known, "pon_found": r.pon_found}));
             } else {
                 println!("boot {}: {} new events, {} already in the log, PMIC reasons {}", r.boot.map_or("?".into(), |b| b.to_string()), r.added.len(), r.known, if r.pon_found { "read" } else { "not in the log" });
             }
             if cmd == "follow" {
-                return follow(s, r.boot);
+                return follow(s, r.boot, r.epoch);
             }
             ExitCode::SUCCESS
         }
@@ -280,10 +280,20 @@ fn main() -> ExitCode {
                 events.iter().rev().find(|e| e.level == Level::Critical)
             };
             let Some(e) = found else { return fail("no such event".into()) };
+            let full = e.text_file.as_deref().map(|f| lucina_evlog::record_text::read(&a.dir, f));
             if a.json {
-                println!("{}", serde_json::to_string(e).unwrap_or_default());
+                let mut v = serde_json::to_value(e).unwrap_or_default();
+                if let Some(Some(text)) = &full {
+                    v["record_text"] = json!(String::from_utf8_lossy(text));
+                }
+                println!("{v}");
             } else {
                 print!("{}", export::event_text(e, off));
+                match (&e.text_file, full) {
+                    (Some(f), Some(Some(text))) => print!("\n--- the record's full text ({f}) ---\n{}", String::from_utf8_lossy(&text)),
+                    (Some(f), _) => println!("\n(the record's full text, {f}, was dropped to stay within 4 MiB)"),
+                    _ => {}
+                }
             }
             ExitCode::SUCCESS
         }
@@ -337,13 +347,14 @@ fn main() -> ExitCode {
         "import" if !data_ready(&a.dir, 0) => fail("/data is not mounted".into()),
         "backfill-boot" => {
             let (Some(boot), Some(t)) = (a.rest.get(1).and_then(|b| b.parse().ok()), a.rest.get(2).and_then(|t| t.parse().ok())) else {
-                return fail("usage: lucina-evlog backfill-boot <boot> <unix ms> [--source S] [--pon LINE]".into());
+                return fail("usage: lucina-evlog backfill-boot <boot> <unix ms> [--epoch N] [--source S] [--pon LINE]".into());
             };
             let mut s = match Store::open(&a.dir, Retention::default()) {
                 Ok(s) => s,
                 Err(e) => return fail(e.to_string()),
             };
-            match ingest::backfill_boot(&mut s, boot, t, a.opt("--pon"), a.opt("--source").unwrap_or("given by hand"), now) {
+            let epoch = a.opt("--epoch").and_then(|e| e.parse().ok()).unwrap_or_else(|| ingest::load_epoch_state(&a.dir).map_or(0, |st| st.epoch));
+            match ingest::backfill_boot(&mut s, epoch, boot, t, a.opt("--pon"), a.opt("--source").unwrap_or("given by hand"), now) {
                 Ok(r) => {
                     println!("{r:?}");
                     ExitCode::SUCCESS
@@ -389,9 +400,9 @@ fn main() -> ExitCode {
 }
 
 /// Runs for ever: lucina-eventd's kernel probes on one thread, /dev/kmsg's new lines on another, one store between them.
-fn follow(store: Store, boot: Option<u32>) -> ExitCode {
+fn follow(store: Store, boot: Option<u32>, epoch: u32) -> ExitCode {
     let store = Arc::new(Mutex::new(store));
-    let follower = Arc::new(Mutex::new(Follower::new(boot)));
+    let follower = Arc::new(Mutex::new(Follower::in_epoch(boot, epoch)));
     let write = {
         let store = store.clone();
         move |e: Event| {

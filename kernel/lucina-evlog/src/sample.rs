@@ -66,6 +66,7 @@ pub fn events(now_ms: i64) -> Vec<Event> {
         next_pon_source: Some("boot 3's kernel log".into()),
         boot_start_ms: Some(d5),
         next_boot_start_ms: Some(d5 + 3 * MIN),
+        epoch: 0,
     };
     out.push(analyze::saved_event(
         &saved(2, 20, "unexplained reset"),
@@ -103,6 +104,7 @@ pub fn events(now_ms: i64) -> Vec<Event> {
         next_pon_source: Some("boot 8's kernel log".into()),
         boot_start_ms: Some(t),
         next_boot_start_ms: Some(t + 4 * MIN),
+        epoch: 0,
     };
     out.push(analyze::saved_event(
         &saved(7, 41, "unexplained reset"),
@@ -116,6 +118,7 @@ pub fn events(now_ms: i64) -> Vec<Event> {
         next_pon_source: Some("boot 12's kernel log".into()),
         boot_start_ms: Some(t11),
         next_boot_start_ms: Some(t11 + 92 * MIN),
+        epoch: 0,
     };
     out.push(analyze::saved_event(
         &saved(11, 44, "panic"),
@@ -129,6 +132,7 @@ pub fn events(now_ms: i64) -> Vec<Event> {
         next_pon_source: Some("boot 14's kernel log".into()),
         boot_start_ms: Some(t13),
         next_boot_start_ms: Some(t13 + 8 * MIN),
+        epoch: 0,
     };
     out.push(analyze::saved_event(
         &saved(13, 46, "unexplained reset"),
@@ -142,6 +146,7 @@ pub fn events(now_ms: i64) -> Vec<Event> {
         next_pon_source: Some("boot 17's kernel log".into()),
         boot_start_ms: Some(t16),
         next_boot_start_ms: Some(t16 + 2 * MIN),
+        epoch: 0,
     };
     out.push(analyze::saved_event(
         &saved(16, 48, "unexplained reset"),

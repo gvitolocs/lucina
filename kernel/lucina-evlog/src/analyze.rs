@@ -10,6 +10,7 @@ use serde_json::json;
 
 use crate::bucket;
 use crate::event::{Cause, Channel, Confidence, Event, Evidence, Level, LogLine};
+use crate::keys;
 use crate::pon::{OffReason, OnBit, Pon};
 use crate::providers::{self, id};
 use crate::record::{self, Record};
@@ -44,6 +45,8 @@ pub struct Context {
     pub boot_start_ms: Option<i64>,
     /// Wall clock at the start of the next boot.
     pub next_boot_start_ms: Option<i64>,
+    /// The event log's epoch of the record's boot (patch 1370).
+    pub epoch: u32,
 }
 
 /// A record as `/sys/fs/pstore/status` lists it.
@@ -67,11 +70,6 @@ impl From<&lucina_watchd::Saved> for Saved {
             reason: s.reason.clone(),
         }
     }
-}
-
-/// The source key of a saved record: the boot counter and the record's sequence number never repeat together.
-pub fn saved_key(boot: u32, seq: u32) -> String {
-    format!("pstore:boot{boot}:seq{seq}")
 }
 
 /// A subsystem's name in words.
@@ -650,6 +648,30 @@ pub fn saved_event(saved: &Saved, text: &[u8], ctx: &Context) -> Event {
                 ),
             ));
         }
+        // Patch 1370: the saved log could not use its region and laid it out afresh; the record is the new region's first, and
+        // says why. An event inside the boot, like the modem's: the next boot's PMIC reasons say nothing about it.
+        "region restarted" => {
+            provider = providers::CRASH;
+            eid = id::REGION_RESTARTED;
+            level = Level::Warning;
+            fields.remove("pon");
+            let why = rec.reason.lines().next().unwrap_or("").trim().to_string();
+            summary = format!(
+                "The saved crash log was started over: {why}; the records it held are lost."
+            );
+            cause = Some(Cause {
+                text: format!("The saved log's region could not be used as it was: {why}."),
+                confidence: Confidence::Certain,
+            });
+            next_step = None;
+            bucket = Some(bucket::make(
+                &[
+                    ("kind", "region restarted".into()),
+                    ("reason", bucket::normalize(&why)),
+                ],
+                format!("saved log restarted: {}", bucket::normalize(&why)),
+            ));
+        }
         "requested reset" => {
             provider = providers::KERNEL_POWER;
             eid = id::RESTART_REQUESTED;
@@ -769,15 +791,17 @@ pub fn saved_event(saved: &Saved, text: &[u8], ctx: &Context) -> Event {
     }
 
     let mut e = Event::new(provider, eid, level, Channel::System, summary);
-    e.key = Some(saved_key(saved.boot, saved.seq));
+    e.key = Some(keys::saved_key(ctx.epoch, saved.boot, saved.seq));
     e.boot = Some(saved.boot);
+    e.epoch = ctx.epoch;
     e.uptime_ms = last_ms;
     e.build = rec.build.clone();
-    e.activity = Some(format!("boot:{}", saved.boot));
+    e.activity = Some(keys::activity(ctx.epoch, saved.boot));
     e.cause = cause;
     e.next_step = next_step;
     e.bucket = bucket;
-    if saved.kind != "modem" {
+    let inside_the_boot = matches!(saved.kind.as_str(), "modem" | "region restarted");
+    if !inside_the_boot {
         ev.extend(pmic);
     }
     e.evidence = ev;
@@ -790,7 +814,7 @@ pub fn saved_event(saved: &Saved, text: &[u8], ctx: &Context) -> Event {
             e.time_ms = Some(start + ms as i64);
             e.time_estimated = true;
         }
-        (_, _, Some(next)) if saved.kind != "modem" => {
+        (_, _, Some(next)) if !inside_the_boot => {
             e.time_ms = Some(next - FIRMWARE_RESTART_MS);
             e.time_estimated = true;
             e.evidence.push(Evidence {
@@ -801,6 +825,10 @@ pub fn saved_event(saved: &Saved, text: &[u8], ctx: &Context) -> Event {
             });
         }
         _ => {}
+    }
+    if saved.kind == "region restarted" && e.time_ms.is_none() {
+        // Written at the start of its boot.
+        e.time_ms = ctx.boot_start_ms;
     }
     e
 }
@@ -874,6 +902,19 @@ pub fn boot_started(
     pon: Option<Pon>,
     last_boot: &str,
 ) -> Event {
+    boot_started_in(0, boot, now_ms, uptime_ms, build, pon, last_boot)
+}
+
+/// [`boot_started`] in an epoch of the event log (patch 1370).
+pub fn boot_started_in(
+    epoch: u32,
+    boot: u32,
+    now_ms: i64,
+    uptime_ms: u64,
+    build: Option<String>,
+    pon: Option<Pon>,
+    last_boot: &str,
+) -> Event {
     let how = match pon {
         Some(p) => {
             let by: Vec<&str> = p.on_bits().iter().map(|b| b.plain()).collect();
@@ -892,12 +933,13 @@ pub fn boot_started(
         Channel::System,
         format!("Juno started, boot {boot}{how}."),
     );
-    e.key = Some(format!("boot:{boot}"));
+    e.key = Some(keys::boot_key(epoch, boot));
     e.boot = Some(boot);
+    e.epoch = epoch;
     e.uptime_ms = Some(0);
     e.time_ms = Some(now_ms - uptime_ms as i64);
     e.build = build;
-    e.activity = Some(format!("boot:{boot}"));
+    e.activity = Some(keys::activity(epoch, boot));
     e.fields.insert("last_boot".into(), json!(last_boot));
     if let Some(p) = pon {
         e.fields.insert(
@@ -945,6 +987,16 @@ pub fn pon_of(e: &Event) -> Option<Pon> {
 
 /// The clean end of a boot (Kernel-General 13 / User32 1074 rolled into one), with who asked, from that boot's log.
 pub fn clean_end(boot: u32, last_log: &[LogLine], next_boot_start_ms: Option<i64>) -> Event {
+    clean_end_in(0, boot, last_log, next_boot_start_ms)
+}
+
+/// [`clean_end`] in an epoch of the event log (patch 1370).
+pub fn clean_end_in(
+    epoch: u32,
+    boot: u32,
+    last_log: &[LogLine],
+    next_boot_start_ms: Option<i64>,
+) -> Event {
     // Patch 0842: "[kernel] <program> (pid <n>) asks for <Command>".
     let asked = last_log.iter().rev().find_map(|l| {
         let rest = l.text.strip_prefix("[kernel] ")?;
@@ -965,9 +1017,10 @@ pub fn clean_end(boot: u32, last_log: &[LogLine], next_boot_start_ms: Option<i64
         Channel::System,
         summary,
     );
-    e.key = Some(format!("end:boot{boot}"));
+    e.key = Some(keys::end_key(epoch, boot));
     e.boot = Some(boot);
-    e.activity = Some(format!("boot:{boot}"));
+    e.epoch = epoch;
+    e.activity = Some(keys::activity(epoch, boot));
     if let Some((who, cmd, at)) = asked {
         e.fields.insert("by".into(), json!(who));
         e.fields.insert("command".into(), json!(cmd));

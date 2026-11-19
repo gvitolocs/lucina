@@ -17,6 +17,7 @@ fn ctx(pon: Pon) -> Context {
         next_pon_source: Some("boot 17's kernel log".into()),
         boot_start_ms: Some(1_000_000),
         next_boot_start_ms: Some(2_000_000),
+        epoch: 0,
     }
 }
 
@@ -338,7 +339,10 @@ fn the_records_own_pmic_line_stands_in_for_the_next_boots_log() {
     let key = e
         .evidence
         .iter()
-        .find(|v| v.fact.starts_with("The next boot was started by the power key"))
+        .find(|v| {
+            v.fact
+                .starts_with("The next boot was started by the power key")
+        })
         .expect("the power key from the record's line");
     assert!(
         key.source.contains("pmic line, written by boot 17"),
@@ -349,7 +353,9 @@ fn the_records_own_pmic_line_stands_in_for_the_next_boots_log() {
     // The next boot's own log, when the ingest has it, still wins.
     let e2 = saved_event(&saved("unexplained reset"), t.as_bytes(), &ctx(PON_RESET));
     assert!(
-        !e2.evidence.iter().any(|v| v.fact.starts_with("The next boot was started by the power key")),
+        !e2.evidence.iter().any(|v| v
+            .fact
+            .starts_with("The next boot was started by the power key")),
         "{:#?}",
         e2.evidence
     );

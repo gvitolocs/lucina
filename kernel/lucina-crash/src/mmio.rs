@@ -47,6 +47,57 @@ pub const COPIES: usize = 5;
 pub const ENTRY_LEN: usize = 24;
 /// Bytes before the entries.
 pub const HEADER_LEN: usize = 64;
+/// Where the idle-stamp mode word is written, three copies in the header's spare bytes after the [`COPIES`] header words
+/// (patch 1371, review finding 4 of patch 1213).
+pub const MODE_OFFSETS: [usize; 3] = [COPIES * 8, COPIES * 8 + 8, COPIES * 8 + 16];
+const _: () = assert!(MODE_OFFSETS[2] + 8 <= HEADER_LEN);
+/// `MD` in the top bits of the mode word; the idle-stamp mode is in the low byte.
+pub const MODE_TAG: u64 = 0x4d44 << 48;
+
+/// Which WFI entries the kernel stamped (`lucina.idlestamp=off|on|stopped`). A CPU's idle state is known only when the mode
+/// is `On`: with `Off` there are no stamps, and with `Stopped` a sleep with the tick running is never stamped, so the last
+/// stamp can be an older exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdleMode {
+    /// The word is not there (a kernel from before the word, or a format-2 trace) or does not read.
+    Unknown,
+    On,
+    Stopped,
+    Off,
+}
+
+impl IdleMode {
+    pub const fn word(self) -> u64 {
+        MODE_TAG
+            | match self {
+                IdleMode::Unknown => 0,
+                IdleMode::On => 1,
+                IdleMode::Stopped => 2,
+                IdleMode::Off => 3,
+            }
+    }
+
+    pub const fn decode(word: u64) -> IdleMode {
+        if word & TAG_MASK != MODE_TAG {
+            return IdleMode::Unknown;
+        }
+        match word & 0xff {
+            1 => IdleMode::On,
+            2 => IdleMode::Stopped,
+            3 => IdleMode::Off,
+            _ => IdleMode::Unknown,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            IdleMode::Unknown => "unknown",
+            IdleMode::On => "on",
+            IdleMode::Stopped => "for tick-stopped sleeps",
+            IdleMode::Off => "off",
+        }
+    }
+}
 /// Remote processors whose SMP2P state is kept after the entries (patch 1210): the modem (MPSS, which also runs the
 /// Wi-Fi firmware on sc7180) and the audio DSP (ADSP).
 pub const REMOTES: [&str; 2] = ["mpss", "adsp"];
@@ -332,6 +383,10 @@ impl Wait {
             return None;
         }
         let low = words[0] & ADDR_MASK;
+        // The kernel clears a wait with zeros, so a tag over address 0 is bit flips, not a wait.
+        if low == 0 {
+            return None;
+        }
         let lock = if low & (1 << 47) != 0 {
             low | TAG_MASK
         } else {
@@ -567,6 +622,8 @@ pub struct Trace {
     pub cpus: [[Option<Entry>; ENTRIES]; CPUS],
     /// Each of [`REMOTES`], if the area has room for them and a kernel wrote one (patch 1210).
     pub remotes: [Option<Remote>; 2],
+    /// Which WFI entries were stamped; only `On` makes a CPU's idle state known.
+    pub idle_mode: IdleMode,
     /// Each CPU's last WFI entry or exit (format 3).
     pub idle: [Option<Idle>; CPUS],
     /// Each CPU's spin-lock wait of a second or more, if it was still waiting (format 3).
@@ -608,6 +665,7 @@ impl Trace {
             image_hash: (header >> 32) as u32,
             cpus,
             remotes: [None; 2],
+            idle_mode: IdleMode::Unknown,
             idle: [None; CPUS],
             waits: [None; CPUS],
             wake: None,
@@ -628,6 +686,9 @@ impl Trace {
             *slot = Remote::decode([word(0), word(1)]);
         }
         if l.has_stamps() {
+            let w = MODE_OFFSETS.map(|at_| read_word(mem, at + at_));
+            let voted = w[0] & w[1] | w[0] & w[2] | w[1] & w[2];
+            trace.idle_mode = IdleMode::decode(voted);
             for cpu in 0..CPUS {
                 let word = |w: usize| vote(mem, |copy| at + l.idle_offset(copy, cpu) + w * 8);
                 trace.idle[cpu] = Idle::decode([word(0), word(1)]);
@@ -815,6 +876,7 @@ impl Trace {
                 writeln!(w)?;
             }
             let (waiting, in_wfi, seen) = self.wait_chain();
+            let unknown = self.idle_unknown();
             let waiters = waiting.iter().filter(|l| **l != 0).count();
             if let (Some(lock), true) = (waits::same_lock(&waiting), waiters > 1) {
                 writeln!(w, "  all {waiters} waiters wait on lock {lock:#x}")?;
@@ -828,6 +890,24 @@ impl Trace {
                 from = cpu + 1;
             }
             writeln!(w, "{}", if none { " none traced" } else { "" })?;
+            // The CPUs that would be listed if they were not in WFI, but whose idle state the trace does not know.
+            let known_in_wfi: [bool; CPUS] =
+                core::array::from_fn(|cpu| in_wfi[cpu] && !unknown[cpu]);
+            let mut from = 0;
+            let mut any = false;
+            while let Some(cpu) = waits::next_holder(from, &waiting, &known_in_wfi, &seen) {
+                if unknown[cpu] {
+                    if !any {
+                        write!(w, "  may hold it (idle state unknown):")?;
+                        any = true;
+                    }
+                    write!(w, " cpu {cpu}")?;
+                }
+                from = cpu + 1;
+            }
+            if any {
+                writeln!(w)?;
+            }
         }
         if let Some(k) = self.wake {
             if k.released {
@@ -884,11 +964,20 @@ impl Trace {
         Ok(())
     }
 
-    /// What the wait-chain reader ([`waits`]) takes: each CPU's waited-on lock (0 for none), whether it sat in WFI, and
+    /// The CPUs whose idle state the trace does not know: no stamp, or a stamp mode other than `On`.
+    pub fn idle_unknown(&self) -> [bool; CPUS] {
+        core::array::from_fn(|cpu| self.idle_mode != IdleMode::On || self.idle[cpu].is_none())
+    }
+
+    /// What the wait-chain reader ([`waits`]) takes: each CPU's waited-on lock (0 for none), whether it sat in WFI (true when unknown) and
     /// whether it left any trace.
     pub fn wait_chain(&self) -> ([u64; CPUS], [bool; CPUS], [bool; CPUS]) {
         let waiting = core::array::from_fn(|cpu| self.waits[cpu].map_or(0, |x| x.lock));
-        let in_wfi = core::array::from_fn(|cpu| self.idle[cpu].is_some_and(|i| i.in_wfi));
+        // An unknown idle state counts as in WFI here, so that [`waits`] leaves the CPU out of the holders it is sure of;
+        // `write_text` lists those CPUs apart (`idle_unknown`).
+        let unknown = self.idle_unknown();
+        let in_wfi =
+            core::array::from_fn(|cpu| unknown[cpu] || self.idle[cpu].is_some_and(|i| i.in_wfi));
         let seen = core::array::from_fn(|cpu| {
             self.idle[cpu].is_some() || self.newest_first(cpu).1 > 0 || self.waits[cpu].is_some()
         });
@@ -958,6 +1047,12 @@ mod tests {
 
     fn start(mem: &mut Ram, at: usize, hash: u32) {
         put(mem, |copy| at + header_offset(copy), &[header_word(hash)]);
+    }
+
+    fn put_mode(mem: &mut Ram, mode: IdleMode) {
+        for at in MODE_OFFSETS {
+            mem.write(at, &mode.word().to_le_bytes());
+        }
     }
 
     fn entry(seq: u16, pa: u64) -> Entry {
@@ -1604,6 +1699,7 @@ mod tests {
         let f = 19_200_000;
         let mut mem = ram();
         start(&mut mem, 0, 1);
+        put_mode(&mut mem, IdleMode::On);
         note_at(&mut mem, 0, 1, 0, 0x1000, 10 * f);
         let stamp = |in_wfi, tick_stopped, count, time| {
             Idle {
@@ -1681,6 +1777,91 @@ mod tests {
             "{}",
             s.as_str()
         );
+    }
+
+    #[test]
+    fn a_cpu_whose_idle_state_is_unknown_is_listed_apart() {
+        let f = 19_200_000;
+        let lock = 0xffff_8000_0040_1230;
+        let build = |mode: Option<IdleMode>| {
+            let mut mem = ram();
+            start(&mut mem, 0, 1);
+            if let Some(mode) = mode {
+                put_mode(&mut mem, mode);
+            }
+            note_at(&mut mem, 0, 1, 0, 0x1000, 10 * f); // cpu 1: traced, no stamp
+            note_at(&mut mem, 0, 5, 0, 0x1000, 10 * f); // cpu 5: traced, stamped running
+            let running = Idle {
+                in_wfi: false,
+                tick_stopped: false,
+                count: 3,
+                time: 9 * f,
+            }
+            .encode();
+            put(&mut mem, |copy| idle_offset(copy, 5), &running);
+            for cpu in [2, 3] {
+                put(
+                    &mut mem,
+                    |copy| wait_offset(copy, cpu),
+                    &Wait {
+                        lock,
+                        location: 1,
+                        since: 5 * f,
+                    }
+                    .encode(),
+                );
+            }
+            text(&Trace::read(&mem, 0).unwrap(), 2, f)
+        };
+        // Stamps on: cpu 5 is known to run, cpu 1 has no stamp, so its state is unknown.
+        let on = build(Some(IdleMode::On));
+        assert!(
+            on.as_str().contains(
+                "not in WFI): cpu 5
+"
+            ),
+            "{}",
+            on.as_str()
+        );
+        assert!(
+            on.as_str().contains(
+                "  may hold it (idle state unknown): cpu 1
+"
+            ),
+            "{}",
+            on.as_str()
+        );
+        // Stamps stopped-only, off, or no mode word: nobody's state is known.
+        for mode in [Some(IdleMode::Stopped), Some(IdleMode::Off), None] {
+            let t = build(mode);
+            assert!(
+                t.as_str().contains("not in WFI): none traced\n"),
+                "{}",
+                t.as_str()
+            );
+            assert!(
+                t.as_str()
+                    .contains("  may hold it (idle state unknown): cpu 1 cpu 5\n"),
+                "{:?} {}",
+                mode,
+                t.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn a_wait_tag_over_address_zero_is_no_wait() {
+        let mut words = Wait {
+            lock: 0x40,
+            location: 1,
+            since: 2,
+        }
+        .encode();
+        assert!(Wait::decode(words).is_some());
+        words[0] = WAIT_TAG;
+        assert_eq!(Wait::decode(words), None);
+        // Bit flips in the tag's low half only: still a wait to someone's address.
+        assert!(Wait::decode([WAIT_TAG | 1, 0, 0]).is_some());
     }
 
     struct Text {

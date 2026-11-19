@@ -66,6 +66,17 @@ pub const MIN_SIZE: usize = 64 * 1024;
 /// How many bytes of the console an unexplained reset's record keeps, at most.
 const UNEXPLAINED_TAIL: usize = 48 * 1024;
 
+/// The epoch block's tag (patch 1370).
+const EPOCH_TAG: u32 = u32::from_le_bytes(*b"EPCH");
+/// Its data: the tag, the id, a checksum over both.
+const EPOCH_FIELDS: usize = 16;
+// The epoch block sits after the state, and its three copies end below the first record.
+const _: () = assert!(
+    layout::EPOCH_AT >= STATE_AT + protected_len(STATE_LEN)
+        && layout::EPOCH_COPY >= EPOCH_FIELDS + PARITY
+        && layout::EPOCH_AT + layout::EPOCH_COPIES * layout::EPOCH_COPY <= FIRST_ZONE
+);
+
 /// The longest reason a program can give for a restart.
 const MAX_REASON: usize = 256;
 
@@ -406,6 +417,164 @@ pub struct Scrub {
     pub lost_blocks: usize,
 }
 
+/// A new epoch id from the words the hardware gave: the counter, the region's address and a random word, mixed (splitmix64)
+/// with the size. Never 0, which stands for "no epoch yet".
+fn new_epoch_id(seed: u64, size: usize) -> u64 {
+    let mut x = seed ^ (size as u64).rotate_left(32);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    x.max(1)
+}
+
+fn epoch_fields(id: u64) -> [u8; EPOCH_FIELDS] {
+    let mut f = [0u8; EPOCH_FIELDS];
+    f[..4].copy_from_slice(&EPOCH_TAG.to_le_bytes());
+    f[4..12].copy_from_slice(&id.to_le_bytes());
+    let crc = crc32(&[&f[..12]]);
+    f[12..16].copy_from_slice(&crc.to_le_bytes());
+    f
+}
+
+fn epoch_fields_ok(f: &[u8; EPOCH_FIELDS]) -> bool {
+    u32_at(f, 0) == EPOCH_TAG && crc32(&[&f[..12]]) == u32_at(f, 12)
+}
+
+/// Writes three copies of the epoch block, each with its parity, so that a reset in the middle of one leaves the others.
+fn write_epoch<M: Mem>(mem: &mut M, id: u64) {
+    let fields = epoch_fields(id);
+    let parity = ecc::parity_of(&fields);
+    for copy in 0..layout::EPOCH_COPIES {
+        let base = layout::EPOCH_AT + copy * layout::EPOCH_COPY;
+        mem.write(base, &fields);
+        mem.write(base + EPOCH_FIELDS, &parity);
+    }
+    mem.sync();
+}
+
+/// Reads the epoch block. A copy that its parity cannot correct, or whose tag or checksum is wrong, does not vote; the rest
+/// vote bit by bit (as `mmio.rs` does) and the result must pass the checksum too. `Err` says whether any copy had the tag.
+fn read_epoch_block<M: Mem>(mem: &M) -> Result<u64, EpochOrigin> {
+    let mut good: [[u8; EPOCH_FIELDS]; layout::EPOCH_COPIES] =
+        [[0; EPOCH_FIELDS]; layout::EPOCH_COPIES];
+    let mut count = 0;
+    let mut tagged = false;
+    for copy in 0..layout::EPOCH_COPIES {
+        let base = layout::EPOCH_AT + copy * layout::EPOCH_COPY;
+        let mut fields = [0u8; EPOCH_FIELDS];
+        let mut parity = [0u8; PARITY];
+        mem.read(base, &mut fields);
+        mem.read(base + EPOCH_FIELDS, &mut parity);
+        tagged |= u32_at(&fields, 0) == EPOCH_TAG;
+        if ecc::decode(&mut fields, &mut parity).is_some() && epoch_fields_ok(&fields) {
+            good[count] = fields;
+            count += 1;
+        }
+    }
+    let voted = match count {
+        0 => {
+            return Err(if tagged {
+                EpochOrigin::Damaged
+            } else {
+                EpochOrigin::NoBlock
+            });
+        }
+        3 => core::array::from_fn(|i| {
+            let (a, b, c) = (good[0][i], good[1][i], good[2][i]);
+            a & b | a & c | b & c
+        }),
+        _ => good[0],
+    };
+    let fields = if epoch_fields_ok(&voted) {
+        voted
+    } else {
+        good[0]
+    };
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&fields[4..12]);
+    Ok(u64::from_le_bytes(id))
+}
+
+/// Why the store laid a region out afresh instead of using it (patch 1372), as far as a format-4 kernel can tell.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RestartCause {
+    /// Every page was zero: nobody had used it (or RAM was wiped, which looks the same).
+    FirstUse,
+    /// Not our header: the pages by what they hold.
+    NoHeader {
+        zero_pages: usize,
+        ones_pages: usize,
+        other_pages: usize,
+    },
+    /// Our magic, another format: older than [`VERSION`] (2 or less), or newer.
+    OtherFormat(u32),
+    /// Our magic and a known format, but too many bits wrong after the vote.
+    WrongBits(u32),
+    /// Our header for a region of another size.
+    SizeChanged,
+    /// A format-3 header over an epoch block: a kernel from before patch 1213 laid out the region we had made.
+    OldKernel(u32),
+}
+
+impl core::fmt::Display for RestartCause {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            RestartCause::FirstUse => f.write_str("first use"),
+            RestartCause::NoHeader {
+                zero_pages,
+                ones_pages,
+                other_pages,
+            } => write!(
+                f,
+                "no header: {zero_pages} pages zero, {ones_pages} all ones, {other_pages} other"
+            ),
+            RestartCause::OtherFormat(n) if n < VERSION => {
+                write!(f, "header of format {n} from an older kernel")
+            }
+            RestartCause::OtherFormat(n) => write!(f, "header of format {n} from a newer kernel"),
+            RestartCause::WrongBits(m) => {
+                write!(f, "header with {m} wrong bits after the vote")
+            }
+            RestartCause::SizeChanged => f.write_str("region size changed"),
+            RestartCause::OldKernel(n) => write!(
+                f,
+                "a kernel of format {n} laid it out again (a format {n} header over an epoch block)"
+            ),
+        }
+    }
+}
+
+/// What a region that [`Store::attach`] refused held, for the log and for the first record of the new region.
+fn classify_restart<M: Mem>(mem: &M) -> RestartCause {
+    let mut h = [0u8; HEADER_LEN];
+    read_majority(mem, 0, HEADER_LEN, &mut h);
+    let magic_bits: u32 = h[..8]
+        .iter()
+        .zip(MAGIC)
+        .map(|(a, b)| (a ^ b).count_ones())
+        .sum();
+    if magic_bits <= 8 {
+        let version = u32_at(&h, 8);
+        if version != 3 && version != VERSION {
+            return RestartCause::OtherFormat(version);
+        }
+        if u32_at(&h, 12) as usize != mem.size() {
+            return RestartCause::SizeChanged;
+        }
+        let bits = Geometry::for_size(mem.size()).map_or(0, |g| majority_header_errors(mem, &g));
+        return RestartCause::WrongBits(bits);
+    }
+    match foreign_contents(mem) {
+        Some(f) if f.zero_pages == f.pages => RestartCause::FirstUse,
+        Some(f) => RestartCause::NoHeader {
+            zero_pages: f.zero_pages,
+            ones_pages: f.ones_pages,
+            other_pages: f.other_pages,
+        },
+        None => RestartCause::FirstUse,
+    }
+}
+
 /// How many bits differ between a header and what it should be.
 fn header_errors(have: &[u8; HEADER_LEN], want: &[u8; HEADER_LEN]) -> u32 {
     have.iter()
@@ -427,6 +596,15 @@ pub fn repairable_header_errors<M: Mem>(mem: &M) -> Option<u32> {
     let geometry = Geometry::for_size(mem.size())?;
     (majority_header_errors(mem, &geometry) <= HEADER_TOLERANCE)
         .then(|| all_header_errors(mem, &geometry))
+}
+
+/// Which format (3 or 4) the region's header is, if it is within the tolerance of that format's geometry, as
+/// [`repairable_header_errors`] measures: format 4 is tried first. `None` for a header that is neither.
+pub fn header_format<M: Mem>(mem: &M) -> Option<u32> {
+    [VERSION, 3].into_iter().find(|&version| {
+        Geometry::for_version(mem.size(), version)
+            .is_some_and(|g| majority_header_errors(mem, &g) <= HEADER_TOLERANCE)
+    })
 }
 
 fn all_header_errors<M: Mem>(mem: &M, geometry: &Geometry) -> u32 {
@@ -593,6 +771,9 @@ struct RecordHeader {
 const VANISHED_TITLE: &[u8] = b"The machine reset with no crash report\n\
 reason: nothing recorded a crash: a hardware watchdog, a firmware reset or a hang with interrupts off\n";
 
+/// The start of the record that keeps a clean last boot's console across the format change (format 3 to 4).
+const KEPT_CONSOLE_TITLE: &[u8] = b"the last boot's console, kept across the format change\n";
+
 pub struct Store<M: Mem> {
     mem: M,
     geometry: Geometry,
@@ -619,6 +800,37 @@ pub struct Store<M: Mem> {
     /// On the boot that upgraded the region, the record written for a boot that vanished is not rewritten: its console has
     /// moved and may be partly overwritten by now (patch 1213).
     frozen: bool,
+    /// What the hardware gave to make a new epoch id from (patch 1370): counter, address, a random word.
+    seed: u64,
+    /// This region's epoch id; 0 until the block has been read or made.
+    epoch: u64,
+    /// Why this boot made a new epoch, if it did.
+    epoch_new: Option<EpochOrigin>,
+    /// Why the region was laid out afresh, if it was (patch 1372).
+    restart: Option<RestartCause>,
+    /// The record of it is written by the first [`Store::begin_boot`].
+    restart_pending: bool,
+}
+
+/// Why a region got a new epoch id.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EpochOrigin {
+    /// The store formatted the region.
+    Formatted,
+    /// A region from before the epoch block (patch 1213), or one whose block was overwritten.
+    NoBlock,
+    /// The block was there but no copy passed its checks.
+    Damaged,
+}
+
+impl EpochOrigin {
+    pub fn name(self) -> &'static str {
+        match self {
+            EpochOrigin::Formatted => "formatted",
+            EpochOrigin::NoBlock => "no epoch block",
+            EpochOrigin::Damaged => "epoch block failed its vote",
+        }
+    }
 }
 
 /// The most that [`Store::append_unexplained`] adds to a vanished boot's record.
@@ -631,7 +843,9 @@ pub const NOTE_MAX: usize = 4096;
 /// 68 KiB in format 4's 2 MiB region (patch 1213).
 pub fn spare_tail(size: usize) -> Option<core::ops::Range<usize>> {
     let g = Geometry::for_size(size)?;
-    let end = g.console_at(2);
+    // layout::tail_start and console_at(2) are the same address; the layout is what the proofs check, and the
+    // spare tail must start where the layout says the tail starts.
+    let end = layout::tail_start(size, g.version);
     (end < size).then_some(end..size)
 }
 
@@ -639,14 +853,19 @@ pub fn spare_tail(size: usize) -> Option<core::ops::Range<usize>> {
 /// upgrades the region.
 pub fn format3_tail(size: usize) -> Option<core::ops::Range<usize>> {
     let g = Geometry::for_version(size, 3)?;
-    let end = g.console_at(2);
+    let end = layout::tail_start(size, g.version);
     (end < size).then_some(end..size)
 }
 
 impl<M: Mem> Store<M> {
     /// Takes a region as it is, repairing a header with a few wrong bits. A region that is too small, or whose header is not
     /// close to what it should be, is given back.
-    pub fn attach(mut mem: M) -> Result<Self, M> {
+    pub fn attach(mem: M) -> Result<Self, M> {
+        Self::attach_seeded(mem, 0)
+    }
+
+    /// [`Store::attach`] with the words the hardware gives for a new epoch id (see [`Store::epoch`]).
+    pub fn attach_seeded(mut mem: M, seed: u64) -> Result<Self, M> {
         let Some(mut geometry) = Geometry::for_size(mem.size()) else {
             return Err(mem);
         };
@@ -683,8 +902,19 @@ impl<M: Mem> Store<M> {
             extra_len: 0,
             upgrade_from: None,
             frozen: false,
+            seed,
+            epoch: 0,
+            epoch_new: None,
+            restart: None,
+            restart_pending: false,
         };
         store.upgrade_from = upgrade_from;
+        store.epoch = store.read_epoch().unwrap_or(0);
+        if upgrade_from == Some(3) && store.epoch != 0 {
+            // Our epoch block under a format-3 header: a kernel from before patch 1213 started the region over.
+            store.restart = Some(RestartCause::OldKernel(3));
+            store.restart_pending = true;
+        }
         store.state = store.read_state().unwrap_or_default();
         store.console_written = store.read_console_written(store.state.active_console);
         Ok(store)
@@ -706,10 +936,17 @@ impl<M: Mem> Store<M> {
     }
 
     /// Writes an empty region's header. Gives the region back if it is too small to use.
-    pub fn format(mut mem: M) -> Result<Self, M> {
+    pub fn format(mem: M) -> Result<Self, M> {
+        Self::format_seeded(mem, 0)
+    }
+
+    /// [`Store::format`] with the words the hardware gives for a new epoch id (see [`Store::epoch`]).
+    pub fn format_seeded(mut mem: M, seed: u64) -> Result<Self, M> {
         let Some(geometry) = Geometry::for_size(mem.size()) else {
             return Err(mem);
         };
+        let epoch = new_epoch_id(seed, mem.size());
+        write_epoch(&mut mem, epoch);
         for slot in 0..RECORDS {
             mem.write(geometry.record_at(slot), &[0; RECORD_PREFIX]);
         }
@@ -736,15 +973,68 @@ impl<M: Mem> Store<M> {
             extra_len: 0,
             upgrade_from: None,
             frozen: false,
+            seed,
+            epoch,
+            epoch_new: Some(EpochOrigin::Formatted),
+            restart: None,
+            restart_pending: false,
         })
     }
 
     /// Takes a region at the start of a boot: keeps what it holds if its header is good, starts over if not. `None` if it
     /// is too small.
     pub fn open(mem: M) -> Option<Self> {
-        match Self::attach(mem) {
+        let mut store = Self::open_seeded(mem, 0)?;
+        // The unseeded form is for tools and tests: it says why (`restart_cause`) but keeps the new region empty.
+        store.restart_pending = false;
+        Some(store)
+    }
+
+    /// [`Store::open`] with the words the hardware gives for a new epoch id (see [`Store::epoch`]).
+    pub fn open_seeded(mem: M, seed: u64) -> Option<Self> {
+        match Self::attach_seeded(mem, seed) {
             Ok(store) => Some(store),
-            Err(mem) => Self::format(mem).ok(),
+            Err(mem) => {
+                let cause = Geometry::for_size(mem.size()).map(|_| classify_restart(&mem));
+                let mut store = Self::format_seeded(mem, seed).ok()?;
+                store.restart = cause;
+                store.restart_pending = cause.is_some();
+                Some(store)
+            }
+        }
+    }
+
+    /// Why this store laid the region out afresh, if it did (patch 1372).
+    pub fn restart_cause(&self) -> Option<RestartCause> {
+        self.restart
+    }
+
+    /// The region's epoch id: it changes when the region is formatted or its epoch block is lost, and only then. A restart
+    /// that keeps the region keeps the id, and the boot counter counts within it (patch 1370). 0 before [`Store::begin_boot`]
+    /// on a region that has no block yet.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Why this boot made a new epoch, if it did.
+    pub fn epoch_new(&self) -> Option<EpochOrigin> {
+        self.epoch_new
+    }
+
+    /// Reads the epoch block: the copies that pass their error correction and checksum vote, bit by bit.
+    fn read_epoch(&self) -> Option<u64> {
+        read_epoch_block(&self.mem).ok()
+    }
+
+    /// Makes a new epoch if the block fails its vote.
+    fn ensure_epoch(&mut self) {
+        match read_epoch_block(&self.mem) {
+            Ok(id) => self.epoch = id,
+            Err(origin) => {
+                self.epoch = new_epoch_id(self.seed, self.mem.size());
+                write_epoch(&mut self.mem, self.epoch);
+                self.epoch_new = Some(origin);
+            }
         }
     }
 
@@ -842,12 +1132,31 @@ impl<M: Mem> Store<M> {
                 self.state.crashes_in_a_row += 1;
                 self.record_vanished_boot();
             }
-            LastBoot::Clean => self.state.crashes_in_a_row = 0,
+            LastBoot::Clean => {
+                self.state.crashes_in_a_row = 0;
+                // The format change moves the consoles: format 4's zone 1 overlaps the end of format 3's zone 0, and the
+                // last boot's console is read from the wrong place after the switch. Its end is kept as a record now, read
+                // with the format-3 geometry (review of patch 1213, finding 8).
+                if self.upgrade_from.is_some()
+                    && self.geometry.version != VERSION
+                    && self.last_console_len_now() > 0
+                {
+                    self.record_console_tail(
+                        Kind::UnexplainedReset,
+                        &[KEPT_CONSOLE_TITLE, b"last kernel log:\n"],
+                    );
+                }
+            }
             LastBoot::Crashed | LastBoot::Unknown => {}
         }
+        self.ensure_epoch();
         self.state.active_console ^= 1;
         self.state.boot = self.state.boot.wrapping_add(1);
         self.state.flags = FLAG_RUNNING;
+        if let Some(cause) = self.restart.filter(|_| self.restart_pending) {
+            self.restart_pending = false;
+            self.record_restart(cause);
+        }
         self.save_state();
         if self.upgrade_from.is_some() && self.geometry.version != VERSION {
             // The upgrade (patch 1213): the records stay where they are; this boot's console starts at its format-4 place.
@@ -863,6 +1172,30 @@ impl<M: Mem> Store<M> {
         self.save_console_header();
         self.mem.sync();
         last
+    }
+
+    /// Writes the record that says why the region was started over, with the same words as the console line.
+    fn record_restart(&mut self, cause: RestartCause) {
+        use core::fmt::Write;
+        struct Line([u8; 320], usize);
+        impl Write for Line {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let n = s.len().min(self.0.len() - self.1);
+                self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+                self.1 += n;
+                Ok(())
+            }
+        }
+        let mut line = Line([0; 320], 0);
+        let _ = write!(line, "{cause}");
+        self.write_record(
+            Kind::RegionRestarted,
+            &[
+                b"The saved log's region was started over\nreason: ",
+                &line.0[..line.1],
+                b"\nthe records it held are lost\n",
+            ],
+        );
     }
 
     /// Sets lines that the record of a vanished boot carries under its reason, before [`Store::begin_boot`] writes it: the
@@ -1384,6 +1717,12 @@ impl<M: Mem> Store<M> {
         total
     }
 
+    /// The length of the console of the boot that `state` still says is active: before [`Store::begin_boot`] flips it, the
+    /// last boot's.
+    fn last_console_len_now(&self) -> usize {
+        self.console_len_of(self.state.active_console)
+    }
+
     /// The length of the last boot's console.
     pub fn last_console_len(&self) -> usize {
         self.console_len_of(self.state.active_console ^ 1)
@@ -1403,7 +1742,7 @@ impl<M: Mem> Store<M> {
 #[cfg(test)]
 mod tests {
     extern crate std;
-    use std::{string::String, vec, vec::Vec};
+    use std::{format, string::String, vec, vec::Vec};
 
     use super::*;
 
@@ -2475,5 +2814,413 @@ mod tests {
         let n = s.read_last_console(0, &mut out);
         assert_eq!(n, s.last_console_len());
         assert!(n <= g.console_capacity());
+    }
+    fn region_of(version: u32) -> Ram {
+        let mut mem = fresh();
+        let g = Geometry::for_version(mem.size(), version).unwrap();
+        Store::<Ram>::write_header(&mut mem, &g);
+        mem
+    }
+
+    #[test]
+    fn the_header_survey_tells_format_3_from_4_and_neither() {
+        assert_eq!(header_format(&region_of(3)), Some(3));
+        assert_eq!(header_format(&region_of(4)), Some(4));
+        // A few flipped bits still count.
+        let mut mem = region_of(3);
+        mem.0[1] ^= 0x01;
+        mem.0[40] ^= 0x80;
+        assert_eq!(header_format(&mem), Some(3));
+        // Random bytes are neither.
+        let mut x = 0x1234_5678_9abc_def0u64;
+        let random = Ram((0..SIZE)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect());
+        assert_eq!(header_format(&random), None);
+        assert_eq!(header_format(&Ram(vec![0; SIZE])), None);
+        // A region of another size.
+        assert_eq!(header_format(&Ram(vec![0; 1024])), None);
+        // The existing survey functions are as they were: a format-3 header is foreign to format 4's.
+        assert!(foreign_contents(&region_of(3)).is_some());
+        assert!(foreign_contents(&region_of(4)).is_none());
+    }
+
+    #[test]
+    fn a_fresh_format_makes_an_epoch_block() {
+        let s = Store::format_seeded(fresh(), 0xdead_beef).ok().unwrap();
+        assert_ne!(s.epoch(), 0);
+        assert_eq!(s.epoch_new(), Some(EpochOrigin::Formatted));
+        let mut s = reset(s);
+        assert_eq!(s.begin_boot(), LastBoot::Unknown);
+        assert_eq!(
+            s.epoch_new(),
+            None,
+            "a reset that keeps the region keeps its id"
+        );
+        let id = s.epoch();
+        s.begin_boot();
+        let s = reset(s);
+        assert_eq!(s.epoch(), id);
+        assert_eq!(read_epoch_block(&s.mem), Ok(id));
+    }
+
+    #[test]
+    fn two_formats_give_different_ids() {
+        let a = Store::format_seeded(fresh(), 1000).ok().unwrap().epoch();
+        let b = Store::format_seeded(fresh(), 1001).ok().unwrap().epoch();
+        assert_ne!(a, b);
+        let c = Store::open_seeded(Ram(vec![0; SIZE]), 77).unwrap().epoch();
+        assert_ne!(c, a);
+    }
+
+    #[test]
+    fn a_region_from_1213_gets_an_epoch_and_keeps_everything() {
+        // A format-4 region with a record, as 1213 left it: no epoch block, only whatever RAM held there.
+        let mut old = Store::format(fresh()).ok().unwrap();
+        old.begin_boot();
+        old.write_record(Kind::Panic, &[b"a crash from before epochs"]);
+        old.console_write(b"[ 1.0] a line\n");
+        let mut mem = old.mem;
+        let junk: Vec<u8> = (0..FIRST_ZONE - layout::EPOCH_AT)
+            .map(|i| (i * 7 + 3) as u8)
+            .collect();
+        mem.0[layout::EPOCH_AT..layout::EPOCH_AT + junk.len()].copy_from_slice(&junk);
+        let mut s = Store::attach_seeded(mem, 4242).ok().unwrap();
+        assert_eq!(s.epoch(), 0);
+        s.begin_boot();
+        assert_ne!(s.epoch(), 0);
+        assert_eq!(s.epoch_new(), Some(EpochOrigin::NoBlock));
+        let id = s.epoch();
+        let s = reset(s);
+        assert_eq!(s.epoch(), id);
+        // The record, and the one for the boot that vanished.
+        let records: Vec<_> = s.records().flatten().collect();
+        assert_eq!(records.len(), 2);
+        let old = records.iter().find(|r| r.kind == Kind::Panic).unwrap();
+        assert_eq!(text_of(&s, old.slot), "a crash from before epochs");
+    }
+
+    #[test]
+    fn an_epoch_block_that_fails_the_vote_makes_a_new_epoch() {
+        let s = Store::format_seeded(fresh(), 5).ok().unwrap();
+        let id = s.epoch();
+        let mut mem = s.mem;
+        // Tag intact, but every copy overwritten past repair.
+        for copy in 0..layout::EPOCH_COPIES {
+            let at = layout::EPOCH_AT + copy * layout::EPOCH_COPY + 4;
+            for b in &mut mem.0[at..at + 120] {
+                *b ^= 0xa5;
+            }
+        }
+        let mut s = Store::attach_seeded(mem, 6).ok().unwrap();
+        s.begin_boot();
+        assert_eq!(s.epoch_new(), Some(EpochOrigin::Damaged));
+        assert_ne!(s.epoch(), id);
+    }
+
+    #[test]
+    fn a_torn_epoch_block_is_outvoted() {
+        let s = Store::format_seeded(fresh(), 5).ok().unwrap();
+        let id = s.epoch();
+        let mut mem = s.mem;
+        let at = layout::EPOCH_AT + layout::EPOCH_COPY;
+        mem.0[at..at + EPOCH_FIELDS + PARITY].fill(0);
+        let mut s = Store::attach_seeded(mem, 6).ok().unwrap();
+        s.begin_boot();
+        assert_eq!(s.epoch(), id);
+        assert_eq!(s.epoch_new(), None);
+    }
+
+    #[test]
+    fn the_epoch_survives_the_flip_rate_the_records_see() {
+        for seed in 0..40u64 {
+            let s = Store::format_seeded(fresh(), seed).ok().unwrap();
+            let id = s.epoch();
+            let mut mem = s.mem;
+            // 1 bit in 64 over the whole first zone, a good deal more than the 1.57% of a firmware reset.
+            let mut zone = Ram(mem.0[..FIRST_ZONE].to_vec());
+            decay(&mut zone, 64, seed);
+            mem.0[..FIRST_ZONE].copy_from_slice(&zone.0);
+            let mut s = Store::open_seeded(mem, 999).unwrap();
+            s.begin_boot();
+            assert_eq!(s.epoch(), id, "seed {seed}");
+            assert_eq!(s.epoch_new(), None, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn the_epoch_block_moves_nothing_else() {
+        let a = Store::format(fresh()).ok().unwrap();
+        let mut b = Store::format(fresh()).ok().unwrap();
+        b.begin_boot();
+        let epoch_end = layout::EPOCH_AT + layout::EPOCH_COPIES * layout::EPOCH_COPY;
+        let outside = |m: &Ram| {
+            let mut v = m.0.clone();
+            v[layout::EPOCH_AT..epoch_end].fill(0);
+            v
+        };
+        let mut a = a;
+        a.begin_boot();
+        assert_eq!(outside(&a.mem), outside(&b.mem));
+        // What the block does not use it leaves: the bytes after it are still what RAM held.
+        let written = Store::format(fresh()).ok().unwrap();
+        assert_eq!(
+            written.mem.0[epoch_end..FIRST_ZONE],
+            fresh().0[epoch_end..FIRST_ZONE]
+        );
+    }
+
+    /// `spare_tail`/`format3_tail` are the store's own words for the layout's tail start, and the spare tail must start
+    /// where the layout says the tail starts. layout::tail_start and console_at(2) are the same address.
+    #[test]
+    fn the_third_console_offset_is_the_layouts_tail_start() {
+        for size in [
+            layout::MIN_SIZE,
+            128 * 1024,
+            layout::RESERVE_FROM,
+            2 * 1024 * 1024,
+            16 * 1024 * 1024,
+        ] {
+            for version in [3, 4] {
+                let g = Geometry::for_version(size, version).unwrap();
+                assert_eq!(g.console_at(2), layout::tail_start(size, version));
+            }
+            let r = spare_tail(size).unwrap();
+            assert!(r.end > r.start, "{size}");
+            assert_eq!(r.end, size);
+        }
+    }
+
+    /// A format-3 region as the old kernel leaves it after boots that ended clean, each writing `text` to its console.
+    fn old_format_region(boots: &[&[u8]]) -> Ram {
+        let mut mem = fresh();
+        let old = Geometry::for_version(mem.size(), 3).unwrap();
+        Store::<Ram>::write_header(&mut mem, &old);
+        for text in boots {
+            let mut s = Store::attach(mem).ok().unwrap();
+            // Played as the old kernel would: it never upgrades.
+            s.upgrade_from = None;
+            s.begin_boot();
+            s.console_write(text);
+            s.note_clean_end();
+            mem = s.mem;
+        }
+        mem
+    }
+
+    fn kept_console(s: &Store<Ram>) -> Option<String> {
+        s.records()
+            .flatten()
+            .find(|r| r.kind == Kind::UnexplainedReset)
+            .map(|r| text_of(s, r.slot))
+    }
+
+    #[test]
+    fn a_clean_last_boot_in_zone_1_keeps_its_console_across_the_upgrade() {
+        // The first boot of a region uses zone 1.
+        let mem = old_format_region(&[b"[ 1.0] the old boot's last line\n"]);
+        let mut s = Store::attach(mem).ok().unwrap();
+        assert_eq!(s.begin_boot(), LastBoot::Clean);
+        assert_eq!(s.upgraded_from(), Some(3));
+        let text = kept_console(&s).expect("a record");
+        assert!(
+            text.starts_with(
+                "the last boot's console, kept across the format change\nlast kernel log:\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("[ 1.0] the old boot's last line\n"),
+            "{text}"
+        );
+        // The next boot finds format 4 and the record still there.
+        s.console_write(b"[ 2.0] new\n");
+        s.note_clean_end();
+        let mut s = reset(s);
+        assert_eq!(s.begin_boot(), LastBoot::Clean);
+        assert_eq!(s.upgraded_from(), None);
+        assert!(
+            kept_console(&s)
+                .unwrap()
+                .ends_with("[ 1.0] the old boot's last line\n")
+        );
+    }
+
+    #[test]
+    fn a_clean_last_boot_in_zone_0_keeps_its_console_across_the_upgrade() {
+        let mem = old_format_region(&[b"[ 1.0] first\n", b"[ 2.0] the second boot's last line\n"]);
+        let mut s = Store::attach(mem).ok().unwrap();
+        assert_eq!(s.begin_boot(), LastBoot::Clean);
+        let text = kept_console(&s).expect("a record");
+        assert!(
+            text.ends_with("[ 2.0] the second boot's last line\n"),
+            "{text}"
+        );
+        // A long console is cut to the record's room, keeping its end.
+        let mem = old_format_region(&[b"x", &b"line of text\n".repeat(60_000)]);
+        let mut s = Store::attach(mem).ok().unwrap();
+        s.begin_boot();
+        let text = kept_console(&s).unwrap();
+        assert!(
+            text.ends_with("line of text\n"),
+            "{}",
+            &text[text.len() - 20..]
+        );
+    }
+
+    #[test]
+    fn a_region_that_is_already_format_4_makes_no_extra_record() {
+        let mut s = Store::format(fresh()).ok().unwrap();
+        s.begin_boot();
+        s.console_write(b"a line\n");
+        s.note_clean_end();
+        let mut s = reset(s);
+        assert_eq!(s.begin_boot(), LastBoot::Clean);
+        assert_eq!(s.records().flatten().count(), 0);
+    }
+
+    fn restart_record(s: &Store<Ram>) -> Option<String> {
+        s.records()
+            .flatten()
+            .find(|r| r.kind == Kind::RegionRestarted)
+            .map(|r| text_of(s, r.slot))
+    }
+
+    fn header_in(mem: &mut Ram, header: &[u8; HEADER_LEN]) {
+        for copy in 0..COPIES {
+            mem.write(copy * HEADER_LEN, header);
+        }
+    }
+
+    /// Opens, begins a boot and returns the cause, the record's text and the first record's slot count.
+    fn restarted(mem: Ram) -> (RestartCause, String) {
+        let mut s = Store::open_seeded(mem, 9).unwrap();
+        let cause = s.restart_cause().expect("a cause");
+        s.begin_boot();
+        let all: Vec<_> = s.records().flatten().collect();
+        assert_eq!(all.len(), 1, "the new region's first record, and no other");
+        let text = restart_record(&s).expect("a restart record");
+        assert!(
+            text.starts_with("The saved log's region was started over\nreason: "),
+            "{text}"
+        );
+        assert!(text.ends_with("\nthe records it held are lost\n"), "{text}");
+        (cause, text)
+    }
+
+    #[test]
+    fn a_zeroed_region_is_first_use() {
+        let (cause, text) = restarted(Ram(vec![0; SIZE]));
+        assert_eq!(cause, RestartCause::FirstUse);
+        assert!(text.contains("reason: first use\n"), "{text}");
+    }
+
+    #[test]
+    fn a_region_of_other_bytes_has_no_header_and_says_what_it_held() {
+        let (cause, text) = restarted(fresh());
+        let RestartCause::NoHeader {
+            zero_pages,
+            ones_pages,
+            other_pages,
+        } = cause
+        else {
+            panic!("{cause:?}");
+        };
+        assert_eq!((zero_pages, ones_pages, other_pages), (0, 0, SIZE / 4096));
+        assert!(
+            text.contains(&format!(
+                "reason: no header: 0 pages zero, 0 all ones, {} other\n",
+                SIZE / 4096
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_header_of_another_format_is_named() {
+        for (version, older) in [(2u32, true), (5, false)] {
+            let mut mem = fresh();
+            let mut h = Geometry::for_size(SIZE).unwrap().header();
+            h[8..12].copy_from_slice(&version.to_le_bytes());
+            let crc = crc32(&[&h[..28]]);
+            h[28..32].copy_from_slice(&crc.to_le_bytes());
+            header_in(&mut mem, &h);
+            let (cause, text) = restarted(mem);
+            assert_eq!(cause, RestartCause::OtherFormat(version));
+            let words = if older { "older" } else { "newer" };
+            assert!(
+                text.contains(&format!(
+                    "reason: header of format {version} from an {words} kernel\n"
+                )) || text.contains(&format!(
+                    "reason: header of format {version} from a {words} kernel\n"
+                )),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_header_with_too_many_wrong_bits_says_how_many() {
+        let mut mem = fresh();
+        let mut h = Geometry::for_size(SIZE).unwrap().header();
+        h[16] ^= 0xff;
+        h[17] ^= 0x0f;
+        header_in(&mut mem, &h);
+        let (cause, text) = restarted(mem);
+        assert_eq!(cause, RestartCause::WrongBits(12));
+        assert!(
+            text.contains("reason: header with 12 wrong bits after the vote\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_header_for_another_size_says_so() {
+        let mut mem = fresh();
+        let h = Geometry::for_size(SIZE / 2).unwrap().header();
+        header_in(&mut mem, &h);
+        let (cause, text) = restarted(mem);
+        assert_eq!(cause, RestartCause::SizeChanged);
+        assert!(text.contains("reason: region size changed\n"), "{text}");
+    }
+
+    #[test]
+    fn a_format_3_header_over_our_epoch_block_means_an_old_kernel_started_it_over() {
+        // What a kernel from before patch 1213 leaves: it lays out format 3 and never touches the epoch block.
+        let s = Store::format_seeded(fresh(), 5).ok().unwrap();
+        let id = s.epoch();
+        let mut mem = s.mem;
+        let old = Geometry::for_version(SIZE, 3).unwrap();
+        Store::<Ram>::write_header(&mut mem, &old);
+        let mut s = Store::open_seeded(mem, 6).unwrap();
+        assert_eq!(s.restart_cause(), Some(RestartCause::OldKernel(3)));
+        assert_eq!(s.upgraded_from(), None, "before the upgrade");
+        s.begin_boot();
+        assert_eq!(s.upgraded_from(), Some(3));
+        assert_eq!(s.epoch(), id, "the id is kept");
+        let text = restart_record(&s).expect("a record");
+        assert!(
+            text.contains("reason: a kernel of format 3 laid it out again"),
+            "{text}"
+        );
+        // A format-3 region that never had an epoch block is an upgrade, not a restart.
+        let mut mem = fresh();
+        Store::<Ram>::write_header(&mut mem, &old);
+        let s = Store::open_seeded(mem, 6).unwrap();
+        assert_eq!(s.restart_cause(), None);
+    }
+
+    #[test]
+    fn a_region_that_is_ours_has_no_restart() {
+        let s = Store::format(fresh()).ok().unwrap();
+        let mut s = reset(s);
+        assert_eq!(s.restart_cause(), None);
+        s.begin_boot();
+        assert!(restart_record(&s).is_none());
     }
 }
