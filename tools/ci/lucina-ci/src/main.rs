@@ -1103,20 +1103,50 @@ fn cmd_alert_plan(a: &Args) -> Result<i32, String> {
 fn cmd_sweep_target(a: &Args) -> Result<i32, String> {
     let dir = PathBuf::from(a.need("--dir")?);
     let limit = a.num("--limit-gib", 30)?;
-    let to = a.num("--to-gib", limit * 4 / 5)?;
+    let to_default = limit.checked_mul(4).map(|x| x / 5).ok_or_else(|| {
+        "sweep-target: --limit-gib is too large to count in bytes; nothing was removed".to_string()
+    })?;
+    let to = a.num("--to-gib", to_default)?;
+    // Both modes work only under the canonical `$HOME/.cache`. An unset or empty HOME is a refusal: no other root is ever substituted.
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            "sweep-target: HOME is unset or empty; refusing to guess a cache root; nothing was removed".to_string()
+        })?;
+    if !home.is_absolute() {
+        return Err("sweep-target: HOME is not an absolute path; nothing was removed".into());
+    }
+    let allowed = std::fs::canonicalize(home.join(".cache")).map_err(|e| {
+        format!("sweep-target: cannot resolve $HOME/.cache ({e}); nothing was removed")
+    })?;
+    let guard = sweep::Guard {
+        allowed: &allowed,
+        home: Some(&home),
+        procs: Path::new("/proc"),
+    };
     if a.has("--single") {
         // The KiB marks are so a test can run the real thing over a folder of a few KiB; the GiB marks are what people and the
         // timer give.
         let (lim, to) = if a.has("--limit-kib") {
             let lim = a.num("--limit-kib", 0)?;
-            (lim, a.num("--to-kib", lim * 4 / 5)?)
+            let to_default = lim.checked_mul(4).map(|x| x / 5).ok_or_else(|| {
+                "sweep-target: --limit-kib is too large; nothing was removed".to_string()
+            })?;
+            (lim, a.num("--to-kib", to_default)?)
         } else {
-            sweep::caps_kib(limit, to)
+            if limit == 0 {
+                return Err("sweep-target: refusing --limit-gib 0 (it would empty the target); nothing was removed".into());
+            }
+            sweep::caps_kib_checked(limit, to).ok_or_else(|| {
+                "sweep-target: --limit-gib is too large to count in bytes; nothing was removed"
+                    .to_string()
+            })?
         };
-        return sweep::run_single(&dir, lim, to, a.has("--dry-run"));
+        return sweep::run_single(&dir, lim, to, a.has("--dry-run"), &guard);
     }
     let keep = a.val("--keep").map(PathBuf::from);
-    sweep::run(&dir, limit, to, keep.as_deref(), a.has("--dry-run"))
+    sweep::run(&dir, limit, to, keep.as_deref(), a.has("--dry-run"), &guard)
 }
 
 /// `output-check --kind K < unit.log`: what a unit's log must show for its pass to count (verdict::check_output); exit 1 with the reason.

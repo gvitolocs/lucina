@@ -64,12 +64,10 @@ fn run_script(home: &Path, dry: bool) -> (i32, String) {
 /// The same, with the folder table at `conf`: a path of a test's choosing, so a run without one is a run like any other.
 fn run_conf(home: &Path, dry: bool, conf: &Path) -> (i32, String) {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../scripts/sweep-caches.sh");
-    fs::create_dir_all(home.join("fake-proc")).unwrap();
     let mut cmd = Command::new(&script);
     cmd.env("HOME", home)
         .env("LUCINA_SWEEP_CONF", conf)
         .env("LUCINA_CI_SWEEP", env!("CARGO_BIN_EXE_lucina-ci"))
-        .env("LUCINA_PROC_ROOT", home.join("fake-proc"))
         .env("LUCINA_SWEEP_LIMIT_KIB", "20")
         .env("LUCINA_SWEEP_TO_KIB", "16")
         .env_remove("LUCINA_CACHE_SWEEP_LOG");
@@ -242,18 +240,16 @@ fn no_folder_table_means_no_sweep_and_no_failure() {
 #[test]
 fn a_single_target_with_a_gib_cap_is_within_it_and_reports_the_gib() {
     let home = tmp("gibcap");
-    let target = home.join("cargo-target/secretaryios");
+    // Under the fake HOME's cache, which is where the binary now requires every target to be.
+    let target = home.join(".cache/cargo-target/secretaryios");
     artifact(&target.join("debug/deps"), "old.rlib", 30, 3);
     artifact(&target.join("debug/deps"), "new.rlib", 2, 1);
-    // An empty fake process table, as the script tests use: nothing here pretends to be a build.
-    let procs = home.join("fake-proc");
-    fs::create_dir_all(&procs).unwrap();
     let o = Command::new(env!("CARGO_BIN_EXE_lucina-ci"))
         .arg("sweep-target")
         .arg("--dir")
         .arg(&target)
         .args(["--single", "--limit-gib", "40"])
-        .env("LUCINA_PROC_ROOT", &procs)
+        .env("HOME", &home)
         .output()
         .unwrap();
     let msg = format!(
