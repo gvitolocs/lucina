@@ -43,7 +43,11 @@ jobs:
       - name: Build the launcher
         run: cargo build --release --locked --manifest-path tools/ci/lucina-ci/Cargo.toml
       - name: Launcher tests
-        run: cargo test --release --locked --manifest-path tools/ci/lucina-ci/Cargo.toml
+        # Each test binary runs under its own time limit (300 s) and the step under a budget of 900 s, build included; a binary
+        # over its limit is killed and named (`HUNG: <binary> after <n> s`). The limits are LUCINA_CI_TEST_BINARY_LIMIT_S
+        # and LUCINA_CI_TEST_STEP_BUDGET_S.
+        timeout-minutes: 17
+        run: tools/ci/lucina-ci/target/release/lucina-ci test-binaries --manifest-path tools/ci/lucina-ci/Cargo.toml
       - name: Every proof is in the inventory
         run: tools/ci/lucina-ci/target/release/lucina-ci inventory --check
       - id: plan
@@ -135,12 +139,13 @@ jobs:
         run: |
           curl -fsSL --retry 5 -o "$HOME/tla2tools.jar" https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
           sha256sum "$HOME/tla2tools.jar"
-          expected=7e53aa636dac8a3cb0533f343115c0548e03fc0ce5edc7739becf58d3d0fb84f
+          # Re-pinned 2026-11-20: upstream rebuilds the rolling v1.8.0 pre-release asset in place (GitHub digest, size 4510915, Main-class tlc2.TLC, build 2026-11-19).
+          expected=fdffef247f563ef6edbfd44958d2a82db79e7564e07cb673262d896353fa6713
           if echo "$expected  $HOME/tla2tools.jar" | sha256sum -c --status; then
             java -version
           else
             actual=$(sha256sum "$HOME/tla2tools.jar" | cut -d' ' -f1)
-            echo "upstream rebuilt the pre-release jar; re-pin (expected $expected, got $actual)"
+            echo "tool install failed (not a model failure): tla2tools.jar hash mismatch; expected $expected, got $actual"
             exit 1
           fi
       - name: Run

@@ -1,24 +1,188 @@
 #!/usr/bin/env bash
 # The fast local check, run in your worktree before a commit: only what the change touched, capped. docs/ci/SHIFT-LEFT.md.
-# Usage: scripts/check-fast [--base REF] [--no-build] [--proofs [--mutants] [--all-proofs]]
+# Usage: scripts/check-fast [--base REF] [--no-build] [--proofs [--mutants] [--all-proofs]] [--merge-gate]
+#   --merge-gate                  must arrive as a bare argument (not --merge-gate=...): it asks the queue for the gate priority.
 #   CHECK_FAST_FILTER_ONLY=<log>  run only the gate pass below over an existing check-fast log, and exit: how a test
 #                                 reads a log without building, queueing or filling a disk.
 #   CHECK_FAST_BIN=<path>         run that binary instead of the built release, and leave it where it is: the stub of
 #                                 `lucina-ci check-fast` scripts/tests/check-fast-oos-test.sh drives end to end.
 #   CHECK_FAST_LOG=<path>         write the raw unfiltered output there and keep it (a private temp file is deleted):
 #                                 the same test reads what the pass folded.
-#   LUCINA_CHECK_TMP=<dir>        where a run keeps its temp files (default $HOME/scratch/tmp/check-fast); TMPDIR is set to it.
-#   LUCINA_BQ=<path>              the build queue to run the check through (default $HOME/.local/bin/bq), and only when it is
-#                                 executable and prints our own usage. A `bq` on PATH is never taken: see the queue step below.
+#   LUCINA_CHECK_TMP=<dir>        where a run keeps its temp files (default <home>/scratch/tmp/check-fast); TMPDIR is set to it.
+#   (the build queue)             <home>/.local/bin/bq, <home> being the passwd entry of this uid (never $HOME), which must print our
+#                                 own usage or the check fails; a `bq` on PATH only when that file does not exist. No variable
+#                                 names it. The launcher re-runs itself through it, class long (see the queue step below).
 # Verus runs on GitHub; --proofs runs the affected proofs here.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+# The build queue. Every check-fast runs as ONE job of the queue's `long` class, so that several of them at once
+# cannot stack up their steps outside the queue's slots (the host ran out of memory when 80 step scopes from concurrent runs stacked up). The
+# launcher always re-runs itself through `bq run --class long`, and the job's own call (the same launcher, marked with the
+# first argument --queued-by-bq, which only this launcher puts there and which is ignored unless bq really holds a slot for the run)
+# does the work. No environment variable decides whether a
+# run is queued: bq itself runs a nested call of the SAME class right there, with no ticket and no second slot, and queues a
+# nested call of another class in its own pool (docs/ci/BQ.md, "Never nest"); it believes the BQ_SLOT / BQ_SLOT_PID mark only
+# against its own slot record (tools/bq/src/main.rs, ancestor_slot_class), and a launcher that read the mark itself would be
+# believing a caller's word on a weaker test. BQ_* names also reach the job unscrubbed (tools/bq/src/main.rs:1794-1799; the
+# scrub list is :133), so keying on them would let any caller skip the queue.
+# The queue is looked up in the home directory of the real uid from the passwd entry, never in $HOME (a caller's HOME decides
+# nothing here): <home>/.local/bin/bq first, which must print our usage or the check FAILS (exit 2) and runs nothing; a `bq`
+# on PATH only when that file does not exist, and only if it prints our usage (PATH holds the Google Cloud SDK's BigQuery
+# `/usr/bin/bq` on GitHub's runners). A home that cannot be resolved is a refusal (exit 2), not "no queue here". Only a host with
+# neither (GitHub's runners and any host without the queue binary) runs the check directly, and says so first, on stderr.
+# The next line is the only one a test replaces (with a fixed home, in a copy of this script); nothing in the environment can.
+qhome=$(
+    export PATH=/usr/bin:/bin
+    getent passwd "$(id -ru)" | cut -d: -f6
+) || qhome=""
+if [ -z "$qhome" ] || [ ! -d "$qhome" ]; then
+    echo "check-fast: cannot resolve the home directory of this uid from the passwd entry; refusing, since the build queue is looked up there and nowhere else" >&2
+    exit 2
+fi
+bq_is_ours() {
+    local bq_usage
+    [ -x "$1" ] || return 1
+    bq_usage=$(timeout 5 "$1" </dev/null 2>&1 || true)
+    # Our queue's usage offers `--class short|long|proof` and every option the call below passes; a queue that does not is
+    # not one this launcher can call as written, and is not taken.
+    case "$bq_usage" in
+        *'--class short|long|proof'*) ;;
+        *) return 1 ;;
+    esac
+    case "$bq_usage" in
+        *'--max-wait'*) ;;
+        *) return 1 ;;
+    esac
+    case "$bq_usage" in
+        *'--priority'*) ;;
+        *) return 1 ;;
+    esac
+    case "$bq_usage" in
+        *'--keep-env'*) ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+# 0: found, printed. 1: no bq of ours anywhere. 2: the bq in the home directory exists and is not ours.
+bq_find() {
+    local home_bq=$qhome/.local/bin/bq c
+    if [ -e "$home_bq" ] || [ -L "$home_bq" ]; then
+        if bq_is_ours "$home_bq"; then
+            printf '%s\n' "$home_bq"
+            return 0
+        fi
+        return 2
+    fi
+    c=$(command -v bq 2>/dev/null || true)
+    if [ -n "$c" ] && bq_is_ours "$c"; then
+        printf '%s\n' "$c"
+        return 0
+    fi
+    return 1
+}
+# A typed --queued-by-bq is ignored unless bq really holds a slot for this run: the inner run believes it only as bq believes its
+# own mark (tools/bq/src/main.rs, ancestor_slot_class): BQ_SLOT and BQ_SLOT_PID are set, BQ_SLOT_PID is a live ancestor of this
+# shell, and the slot's meta file in the queue's state directory (<passwd home>/.cache/bq, never $HOME or BQ_DIR) names
+# pid=<BQ_SLOT_PID> and a class bq knows. Otherwise the argument is dropped and the run queues like any other.
+# Coupling: a nested check-fast is believed only if bq's state directory equals <passwd home>/.cache/bq. A bq run with BQ_DIR set,
+# or with a $HOME different from the passwd home, writes its slot records elsewhere, so a genuine nested run re-queues and stops with
+# exit 2 (queued twice, no slot record): it fails closed, never runs unqueued, and costs only availability.
+bq_slot_is_real() {
+    local spid=${BQ_SLOT_PID:-} p=$$ stat rest n=0 meta
+    [ -n "${BQ_SLOT:-}" ] || return 1
+    case "$BQ_SLOT" in */* | .*) return 1 ;; esac
+    case "$spid" in '' | *[!0-9]*) return 1 ;; esac
+    [ "$spid" -gt 1 ] || return 1
+    [ -d "/proc/$spid" ] || return 1
+    meta=$qhome/.cache/bq/$BQ_SLOT.meta
+    [ -f "$meta" ] || return 1
+    grep -qx "pid=$spid" "$meta" || return 1
+    grep -qxE 'class=(gate|short|long|proof|node)' "$meta" || return 1
+    while [ "$p" -gt 1 ] && [ "$n" -lt 64 ]; do
+        [ "$p" = "$spid" ] && return 0
+        stat=$(<"/proc/$p/stat") 2>/dev/null || return 1
+        rest=${stat##*) } # after the command name, which may hold spaces and parentheses: "S ppid ..."
+        rest=${rest#* }
+        p=${rest%% *}
+        case "$p" in '' | *[!0-9]*) return 1 ;; esac
+        n=$((n + 1))
+    done
+    return 1
+}
+# The argument carries how many times this run has been through the queue (--queued-by-bq=N; a typed bare --queued-by-bq is 0). A
+# run that still finds no real slot after being queued twice stops (exit 2) instead of going round again: a queue whose state
+# directory is not the one looked up here would otherwise send the launcher through it for ever.
+queued=0
+depth=0
+case "${1:-}" in
+    --queued-by-bq=[0-9]*)
+        depth=${1#--queued-by-bq=}
+        shift
+        case "$depth" in *[!0-9]*) depth=0 ;; esac
+        if bq_slot_is_real; then queued=1; fi
+        ;;
+    --queued-by-bq)
+        shift
+        if bq_slot_is_real; then queued=1; fi
+        ;;
+esac
+if [ "$queued" = 0 ] && [ "$depth" -ge 2 ]; then
+    echo "check-fast: queued twice and bq holds no slot for this run (no $qhome/.cache/bq/<slot>.meta naming this run); refusing to go round again" >&2
+    exit 2
+fi
+if [ "$queued" = 0 ] && [ -z "${CHECK_FAST_FILTER_ONLY:-}" ]; then
+    bqrc=0
+    bqbin=$(bq_find) || bqrc=$?
+    if [ "$bqrc" -eq 2 ]; then
+        echo "check-fast: $qhome/.local/bin/bq exists but is not our build queue (its usage does not offer --class short|long|proof, --max-wait, --priority and --keep-env); refusing to run without the queue" >&2
+        exit 2
+    fi
+    if [ "$bqrc" -eq 0 ]; then
+        prio=normal
+        # 3600 s for a plain run. The merge gate runs under the outer limit of its pipeline gate (.lucina/pipeline.toml), which counts
+        # the wait for the one gate slot, so it waits at most BQ_WAIT_ALLOWANCE_S (tools/ci/lucina-ci/src/budget.rs) and then fails at
+        # once with bq's own message, instead of being killed by the clock halfway through its steps. A test ties the two.
+        maxwait=3600
+        for arg in "$@"; do
+            if [ "$arg" = "--merge-gate" ]; then
+                prio=gate
+                maxwait=300
+            fi
+        done
+        self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+        exec "$bqbin" run --class long --priority "$prio" --max-wait "$maxwait" --keep-env GIT_CONFIG_COUNT \
+            --who "check-fast:$(basename "$root")" -- "$self" "--queued-by-bq=$((depth + 1))" "$@"
+    fi
+    # On stderr, so that the stdout of a run is still the check's own bytes; it is the first line the run prints.
+    echo "check-fast: no bq on this host; running without the queue" >&2
+fi
 # A run is not small: the private copy of the binary, the raw log, and every temp file of lucina-ci and its children (reports,
 # coverage, sweep scratch) go to TMPDIR. buildhost's /tmp is a quota'd tmpfs shared by every session, and on 2026-11-12 it filled and
 # every check-fast failed. So the point is to leave /tmp: TMPDIR is set here rather than inherited, which means a caller's own
 # TMPDIR is NOT kept; only an explicitly set LUCINA_CHECK_TMP steers this, and it does not touch anyone else's TMPDIR.
-tmp_root=${LUCINA_CHECK_TMP:-$HOME/scratch/tmp/check-fast}
-mkdir -p "$tmp_root"
+tmp_root=${LUCINA_CHECK_TMP:-$qhome/scratch/tmp/check-fast}
+# The private copy of the tool this launcher execs is an O_EXCL mktemp file (mode 0700) in this directory, which the
+# environment may choose. It must be a directory owned by this user and writable by no one else (a group or world write bit lets
+# another process replace a file in it between the copy and the exec); anything else is a refusal with exit 2, with the command
+# that fixes it. Made here with umask 022, a fresh one passes. It need not be under the home directory: the exclusive 0700 file
+# is what is run, and CI and tests keep their temp folders elsewhere.
+(
+    umask 022
+    mkdir -p "$tmp_root"
+)
+tmp_real=$(cd "$tmp_root" 2>/dev/null && pwd -P) || {
+    echo "check-fast: $tmp_root is not a directory" >&2
+    exit 2
+}
+read -r tmp_owner tmp_mode < <(stat -c '%u %a' "$tmp_real")
+if [ "$tmp_owner" != "$(id -u)" ]; then
+    echo "check-fast: $tmp_root is owned by uid $tmp_owner, not by this user; refusing to run a copy of the tool from there" >&2
+    exit 2
+fi
+if [ $((8#$tmp_mode & 8#022)) -ne 0 ]; then
+    echo "check-fast: $tmp_root is writable by group or others (mode $tmp_mode); refusing to run a copy of the tool from there. Fix: chmod go-w \"$tmp_real\"" >&2
+    exit 2
+fi
 export TMPDIR=$tmp_root
 
 # The one pass over the output of `lucina-ci check-fast`, which changes only how a full disk reads.
@@ -148,25 +312,49 @@ fi
 # target shared by worktrees on different commits let one overwrite the others' rlibs and test binaries: a check could test code that
 # was not in its worktree (seen twice on 2026-11-11). The first check in a new worktree compiles its dependencies (measured about 40 s
 # for a one-crate change, 10 s warm). The root is swept to a size limit below (tools/ci/lucina-ci/src/sweep.rs).
-cache_root=${LUCINA_CHECK_CACHE:-$HOME/.cache/lucina-check-target}
+cache_root=${LUCINA_CHECK_CACHE:-$qhome/.cache/lucina-check-target}
 wt_id=wt-$(printf '%s' "$root" | sha1sum | cut -c1-10)
 if [ -n "${CARGO_TARGET_DIR:-}" ] && [ "${CARGO_TARGET_DIR#"$cache_root"/}" = "$CARGO_TARGET_DIR" ] && [ "${LUCINA_CHECK_ALLOW_TARGET:-}" != 1 ]; then
     echo "check-fast: warning: CARGO_TARGET_DIR=$CARGO_TARGET_DIR (inherited) is outside $cache_root; a target shared with other worktrees can hold another commit's artifacts. lucina-ci also refuses a binary whose sources differ from this tree (set LUCINA_CHECK_ALLOW_TARGET=1 to silence this)." >&2
 fi
+# Root-mode sweep-target refuses a cache root without this marker file (a regular file `.lucina-check-target` holding `lucina-check-target`;
+# Cargo's own CACHEDIR.TAG is left alone), so a LUCINA_CHECK_CACHE pointed at another cache cannot get its targets swept. Written when
+# the cache root is created, and once on the default root, which is compared by resolved path.
+# marker-begin
+default_cache=${HOME:-/nonexistent}/.cache/lucina-check-target
+if [ ! -d "$cache_root" ] || { [ -d "$default_cache" ] && [ "$(readlink -f "$cache_root")" = "$(readlink -f "$default_cache")" ]; }; then
+    # A cache root that cannot be created is a warning, never a failed gate.
+    mkdir -p "$cache_root" || echo "check-fast: warning: cannot create $cache_root" >&2
+    marker=$cache_root/.lucina-check-target
+    # A marker that is not a small regular file holding the expected line (a folder, a dangling link, a big file, other content) is
+    # moved aside, so it cannot stay and make every sweep refuse this cache; the size is tested before anything is read. It goes under
+    # the `.sweep-parked-` prefix, which the sweep never lists as a candidate and never deletes. The link check and the write are not
+    # atomic; the only writer who can exploit that already owns the cache.
+    if { [ -e "$marker" ] || [ -L "$marker" ]; } && ! { [ ! -L "$marker" ] && [ -f "$marker" ] && [ "$(stat -c %s "$marker")" -le 512 ] && [ "$(cat "$marker")" = "lucina-check-target" ]; }; then
+        aside=$cache_root/.sweep-parked-$$-lucina-check-target-marker
+        echo "check-fast: warning: $marker is not the cache marker; moved to $aside" >&2
+        mv -- "$marker" "$aside" || true
+    fi
+    [ -e "$marker" ] || [ -L "$marker" ] || { printf 'lucina-check-target\n' > "$marker"; } 2> /dev/null || echo "check-fast: warning: cannot write $marker" >&2
+fi
+# marker-end
+# The lines above between marker-begin and marker-end are what scripts/tests/check-fast-marker-test.sh runs; the target-dir lines below
+# are covered by scripts/tests/check-fast-cache-root-test.sh. A cache root or target dir that cannot be created is a warning here,
+# never a failed gate: cargo then creates the folder itself or fails with its own message, as it did before the marker existed.
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$cache_root/$wt_id}
-mkdir -p "$CARGO_TARGET_DIR"
-touch "$CARGO_TARGET_DIR/.last-used"
+mkdir -p "$CARGO_TARGET_DIR" || echo "check-fast: warning: cannot create $CARGO_TARGET_DIR; cargo will try to create it or say why not" >&2
+touch "$CARGO_TARGET_DIR/.last-used" 2> /dev/null || true
 # No incremental compilation: the caches rarely get reused and were nearly half the old shared target's size (40 of 89 GiB on 2026-11-11,
 # when buildhost's disk ran short). A caller that sets CARGO_INCREMENTAL keeps its value.
 export CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0}
 export LUCINA_CI_CPU_QUOTA=${LUCINA_CI_CPU_QUOTA:-400%}
-free=$(df --output=avail -BG "$HOME" | tail -1 | tr -dc 0-9)
+free=$(df --output=avail -BG "$qhome" | tail -1 | tr -dc 0-9)
 floor=${LUCINA_CHECK_FREE_FLOOR_GIB:-20}
 [ "$free" -ge "$floor" ] || {
     # What to clean first, named: the three largest folders directly under ~/.cache. du gets 20 s, because walking a few hundred
     # GiB can take longer than that and a refusal that hangs is worse than one that says nothing about sizes. Only on a refusal,
     # never on the way through. No -s with --max-depth: on GNU du -s IS --max-depth=0 and refuses to combine with it.
-    cache_home=$HOME/.cache
+    cache_home=$qhome/.cache
     rc=0
     big=$(timeout 20 du -k --max-depth=1 "$cache_home" 2>/dev/null) || rc=$?
     if [ "$rc" -eq 124 ]; then
@@ -184,15 +372,24 @@ floor=${LUCINA_CHECK_FREE_FLOOR_GIB:-20}
             note="No folders to name under $cache_home."
         fi
     fi
-    echo "check-fast: only ${free} GiB free on $HOME's disk, the floor is ${floor} GiB: refusing to build rather than fill it. ${note} Free space first (stale worktrees: wt prune; the check cache $cache_root; one target: lucina-ci sweep-target --single)." >&2
+    echo "check-fast: only ${free} GiB free on $qhome's disk, the floor is ${floor} GiB: refusing to build rather than fill it. ${note} Free space first (stale worktrees: wt prune; the check cache $cache_root; one target: lucina-ci sweep-target --single)." >&2
     exit 2
 }
 # The binary to run: the built release, or CHECK_FAST_BIN. scripts/tests/check-fast-oos-test.sh gives a stub of
 # `lucina-ci check-fast`, so the gate pass is tested end to end without a build, a queue or a real disk.
 [ -n "${CHECK_FAST_BIN:-}" ] || cargo build --quiet --release --locked --manifest-path "$root/tools/ci/lucina-ci/Cargo.toml"
-# Run from a private copy of the launcher, so a rebuild of release/lucina-ci under a running check cannot pull it out from under its own
-# sub-steps ("Failed to find executable ... (deleted)", seen 2026-11-11). CHECK_FAST_BIN is used where it is, and CHECK_FAST_LOG keeps
-# the raw unfiltered output where the caller can read it: neither is deleted. Without them the run is what it always was.
+# Run from a private copy, so a rebuild of release/lucina-ci under a running check cannot pull it out from under its own
+# sub-steps ("Failed to find executable ... (deleted)", seen 2026-11-11). This is the rename-install of the
+# tool, done where this repo can do it: nothing of ours ever writes a name another run reads. Cargo owns the one name it
+# writes itself ($CARGO_TARGET_DIR/release/lucina-ci, one target per worktree above, which is the same source-id keying the
+# design, and `lucina-ci` refuses to start a check whose binary and tree sources differ); what a run reads is
+# copied to a fresh unique name that belongs to this run alone — nothing else ever reads it, so nothing else can see it half
+# written — and lucina-ci makes a copy of its own in the directory of the run it is in (RunDir and self_copy in
+# tools/ci/lucina-ci/src/main.rs), so the guarantee also holds for a check-fast started straight off the built binary, with
+# this launcher not in the way. Two copies of 3 MiB, both removed on every exit: the trap below for this one, the guard in
+# Rust for the run's own directory.
+# CHECK_FAST_BIN is used where it is, and CHECK_FAST_LOG keeps the raw unfiltered output where the caller can read it:
+# neither is deleted. Without them the run is what it always was.
 bin=${CHECK_FAST_BIN:-}
 private_bin=""
 if [ -z "$bin" ]; then
@@ -214,48 +411,11 @@ cleanup() {
 trap cleanup EXIT
 # A size cap on the whole cache: over the limit the least recently used worktree targets go whole (never this one, never one with a build running).
 "$bin" sweep-target --dir "$cache_root" --keep "$CARGO_TARGET_DIR" --limit-gib "${LUCINA_CHECK_TARGET_LIMIT_GIB:-30}" || true
-# One place in the build queue (docs/ci/BQ.md): a short job, so it never waits behind a long build.
-# The queue is named and never looked up on PATH: PATH holds a DIFFERENT `bq` on GitHub's ubuntu-24.04 runners, the Google Cloud
-# SDK's BigQuery CLI (/usr/bin/bq), which answers "ERROR: (bq) You do not currently have an active account selected" and exits 1,
-# so the public proof CI printed nothing and failed (run 43276124239). So it is $HOME/.local/bin/bq, or LUCINA_BQ, and even that
-# only after it proves it is ours: running it with no arguments prints its usage, and our queue's usage offers `--class
-# short|long|proof`. No queue, or one that is not ours: run the check directly and say nothing, which is the normal case on GitHub
-# and on laptops. The probe reads no stdin and dies after 5 s, so a queue that waits for something, or that is not a queue at all,
-# cannot hang a check. Its exit code is not part of the test: our queue is free to exit non-zero on its usage.
-bqbin=${LUCINA_BQ:-$HOME/.local/bin/bq}
-# A merge gate is the last thing a session waits for, and it timed out behind 40 ordinary jobs of its class (position 42 of 42,
-# 2026-11-13). A gate run asks the queue for the gate priority when the queue knows `--priority`, which puts it ahead of the
-# ordinary waiters that had waited less than 30 minutes; an older queue is called exactly as it is today.
-merge_gate=0
-for arg in "$@"; do
-    if [ "$arg" = "--merge-gate" ]; then merge_gate=1; fi
-done
-runner=()
-if [ -x "$bqbin" ]; then
-    bq_usage=$(timeout 5 "$bqbin" </dev/null 2>&1 || true)
-    case "$bq_usage" in
-        *'--class short|long|proof'*)
-            prio=()
-            case "$bq_usage" in
-                *'--priority'*)
-                    if [ "$merge_gate" = 1 ]; then prio=(--priority gate); fi
-                    ;;
-            esac
-            runner=("$bqbin" run --class short --who "$(basename "$root")" ${prio[@]+"${prio[@]}"} --)
-            # Waiting for the slot is bounded on its own (15 minutes, CHECK_FAST_SLOT_WAIT_S), and a step's time limit starts only
-            # after the slot is mine, so a full queue ("no build slot in 15 minutes") and a slow step ("past its N s limit at
-            # merge") read differently. A queue older than this option does not know it and is run without.
-            case "$bq_usage" in
-                *'--max-wait'*) runner=("$bqbin" run --class short --who "$(basename "$root")" ${prio[@]+"${prio[@]}"} --max-wait "${CHECK_FAST_SLOT_WAIT_S:-900}" --) ;;
-            esac
-            ;;
-    esac
-fi
 # A run that ends without its summary line (killed, cut off mid-step, a tool that exited early) is a failure even when the exit code
 # was 0: the output streams through tee, and the last word is the summary line. Stdout only; stderr stays on stderr. The raw log
 # keeps what the binary printed, unfiltered, and the pass that collapses a full disk (above) reads the live stream.
 rc=0
-{ "${runner[@]}" "$bin" check-fast "$@" | tee "$log" | gate_pass; } || rc=$?
+{ "$bin" check-fast "$@" | tee "$log" | gate_pass; } || rc=$?
 if [ "$rc" -ne 0 ]; then
     exit "$rc"
 fi

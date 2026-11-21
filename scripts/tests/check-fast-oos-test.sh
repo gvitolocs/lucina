@@ -3,8 +3,8 @@
 #
 # It runs the real launcher with CHECK_FAST_BIN, a stub of `lucina-ci check-fast` that prints what the binary prints and exits
 # with the code it exits with, and CHECK_FAST_LOG, which keeps the raw unfiltered output so the test can read it. So the pass is
-# judged the way a reader judges it: on the launcher's own exit code and its own stdout, with no build, no queue and no disk
-# filled. The rule under test is the condition the coordinator set for the pass: it may only rename a failure that already fails,
+# judged the way a reader judges it: on the launcher's own exit code and its own stdout, with no build, no queue (the
+# launcher runs from a copy whose passwd home holds no bq: make_launcher) and no disk filled. The rule under test is the condition set for the pass: it may only rename a failure that already fails,
 # and may never turn a gate's failure into a pass, a skip or a warning. The last line is `check-fast-oos-test: pass`.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
@@ -26,9 +26,29 @@ fail() { # fail <why>: what the case checked, plus what the launcher said on its
     exit 1
 }
 
+# make_launcher <fake home> <dir>: a copy of scripts/check-fast at <dir>/scripts/check-fast whose one assignment of `qhome` (the
+# passwd lookup of this uid's home, which a test cannot change) is a fixed directory. The folder is named like this repo, because
+# --who is its basename. Nothing else differs: the copy is refused unless exactly that assignment (4 lines out, 1 in) changed.
+make_launcher() {
+    local fake=$1 d=$2
+    mkdir -p "$d/scripts"
+    awk -v h="$fake" '
+        /^qhome=\$\($/ { print "qhome=\"" h "\""; skip = 1; next }
+        skip && /^\) \|\| qhome=""$/ { skip = 0; next }
+        skip { next }
+        { print }' "$root/scripts/check-fast" > "$d/scripts/check-fast"
+    chmod +x "$d/scripts/check-fast"
+    [ "$(diff "$root/scripts/check-fast" "$d/scripts/check-fast" | grep -c '^[<>]')" -eq 5 ] ||
+        fail "the launcher copy differs from the real one in more than its home assignment"
+}
+
 home=$tmp/home
 tdir=$tmp/reports
 mkdir -p "$home" "$tdir" "$tmp/noawk"
+chmod 755 "$tdir"
+proot=$tmp/pl/$(basename "$root")
+make_launcher "$home" "$proot"
+launcher=$proot/scripts/check-fast
 cat > "$tmp/noawk/awk" <<'EOF'
 #!/usr/bin/env bash
 # The pass of scripts/check-fast runs in awk; this is a broken awk: it dies instead of filtering, so it prints nothing.
@@ -80,7 +100,7 @@ $diff_out"
 }
 
 # run_case <name> <stdout-file> <exit code> [stderr-file] [dir-first-on-PATH]: the real scripts/check-fast over the stub, with a
-# free-space floor it cannot trip, a temp dir of its own and no `bq` on PATH (so nothing is built, queued or waited for).
+# free-space floor it cannot trip, a temp dir of its own and a passwd home with no `bq` in it (so nothing is built, queued or waited for).
 # LUCINA_CHECK_TMP is the launcher's own knob for that dir: it sets TMPDIR from it and does not keep the caller's, and the folded
 # class of a step that names no path is the dir the pass reads off TMPDIR, so the cases below that expect $tdir pin it here.
 # It leaves rc, out (what the launcher printed), raw (the unfiltered log) and er (its stderr) for the asserts.
@@ -89,11 +109,11 @@ run_case() {
     export OOS_OUT=$of OOS_RC=$code
     if [ -n "$err" ]; then export OOS_ERR=$err; else unset OOS_ERR; fi
     rc=0
-    HOME=$home PATH=${first:+$first:}/usr/bin:/bin TMPDIR=$tdir LUCINA_CHECK_TMP=$tdir \
+    env -u BQ_SLOT -u BQ_SLOT_PID HOME=$home PATH=${first:+$first:}/usr/bin:/bin TMPDIR=$tdir LUCINA_CHECK_TMP=$tdir \
         CHECK_FAST_BIN=$stub CHECK_FAST_LOG=$tmp/$name.raw \
         CARGO_TARGET_DIR=$tmp/target \
         LUCINA_CHECK_FREE_FLOOR_GIB=0 LUCINA_CHECK_ALLOW_TARGET_DIR=1 \
-        "$root/scripts/check-fast" > "$tmp/$name.out" 2> "$tmp/$name.err" || rc=$?
+        "$launcher" > "$tmp/$name.out" 2> "$tmp/$name.err" || rc=$?
     out=$tmp/$name.out
     raw=$tmp/$name.raw
     er=$tmp/$name.err
@@ -274,10 +294,10 @@ see=$tmp/i.see
 before=$(n_in_tmp)
 rc=0
 OOS_OUT=$f OOS_RC=0 OOS_SEE=$see FAKE_CARGO_STUB=$stub \
-    HOME=$home PATH=$fakebin:/usr/bin:/bin TMPDIR=$tdir LUCINA_CHECK_TMP=$ltmp \
+    env -u BQ_SLOT -u BQ_SLOT_PID HOME=$home PATH=$fakebin:/usr/bin:/bin TMPDIR=$tdir LUCINA_CHECK_TMP=$ltmp \
     CHECK_FAST_BIN='' CHECK_FAST_LOG='' CARGO_TARGET_DIR='' \
     LUCINA_CHECK_FREE_FLOOR_GIB=0 \
-    "$root/scripts/check-fast" > "$tmp/i.out" 2> "$tmp/i.err" || rc=$?
+    "$launcher" > "$tmp/i.out" 2> "$tmp/i.err" || rc=$?
 [ "$rc" -eq 0 ] || fail "(i) a clean run under LUCINA_CHECK_TMP failed: exit $rc, $(cat "$tmp/i.err")"
 has "$tmp/i.out" "check-fast: 6s, 0 failed, 0 skipped" "(i) the run is the private copy of the stub's own output"
 has "$see" "tmpdir=$ltmp" "(i) TMPDIR is LUCINA_CHECK_TMP, not the caller's TMPDIR ($tdir), which the launcher does not keep"
@@ -292,8 +312,7 @@ echo "ok: (i) LUCINA_CHECK_TMP holds the private bin and log while the run goes,
 # (j) The queue is never taken from PATH. On GitHub's ubuntu-24.04 runners, PATH's `bq` is the Google Cloud SDK's BigQuery CLI,
 # a different program of the same name, and the old lookup ran the check through it: it died on "no active account" and the public
 # proof CI printed nothing (run 43276124239). So a `bq` first on PATH is a decoy here: it must not be run at all, and case (d)'s
-# clean run stays exactly as clean. LUCINA_BQ (j2) is the one way of naming a queue that lives elsewhere.
-unset LUCINA_BQ
+# clean run stays exactly as clean. A queue in the passwd home's .local/bin/bq (j2) is the one place a launcher takes its queue from first.
 gcloud=$tmp/gcloud-bin
 mkdir -p "$gcloud"
 cat > "$gcloud/bq" <<'EOF'
@@ -313,10 +332,11 @@ hasnt "$er" "active account" "(j) the decoy was never run, so not one line of it
 hasnt "$out" "active account" "(j) and nothing of it is on stdout either"
 echo "ok: (j) a bq on PATH that is not the LucinaOS queue is ignored: the clean run still passes, byte for byte"
 
-# (j2) A queue that IS ours, named by LUCINA_BQ, is used: with no arguments it prints the usage line the probe looks for, and as
-# `run` it records its arguments and execs what comes after the `--`. So the check goes through it as a short job, and the bytes
+# (j2) A queue that IS ours, at $HOME/.local/bin/bq, is used: with no arguments it prints the usage line the probe looks for, and as
+# `run` it records its arguments and execs what comes after the `--`. So the check goes through it as one long job (BQ_SLOT and BQ_SLOT_PID set for what it execs), and the bytes
 # the launcher prints are still the binary's own.
-ownq=$tmp/own-bq
+ownq=$home/.local/bin/bq
+mkdir -p "$home/.local/bin"
 rec=$tmp/j2.calls
 cat > "$ownq" <<'EOF'
 #!/usr/bin/env bash
@@ -326,20 +346,25 @@ if [ "${1:-}" = run ]; then
     printf '%s\n' "$*" > "$OWN_BQ_CALLS"
     while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
     shift
+    h=$(cd "$(dirname "$0")/../.." && pwd)
+mkdir -p "$h/.cache/bq"
+printf 'pid=%s\nclass=long\n' "$$" > "$h/.cache/bq/long-0.meta"
+export BQ_SLOT=long-0 BQ_SLOT_PID=$$
+
     exec "$@"
 fi
-printf 'usage: bq run --class short|long|proof [--lock PATH] [--cores N] [--exclusive] [--who NAME] -- cmd args...\n'
+printf 'usage: bq run --class short|long|proof [--lock PATH] [--cores N] [--exclusive] [--who NAME] [--priority gate|normal] [--max-wait SECONDS] [--keep-env NAME] -- cmd args...\n'
 exit 2
 EOF
 chmod +x "$ownq"
-export LUCINA_BQ=$ownq OWN_BQ_CALLS=$rec
+export OWN_BQ_CALLS=$rec
 run_case j2 "$tmp/d.txt" 0
-unset LUCINA_BQ OWN_BQ_CALLS
-[ "$rc" -eq 0 ] || fail "(j2) a run through the queue named by LUCINA_BQ failed: exit $rc, $(cat "$er")"
-nlines "$rec" '^run --class short --who ' 1 "(j2) exactly one queue call, and the usage probe was not one"
-has "$rec" "run --class short --who $(basename "$root") -- $stub check-fast" "(j2) a short job, this worktree as --who, the binary after the --"
+unset OWN_BQ_CALLS
+[ "$rc" -eq 0 ] || fail "(j2) a run through the queue in HOME failed: exit $rc, $(cat "$er")"
+nlines "$rec" '^run --class long --priority normal ' 1 "(j2) exactly one queue call (the run inside the job does not queue again), and the usage probe was not one"
+[ "$(cat "$rec")" = "run --class long --priority normal --max-wait 3600 --keep-env GIT_CONFIG_COUNT --who check-fast:$(basename "$root") -- $launcher --queued-by-bq=1" ] || fail "(j2) the queue call is not byte-exact: $(cat "$rec")"
 OOS_OUT=$tmp/d.txt OOS_RC=0 "$stub" check-fast > "$tmp/j2.direct" 2> /dev/null
 samebytes j2
-echo "ok: (j2) LUCINA_BQ naming our own queue puts the run through it, as --class short, with the same bytes out"
+echo "ok: (j2) our own queue in the passwd home's .local/bin/bq puts the run through it, as one --class long job of the launcher, with the same bytes out"
 
 echo "check-fast-oos-test: pass"

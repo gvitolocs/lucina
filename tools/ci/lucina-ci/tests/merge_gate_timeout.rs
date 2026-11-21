@@ -5,8 +5,31 @@
 //! scripts/check-fast takes the slot first, so a step's limit counts its own run time only.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+mod common;
+
+/// A stub goes in through a child, never from this thread: it is exec'd by the step, and a file this thread still holds open
+/// for writing makes that exec answer "Text file busy" (ETXTBSY) when another thread forks at the same moment, after which
+/// the shell goes on to the next `diffgate` on PATH, the real one. The same helper in SecretaryIOS explains the measurement.
+fn write_exec(path: &Path, script: &str) {
+    let mut child = Command::new("sh")
+        .args(["-c", "cat > \"$1\" && chmod 0755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut w = child.stdin.take().unwrap();
+    w.write_all(script.as_bytes()).unwrap();
+    drop(w);
+    assert!(
+        child.wait().unwrap().success(),
+        "sh cannot write {}: the stand-in is never exec'd",
+        path.display()
+    );
+}
 
 fn copy_dir(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
@@ -70,8 +93,7 @@ fn setup(tag: &str, sleep_s: u32) -> (PathBuf, PathBuf) {
     let bin = d.join("bin");
     fs::create_dir_all(&bin).unwrap();
     let stub = bin.join("diffgate");
-    fs::write(&stub, format!("#!/bin/sh\nsleep {sleep_s}\nexit 0\n")).unwrap();
-    Command::new("chmod").arg("+x").arg(&stub).status().unwrap();
+    write_exec(&stub, &format!("#!/bin/sh\nsleep {sleep_s}\nexit 0\n"));
     (repo, bin)
 }
 
@@ -108,6 +130,11 @@ fn run(repo: &Path, bin: &Path, cap: &str) -> (i32, String) {
 
 #[test]
 fn merge_gate_step_past_its_limit_fails_the_merge_and_is_never_a_skip() {
+    if common::skip_without_scope(
+        "merge_gate_step_past_its_limit_fails_the_merge_and_is_never_a_skip",
+    ) {
+        return;
+    }
     let (repo, bin) = setup("late", 30);
     let (code, out) = run(&repo, &bin, "1");
     assert_ne!(code, 0, "a timed-out step fails the merge: {out}");
@@ -126,6 +153,11 @@ fn merge_gate_step_past_its_limit_fails_the_merge_and_is_never_a_skip() {
 
 #[test]
 fn merge_gate_step_within_its_limit_passes_without_the_late_message() {
+    if common::skip_without_scope(
+        "merge_gate_step_within_its_limit_passes_without_the_late_message",
+    ) {
+        return;
+    }
     // the step ran for 2 s of its own, under a 20 s limit; any time spent waiting for a queue slot is not on this clock
     let (repo, bin) = setup("ontime", 2);
     let (_code, out) = run(&repo, &bin, "20");

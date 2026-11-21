@@ -3,6 +3,14 @@
 # (scripts/verify-models.sh). The single entry point of docs/design/lucinaos-correctness.md.
 # On buildhost, run it through the gate:  verify-gate -- scripts/verify.sh
 # Env: VERUS overrides the binary; it must still match the version and sha256 pinned in references/upstream.lock.
+
+# Refuse to run inside a lane worker.
+. "$(dirname "$0")/lib/in-lane-worker.sh" || exit 75
+if in_lane_worker; then
+    echo "verify.sh: refused inside a lane worker (proofs run on GitHub)" >&2
+    exit 75
+fi
+
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)

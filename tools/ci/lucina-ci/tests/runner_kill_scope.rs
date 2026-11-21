@@ -1,5 +1,5 @@
-//! GATE-03: a deadline must STOP a step, not only flag it. `runner::inner` gives every step its own cgroup scope and,
-//! where no scope can be had, its own process group; at the deadline the step is SIGTERMed, and rounds of SIGKILL follow
+//! A deadline must STOP a step, not only flag it. `runner::inner` gives every step its own cgroup scope (a step that cannot get one fails the check, and is
+//! never run uncapped); at the deadline the step is SIGTERMed, and rounds of SIGKILL follow
 //! until nothing of the step is left or a hard bound passes, and only then is the step reported.
 //!
 //! These tests drive the real binary over a throwaway repository whose `diffgate` step is a shell script that ignores
@@ -22,11 +22,34 @@
 //! running, which is how a step here came back `ok 1.0s` with its sleeps killed by a thread that had finished.)
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
+
+mod common;
+
+/// A stub goes in through a child, never from this thread: it is exec'd by the step, and a file this thread still holds open
+/// for writing makes that exec answer "Text file busy" (ETXTBSY) when another thread forks at the same moment, after which
+/// the shell goes on to the next `diffgate` on PATH, the real one. The same helper in SecretaryIOS explains the measurement.
+fn write_exec(path: &Path, script: &str) {
+    let mut child = Command::new("sh")
+        .args(["-c", "cat > \"$1\" && chmod 0755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut w = child.stdin.take().unwrap();
+    w.write_all(script.as_bytes()).unwrap();
+    drop(w);
+    assert!(
+        child.wait().unwrap().success(),
+        "sh cannot write {}: the stand-in is never exec'd",
+        path.display()
+    );
+}
 
 /// `runner::KILL_GRACE_S`: the time a step gets to leave on its own after the deadline's SIGTERM.
 const GRACE_S: f64 = 5.0;
@@ -106,7 +129,7 @@ impl Drop for Case {
     }
 }
 
-/// The step's script: it ignores SIGTERM, says which cgroup it stands in (its own scope, or the fallback), then runs
+/// The step's script: it ignores SIGTERM, says which cgroup it stands in, then runs
 /// `body` and waits for what it started. The counts of `body` name this test's own markers: a pattern that covers every
 /// sleeper of this process would count the sleepers of the tests running next door.
 fn setup(tag: &str, body: &str) -> Case {
@@ -139,8 +162,7 @@ fn setup(tag: &str, body: &str) -> Case {
          wait\n"
     );
     let stub = bin.join("diffgate");
-    fs::write(&stub, &script).unwrap();
-    Command::new("chmod").arg("+x").arg(&stub).status().unwrap();
+    write_exec(&stub, &script);
     Case { repo, bin }
 }
 
@@ -251,17 +273,16 @@ impl Drop for Markers {
     }
 }
 
-/// Runs the merge gate over `case`. `no_scope` forces the fallback branch (`LUCINA_CI_NO_SCOPE`) on a machine where a
-/// scope is available, so the branch a test means to cover is the branch it gets.
-fn run(case: &Case, cap: &str, no_scope: bool) -> (i32, String) {
-    run_env(case, cap, no_scope, None)
+/// Runs the merge gate over `case`.
+fn run(case: &Case, cap: &str) -> (i32, String) {
+    run_env(case, cap, None, &[])
 }
 
 /// `quota` is `LUCINA_CI_CPU_QUOTA`, the one switch the runner has for the properties of a step's scope: with it set,
 /// `run_unit` asks systemd for `CPUQuota=<it>,TasksMax=256` (`runner.rs`). `None` passes on what this process already
 /// carries, which is the check's own value (`scripts/check-fast` exports it) — so the ordinary cases here run with a
 /// task-capped scope, exactly as a real check does.
-fn run_env(case: &Case, cap: &str, no_scope: bool, quota: Option<&str>) -> (i32, String) {
+fn run_env(case: &Case, cap: &str, quota: Option<&str>, envs: &[(&str, &str)]) -> (i32, String) {
     let path = format!(
         "{}:{}",
         case.bin.display(),
@@ -285,9 +306,7 @@ fn run_env(case: &Case, cap: &str, no_scope: bool, quota: Option<&str>) -> (i32,
     // The check and everything it starts live in this group and no other, so `Sweep` takes them all without touching the
     // test process, which stands in a group of its own.
     .process_group(0);
-    if no_scope {
-        c.env("LUCINA_CI_NO_SCOPE", "1");
-    }
+    c.envs(envs.iter().copied());
     if let Some(q) = quota {
         c.env("LUCINA_CI_CPU_QUOTA", q);
     }
@@ -482,15 +501,18 @@ fn assert_stopped(out: &str, sleepers: &[String], what: &str) {
 /// start, and all of it is gone inside the bound.
 #[test]
 fn a_step_that_ignores_sigterm_is_gone_at_its_deadline() {
+    if common::skip_without_scope("a_step_that_ignores_sigterm_is_gone_at_its_deadline") {
+        return;
+    }
     let s = sleeper(1);
     let _markers = Markers(vec![s.clone()]);
     let body = format!("{s} &\n( {s} & ) &\n{}", counted(&s, 2));
     let case = setup("term", &body);
-    let (_code, out) = run(&case, LIMIT_S, false);
+    let (_code, out) = run(&case, LIMIT_S);
     assert!(
         scoped(&out),
-        "a step is meant to get a scope of its own; it stood in {} instead, which is the branch (b) forces. A runner \
-         that cannot give a scope caps nothing at all.",
+        "a step is meant to get a scope of its own; it stood in {} instead, which is no scope at all. A runner \
+         that cannot give a scope caps nothing, and the check fails instead.",
         cgroup_of(&out).unwrap_or_default()
     );
     assert_eq!(
@@ -501,38 +523,95 @@ fn a_step_that_ignores_sigterm_is_gone_at_its_deadline() {
     assert_stopped(&out, &[s], "sigterm ignored by child and grandchild");
 }
 
-/// (b) The same step where no scope can be had: the fallback runs it as the leader of its own process group and the kill
-/// takes that group. It must still stop the step, and it must not want — or reach — anything else in the cgroup the
-/// check shares with whatever started it.
+/// (b) A step that cannot get its scope is NOT run uncapped. The machine here has no systemd user manager
+/// (`systemctl --user show-environment` fails, as it does where there is no user bus), a `sudo` that would say yes if it
+/// were asked, and a `systemd-run` that refuses. The check must fail with one message that names the step and the reason;
+/// the step's script must never have started; and `sudo` must never have been called. There is no environment switch
+/// that turns this off: setting the retired `LUCINA_CI_NO_SCOPE` changes nothing.
 #[test]
-fn the_same_step_is_gone_at_its_deadline_when_no_scope_can_be_had() {
-    let s = sleeper(2);
-    let _markers = Markers(vec![s.clone()]);
-    let body = format!("{s} &\n( {s} & ) &\n{}", counted(&s, 2));
-    let case = setup("noscope", &body);
-    let (_code, out) = run(&case, LIMIT_S, true);
-    assert_eq!(
-        cgroup_of(&out).as_deref(),
-        Some(own_cgroup().as_str()),
-        "a step with no scope stands in the cgroup it was handed, and its deadline kill takes its process group, not \
-         everything else in that cgroup"
+fn a_step_that_cannot_get_a_scope_fails_and_never_runs_uncapped() {
+    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("gate03-noscope-{}", std::process::id()));
+    let ran = d.join("ran");
+    let log = d.join("calls.log");
+    let case = setup("noscope", &format!("touch '{}'", ran.display()));
+    let stub = |name: &str, body: &str| {
+        write_exec(&case.bin.join(name), &format!("#!/bin/sh\n{body}\n"));
+    };
+    stub(
+        "id",
+        "case \"$1\" in -u|-g) echo 1000 ;; *) exec /usr/bin/id \"$@\" ;; esac",
+    );
+    stub(
+        "systemctl",
+        &format!("echo \"systemctl $*\" >> '{}'\nexit 1", log.display()),
+    );
+    stub(
+        "systemd-run",
+        &format!("echo \"systemd-run $*\" >> '{}'\nexit 1", log.display()),
+    );
+    stub(
+        "sudo",
+        &format!("echo \"sudo $*\" >> '{}'\nexit 0", log.display()),
+    );
+    let (code, out) = run_env(&case, "20", None, &[("LUCINA_CI_NO_SCOPE", "1")]);
+    assert_ne!(code, 0, "a check with no scope for a step must fail: {out}");
+    assert!(
+        out.contains("cannot get a memory-capped scope") && out.contains("no systemd user manager"),
+        "the failure names the reason: {out}"
     );
     assert!(
-        !out.contains("no systemd user session"),
-        "a check with no scope is a fallback, not a refusal: {out}"
+        out.contains("step fast/diffgate:"),
+        "the failure names the step: {out}"
     );
-    assert_eq!(
-        echo_count(&out, &s),
-        2,
-        "the step did not start the child and the grandchild that ignore SIGTERM: {out}"
+    assert!(
+        !ran.exists(),
+        "the step ran although it had no scope, i.e. uncapped: {out}"
     );
-    assert_stopped(&out, &[s], "no scope, sigterm ignored");
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.lines().any(|l| l.starts_with("sudo")),
+        "lucina-ci called sudo: {calls}"
+    );
+    assert!(
+        !calls.lines().any(|l| l.starts_with("systemd-run")),
+        "the step was handed to systemd-run although no user manager answered: {calls}"
+    );
+}
+
+/// lucina-ci never builds an argv with `sudo` in it. The behavioural half is the test above (a `sudo` stub that
+/// is never called); this half reads the sources, where a command line is built, and refuses the word as a program name
+/// or an argument, in code (comments may say it).
+#[test]
+fn no_source_of_lucina_ci_builds_a_sudo_argv() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut seen = 0;
+    for e in fs::read_dir(&src).unwrap().flatten() {
+        let p = e.path();
+        if p.extension().is_none_or(|x| x != "rs") {
+            continue;
+        }
+        seen += 1;
+        for (i, l) in fs::read_to_string(&p).unwrap().lines().enumerate() {
+            let code = l.split("//").next().unwrap_or("");
+            assert!(
+                !code.contains("\"sudo\"") && !code.contains("sudo -"),
+                "{}:{}: a sudo argv in code: {l}",
+                p.display(),
+                i + 1
+            );
+        }
+    }
+    assert!(seen > 0, "no sources read under {}", src.display());
 }
 
 /// (c) A step that finishes inside its limit is not touched by any of this: it passes, the time recorded for it is its
 /// own work and not the kill machinery, and the straggler it leaves behind is taken when the step ends.
 #[test]
 fn a_step_that_ends_in_time_is_untouched() {
+    if common::skip_without_scope("a_step_that_ends_in_time_is_untouched") {
+        return;
+    }
     let s = sleeper(3);
     let _markers = Markers(vec![s.clone()]);
     // `exit 0` before the script's `wait`: the step is meant to end at once and leave a straggler standing, which is what
@@ -541,7 +620,7 @@ fn a_step_that_ends_in_time_is_untouched() {
         "ontime",
         &format!("{s} &\necho gate03-ontime: yes\nexit 0\n"),
     );
-    let (_code, out) = run(&case, "20", false);
+    let (_code, out) = run(&case, "20");
     let (ok, secs) = step_line(&out, "diffgate").expect("the diffgate step reported a time");
     assert!(
         ok,
@@ -564,6 +643,9 @@ fn a_step_that_ends_in_time_is_untouched() {
 /// deadline reaches it with — and nothing else here does.
 #[test]
 fn work_handed_to_a_nested_scope_is_gone_at_its_deadline() {
+    if common::skip_without_scope("work_handed_to_a_nested_scope_is_gone_at_its_deadline") {
+        return;
+    }
     let (nested, plain) = (sleeper(4), sleeper(5));
     let _markers = Markers(vec![nested.clone(), plain.clone()]);
     let counts = format!("{}\n{}", counted(&nested, 1), counted(&plain, 1));
@@ -575,7 +657,7 @@ fn work_handed_to_a_nested_scope_is_gone_at_its_deadline() {
         outside_cgroup(&nested),
     );
     let case = setup("nested", &body);
-    let (_code, out) = run(&case, LIMIT_S, false);
+    let (_code, out) = run(&case, LIMIT_S);
     assert_eq!(
         echo_count(&out, &plain),
         1,
@@ -614,6 +696,9 @@ fn work_handed_to_a_nested_scope_is_gone_at_its_deadline() {
 /// this is the case only the cgroup route takes. A run where that process never appeared is a failure, not a skip.
 #[test]
 fn work_handed_to_a_new_session_is_gone_at_its_deadline() {
+    if common::skip_without_scope("work_handed_to_a_new_session_is_gone_at_its_deadline") {
+        return;
+    }
     let (detached, plain) = (sleeper(6), sleeper(7));
     let _markers = Markers(vec![detached.clone(), plain.clone()]);
     let counts = format!("{}\n{}", counted(&detached, 1), counted(&plain, 1));
@@ -624,7 +709,7 @@ fn work_handed_to_a_new_session_is_gone_at_its_deadline() {
         outside_group(&detached),
     );
     let case = setup("session", &body);
-    let (_code, out) = run(&case, LIMIT_S, false);
+    let (_code, out) = run(&case, LIMIT_S);
     // Observe before judging (GATE-11): the step waited, up to 5 s, until the sleeper stood in a group other than the
     // step's. If that never happened (or the step was cut off before it said so), nothing was judged, and that is a
     // failure here — never a pass.
@@ -667,6 +752,11 @@ fn work_handed_to_a_new_session_is_gone_at_its_deadline() {
 /// sibling, and judges both. The kill is `kill(2)` now: a system call takes no task slot.
 #[test]
 fn a_step_that_has_taken_every_task_slot_is_still_gone_at_its_deadline() {
+    if common::skip_without_scope(
+        "a_step_that_has_taken_every_task_slot_is_still_gone_at_its_deadline",
+    ) {
+        return;
+    }
     let (nested, plain) = (sleeper(8), sleeper(9));
     let _markers = Markers(vec![nested.clone(), plain.clone()]);
     let case = setup("tasksfull", &fill_body(&nested, &plain));
@@ -674,7 +764,7 @@ fn a_step_that_has_taken_every_task_slot_is_still_gone_at_its_deadline() {
     // `CPUQuota=<it>,TasksMax=256` on the scope whenever it is set. There is no switch for a smaller `TasksMax`, so the
     // step fills all 256 of them. The value is the production one (`scripts/check-fast` exports `400%`): the task cap,
     // not the CPU one, is what is under test.
-    let (_code, out) = run_env(&case, LIMIT_S, false, Some("400%"));
+    let (_code, out) = run_env(&case, LIMIT_S, Some("400%"), &[]);
     assert!(
         scoped(&out),
         "the task cap is a scope property, so this case needs a scope of its own: {}",

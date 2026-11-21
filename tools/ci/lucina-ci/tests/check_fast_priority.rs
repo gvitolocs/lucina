@@ -1,6 +1,7 @@
-//! `scripts/check-fast` asks the queue for the gate priority (`--priority gate`) when it runs as a merge gate and the queue's usage
-//! offers the option, and calls every other case as it did before; see `scripts/tests/check-fast-priority-test.sh`, which runs the
-//! real launcher over a stub `bq`. Called here so `cargo test` covers it, as `check_fast_max_wait.rs` does.
+//! `scripts/check-fast` queues itself as one `long` job with `--priority gate` when it runs as a merge gate and `--priority normal`
+//! otherwise, byte for byte, and a queue that cannot take that call makes the check fail with exit 2; see
+//! `scripts/tests/check-fast-priority-test.sh`, which runs a copy of the launcher (its passwd home replaced by a temp one holding a
+//! stub `bq`). Called here so `cargo test` covers it, as `check_fast_max_wait.rs` does.
 
 use std::path::Path;
 use std::process::Command;

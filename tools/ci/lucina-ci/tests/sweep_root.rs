@@ -198,3 +198,71 @@ fn single_mode_has_the_same_home_and_cache_root_checks() {
     assert!(msg.contains("cap of 0"), "{msg}");
     assert!(gold.exists(), "{msg}");
 }
+
+/// Stamps a file or folder `secs` seconds after the epoch (mtime and atime): old enough to be outside the in-use window.
+fn stamp_old(p: &Path) {
+    let f = fs::File::open(p).unwrap();
+    let when = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+    f.set_times(fs::FileTimes::new().set_modified(when).set_accessed(when))
+        .unwrap();
+}
+
+/// A check-cache-shaped root `home/.cache/lucina-check-target` over 1 GiB (a sparse file) with one idle worktree target `wt-old`.
+fn big_cache(home: &Path) -> (PathBuf, PathBuf) {
+    let root = home.join(".cache/lucina-check-target");
+    let wt = root.join("wt-old");
+    let big = wt.join("debug/deps/big");
+    fs::create_dir_all(big.parent().unwrap()).unwrap();
+    fs::File::create(&big).unwrap().set_len(2 << 30).unwrap();
+    // Bottom up, so stamping a folder is not undone by a later entry in it.
+    for p in [&big, &wt.join("debug/deps"), &wt.join("debug"), &wt] {
+        stamp_old(p);
+    }
+    (root, wt)
+}
+
+#[test]
+fn root_mode_refuses_a_folder_without_the_check_cache_marker_and_sweeps_one_with_it() {
+    let t = tmp("marker");
+    let home = t.0.join("home");
+    let (root, wt) = big_cache(&home);
+    let args = [
+        "--dir",
+        root.to_str().unwrap(),
+        "--limit-gib",
+        "1",
+        "--to-gib",
+        "0",
+    ];
+    // Another cache pointed at (say `LUCINA_CHECK_CACHE=$HOME/.cache/cargo-target`): no marker, exit 2, nothing removed.
+    let (code, msg) = cli(Some(home.to_str().unwrap()), &args);
+    assert_eq!(code, Some(2), "{msg}");
+    assert!(
+        msg.contains("not a check cache") && msg.contains("nothing was removed"),
+        "{msg}"
+    );
+    assert!(wt.exists(), "{msg}");
+    // Cargo's own tag is not the marker.
+    fs::write(
+        root.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n",
+    )
+    .unwrap();
+    let (code, msg) = cli(Some(home.to_str().unwrap()), &args);
+    assert_eq!(code, Some(2), "{msg}");
+    assert!(wt.exists(), "{msg}");
+    // A marker that is a link is refused.
+    let real = t.0.join("real-marker");
+    fs::write(&real, "lucina-check-target\n").unwrap();
+    std::os::unix::fs::symlink(&real, root.join(".lucina-check-target")).unwrap();
+    let (code, msg) = cli(Some(home.to_str().unwrap()), &args);
+    assert_eq!(code, Some(2), "{msg}");
+    assert!(wt.exists(), "{msg}");
+    fs::remove_file(root.join(".lucina-check-target")).unwrap();
+    // The marker file `scripts/check-fast` writes: the folder is swept.
+    fs::write(root.join(".lucina-check-target"), "lucina-check-target\n").unwrap();
+    let (code, msg) = cli(Some(home.to_str().unwrap()), &args);
+    assert_eq!(code, Some(0), "{msg}");
+    assert!(!wt.exists(), "a marked cache is swept: {msg}");
+    assert!(msg.contains("removed"), "{msg}");
+}

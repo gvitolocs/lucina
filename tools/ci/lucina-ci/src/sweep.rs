@@ -8,16 +8,21 @@
 //! *in use*, and skipped, when a cargo build lock is held in it or one of its `debug/`/`release/` folders, **or** when one of the
 //! target's top-level entries or one of the entries of a `deps/` folder (the target's, or a `debug`/`release` profile's) was written
 //! in the last `IN_USE_WINDOW_SECS` (10 minutes) — nothing deeper is read —, **or** when a process has its executable, its working
-//! directory, an open file or a memory mapping inside it, however long ago anything was written: cargo drops the `.cargo-lock`
+//! directory, an open file or a memory mapping inside it, **or** a build program of ours whose `CARGO_TARGET_DIR` / `CARGO_BUILD_TARGET_DIR` names a path inside it (read from `/proc/<pid>/environ`; unreadable counts as in use), however long ago anything was written: cargo drops the `.cargo-lock`
 //! between compiling and running the test binaries, and a sweep that fired in that window stripped `<cache_root>/debug` whole from
 //! a live `cargo test` whose binaries it had not yet reached. A target whose top level cannot be read is skipped too (unreadable),
-//! never removed on a guess. The locks are only probed and are released at once; what closes the race with a build starting now is
-//! the removal itself: the target is renamed to `.sweep-trash-<pid>-<name>` beside it in one step and only that renamed tree is
-//! deleted, so a cargo that starts afterwards makes a fresh folder at the old name and never meets the deletion. A `.sweep-trash-*`
+//! never removed on a guess. The candidate is opened once and its locks are taken through that descriptor and **held until the
+//! rename is done**: age check, process check (the table is read after the locks), `renameat` to `.sweep-trash-<pid>-<name>`
+//! beside it, and a check that what sits under the trash name is the folder that was opened (`st_dev`, `st_ino`; a mismatch is renamed
+//! back and skipped). Only the renamed tree is then deleted, so a cargo that starts afterwards makes a fresh folder at the old name and
+//! never meets the deletion. Root mode refuses a `--dir` that does not carry the check-cache marker (a regular file
+//! `.lucina-check-target` holding `lucina-check-target`, written by `scripts/check-fast`; Cargo's `CACHEDIR.TAG` is not touched). A `.sweep-trash-*`
 //! left by a crashed sweep goes on the next run. The rename and the delete are done relative to a descriptor of the cache root that
 //! is opened (O_DIRECTORY|O_NOFOLLOW) right after the `--dir` check — renameat, openat with O_NOFOLLOW, unlinkat — so a symlink
-//! swapped into the path afterwards is never followed, and the delete never enters a directory whose `st_dev` is not the root's (it
-//! leaves that subtree and says `contains a mount point`). Both modes work only under the canonical `$HOME/.cache` the CLI passes;
+//! swapped into the path afterwards is never followed, and in root mode the delete never enters a directory whose `st_dev` or
+//! mount id (`statx` `STATX_MNT_ID`) is not the root's, or whose mount id is unknown (it leaves that subtree and says `contains a
+//! mount point`). `--single` compares `st_dev` and mount id for the profile folders it lists and for the artifact it removes, not for
+//! `deps/`, `incremental/` and `build/` in between (known limit, see SHIFT-LEFT.md). Both modes work only under the canonical `$HOME/.cache` the CLI passes;
 //! the process table is a parameter (`/proc` in the CLI), never an environment variable. The in-use check sees only processes of our own
 //! uid (one of ours whose `/proc` entries cannot be read counts only when its command line names a path in the target; a process of
 //! another uid is never counted): the cache is per-user, so a build by another uid into it is not protected. `--single` reads the
@@ -95,6 +100,7 @@ pub fn candidates(root: &Path, keep: Option<&Path>) -> Vec<Entry> {
         if !p.is_dir()
             || keep.is_some_and(|k| k == p)
             || e.file_name().to_string_lossy().starts_with(TRASH_PREFIX)
+            || e.file_name().to_string_lossy().starts_with(PARK_PREFIX)
         {
             continue;
         }
@@ -116,25 +122,69 @@ pub fn candidates(root: &Path, keep: Option<&Path>) -> Vec<Entry> {
     out
 }
 
-/// Holds the cargo locks of a target (`.cargo-lock` in it, or in its `debug/` and `release/`), without waiting. `None`: a build holds one.
-fn lock_target(dir: &Path) -> Option<Vec<fs::File>> {
+/// Holds the cargo locks of a target (`.cargo-lock` in the directory `dir`, or in its `debug/` and `release/`), without waiting.
+/// `None`: a build holds one, or one cannot be opened. Everything is opened **through the candidate's descriptor**, never by path: a
+/// `debug/` or `release/` that is a link is not entered, and a `.cargo-lock` is opened with O_NOFOLLOW|O_NONBLOCK, so a link is not
+/// followed and a planted FIFO cannot hang the sweep (a lock file that is not a regular file, or that is a link, is no lock: skipped).
+fn lock_target_fd(dir: RawFd) -> Option<Vec<fs::File>> {
     let mut held = Vec::new();
     for sub in ["", "debug", "release"] {
-        let lock = dir.join(sub).join(".cargo-lock");
-        if !lock.exists() {
+        let sub_fd;
+        let raw = if sub.is_empty() {
+            dir
+        } else {
+            match open_dir_at(dir, OsStr::new(sub)) {
+                Ok(fd) => {
+                    sub_fd = fd;
+                    sub_fd.as_raw_fd()
+                }
+                Err(e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(libc::ENOENT | libc::ELOOP | libc::ENOTDIR)
+                    ) =>
+                {
+                    continue;
+                }
+                Err(_) => return None,
+            }
+        };
+        let flags = libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        // SAFETY: a valid NUL-terminated name and a live directory fd.
+        let fd = unsafe { libc::openat(raw, c".cargo-lock".as_ptr(), flags) };
+        let fd = match check_fd(fd) {
+            Ok(fd) => fd,
+            // No lock there, a link in its place (never followed), or a FIFO nobody reads (ENXIO): nothing to take.
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::ENOENT | libc::ELOOP | libc::ENXIO)
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => return None,
+        };
+        if fstat_fd(fd.as_raw_fd()).ok()?.st_mode & libc::S_IFMT != libc::S_IFREG {
             continue;
         }
-        let f = fs::OpenOptions::new().write(true).open(&lock).ok()?;
+        let f = fs::File::from(fd);
         f.try_lock().ok()?;
         held.push(f);
     }
     Some(held)
 }
 
+/// `lock_target_fd` on a folder given by path (a test's way in).
+#[cfg(test)]
+fn lock_target(dir: &Path) -> Option<Vec<fs::File>> {
+    lock_target_fd(open_dir_path(dir).ok()?.as_raw_fd())
+}
+
 /// A target with anything written under it in this many seconds is left alone even when no build holds a lock: cargo drops the
 /// `.cargo-lock` between compiling and running the test binaries, and a sweep in that window is what GATE-09 lost a live
 /// `cargo test` to. Ten minutes — a rebuild of what genuinely went idle costs minutes, a wrong removal costs a whole gate. Past the
-/// window a process that still has the target open is found by `pid_using`, not by the clock.
+/// window a process that still has the target open is found by `scan_using`, not by the clock.
 const IN_USE_WINDOW_SECS: u64 = 600;
 
 /// The newest write (mtime) under one candidate target, read **shallowly**: the mtimes of the target's top-level entries and of the
@@ -192,7 +242,7 @@ fn written_ago(dir: &Path, now: SystemTime) -> Result<Option<u64>, ()> {
     newest_write(dir).map(|t| t.map(|t| now.duration_since(t).map_or(0, |d| d.as_secs())))
 }
 
-/// One thing a process has, as `pid_using` looks at it.
+/// One thing a process has, as `scan_using` looks at it.
 enum Probe {
     /// It lies inside the target.
     Hit,
@@ -223,6 +273,31 @@ fn maps_path(line: &str) -> &str {
     p.strip_suffix(" (deleted)").unwrap_or(p)
 }
 
+/// Does a NUL-separated environment name `real` (or a path inside it) as `CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR`?
+fn env_names_target(env: &[u8], real: &Path) -> bool {
+    env.split(|b| *b == 0).any(|kv| {
+        let kv = String::from_utf8_lossy(kv);
+        ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"]
+            .iter()
+            .filter_map(|k| kv.strip_prefix(&format!("{k}=")))
+            .any(|v| inside(real, Path::new(v)))
+    })
+}
+
+/// Does the NUL-separated command line carry `--target-dir <path>` or `--target-dir=<path>` with the path inside `real`? A cargo
+/// started like that has no environment variable to give it away.
+fn cmdline_target_dir(cmdline: &[u8], real: &Path) -> bool {
+    let args: Vec<String> = cmdline
+        .split(|b| *b == 0)
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+    args.iter().enumerate().any(|(i, a)| {
+        a.strip_prefix("--target-dir=")
+            .is_some_and(|v| inside(real, Path::new(v)))
+            || (a == "--target-dir" && args.get(i + 1).is_some_and(|v| inside(real, Path::new(v))))
+    })
+}
+
 /// Does `arg` name a path inside `real`: the whole argument, or what follows an `=` in it (`--target-dir=/cache/wt-x/...`)?
 fn arg_names(arg: &str, real: &Path) -> bool {
     Path::new(arg).starts_with(real)
@@ -239,11 +314,29 @@ fn cmdline_names(cmdline: &Path, real: &Path) -> bool {
     })
 }
 
-/// The pid of a process that has its executable, its working directory, any open file or any file mapping inside `dir` (the check
-/// that does not depend on a clock: a test binary that has run for an hour is still found). Our own pid is not counted (we hold
+/// Why a candidate is in use: a process that has something of it (or a builder whose environment names it), or a builder of ours
+/// whose environment cannot be read (`comm` is named in the skip line: it is the reason, not an open file).
+#[derive(Debug, PartialEq, Eq)]
+enum Using {
+    Pid(u32),
+    EnvUnreadable(u32, String),
+}
+
+/// `scan_using` as a pid (a test's way in).
+#[cfg(test)]
+fn pid_using(dir: &Path, procs: &Path) -> Option<u32> {
+    scan_using(dir, procs).map(|u| match u {
+        Using::Pid(p) | Using::EnvUnreadable(p, _) => p,
+    })
+}
+
+/// The process that has its executable, its working directory, any open file or any file mapping inside `dir` (the check
+/// that does not depend on a clock: a test binary that has run for an hour is still found), or that is a build program of ours
+/// (`is_builder`) whose `CARGO_TARGET_DIR` / `CARGO_BUILD_TARGET_DIR` names a path inside `dir` (read from `/proc/<pid>/environ`;
+/// unreadable counts as in use). Our own pid is not counted (we hold
 /// nothing of the target). An entry of another user's process that cannot be read is not "in use"; one of our own uid that cannot
 /// be read (there are always some: `systemd --user`) counts only when its command line names a path in the target. `procs` is `/proc`, or a test's own table.
-fn pid_using(dir: &Path, procs: &Path) -> Option<u32> {
+fn scan_using(dir: &Path, procs: &Path) -> Option<Using> {
     let real = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let me = std::process::id();
     // SAFETY: geteuid has no preconditions and cannot fail.
@@ -259,6 +352,28 @@ fn pid_using(dir: &Path, procs: &Path) -> Option<u32> {
         if pid == me {
             continue;
         }
+        let own = fs::metadata(&p).is_ok_and(|m| m.uid() == uid);
+        // A build program of ours is recognised by its environment as well: `check-fast` exports CARGO_TARGET_DIR, and a
+        // `cargo test` past the write window holds no lock and, between two test binaries, nothing open in the target. If its
+        // CARGO_TARGET_DIR or CARGO_BUILD_TARGET_DIR is inside the candidate, it is in use. An environment that cannot be read counts
+        // as in use: it cannot be shown that this builder is not building here. (A process that exits while we look is gone.)
+        if own {
+            let comm = fs::read_to_string(p.join("comm")).unwrap_or_default();
+            if is_builder(&comm) {
+                // A build started with `--target-dir` has nothing in its environment: its command line says where it builds.
+                if fs::read(p.join("cmdline")).is_ok_and(|c| cmdline_target_dir(&c, &real)) {
+                    return Some(Using::Pid(pid));
+                }
+                match fs::read(p.join("environ")) {
+                    Ok(env) if env_names_target(&env, &real) => return Some(Using::Pid(pid)),
+                    Ok(_) => {}
+                    Err(e)
+                        if e.kind() == io::ErrorKind::NotFound
+                            || e.raw_os_error() == Some(libc::ESRCH) => {}
+                    Err(_) => return Some(Using::EnvUnreadable(pid, comm.trim().to_string())),
+                }
+            }
+        }
         let mut denied = false;
         let mut note = |pr: Probe| match pr {
             Probe::Hit => true,
@@ -269,13 +384,13 @@ fn pid_using(dir: &Path, procs: &Path) -> Option<u32> {
             Probe::Clear => false,
         };
         if note(probe_link(&p.join("exe"), &real)) || note(probe_link(&p.join("cwd"), &real)) {
-            return Some(pid);
+            return Some(Using::Pid(pid));
         }
         match fs::read_dir(p.join("fd")) {
             Ok(rd) => {
                 for e in rd.flatten() {
                     if note(probe_link(&e.path(), &real)) {
-                        return Some(pid);
+                        return Some(Using::Pid(pid));
                     }
                 }
             }
@@ -287,7 +402,7 @@ fn pid_using(dir: &Path, procs: &Path) -> Option<u32> {
                 if maps.lines().any(|l| {
                     maps_path(l).starts_with('/') && Path::new(maps_path(l)).starts_with(&real)
                 }) {
-                    return Some(pid);
+                    return Some(Using::Pid(pid));
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => denied = true,
@@ -296,11 +411,8 @@ fn pid_using(dir: &Path, procs: &Path) -> Option<u32> {
         // A process of ours that cannot be read (dumpable=0: `systemd --user`, `sshd-session`, ...) is only ever one of those: it counts
         // as in use when its command line, which anyone can read, names a path inside the target, and not otherwise — counting them all
         // would make every sweep on a host with a login session skip everything.
-        if denied
-            && fs::metadata(&p).is_ok_and(|m| m.uid() == uid)
-            && cmdline_names(&p.join("cmdline"), &real)
-        {
-            return Some(pid);
+        if denied && own && cmdline_names(&p.join("cmdline"), &real) {
+            return Some(Using::Pid(pid));
         }
     }
     None
@@ -315,12 +427,17 @@ enum Sweep1 {
     Recent(u64),
     /// A process has it open (executable, cwd, file or mapping): skipped (in use by pid N).
     InUse(u32),
+    /// A build program of ours whose environment cannot be read (it cannot be shown not to build here): skipped (in use by pid N (comm):
+    /// environ unreadable).
+    EnvUnreadable(u32, String),
     /// Its top level could not be read: skipped (unreadable).
     Unreadable,
     /// It is itself a mount point (another filesystem than the root): skipped (mount point).
     MountPoint,
-    /// A folder inside it is on another filesystem: skipped whole (contains a mount point), never removed in part.
+    /// A folder inside it is on another filesystem or mount: skipped whole (contains a mount point), never removed in part.
     ContainsMount,
+    /// What sat under the name after the rename was not the folder that was opened (swapped in between): renamed back, skipped.
+    Swapped,
     /// Removed (a dry run would remove): `bytes` freed and the age of its newest write, for the log.
     Removed { bytes: u64, age: u64 },
     /// The removal failed (possibly part-way): the message, logged as `failed to remove`.
@@ -337,14 +454,36 @@ const TRASH_PREFIX: &str = ".sweep-trash-";
 // into it after the check is followed; an fd names the directory that was checked, and what is below it is never reached through a
 // link.
 
-/// The canonical cache root, held open. `dev` is its `st_dev`: nothing below is entered if it is on another filesystem.
+// A test's way to make the kernel give no mount id for the root of the current test thread (set it, run, reset it).
+#[cfg(test)]
+thread_local! {
+    static NO_ROOT_MNT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The canonical cache root, held open. `dev` is its `st_dev` and `mnt` its mount id: in root mode nothing below is entered if it is
+/// on another filesystem **or on another mount** (`--single` checks only the profiles and the artifact it removes). A bind mount of the same filesystem has the same `st_dev` and a different mount id, so the
+/// device number alone does not see it.
 struct Root {
     fd: OwnedFd,
     path: PathBuf,
     dev: u64,
-    /// A test's stand-in for a mount point (a name that counts as foreign), since a unit test cannot mount. Not in a release build.
+    /// The root's mount id (`statx` with `STATX_MNT_ID`). `None` when the kernel does not give one: then no directory below can be
+    /// shown to be on the root's mount, so `run` and `run_single` stop before anything is read (`root_mount_id_error`), and a direct
+    /// use of the root would count every directory as foreign (fail closed).
+    mnt: Option<u64>,
+    /// A test's stand-in for a mount (a unit test cannot mount): the directory of this name reads as having this mount id (`None`:
+    /// `statx` gave none). A `RefCell`, so a hook can make a mount appear after the pre-check. Not in a release build.
     #[cfg(test)]
-    fake_mount: Option<OsString>,
+    fake_mnt: std::cell::RefCell<Option<(OsString, Option<u64>)>>,
+    /// A test's hook that runs after the checks and right before the rename of a candidate (to swap the name under it).
+    #[cfg(test)]
+    before_rename: Option<Box<dyn Fn()>>,
+    /// A test's hook that runs right after the rename succeeded, before the identity check.
+    #[cfg(test)]
+    after_rename: Option<Box<dyn Fn()>>,
+    /// A test's hook that runs after the locks are let go, before the renamed tree is deleted.
+    #[cfg(test)]
+    before_delete: Option<Box<dyn Fn()>>,
 }
 
 fn cstr(name: &OsStr) -> io::Result<CString> {
@@ -462,33 +601,84 @@ fn dir_names(fd: RawFd) -> io::Result<Vec<OsString>> {
     Ok(out)
 }
 
+/// The mount id of the directory `fd` (`statx(fd, "", AT_EMPTY_PATH, STATX_MNT_ID)`). `None` when the call fails or the kernel does
+/// not fill the field in (older than 5.8): the caller then treats the directory as foreign.
+fn mnt_id(fd: RawFd) -> Option<u64> {
+    // SAFETY: an all-zero `statx` is a valid value for the kernel to overwrite.
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: an empty path with AT_EMPTY_PATH names the open directory `fd`; the out pointer is valid.
+    let r = unsafe {
+        libc::statx(
+            fd,
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH,
+            libc::STATX_MNT_ID,
+            &mut stx,
+        )
+    };
+    (r == 0 && stx.stx_mask & libc::STATX_MNT_ID != 0).then_some(stx.stx_mnt_id)
+}
+
 impl Root {
-    /// Opens `path` (already canonical) without following a link in its last component.
+    /// Opens `path` (already canonical) without following a link in its last component (a test's way in; the CLI hands over the
+    /// descriptor `check_root` opened).
+    #[cfg(test)]
     fn open(path: &Path) -> io::Result<Root> {
-        let fd = open_dir_path(path)?;
+        Root::from_fd(open_dir_path(path)?, path)
+    }
+
+    /// A root from a directory already opened (O_DIRECTORY|O_NOFOLLOW) by the caller; `path` is its canonical name, for the log.
+    fn from_fd(fd: OwnedFd, path: &Path) -> io::Result<Root> {
         let dev = fstat_fd(fd.as_raw_fd())?.st_dev as u64;
+        let mnt = mnt_id(fd.as_raw_fd());
+        #[cfg(test)]
+        let mnt = if NO_ROOT_MNT.with(|c| c.get()) {
+            None
+        } else {
+            mnt
+        };
         Ok(Root {
             fd,
             path: path.to_path_buf(),
             dev,
+            mnt,
             #[cfg(test)]
-            fake_mount: None,
+            fake_mnt: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            before_rename: None,
+            #[cfg(test)]
+            after_rename: None,
+            #[cfg(test)]
+            before_delete: None,
         })
     }
 
-    /// Is a directory with this `st_dev` (and this name) somebody else's filesystem?
-    fn foreign(&self, dev: u64, name: &OsStr) -> bool {
-        self.fake(name) || crosses_device(self.dev, dev)
+    /// Is the directory `fd` (called `name`) somebody else's: another filesystem (`st_dev`) or another mount (mount id)? Fails closed:
+    /// a directory whose `fstat` or mount id cannot be read, or a root whose mount id is unknown, is foreign.
+    fn foreign(&self, fd: RawFd, name: &OsStr) -> bool {
+        let Ok(st) = fstat_fd(fd) else {
+            return true;
+        };
+        if crosses_device(self.dev, to_u64(st.st_dev)) {
+            return true;
+        }
+        match (self.mnt, self.mnt_of(fd, name)) {
+            (Some(root), Some(here)) => root != here,
+            _ => true,
+        }
     }
 
     #[cfg(test)]
-    fn fake(&self, name: &OsStr) -> bool {
-        self.fake_mount.as_deref() == Some(name)
+    fn mnt_of(&self, fd: RawFd, name: &OsStr) -> Option<u64> {
+        match &*self.fake_mnt.borrow() {
+            Some((n, id)) if n.as_os_str() == name => *id,
+            _ => mnt_id(fd),
+        }
     }
 
     #[cfg(not(test))]
-    fn fake(&self, _name: &OsStr) -> bool {
-        false
+    fn mnt_of(&self, fd: RawFd, _name: &OsStr) -> Option<u64> {
+        mnt_id(fd)
     }
 }
 
@@ -522,7 +712,7 @@ fn remove_entry(root: &Root, parent: RawFd, name: &OsStr) -> io::Result<Removed>
         }
         Err(e) => return Err(e),
     };
-    if root.foreign(fstat_fd(dfd.as_raw_fd())?.st_dev as u64, name) {
+    if root.foreign(dfd.as_raw_fd(), name) {
         return Ok(Removed::Mount);
     }
     let mut left = false;
@@ -538,6 +728,14 @@ fn remove_entry(root: &Root, parent: RawFd, name: &OsStr) -> io::Result<Removed>
     Ok(Removed::Done)
 }
 
+/// `.sweep-parked-<pid>-<n>-<name>`, where a renamed tree that could not be put back is left (see `PARK_PREFIX`); `n` counts the
+/// tries when a name is taken.
+fn parked_name(name: &OsStr, n: u32) -> OsString {
+    let mut v = format!("{PARK_PREFIX}{}-{n}-", std::process::id()).into_bytes();
+    v.extend_from_slice(name.as_bytes());
+    OsString::from_vec(v)
+}
+
 /// `.sweep-trash-<pid>-<name>`, the sibling a candidate is renamed to before it is deleted.
 fn trash_name(name: &OsStr) -> OsString {
     let mut v = format!("{TRASH_PREFIX}{}-", std::process::id()).into_bytes();
@@ -545,13 +743,16 @@ fn trash_name(name: &OsStr) -> OsString {
     OsString::from_vec(v)
 }
 
-/// Decide one candidate target and, unless `dry`, remove it. Cargo's locks are only probed, without waiting, and let go at once —
-/// holding one across a removal made a cargo that arrived wait for the whole deletion and then find its folder gone. The race with
-/// a build starting after the probe is closed by the removal, not by a lock: the target is renamed (`renameat`, relative to the
-/// held root fd) to a sibling `.sweep-trash-<pid>-<name>` in one step — a cargo that starts afterwards makes a fresh folder at the
-/// old name — and only the renamed tree is deleted, through the same fd. The never-used classing has already put this target in
-/// `doomed`; here it meets the in-use test: a `debug/` in use is skipped like any other. `path` is the candidate, a direct child of
-/// `root.path`; `log` gets the `removing` line before the rename, so a wrong deletion leaves a line.
+/// Decide one candidate target and, unless `dry`, remove it. The order is the point: the candidate is opened once
+/// (`openat`, O_NOFOLLOW|O_DIRECTORY) and its `(st_dev, st_ino)` taken from the descriptor; its cargo locks are taken **through that
+/// descriptor** and **kept until the rename is done**; only then the age, the process table (read now, after the locks), the
+/// rename (`renameat`, relative to the held root fd) to a sibling `.sweep-trash-<pid>-<name>`, and a check that what sits under the
+/// trash name is the folder that was opened (`fstatat`, same `(st_dev, st_ino)`). A different one — somebody swapped the name between
+/// the open and the rename — is renamed back and skipped (`Swapped`), never deleted. Then the locks go and the renamed tree is
+/// deleted through the same root fd. A build starting after the rename makes a fresh folder at the old name and never meets the
+/// deletion. The never-used classing has already put this target in `doomed`; here it meets the in-use test: a `debug/` in use is
+/// skipped like any other. `path` is the candidate, a direct child of `root.path`; `log` gets the `removing` line before the
+/// rename, so a wrong deletion leaves a line.
 fn sweep_candidate(
     path: &Path,
     bytes: u64,
@@ -570,16 +771,22 @@ fn sweep_candidate(
         // A link is unlinked, never followed: nothing of what it points at is read or touched.
         return remove_candidate(root, path, bytes, 0, dry, log);
     }
-    if crosses_device(root.dev, st.st_dev as u64) {
+    let Ok(cfd) = open_dir_at(root.fd.as_raw_fd(), name) else {
+        return Sweep1::Unreadable;
+    };
+    let Ok(opened) = fstat_fd(cfd.as_raw_fd()) else {
+        return Sweep1::Unreadable;
+    };
+    let id = (to_u64(opened.st_dev), to_u64(opened.st_ino));
+    if root.foreign(cfd.as_raw_fd(), name) {
         return Sweep1::MountPoint;
     }
-    if contains_foreign_dev(path, root.dev) {
+    if contains_foreign(root, cfd.as_raw_fd()) {
         return Sweep1::ContainsMount;
     }
-    let Some(locks) = lock_target(path) else {
+    let Some(locks) = lock_target_fd(cfd.as_raw_fd()) else {
         return Sweep1::Locked;
     };
-    drop(locks);
     let age = match written_ago(path, now) {
         Err(()) => return Sweep1::Unreadable,
         Ok(a) => a,
@@ -589,14 +796,25 @@ fn sweep_candidate(
     {
         return Sweep1::Recent(a);
     }
-    if let Some(pid) = pid_using(path, procs) {
-        return Sweep1::InUse(pid);
+    // The process table is read here, after the locks are held: a builder that started during the sweep is in it.
+    match scan_using(path, procs) {
+        Some(Using::Pid(pid)) => return Sweep1::InUse(pid),
+        Some(Using::EnvUnreadable(pid, comm)) => return Sweep1::EnvUnreadable(pid, comm),
+        None => {}
     }
-    remove_candidate(root, path, bytes, age.unwrap_or(0), dry, log)
+    remove_held(
+        root,
+        path,
+        bytes,
+        age.unwrap_or(0),
+        dry,
+        log,
+        Expect::Dir(id.0, id.1),
+        locks,
+    )
 }
 
-/// The removal itself: log `removing <path>` (before anything is touched), `renameat` to the trash name, delete the renamed tree
-/// through the root fd. A dry run does none of it.
+/// The removal of a candidate that is not known by identity: a link, or a test's direct call. See `remove_held`.
 fn remove_candidate(
     root: &Root,
     path: &Path,
@@ -605,23 +823,158 @@ fn remove_candidate(
     dry: bool,
     log: &mut dyn FnMut(&str),
 ) -> Sweep1 {
+    remove_held(root, path, bytes, age, dry, log, Expect::Link, Vec::new())
+}
+
+/// What the renamed candidate must turn out to be: the directory that was opened (`(st_dev, st_ino)`), or, for a candidate that
+/// `stat` found to be a link, a link again — a directory that took the name of a link between the `stat` and the rename was never
+/// opened, listed or checked, so it is renamed back, never deleted.
+#[derive(Clone, Copy)]
+enum Expect {
+    Dir(u64, u64),
+    Link,
+}
+
+/// Prefix of a folder a sweep could not put back (the name was taken again): never matched by `clean_trash`, so a later run does
+/// not delete a tree nobody verified. It is left for a person. A parked tree is excluded from the sweepable set (`candidates`) but
+/// from the measured total (`left_for_a_person`), so it is not paid for by removing idle targets; every run names it until it is
+/// removed by hand. A planted folder with this prefix therefore sits outside the cap.
+const PARK_PREFIX: &str = ".sweep-parked-";
+
+/// A file a sweep leaves inside a tree it could not park (every parking name was taken): `clean_trash` skips a trash folder that
+/// holds it, so the tree is not deleted unverified by a later run.
+const UNVERIFIED_FILE: &str = ".sweep-unverified";
+
+/// How many parking names are tried before the tree is left under its trash name, marked with `UNVERIFIED_FILE`.
+const PARK_TRIES: u32 = 8;
+
+/// The removal itself: log `removing <path>` (before anything is touched), `renameat` to the trash name, check the identity of what
+/// was renamed against `expect` (the `(st_dev, st_ino)` the caller opened; renamed back and `Swapped` when it differs), let `locks`
+/// go, delete the renamed tree through the root fd. A dry run does none of it.
+#[allow(clippy::too_many_arguments)]
+fn remove_held(
+    root: &Root,
+    path: &Path,
+    bytes: u64,
+    age: u64,
+    dry: bool,
+    log: &mut dyn FnMut(&str),
+    expect: Expect,
+    locks: Vec<fs::File>,
+) -> Sweep1 {
     if !dry {
         let name = path.file_name().unwrap_or_default();
+        let rfd = root.fd.as_raw_fd();
         log(&format!("sweep-target: removing {}", path.display()));
         let trash = trash_name(name);
-        if let Err(e) = rename_at(root.fd.as_raw_fd(), name, &trash) {
+        #[cfg(test)]
+        {
+            if let Some(hook) = &root.before_rename {
+                hook();
+            }
+        }
+        if let Err(e) = rename_at(rfd, name, &trash) {
             return Sweep1::Failed(format!(
                 "rename to {}: {e}",
                 root.path.join(&trash).display()
             ));
         }
-        match remove_entry(root, root.fd.as_raw_fd(), &trash) {
+        #[cfg(test)]
+        {
+            if let Some(hook) = &root.after_rename {
+                hook();
+            }
+        }
+        let same = stat_at(rfd, &trash).is_ok_and(|s| match expect {
+            Expect::Dir(dev, ino) => (to_u64(s.st_dev), to_u64(s.st_ino)) == (dev, ino),
+            Expect::Link => is_link_mode(&s),
+        });
+        if !same {
+            return match rename_at(rfd, &trash, name) {
+                Ok(()) => Sweep1::Swapped,
+                Err(e) => {
+                    // The name is taken again: park the tree under a prefix `clean_trash` leaves alone.
+                    let at = park(root, &trash, name);
+                    Sweep1::Failed(format!(
+                        "the folder was replaced during the sweep and could not be put back ({e}); it is at {}",
+                        at.display()
+                    ))
+                }
+            };
+        }
+        drop(locks);
+        #[cfg(test)]
+        {
+            if let Some(hook) = &root.before_delete {
+                hook();
+            }
+        }
+        match remove_entry(root, rfd, &trash) {
             Ok(Removed::Done) => {}
             Ok(Removed::Mount) => return Sweep1::Failed("contains a mount point".into()),
             Err(e) => return Sweep1::Failed(e.to_string()),
         }
     }
     Sweep1::Removed { bytes, age }
+}
+
+/// Writes `UNVERIFIED_FILE` into the folder `name` of the root; false when it could not be written.
+fn mark_unverified(root: &Root, name: &OsStr) -> bool {
+    let Ok(fd) = open_dir_at(root.fd.as_raw_fd(), name) else {
+        return false;
+    };
+    let Ok(f) = cstr(OsStr::new(UNVERIFIED_FILE)) else {
+        return false;
+    };
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: a valid NUL-terminated name and a live directory fd; the mode is only read with O_CREAT.
+    let r = unsafe { libc::openat(fd.as_raw_fd(), f.as_ptr(), flags, 0o600 as libc::c_uint) };
+    check_fd(r).is_ok()
+}
+
+/// Parks the renamed tree `trash` under a name `clean_trash` leaves alone, trying `PARK_TRIES` names; where it ended up. If every name
+/// is taken it stays under its trash name with `UNVERIFIED_FILE` in it, which `clean_trash` respects, but only when that mark was
+/// really written: a tree whose mark cannot be written is never left under a trash name — parking is then the only way, and
+/// more names are tried. Only if the mark cannot be written and no parking name is free either does the tree stay under its trash
+/// name unmarked, and the caller's message says where it is.
+fn park(root: &Root, trash: &OsStr, name: &OsStr) -> PathBuf {
+    let rfd = root.fd.as_raw_fd();
+    let try_names = |range: std::ops::Range<u32>| {
+        range.into_iter().find_map(|n| {
+            let parked = parked_name(name, n);
+            rename_at(rfd, trash, &parked)
+                .is_ok()
+                .then(|| root.path.join(&parked))
+        })
+    };
+    if let Some(at) = try_names(0..PARK_TRIES) {
+        return at;
+    }
+    if mark_unverified(root, trash) {
+        return root.path.join(trash);
+    }
+    try_names(PARK_TRIES..PARK_TRIES * 8).unwrap_or_else(|| root.path.join(trash))
+}
+
+/// What a sweep left for a person: the `.sweep-parked-*` folders and the `.sweep-trash-*` folders marked `UNVERIFIED_FILE`, with
+/// their sizes. They are never swept and never deleted, so their bytes are not counted against the limit: paying for them by
+/// removing every idle target would not free a byte of them.
+fn left_for_a_person(root: &Root) -> Vec<(OsString, u64)> {
+    let rfd = root.fd.as_raw_fd();
+    let mut out = Vec::new();
+    for name in dir_names(rfd).unwrap_or_default() {
+        let b = name.as_bytes();
+        let parked = b.starts_with(PARK_PREFIX.as_bytes());
+        let unverified = b.starts_with(TRASH_PREFIX.as_bytes())
+            && open_dir_at(rfd, &name)
+                .is_ok_and(|d| stat_at(d.as_raw_fd(), OsStr::new(UNVERIFIED_FILE)).is_ok());
+        if parked || unverified {
+            let bytes = bytes_at(rfd, &name);
+            out.push((name, bytes));
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Removes the `.sweep-trash-*` folders a crashed sweep left in the cache root, through the root fd and with the same device check,
@@ -635,6 +988,13 @@ fn clean_trash(root: &Root, dry: bool, log: &mut dyn FnMut(&str)) {
             continue;
         }
         let p = root.path.join(&name);
+        // A tree a sweep could not park is marked and left for a person.
+        if open_dir_at(root.fd.as_raw_fd(), &name)
+            .is_ok_and(|d| stat_at(d.as_raw_fd(), OsStr::new(UNVERIFIED_FILE)).is_ok())
+        {
+            log(&format!("sweep-target: left unverified {}", p.display()));
+            continue;
+        }
         if dry {
             log(&format!("sweep-target: would remove stale {}", p.display()));
             continue;
@@ -672,10 +1032,18 @@ fn sweep_log(path: &Path, out: &Sweep1, dry: bool) -> String {
                 path.display()
             )
         }
+        Sweep1::EnvUnreadable(pid, comm) => format!(
+            "sweep-target: skipped {} (in use by pid {pid} ({comm}): environ unreadable)",
+            path.display()
+        ),
         Sweep1::Unreadable => format!("sweep-target: skipped {} (unreadable)", path.display()),
         Sweep1::MountPoint => format!("sweep-target: skipped {} (mount point)", path.display()),
         Sweep1::ContainsMount => format!(
             "sweep-target: skipped {} (contains a mount point)",
+            path.display()
+        ),
+        Sweep1::Swapped => format!(
+            "sweep-target: skipped {} (changed during the sweep)",
             path.display()
         ),
         Sweep1::Removed { bytes, age } => format!(
@@ -694,19 +1062,21 @@ fn crosses_device(root_dev: u64, entry_dev: u64) -> bool {
     root_dev != entry_dev
 }
 
-/// Does a folder inside `p` (at any depth, found with `lstat`, so no symlink is followed) sit on another filesystem than `root_dev`?
-/// A candidate holding one is skipped whole: removing part of it would be worse than removing none.
-fn contains_foreign_dev(p: &Path, root_dev: u64) -> bool {
-    let Ok(rd) = fs::read_dir(p) else {
-        return false;
-    };
-    for e in rd.flatten() {
-        let q = e.path();
-        let Ok(md) = fs::symlink_metadata(&q) else {
+/// Does a folder inside the directory `fd` (at any depth, opened with O_NOFOLLOW|O_DIRECTORY through descriptors, so no symlink is
+/// followed and no path is looked up twice) sit on another filesystem or another mount than the root? A candidate holding one is
+/// skipped whole: removing part of it would be worse than removing none.
+fn contains_foreign(root: &Root, fd: RawFd) -> bool {
+    for name in dir_names(fd).unwrap_or_default() {
+        let Ok(st) = stat_at(fd, &name) else {
             continue;
         };
-        if md.is_dir() && (crosses_device(root_dev, md.dev()) || contains_foreign_dev(&q, root_dev))
-        {
+        if !is_dir_mode(&st) {
+            continue;
+        }
+        let Ok(sub) = open_dir_at(fd, &name) else {
+            continue;
+        };
+        if root.foreign(sub.as_raw_fd(), &name) || contains_foreign(root, sub.as_raw_fd()) {
             return true;
         }
     }
@@ -722,12 +1092,42 @@ pub struct Guard<'a> {
     pub procs: &'a Path,
 }
 
+/// The file, beside Cargo's own `CACHEDIR.TAG`, that marks a folder as the fast-check cache (root mode refuses any other folder), and
+/// its whole content. `scripts/check-fast` writes it; Cargo's tag is never read or changed.
+const CACHE_MARKER_FILE: &str = ".lucina-check-target";
+const CACHE_MARKER_CONTENT: &str = "lucina-check-target";
+
+/// Does the root carry the check-cache marker: a regular file `.lucina-check-target` (opened through the root fd with
+/// O_NOFOLLOW|O_NONBLOCK, so a link is refused and a FIFO cannot hang it) whose content is the single line `lucina-check-target`?
+fn has_cache_marker(root: &Root) -> bool {
+    use std::io::Read;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let Ok(name) = cstr(OsStr::new(CACHE_MARKER_FILE)) else {
+        return false;
+    };
+    // SAFETY: a valid NUL-terminated name and a live directory fd.
+    let fd = unsafe { libc::openat(root.fd.as_raw_fd(), name.as_ptr(), flags) };
+    let Ok(fd) = check_fd(fd) else {
+        return false;
+    };
+    if !fstat_fd(fd.as_raw_fd()).is_ok_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFREG) {
+        return false;
+    }
+    let mut head = Vec::new();
+    if fs::File::from(fd).take(256).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    String::from_utf8_lossy(&head).trim_end_matches('\n') == CACHE_MARKER_CONTENT
+}
+
 /// Checks `--dir` before anything is read or removed, and gives back the canonical root. Refused (an `Err` that names the reason;
 /// nothing has been removed) when it is empty or not absolute, has a `..` component, is itself a symlink, canonicalizes to `/` or to
 /// the home directory, or canonicalizes to anything that is not strictly under the allowed prefix (the canonical `$HOME/.cache` the
 /// CLI passes, a temp root in a test) — and when that prefix is itself `/`, under which every path would be legal. From here on only
-/// the canonical path is used.
-fn check_root(root: &Path, guard: &Guard) -> Result<PathBuf, String> {
+/// the canonical path is used, and the directory itself: it is opened once (O_DIRECTORY|O_NOFOLLOW) before the path is resolved, its
+/// `(st_dev, st_ino)` is kept, and the canonical path opened afterwards must be that same directory — a path swapped between the
+/// lookups is refused, and the caller works on the descriptor returned, never on the string.
+fn check_root(root: &Path, guard: &Guard) -> Result<(PathBuf, OwnedFd), String> {
     let refuse = |why: String| {
         Err(format!(
             "sweep-target: refusing --dir {:?}: {why}; nothing was removed",
@@ -750,6 +1150,18 @@ fn check_root(root: &Path, guard: &Guard) -> Result<PathBuf, String> {
     if md.file_type().is_symlink() {
         return refuse("it is a symlink".into());
     }
+    let first = match open_dir_path(root) {
+        Ok(fd) => fd,
+        Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => {
+            return refuse("it is not a directory".into());
+        }
+        Err(e) => return refuse(format!("it cannot be opened as a directory: {e}")),
+    };
+    let identity =
+        |fd: &OwnedFd| fstat_fd(fd.as_raw_fd()).map(|s| (to_u64(s.st_dev), to_u64(s.st_ino)));
+    let Ok(id) = identity(&first) else {
+        return refuse("it cannot be read".into());
+    };
     let canon = match fs::canonicalize(root) {
         Ok(c) => c,
         Err(e) => return refuse(format!("it cannot be resolved: {e}")),
@@ -781,7 +1193,15 @@ fn check_root(root: &Path, guard: &Guard) -> Result<PathBuf, String> {
             allowed.display()
         ));
     }
-    Ok(canon)
+    // The directory the canonical path names now must be the one opened first.
+    let fd = match open_dir_path(&canon) {
+        Ok(fd) => fd,
+        Err(e) => return refuse(format!("{} cannot be opened: {e}", canon.display())),
+    };
+    if identity(&fd).ok() != Some(id) {
+        return refuse("it changed while it was being checked".into());
+    }
+    Ok((canon, fd))
 }
 
 /// `sweep-target --dir ROOT --limit-gib N [--to-gib M] [--keep TARGET] [--dry-run]`, root mode, logging to stderr. Exit 0 except a
@@ -822,17 +1242,37 @@ fn run_with(
             "sweep-target: refusing --limit-gib {limit_gib} / --to-gib {to_gib}: too large to count in bytes; nothing was removed"
         ));
     };
-    let canon = check_root(root, guard)?;
+    let (canon, fd) = check_root(root, guard)?;
     // From here every rename and delete goes through this descriptor, not through the path string.
-    let root = Root::open(&canon).map_err(|e| {
+    let root = Root::from_fd(fd, &canon).map_err(|e| {
         format!(
             "sweep-target: refusing --dir {:?}: cannot open it as a directory: {e}; nothing was removed",
             canon.display().to_string()
         )
     })?;
+    if let Some(e) = root_mount_id_error(&root) {
+        return Err(e);
+    }
+    // Root mode only ever sweeps a check cache: a folder that carries the marker `scripts/check-fast` writes when it creates one.
+    // `LUCINA_CHECK_CACHE` pointed at `$HOME/.cache/cargo-target` would otherwise have whole app targets removed as never used.
+    if !has_cache_marker(&root) {
+        return Err(format!(
+            "sweep-target: refusing --dir {:?}: it is not a check cache (no regular file `{CACHE_MARKER_FILE}` holding `{CACHE_MARKER_CONTENT}`, which scripts/check-fast writes when it creates the cache); nothing was removed",
+            canon.display().to_string()
+        ));
+    }
     let keep = keep.map(|k| fs::canonicalize(k).unwrap_or_else(|_| k.to_path_buf()));
     clean_trash(&root, dry, log);
-    let total = tree_bytes(&root.path);
+    // The cache's own bytes: what is left for a person is named on every run and not counted.
+    let mut total = tree_bytes(&root.path);
+    for (name, bytes) in left_for_a_person(&root) {
+        total = total.saturating_sub(bytes);
+        log(&format!(
+            "sweep-target: parked tree {} {:.1} GiB left for a person",
+            name.to_string_lossy(),
+            bytes as f64 / GIB as f64
+        ));
+    }
     println!(
         "sweep-target: {} is {:.1} GiB (limit {limit_gib}, sweep down to {to_gib})",
         root.path.display(),
@@ -841,15 +1281,17 @@ fn run_with(
     if total <= limit_bytes {
         return Ok(0);
     }
-    let now = SystemTime::now();
     let entries = candidates(&root.path, keep.as_deref());
     let doomed = plan(&entries, total, limit_bytes, to_bytes);
     let (mut freed, mut n, mut busy) = (0u64, 0, 0);
+    let mut outcomes = Vec::new();
     for i in &doomed {
         let e = &entries[*i];
+        // The clock is read per candidate, so the age of the last one is not measured from the start of a long sweep.
+        let now = SystemTime::now();
         let out = sweep_candidate(&e.path, e.bytes, now, dry, guard.procs, &root, log);
         log(&sweep_log(&e.path, &out, dry));
-        match out {
+        match &out {
             Sweep1::Removed { bytes, .. } => {
                 freed += bytes;
                 n += 1;
@@ -857,14 +1299,43 @@ fn run_with(
             Sweep1::Failed(_) => {}
             _ => busy += 1,
         }
+        outcomes.push(out);
+    }
+    if let Some(line) = env_summary(&outcomes) {
+        log(line);
     }
     println!(
-        "sweep-target: {} {n} cache folders, {:.1} GiB, least recently used first; {busy} skipped (a build holds a cargo lock, something was just written, a process has it open, it cannot be read, or it is or holds a mount point){}",
+        "sweep-target: {} {n} cache folders, {:.1} GiB, least recently used first; {busy} skipped (a build holds a cargo lock, something was just written, a process has it open or a build program's environment cannot be read, it cannot be read, it changed during the sweep, or it is or holds a mount point){}",
         if dry { "would remove" } else { "removed" },
         freed as f64 / GIB as f64,
         if dry { " (dry run)" } else { "" }
     );
     Ok(0)
+}
+
+/// The one sentence that names the host cause when EVERY candidate was skipped because a build program's environment could not be
+/// read: without it the cap would stop silently. The causes are a non-dumpable process (setuid, capabilities or a credential change)
+/// or a security module, not Yama's attach scope: measured on 2026-11-19 on the dev host, `kernel.yama.ptrace_scope` was 1 and the
+/// environment of a non-child `cargo` of our uid was readable, while that of `systemd --user` (non-dumpable) was denied.
+fn env_summary(outcomes: &[Sweep1]) -> Option<&'static str> {
+    let env_unreadable = outcomes
+        .iter()
+        .filter(|o| matches!(o, Sweep1::EnvUnreadable(..)))
+        .count();
+    (env_unreadable > 0 && env_unreadable == outcomes.len()).then_some(
+        "sweep-target: no candidate could be decided: the environment of a build program of ours cannot be read here (a non-dumpable process, or a security module that forbids reading /proc/<pid>/environ)",
+    )
+}
+
+/// When the kernel gives no mount id for the root, nothing below can be shown to be on its mount, and every directory would be
+/// reported as a mount point: say the real cause once and stop.
+fn root_mount_id_error(root: &Root) -> Option<String> {
+    root.mnt.is_none().then(|| {
+        format!(
+            "sweep-target: could not read the mount id of {}; nothing swept",
+            root.path.display()
+        )
+    })
 }
 
 /// The paths a folder holds; none when it cannot be read. (The process table is read this way; no target is.)
@@ -911,9 +1382,11 @@ fn to_u64<T: TryInto<u64>>(v: T) -> u64 {
     v.try_into().unwrap_or(0)
 }
 
-/// The later of mtime and atime, in seconds: a link, a test run or a rebuild reads an artifact without writing it.
+/// The last use of an artifact, in seconds: its **mtime only**. The atime is not used: under `relatime` (the default) it is only
+/// refreshed when it is older than the mtime or a day old, and `noatime` never moves it, so it cannot order artifacts by use. A
+/// file Cargo reads without writing therefore counts as last used when it was written. The oldest written go first.
 fn stat_use(st: &libc::stat) -> u64 {
-    to_u64(st.st_mtime).max(to_u64(st.st_atime))
+    to_u64(st.st_mtime)
 }
 
 /// The bytes under the directory `fd` (files by `lstat` size, folders by their entries; a link counts its own length, never what it
@@ -940,14 +1413,13 @@ fn is_profile_at(name: &OsStr, fd: RawFd) -> bool {
         || stat_at(fd, OsStr::new("deps")).is_ok_and(|s| is_dir_mode(&s))
 }
 
-/// Keeps a profile unless its device is not the root's: its own `fstat` says so, and a foreign one is skipped with a line.
+/// Keeps a profile unless it is on another device or another mount than the root: its own descriptor says so (`st_dev` and mount
+/// id), and a foreign one is skipped with a line.
 fn add_profile(root: &Root, scan: &mut Scan, path: PathBuf, name: &OsStr, fd: OwnedFd) {
-    match fstat_fd(fd.as_raw_fd()) {
-        Ok(st) if !root.foreign(to_u64(st.st_dev), name) => {
-            scan.profiles.push(ProfileFd { path, fd })
-        }
-        Ok(_) => eprintln!("sweep-target: skipped {} (mount point)", path.display()),
-        Err(e) => eprintln!("sweep-target: skipped {} ({e})", path.display()),
+    if root.foreign(fd.as_raw_fd(), name) {
+        eprintln!("sweep-target: skipped {} (mount point)", path.display());
+    } else {
+        scan.profiles.push(ProfileFd { path, fd });
     }
 }
 
@@ -1112,15 +1584,7 @@ fn target_in_use(dir: &Path, procs: &Path) -> Option<String> {
         }
         let comm = fs::read_to_string(p.join("comm")).unwrap_or_default();
         let builder = is_builder(&comm);
-        let names_us = fs::read(p.join("environ")).is_ok_and(|env| {
-            env.split(|b| *b == 0).any(|kv| {
-                let kv = String::from_utf8_lossy(kv);
-                ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"]
-                    .iter()
-                    .filter_map(|k| kv.strip_prefix(&format!("{k}=")))
-                    .any(|v| inside(&real, Path::new(v)))
-            })
-        });
+        let names_us = fs::read(p.join("environ")).is_ok_and(|env| env_names_target(&env, &real));
         if !builder && !names_us {
             continue;
         }
@@ -1144,7 +1608,16 @@ fn target_in_use(dir: &Path, procs: &Path) -> Option<String> {
             }
         }
     }
-    None
+    // The rest of what `scan_using` sees: an executable or a mapping inside the target, which the scan above never read,
+    // and a build program of ours whose environment cannot be read.
+    scan_using(dir, procs).map(|u| match u {
+        Using::Pid(pid) => {
+            format!("pid {pid} has its executable, working directory, a file or a mapping in it")
+        }
+        Using::EnvUnreadable(pid, comm) => {
+            format!("pid {pid} ({comm}) is a build program whose environ is unreadable")
+        }
+    })
 }
 
 /// Exclusive non-blocking locks on `.cargo-lock` of EVERY profile folder of one target, held while its artifacts go. `None`: a build
@@ -1174,33 +1647,42 @@ fn lock_profiles(profiles: &[ProfileFd], dry: bool) -> Option<Vec<fs::File>> {
     Some(held)
 }
 
-/// One artifact: a whole folder with what is in it, or a single file, removed relative to the held root fd: each folder on the way
-/// is opened O_NOFOLLOW (a link swapped in for one fails the open), the artifact is `unlinkat`ed or taken by `remove_entry` (so a
-/// folder on another filesystem is left), and `removing <path>` is logged first. False, with a `failed to remove` line, when it
-/// could not be removed.
-fn remove_artifact(root: &Root, p: &Path) -> bool {
+/// One artifact: a whole folder with what is in it, or a single file, removed relative to the **profile descriptor it was listed
+/// from** (the one `scan_profiles` opened and `lock_profiles` locked; nothing above it is looked up again by name): the folder under
+/// it (`deps`, `incremental`, `build`) is opened O_NOFOLLOW (a link swapped in for it fails the open), the artifact is `unlinkat`ed
+/// or taken by `remove_entry` (which leaves an artifact folder on another filesystem or mount; the `deps`, `incremental` and `build`
+/// folders it was opened through are not themselves checked for a mount), and `removing <path>` is logged first. False,
+/// with a `failed to remove` line, when it could not be removed.
+fn remove_artifact(root: &Root, profiles: &[ProfileFd], p: &Path) -> bool {
     // Before the call, so a wrong deletion leaves a line even when the process dies half-way.
     eprintln!("sweep-target: removing {}", p.display());
     let fail = |why: String| {
         eprintln!("sweep-target: failed to remove {}: {why}", p.display());
         false
     };
-    let Ok(rel) = p.strip_prefix(&root.path) else {
+    let Some(prof) = profiles
+        .iter()
+        .filter(|pr| p.starts_with(&pr.path))
+        .max_by_key(|pr| pr.path.as_os_str().len())
+    else {
+        return fail("it is not inside a profile of the target".into());
+    };
+    let Ok(rel) = p.strip_prefix(&prof.path) else {
         return fail("it is not inside the target".into());
     };
     let names: Vec<&OsStr> = rel.components().map(|c| c.as_os_str()).collect();
     let Some((last, parents)) = names.split_last() else {
-        return fail("it is the target itself".into());
+        return fail("it is the profile itself".into());
     };
     let mut held: Option<OwnedFd> = None;
     for name in parents {
-        let raw = held.as_ref().map_or(root.fd.as_raw_fd(), |f| f.as_raw_fd());
+        let raw = held.as_ref().map_or(prof.fd.as_raw_fd(), |f| f.as_raw_fd());
         match open_dir_at(raw, name) {
             Ok(fd) => held = Some(fd),
             Err(e) => return fail(e.to_string()),
         }
     }
-    let raw = held.as_ref().map_or(root.fd.as_raw_fd(), |f| f.as_raw_fd());
+    let raw = held.as_ref().map_or(prof.fd.as_raw_fd(), |f| f.as_raw_fd());
     match remove_entry(root, raw, last) {
         Ok(Removed::Done) => true,
         Ok(Removed::Mount) => fail("contains a mount point".into()),
@@ -1208,8 +1690,10 @@ fn remove_artifact(root: &Root, p: &Path) -> bool {
     }
 }
 
-/// One target dir, byte limits (so a test needs no GiB of files), byte marks and the process table to consult. Exit 0 as usual,
-/// 3 when the target is in use and was left alone, so the caller can log that it skipped; the `Err` paths are the usage errors.
+/// One target dir given by path (a test's way in; the CLI goes through `run_single`, which holds the directory `check_root` opened),
+/// byte limits (so a test needs no GiB of files), byte marks and the process table to consult. Exit 0 as usual, 3 when the target is
+/// in use and was left alone, so the caller can log that it skipped; the `Err` paths are the usage errors.
+#[cfg(test)]
 fn sweep_single(
     dir: &Path,
     limit_bytes: u64,
@@ -1242,6 +1726,9 @@ fn sweep_single_root(
     procs: &Path,
 ) -> Result<i32, String> {
     const GIB: f64 = (1u64 << 30) as f64;
+    if let Some(e) = root_mount_id_error(root) {
+        return Err(e);
+    }
     let dir = root.path.as_path();
     let total = bytes_in(root.fd.as_raw_fd());
     println!(
@@ -1258,6 +1745,9 @@ fn sweep_single_root(
     for l in &scan.symlinks {
         eprintln!("sweep-target: skipped {} (symlink profile)", l.display());
     }
+    // The process table is read here, before the locks of the profiles are taken, and that is safe in this mode: the locks are then
+    // held across the whole removal (there is no rename here), and Cargo takes the profile lock before it creates anything in a
+    // profile, so a build that starts in the gap has no artifact in the doomed list yet and then waits for us.
     if let Some(why) = target_in_use(dir, procs) {
         println!(
             "sweep-target --single: {} in use: not swept ({why})",
@@ -1282,7 +1772,7 @@ fn sweep_single_root(
     let (mut freed, mut n) = (0u64, 0);
     for i in &doomed {
         let e = &entries[*i];
-        if !dry && !remove_artifact(root, &e.path) {
+        if !dry && !remove_artifact(root, &scan.profiles, &e.path) {
             continue;
         }
         freed += e.bytes;
@@ -1339,8 +1829,14 @@ pub fn run_single(
     };
     // The same checks as root mode (a symlink `--dir` is refused, never canonicalized into a sweep), and then only the canonical
     // path, so every `removing` line names the folder that really goes.
-    let dir = check_root(dir, guard)?;
-    sweep_single(&dir, lim, to, dry, guard.procs)
+    let (dir, fd) = check_root(dir, guard)?;
+    let root = Root::from_fd(fd, &dir).map_err(|e| {
+        format!(
+            "sweep-target --single: {} cannot be opened as a directory: {e}",
+            dir.display()
+        )
+    })?;
+    sweep_single_root(&root, lim, to, dry, guard.procs)
 }
 
 #[cfg(test)]
@@ -1808,7 +2304,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cargo_locks_are_not_held_during_the_sweep() {
+    fn the_cargo_locks_are_released_after_a_skip_and_held_until_the_rename() {
         let now = SystemTime::now();
         // Skipped as recent: the probe lock is gone once the call returns.
         let (_g, t) = temp_tree("lockfree");
@@ -1824,17 +2320,17 @@ mod tests {
             "lock held after a skip"
         );
         drop(f);
-        // Being removed: the lock is free at the moment the `removing` line is written, before the folder moves.
+        // Being removed: the lock is still held at the moment the `removing` line is written, before the folder moves.
         let idle = t.join("wt-idle");
         let lock = mk_dep(&idle, ".cargo-lock", 0);
         stamp_all(&idle, now - std::time::Duration::from_secs(700));
-        let mut free_at_log = false;
+        let mut held_at_log = false;
         let out = sweep_candidate(&idle, 1, now, false, no_procs(), &root_of(&t), &mut |_| {
             let f = fs::OpenOptions::new().write(true).open(&lock).unwrap();
-            free_at_log = lock_frees_up(&mut || f.try_lock().is_ok());
+            held_at_log = f.try_lock().is_err();
         });
         assert!(matches!(out, Sweep1::Removed { .. }), "{out:?}");
-        assert!(free_at_log, "the probe lock was held into the removal");
+        assert!(held_at_log, "the lock was let go before the rename");
     }
 
     #[test]
@@ -1893,6 +2389,11 @@ mod tests {
         fs::metadata(p).unwrap().dev()
     }
 
+    /// Makes the directory called `name` read as being on another mount (a unit test cannot mount): same device, other mount id.
+    fn fake_mount(root: &Root, name: &str) {
+        *root.fake_mnt.borrow_mut() = Some((OsString::from(name), Some(root.mnt.unwrap() ^ 1)));
+    }
+
     /// The directory held open the way a sweep holds the cache root.
     fn root_of(p: &Path) -> Root {
         Root::open(p).unwrap()
@@ -1920,6 +2421,15 @@ mod tests {
         let x = allowed.join("x");
         mk_dep(&x, "wt-a/debug/deps/a.rlib", 10);
         (g, allowed, x)
+    }
+
+    /// Writes the marker `scripts/check-fast` writes when it creates the check cache.
+    fn mark(dir: &Path) {
+        fs::write(
+            dir.join(CACHE_MARKER_FILE),
+            format!("{CACHE_MARKER_CONTENT}\n"),
+        )
+        .unwrap();
     }
 
     /// `run` as a dry run (so a wrongly accepted `--dir` could not remove anything), which must refuse.
@@ -2013,8 +2523,12 @@ mod tests {
         // folder inside then counts as being on another filesystem, and with the real device none does.
         let (_g, t) = temp_tree("devwalk");
         mk_dep(&t, "wt-a/debug/deps/a", 1);
-        assert!(contains_foreign_dev(&t.join("wt-a"), dev(&t) ^ 1));
-        assert!(!contains_foreign_dev(&t.join("wt-a"), dev(&t)));
+        let mut wrong = root_of(&t);
+        wrong.dev ^= 1;
+        assert_eq!(wrong.dev, dev(&t) ^ 1);
+        let wt = open_dir_path(&t.join("wt-a")).unwrap();
+        assert!(contains_foreign(&wrong, wt.as_raw_fd()));
+        assert!(!contains_foreign(&root_of(&t), wt.as_raw_fd()));
         // And a candidate whose own device differs from the root's is skipped whole, and logged.
         let now = SystemTime::now();
         let cand = t.join("wt-a");
@@ -2074,6 +2588,8 @@ mod tests {
         // A sparse 2 GiB file: over the 1 GiB limit without writing a byte.
         fs::File::create(&big).unwrap().set_len(2 << 30).unwrap();
         stamp_all(&wt, now - std::time::Duration::from_secs(700));
+        // Root mode sweeps only a folder that carries the check-cache marker.
+        mark(&x);
         // `--dir` in a non-canonical but allowed form.
         let given = allowed.join(".").join("x");
         assert!(given.to_string_lossy().contains("/./"));
@@ -2160,7 +2676,17 @@ mod tests {
         // The same through the candidate removal: the rename and the delete use the descriptor, not the path string, which now
         // leads into somebody else's tree.
         mk_dep(&moved, "wt-c/deps/x", 10);
-        let out = remove_candidate(&root, &x.join("wt-c"), 1, 0, false, &mut |_| {});
+        let st = stat_at(root.fd.as_raw_fd(), OsStr::new("wt-c")).unwrap();
+        let out = remove_held(
+            &root,
+            &x.join("wt-c"),
+            1,
+            0,
+            false,
+            &mut |_| {},
+            Expect::Dir(to_u64(st.st_dev), to_u64(st.st_ino)),
+            Vec::new(),
+        );
         assert!(matches!(out, Sweep1::Removed { .. }), "{out:?}");
         assert!(!moved.join("wt-c").exists());
         assert!(outside.join("wt-b/deps/precious").exists());
@@ -2186,7 +2712,7 @@ mod tests {
     }
 
     #[test]
-    fn the_deletion_stops_at_a_directory_on_another_filesystem() {
+    fn the_deletion_stops_at_a_directory_on_another_mount_or_filesystem() {
         let (_g, t) = temp_tree("devrm");
         mk_dep(&t, "wt-a/keep-me/f", 1);
         mk_dep(&t, "wt-a/mnt/theirs", 1);
@@ -2194,8 +2720,8 @@ mod tests {
         mk_dep(&t, "wt-a/sub/gone", 1);
         mk_dep(&t, "wt-a/z", 1);
         // A unit test cannot mount, so a folder named `mnt` stands in for one: the walk's own predicate says it is foreign.
-        let mut root = root_of(&t);
-        root.fake_mount = Some(OsString::from("mnt"));
+        let root = root_of(&t);
+        fake_mount(&root, "mnt");
         let r = remove_entry(&root, root.fd.as_raw_fd(), OsStr::new("wt-a")).unwrap();
         assert_eq!(r, Removed::Mount);
         assert!(
@@ -2226,9 +2752,12 @@ mod tests {
         mk_dep(&cand, "debug/deps/a", 1);
         mk_dep(&cand, "mnt/theirs", 1);
         stamp_all(&cand, now - std::time::Duration::from_secs(700));
-        let mut root = root_of(&t);
-        root.fake_mount = Some(OsString::from("mnt"));
-        let out = sweep_candidate(&cand, 1, now, false, no_procs(), &root, &mut |_| {});
+        // A mount that is there from the start is caught by the pre-check (`ContainsMount`, see the mount-id tests); this one appears
+        // after it, from the `removing` line, so it is the delete that leaves it.
+        let root = root_of(&t);
+        let out = sweep_candidate(&cand, 1, now, false, no_procs(), &root, &mut |_| {
+            fake_mount(&root, "mnt");
+        });
         assert!(
             matches!(&out, Sweep1::Failed(m) if m == "contains a mount point"),
             "{out:?}"
@@ -2401,12 +2930,12 @@ mod tests {
     // ---- round 3: --single removes through the root fd as well ----
 
     #[test]
-    fn a_single_sweep_leaves_a_directory_on_another_filesystem_and_says_so() {
+    fn a_single_sweep_leaves_a_directory_on_another_mount_or_filesystem_and_says_so() {
         let t = fake_target("sdev");
         let _g = TempTree(t.clone());
         // A folder named `some2-bbb` stands in for a mount point (a unit test cannot mount): the walk's own predicate says foreign.
-        let mut root = root_of(&t);
-        root.fake_mount = Some(OsString::from("some2-bbb"));
+        let root = root_of(&t);
+        fake_mount(&root, "some2-bbb");
         let rc = sweep_single_root(&root, 0, 0, false, &no_builds("sdev")).unwrap();
         assert_eq!(rc, 0);
         assert!(
@@ -2503,12 +3032,12 @@ mod tests {
     }
 
     #[test]
-    fn a_profile_on_another_device_is_skipped_not_locked_and_not_swept() {
+    fn a_profile_on_another_mount_or_device_is_skipped_not_locked_and_not_swept() {
         let t = fake_target("pdev");
         let _g = TempTree(t.clone());
         // A folder named `release` stands in for a mount point (a unit test cannot mount): its device is "foreign".
-        let mut root = root_of(&t);
-        root.fake_mount = Some(OsString::from("release"));
+        let root = root_of(&t);
+        fake_mount(&root, "release");
         let scan = scan_profiles(&root);
         assert!(!scan.profiles.iter().any(|p| p.path == t.join("release")));
         assert!(scan.profiles.iter().any(|p| p.path == t.join("debug")));
@@ -2852,5 +3381,814 @@ mod tests {
         fs::remove_dir_all(&t).ok();
         fs::remove_dir_all(&procs).ok();
         fs::remove_dir_all(&other).ok();
+    }
+    // ---- mount ids, locks across the rename, a swapped name, a planted FIFO ----
+
+    #[test]
+    fn a_directory_on_another_mount_has_another_mount_id() {
+        // `/proc` is always a mount of its own: the id is what tells a bind mount of the same filesystem apart (same `st_dev`).
+        let a = open_dir_path(Path::new("/")).unwrap();
+        let b = open_dir_path(Path::new("/proc")).unwrap();
+        let (ma, mb) = (mnt_id(a.as_raw_fd()), mnt_id(b.as_raw_fd()));
+        assert!(
+            ma.is_some() && mb.is_some(),
+            "statx gave no mount id: {ma:?} {mb:?}"
+        );
+        assert_ne!(ma, mb);
+        let (_g, t) = temp_tree("mntid");
+        let root = root_of(&t);
+        assert!(root.mnt.is_some());
+        assert_eq!(root.mnt, mnt_id(open_dir_path(&t).unwrap().as_raw_fd()));
+    }
+
+    #[test]
+    fn a_directory_with_another_mount_id_is_left_whole_even_on_the_same_device() {
+        let (_g, t) = temp_tree("fakemnt");
+        mk_dep(&t, "wt-a/keep-me/f", 1);
+        mk_dep(&t, "wt-a/bind/theirs", 1);
+        mk_dep(&t, "wt-a/sub/bind/theirs", 1);
+        mk_dep(&t, "wt-a/sub/gone", 1);
+        mk_dep(&t, "wt-a/z", 1);
+        // A unit test cannot mount: the directory named `bind` reads as having another mount id, on the root's own device.
+        let root = root_of(&t);
+        let other = root.mnt.unwrap() ^ 1;
+        *root.fake_mnt.borrow_mut() = Some((OsString::from("bind"), Some(other)));
+        let r = remove_entry(&root, root.fd.as_raw_fd(), OsStr::new("wt-a")).unwrap();
+        assert_eq!(r, Removed::Mount);
+        assert!(
+            t.join("wt-a/bind/theirs").exists(),
+            "the other mount is left whole"
+        );
+        assert!(t.join("wt-a/sub/bind/theirs").exists());
+        assert!(!t.join("wt-a/keep-me").exists(), "everything else went");
+        assert!(!t.join("wt-a/z").exists());
+        assert!(!t.join("wt-a/sub/gone").exists());
+        // The candidate that holds one is skipped whole before anything moves.
+        let now = SystemTime::now();
+        let (_g2, u) = temp_tree("fakemnt2");
+        let cand = u.join("wt-b");
+        mk_dep(&cand, "debug/deps/a", 1);
+        mk_dep(&cand, "bind/theirs", 1);
+        stamp_all(&cand, now - std::time::Duration::from_secs(700));
+        let root = root_of(&u);
+        *root.fake_mnt.borrow_mut() = Some((OsString::from("bind"), Some(root.mnt.unwrap() ^ 1)));
+        let out = sweep_candidate(&cand, 1, now, false, no_procs(), &root, &mut |_| {});
+        assert!(matches!(out, Sweep1::ContainsMount), "{out:?}");
+        assert!(cand.join("debug/deps/a").exists() && cand.join("bind/theirs").exists());
+    }
+
+    #[test]
+    fn a_directory_whose_mount_id_is_unknown_counts_as_foreign() {
+        let (_g, t) = temp_tree("nomnt");
+        mk_dep(&t, "wt-a/deps/f", 1);
+        mk_dep(&t, "wt-a/odd/f", 1);
+        // statx gave no mount id for one directory: it is not shown to be on the root's mount, so it stays.
+        let root = root_of(&t);
+        *root.fake_mnt.borrow_mut() = Some((OsString::from("odd"), None));
+        assert_eq!(
+            remove_entry(&root, root.fd.as_raw_fd(), OsStr::new("wt-a")).unwrap(),
+            Removed::Mount
+        );
+        assert!(t.join("wt-a/odd/f").exists());
+        // The root's own mount id unknown: every directory is foreign, nothing is entered, no profile is listed.
+        let (_g2, u) = temp_tree("nomnt2");
+        mk_dep(&u, "wt-b/debug/deps/f", 1);
+        let mut root = root_of(&u);
+        root.mnt = None;
+        assert!(scan_profiles(&root).profiles.is_empty());
+        assert_eq!(
+            remove_entry(&root, root.fd.as_raw_fd(), OsStr::new("wt-b")).unwrap(),
+            Removed::Mount
+        );
+        assert!(u.join("wt-b/debug/deps/f").exists());
+    }
+
+    #[test]
+    fn a_profile_on_another_mount_is_skipped_under_single() {
+        let t = fake_target("pmnt");
+        let _g = TempTree(t.clone());
+        let root = root_of(&t);
+        *root.fake_mnt.borrow_mut() =
+            Some((OsString::from("release"), Some(root.mnt.unwrap() ^ 1)));
+        let scan = scan_profiles(&root);
+        assert!(!scan.profiles.iter().any(|p| p.path == t.join("release")));
+        assert!(scan.profiles.iter().any(|p| p.path == t.join("debug")));
+        sweep_single_root(&root, 0, 0, false, &no_builds("pmnt")).unwrap();
+        assert!(
+            has(&t, "release/build/some1-aaa/output"),
+            "the other mount is not swept"
+        );
+        assert!(!has(&t, "debug/deps/old.rlib"), "the real profile was");
+    }
+
+    #[test]
+    fn the_cargo_locks_are_held_until_the_rename_is_done() {
+        let now = SystemTime::now();
+        let (_g, t) = temp_tree("lockrename");
+        let cand = t.join("wt-idle");
+        let lock = mk_dep(&cand, "debug/.cargo-lock", 0);
+        mk_dep(&cand, "debug/deps/a", 1);
+        stamp_all(&cand, now - std::time::Duration::from_secs(700));
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut root = root_of(&t);
+        let h = held.clone();
+        root.before_rename = Some(Box::new(move || {
+            let f = fs::OpenOptions::new().write(true).open(&lock).unwrap();
+            h.store(f.try_lock().is_err(), std::sync::atomic::Ordering::SeqCst);
+        }));
+        let out = sweep_candidate(&cand, 1, now, false, no_procs(), &root, &mut |_| {});
+        assert!(matches!(out, Sweep1::Removed { .. }), "{out:?}");
+        assert!(
+            held.load(std::sync::atomic::Ordering::SeqCst),
+            "the cargo lock was not held when the rename was about to happen"
+        );
+    }
+
+    #[test]
+    fn a_directory_swapped_in_between_the_open_and_the_rename_survives() {
+        let now = SystemTime::now();
+        let (_g, t) = temp_tree("swapcand");
+        let cand = t.join("wt-x");
+        mk_dep(&cand, "debug/deps/orig.rlib", 10);
+        stamp_all(&cand, now - std::time::Duration::from_secs(700));
+        let moved = t.join("wt-x-orig");
+        let mut root = root_of(&t);
+        let (c, m) = (cand.clone(), moved.clone());
+        // After the checks and before the rename, the name is taken by another folder (the one that was opened moves away).
+        root.before_rename = Some(Box::new(move || {
+            fs::rename(&c, &m).unwrap();
+            mk_dep(&c, "debug/deps/impostor.rlib", 10);
+        }));
+        let mut lines = Vec::new();
+        let out = sweep_candidate(&cand, 10, now, false, no_procs(), &root, &mut |l| {
+            lines.push(l.to_string())
+        });
+        assert!(matches!(out, Sweep1::Swapped), "{out:?}");
+        assert_eq!(
+            sweep_log(&cand, &out, false),
+            format!(
+                "sweep-target: skipped {} (changed during the sweep)",
+                cand.display()
+            )
+        );
+        assert!(
+            cand.join("debug/deps/impostor.rlib").exists(),
+            "the folder that took the name was renamed back whole"
+        );
+        assert!(moved.join("debug/deps/orig.rlib").exists());
+        let trash: Vec<_> = fs::read_dir(&t)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(TRASH_PREFIX))
+            .collect();
+        assert!(trash.is_empty(), "no trash is left: {trash:?}");
+    }
+
+    #[test]
+    fn a_cargo_lock_that_is_a_fifo_does_not_hang_the_sweep() {
+        let (_g, t) = temp_tree("fifo");
+        let cand = t.join("wt-fifo");
+        mk_dep(&cand, "debug/deps/a", 1);
+        let fifo = cand.join("debug/.cargo-lock");
+        let c = cstr(fifo.as_os_str()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let try_lock = |cand: PathBuf| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                tx.send(lock_target(&cand).map(|v| v.len())).ok();
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("lock_target hung on a FIFO")
+        };
+        // Nobody reads it (ENXIO), then somebody does (the open succeeds, the file is not a regular one): no lock either way.
+        assert_eq!(try_lock(cand.clone()), Some(0));
+        // SAFETY: a valid NUL-terminated path; the descriptor is closed below.
+        let reader = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        assert!(reader >= 0);
+        assert_eq!(try_lock(cand), Some(0));
+        // SAFETY: `reader` is a descriptor this test opened.
+        unsafe { libc::close(reader) };
+    }
+    // ---- the check-cache marker, the environment of a builder, the process scan under --single, mtime order ----
+
+    #[test]
+    fn a_root_without_the_marker_is_refused_and_one_with_it_is_swept() {
+        let now = SystemTime::now();
+        let (_g, allowed, x) = fixture("marker");
+        let wt = x.join("wt-old");
+        let big = wt.join("debug/deps/big");
+        fs::create_dir_all(big.parent().unwrap()).unwrap();
+        // A sparse 2 GiB file: over the 1 GiB limit without writing a byte.
+        fs::File::create(&big).unwrap().set_len(2 << 30).unwrap();
+        stamp_all(&wt, now - std::time::Duration::from_secs(700));
+        let g = guard(&allowed);
+        let refused_for = |why: &str| {
+            let e = run(&x, 1, 0, None, false, &g).unwrap_err();
+            assert!(
+                e.contains("not a check cache") && e.contains("nothing was removed"),
+                "{why}: {e}"
+            );
+            assert!(wt.exists(), "{why}: nothing may be removed");
+        };
+        refused_for("no marker at all");
+        // Cargo's own tag is no marker (it is never read), other content is none, and neither is a link or a folder.
+        fs::write(
+            x.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n# For information about cache directory tags see https://bford.info/cachedir/\n",
+        )
+        .unwrap();
+        refused_for("only Cargo's CACHEDIR.TAG");
+        let tag = x.join(CACHE_MARKER_FILE);
+        fs::write(&tag, "another-cache\n").unwrap();
+        refused_for("other content");
+        fs::write(&tag, "lucina-check-target\nsomething else\n").unwrap();
+        refused_for("more than the one line");
+        fs::remove_file(&tag).unwrap();
+        mark(&allowed);
+        std::os::unix::fs::symlink(allowed.join(CACHE_MARKER_FILE), &tag).unwrap();
+        refused_for("a link");
+        fs::remove_file(&tag).unwrap();
+        fs::create_dir(&tag).unwrap();
+        refused_for("a folder");
+        fs::remove_dir(&tag).unwrap();
+        // With the marker it is swept; Cargo's tag and the marker themselves stay.
+        mark(&x);
+        assert_eq!(run(&x, 1, 0, None, false, &g), Ok(0));
+        assert!(!wt.exists(), "a marked check cache is swept");
+        assert!(tag.exists() && x.join("CACHEDIR.TAG").exists());
+    }
+
+    #[test]
+    fn a_builder_that_names_the_target_only_in_its_environment_is_in_use() {
+        use std::os::unix::fs::PermissionsExt;
+        let now = SystemTime::now();
+        let (_g, t) = temp_tree("envbuild");
+        let cand = t.join("wt-run");
+        mk_dep(&cand, "debug/deps/a", 10);
+        stamp_all(&cand, now - std::time::Duration::from_secs(700));
+        let real = fs::canonicalize(&cand).unwrap();
+        let procs = t.join("procs");
+        // `cargo test` past the write window: nothing open in the target, no lock, only its environment says where it builds.
+        fake_proc(
+            &procs,
+            "5001",
+            "cargo",
+            &[
+                "PATH=/usr/bin",
+                &format!("CARGO_TARGET_DIR={}", real.display()),
+            ],
+            &[],
+        );
+        let out = sweep_candidate(&cand, 1, now, false, &procs, &root_of(&t), &mut |_| {});
+        assert!(matches!(out, Sweep1::InUse(5001)), "{out:?}");
+        assert!(cand.exists());
+        // The other variable, and a folder inside the target, count the same.
+        let (_g2, u) = temp_tree("envbuild2");
+        let procs2 = u.join("procs");
+        fake_proc(
+            &procs2,
+            "5002",
+            "rustc",
+            &[&format!("CARGO_BUILD_TARGET_DIR={}/debug", real.display())],
+            &[],
+        );
+        assert_eq!(pid_using(&cand, &procs2), Some(5002));
+        // Not builders, or building elsewhere, or only an ancestor: no reason to skip.
+        let (_g3, v) = temp_tree("envbuild3");
+        let procs3 = v.join("procs");
+        let env = format!("CARGO_TARGET_DIR={}", real.display());
+        fake_proc(&procs3, "5003", "bash", &[&env], &[]);
+        fake_proc(
+            &procs3,
+            "5004",
+            "cargo",
+            &["CARGO_TARGET_DIR=/somewhere/else"],
+            &[],
+        );
+        let parent = format!("CARGO_TARGET_DIR={}", t.display());
+        fake_proc(&procs3, "5005", "cargo", &[&parent], &[]);
+        assert_eq!(pid_using(&cand, &procs3), None);
+        // A builder of ours whose environment cannot be read is in use.
+        let (_g4, w) = temp_tree("envbuild4");
+        let procs4 = w.join("procs");
+        fake_proc(&procs4, "5006", "cargo", &["PATH=/usr/bin"], &[]);
+        let environ = procs4.join("5006/environ");
+        let _restore = Restore(vec![environ.clone()]);
+        fs::set_permissions(&environ, fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(pid_using(&cand, &procs4), Some(5006));
+    }
+
+    #[test]
+    fn a_process_with_its_executable_or_a_mapping_in_a_single_target_stops_the_sweep() {
+        let t = fake_target("procexe");
+        let procs = no_builds("procexe");
+        let real = fs::canonicalize(&t).unwrap();
+        // An idle-looking `bash` (not a builder, nothing named in its environment) that runs a binary of the target.
+        fake_proc(&procs, "4747", "bash", &["PATH=/usr/bin"], &[]);
+        std::os::unix::fs::symlink(real.join("debug/mybinary"), procs.join("4747/exe")).unwrap();
+        assert_eq!(
+            sweep_single(&t, 0, 0, false, &procs).unwrap(),
+            3,
+            "in use: not swept"
+        );
+        assert!(has(&t, "debug/deps/old.rlib"));
+        fs::remove_dir_all(&procs).ok();
+        // The same for a file mapped from the target.
+        let procs = no_builds("procmap");
+        fake_proc(&procs, "4848", "python3", &["PATH=/usr/bin"], &[]);
+        fs::write(
+            procs.join("4848/maps"),
+            format!(
+                "7f00 r-xp 00000000 00:00 0                          {}/debug/deps/mid.rlib\n",
+                real.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            sweep_single(&t, 0, 0, false, &procs).unwrap(),
+            3,
+            "in use: not swept"
+        );
+        assert!(has(&t, "debug/deps/mid.rlib"));
+        fs::remove_dir_all(&t).ok();
+        fs::remove_dir_all(&procs).ok();
+    }
+
+    #[test]
+    fn single_artifacts_go_oldest_written_first_whatever_their_atime_says() {
+        let t =
+            std::env::temp_dir().join(format!("lucina-sweep-single-mtime-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&t);
+        let _g = TempTree(t.clone());
+        let stamp_both = |rel: &str, m: u64, a: u64| {
+            art(&t, rel, ONE, m);
+            let f = fs::OpenOptions::new()
+                .write(true)
+                .open(t.join(rel))
+                .unwrap();
+            let at = |s: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s);
+            f.set_times(fs::FileTimes::new().set_modified(at(m)).set_accessed(at(a)))
+                .unwrap();
+        };
+        // `read-lately` was written long ago but read a moment ago (a later atime); `written-lately` the other way round.
+        stamp_both("debug/deps/read-lately", 100, 9_000);
+        stamp_both("debug/deps/written-lately", 200, 50);
+        let rc = sweep_single(&t, kib(40), kib(32), false, &no_builds("mtime")).unwrap();
+        assert_eq!(rc, 0);
+        assert!(
+            !has(&t, "debug/deps/read-lately"),
+            "the older mtime goes first, a newer atime does not save it"
+        );
+        assert!(has(&t, "debug/deps/written-lately"));
+    }
+    // ---- a link candidate, a tree that cannot be put back, the locks before the delete ----
+
+    #[test]
+    fn a_directory_that_takes_the_name_of_a_link_before_the_rename_survives() {
+        let now = SystemTime::now();
+        let (_g, t) = temp_tree("linkswap");
+        let (_g2, target) = temp_tree("linkswap-target");
+        mk_dep(&target, "deps/precious", 1);
+        let link = t.join("wt-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut root = root_of(&t);
+        let l = link.clone();
+        // Between the `stat` that found a link and the rename, a real folder takes the name.
+        root.before_rename = Some(Box::new(move || {
+            fs::remove_file(&l).unwrap();
+            mk_dep(&l, "debug/deps/theirs", 10);
+        }));
+        let out = sweep_candidate(&link, 1, now, false, no_procs(), &root, &mut |_| {});
+        assert!(matches!(out, Sweep1::Swapped), "{out:?}");
+        assert!(
+            link.join("debug/deps/theirs").exists(),
+            "the folder was put back whole"
+        );
+        assert!(target.join("deps/precious").exists());
+        let trash: Vec<_> = fs::read_dir(&t)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(TRASH_PREFIX))
+            .collect();
+        assert!(trash.is_empty(), "no trash is left: {trash:?}");
+    }
+
+    #[test]
+    fn a_tree_that_could_not_be_put_back_is_parked_where_clean_trash_leaves_it() {
+        let now = SystemTime::now();
+        let (_g, t) = temp_tree("park");
+        let cand = t.join("wt-x");
+        mk_dep(&cand, "debug/deps/orig.rlib", 10);
+        stamp_all(&cand, now - std::time::Duration::from_secs(700));
+        let moved = t.join("wt-x-orig");
+        let mut root = root_of(&t);
+        let (c, m) = (cand.clone(), moved.clone());
+        root.before_rename = Some(Box::new(move || {
+            fs::rename(&c, &m).unwrap();
+            mk_dep(&c, "debug/deps/impostor.rlib", 10);
+        }));
+        // Right after the rename a new build makes the old name again, so the impostor cannot go back.
+        let c2 = cand.clone();
+        root.after_rename = Some(Box::new(move || {
+            mk_dep(&c2, "debug/deps/new-build", 1);
+        }));
+        let out = sweep_candidate(&cand, 10, now, false, no_procs(), &root, &mut |_| {});
+        let parked = t.join(parked_name(OsStr::new("wt-x"), 0));
+        assert!(
+            matches!(&out, Sweep1::Failed(m) if m.contains("could not be put back") && m.contains(&parked.display().to_string())),
+            "{out:?}"
+        );
+        assert!(parked.join("debug/deps/impostor.rlib").exists());
+        assert!(!t.join(trash_name(OsStr::new("wt-x"))).exists());
+        assert!(cand.join("debug/deps/new-build").exists());
+        let mut lines = Vec::new();
+        clean_trash(&root, false, &mut |l| lines.push(l.to_string()));
+        assert!(lines.is_empty(), "{lines:?}");
+        assert!(
+            parked.join("debug/deps/impostor.rlib").exists(),
+            "clean_trash leaves a parked tree"
+        );
+        let names: Vec<_> = candidates(&t, None)
+            .into_iter()
+            .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with(PARK_PREFIX)),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn the_locks_are_let_go_before_the_renamed_tree_is_deleted() {
+        let now = SystemTime::now();
+        let (_g, t) = temp_tree("unlock");
+        let cand = t.join("wt-idle");
+        mk_dep(&cand, "debug/.cargo-lock", 0);
+        mk_dep(&cand, "debug/deps/a", 1);
+        stamp_all(&cand, now - std::time::Duration::from_secs(700));
+        let free = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (f, base) = (free.clone(), t.clone());
+        let mut root = root_of(&t);
+        root.before_delete = Some(Box::new(move || {
+            // The renamed tree is still there; its lock must already be free.
+            let lock = base
+                .join(trash_name(OsStr::new("wt-idle")))
+                .join("debug/.cargo-lock");
+            let h = fs::OpenOptions::new().write(true).open(&lock).unwrap();
+            f.store(h.try_lock().is_ok(), std::sync::atomic::Ordering::SeqCst);
+        }));
+        let out = sweep_candidate(&cand, 1, now, false, no_procs(), &root, &mut |_| {});
+        assert!(matches!(out, Sweep1::Removed { .. }), "{out:?}");
+        assert!(
+            free.load(std::sync::atomic::Ordering::SeqCst),
+            "the lock was still held when the delete began"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_environment_names_the_process_and_the_reason_in_the_skip_line() {
+        use std::os::unix::fs::PermissionsExt;
+        let now = SystemTime::now();
+        let (_g, t) = temp_tree("envname");
+        let cand = t.join("wt-run");
+        mk_dep(&cand, "debug/deps/a", 10);
+        stamp_all(&cand, now - std::time::Duration::from_secs(700));
+        let procs = t.join("procs");
+        fake_proc(&procs, "5101", "cargo", &["PATH=/usr/bin"], &[]);
+        let environ = procs.join("5101/environ");
+        let _restore = Restore(vec![environ.clone()]);
+        fs::set_permissions(&environ, fs::Permissions::from_mode(0o000)).unwrap();
+        let out = sweep_candidate(&cand, 1, now, false, &procs, &root_of(&t), &mut |_| {});
+        assert!(
+            matches!(&out, Sweep1::EnvUnreadable(5101, c) if c == "cargo"),
+            "{out:?}"
+        );
+        // The outcome `run_with` collects is the input of the summary: a sweep that met only this one ends with the host-cause sentence.
+        assert!(env_summary(std::slice::from_ref(&out)).is_some());
+        assert_eq!(
+            sweep_log(&cand, &out, false),
+            format!(
+                "sweep-target: skipped {} (in use by pid 5101 (cargo): environ unreadable)",
+                cand.display()
+            )
+        );
+        assert!(cand.exists());
+    }
+    // ---- a parked tree, the --single reason, the summary ----
+
+    #[test]
+    fn a_tree_that_cannot_be_parked_under_the_first_names_takes_the_next_free_one() {
+        let now = SystemTime::now();
+        let (_g, t) = temp_tree("parkretry");
+        let cand = t.join("wt-x");
+        mk_dep(&cand, "debug/deps/orig.rlib", 10);
+        stamp_all(&cand, now - std::time::Duration::from_secs(700));
+        // The first two parking names are taken (by non-empty folders), so the rename to them fails.
+        for n in 0..2 {
+            mk_dep(
+                &t,
+                &format!("{}/x", parked_name(OsStr::new("wt-x"), n).to_string_lossy()),
+                1,
+            );
+        }
+        let moved = t.join("wt-x-orig");
+        let mut root = root_of(&t);
+        let (c, m) = (cand.clone(), moved.clone());
+        root.before_rename = Some(Box::new(move || {
+            fs::rename(&c, &m).unwrap();
+            mk_dep(&c, "debug/deps/impostor.rlib", 10);
+        }));
+        let c2 = cand.clone();
+        root.after_rename = Some(Box::new(move || {
+            mk_dep(&c2, "debug/deps/new-build", 1);
+        }));
+        let out = sweep_candidate(&cand, 10, now, false, no_procs(), &root, &mut |_| {});
+        let third = t.join(parked_name(OsStr::new("wt-x"), 2));
+        assert!(
+            matches!(&out, Sweep1::Failed(m) if m.contains(&third.display().to_string())),
+            "{out:?}"
+        );
+        assert!(third.join("debug/deps/impostor.rlib").exists());
+    }
+
+    #[test]
+    fn a_tree_that_could_not_be_parked_at_all_is_marked_and_clean_trash_leaves_it() {
+        let (_g, t) = temp_tree("parkfail");
+        let name = OsStr::new("wt-x");
+        for n in 0..PARK_TRIES {
+            mk_dep(
+                &t,
+                &format!("{}/x", parked_name(name, n).to_string_lossy()),
+                1,
+            );
+        }
+        let trash = trash_name(name);
+        mk_dep(&t, &format!("{}/debug/f", trash.to_string_lossy()), 1);
+        let root = root_of(&t);
+        let at = park(&root, &trash, name);
+        assert_eq!(at, t.join(&trash), "no parking name was free");
+        assert!(
+            t.join(&trash).join(UNVERIFIED_FILE).exists(),
+            "the tree is marked"
+        );
+        let mut lines = Vec::new();
+        clean_trash(&root, false, &mut |l| lines.push(l.to_string()));
+        assert!(t.join(&trash).join("debug/f").exists(), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("left unverified")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_summary_names_the_host_cause_only_when_every_candidate_was_skipped_for_it() {
+        let env = || Sweep1::EnvUnreadable(1, "cargo".into());
+        assert!(
+            env_summary(&[env(), env(), env()])
+                .unwrap()
+                .contains("a non-dumpable process")
+        );
+        assert_eq!(env_summary(&[env(), env(), Sweep1::Locked]), None);
+        assert_eq!(env_summary(&[]), None);
+    }
+
+    #[test]
+    fn single_names_the_build_program_whose_environment_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = fake_target("singleenv");
+        let _g = TempTree(t.clone());
+        let procs = no_builds("singleenv");
+        fake_proc(&procs, "5201", "cargo", &["PATH=/usr/bin"], &[]);
+        let environ = procs.join("5201/environ");
+        let _restore = Restore(vec![environ.clone()]);
+        fs::set_permissions(&environ, fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            target_in_use(&t, &procs).as_deref(),
+            Some("pid 5201 (cargo) is a build program whose environ is unreadable")
+        );
+        assert_eq!(sweep_single(&t, 0, 0, false, &procs).unwrap(), 3);
+        fs::remove_dir_all(&procs).ok();
+    }
+    // ---- left for a person, the root mount id, --target-dir, the marker folder ----
+
+    #[test]
+    fn a_parked_tree_is_not_paid_for_by_removing_idle_targets() {
+        let now = SystemTime::now();
+        let (_g, allowed, x) = fixture("parkedtotal");
+        mark(&x);
+        let idle = x.join("wt-idle");
+        mk_dep(&idle, "debug/deps/old.rlib", 1000);
+        stamp_all(&idle, now - std::time::Duration::from_secs(700));
+        // A parked tree of 2 GiB (sparse): over the 1 GiB limit only because of it.
+        let parked = x.join(".sweep-parked-1-0-wt-z");
+        fs::create_dir_all(&parked).unwrap();
+        fs::File::create(parked.join("big"))
+            .unwrap()
+            .set_len(2 << 30)
+            .unwrap();
+        let mut lines = Vec::new();
+        let rc = run_with(&x, 1, 0, None, false, &guard(&allowed), &mut |l| {
+            lines.push(l.to_string())
+        });
+        assert_eq!(rc, Ok(0));
+        assert!(
+            idle.exists(),
+            "an idle target was removed to pay for a tree nobody can sweep: {lines:?}"
+        );
+        assert!(
+            parked.join("big").exists(),
+            "a parked tree is never touched"
+        );
+        assert!(
+            lines.iter().any(|l| l
+                == "sweep-target: parked tree .sweep-parked-1-0-wt-z 2.0 GiB left for a person"),
+            "{lines:?}"
+        );
+        // An unverified trash folder counts the same way.
+        fs::remove_dir_all(&parked).unwrap();
+        let trash = x.join(".sweep-trash-1-wt-y");
+        fs::create_dir_all(&trash).unwrap();
+        fs::File::create(trash.join("big"))
+            .unwrap()
+            .set_len(2 << 30)
+            .unwrap();
+        fs::write(trash.join(UNVERIFIED_FILE), "").unwrap();
+        let mut lines = Vec::new();
+        run_with(&x, 1, 0, None, false, &guard(&allowed), &mut |l| {
+            lines.push(l.to_string())
+        })
+        .unwrap();
+        assert!(idle.exists(), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("parked tree .sweep-trash-1-wt-y 2.0 GiB")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_root_whose_mount_id_is_unknown_says_so_and_sweeps_nothing() {
+        let (_g, t) = temp_tree("rootnomnt");
+        mk_dep(&t, "wt-a/debug/deps/old-0000000000000001.rlib", 10);
+        let mut root = root_of(&t);
+        root.mnt = None;
+        let e = root_mount_id_error(&root).unwrap();
+        assert_eq!(
+            e,
+            format!(
+                "sweep-target: could not read the mount id of {}; nothing swept",
+                t.display()
+            )
+        );
+        assert!(!e.contains("mount point"), "{e}");
+        let e = sweep_single_root(&root, 0, 0, false, &no_builds("rootnomnt")).unwrap_err();
+        assert!(e.contains("could not read the mount id"), "{e}");
+        assert!(t.join("wt-a/debug/deps/old-0000000000000001.rlib").exists());
+    }
+
+    #[test]
+    fn a_tree_whose_mark_cannot_be_written_is_parked_not_left_under_a_trash_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_g, t) = temp_tree("markfail");
+        let name = OsStr::new("wt-x");
+        for n in 0..PARK_TRIES {
+            mk_dep(
+                &t,
+                &format!("{}/x", parked_name(name, n).to_string_lossy()),
+                1,
+            );
+        }
+        let trash = trash_name(name);
+        mk_dep(&t, &format!("{}/debug/f", trash.to_string_lossy()), 1);
+        // The folder cannot be written into, so the mark cannot be created in it.
+        let _restore = Restore(vec![t.join(parked_name(name, PARK_TRIES))]);
+        fs::set_permissions(t.join(&trash), fs::Permissions::from_mode(0o555)).unwrap();
+        let root = root_of(&t);
+        let at = park(&root, &trash, name);
+        assert_eq!(
+            at,
+            t.join(parked_name(name, PARK_TRIES)),
+            "parked under a further name"
+        );
+        assert!(
+            !t.join(&trash).exists(),
+            "nothing is left under the trash name"
+        );
+        assert!(at.join("debug/f").exists());
+    }
+
+    #[test]
+    fn a_cargo_started_with_target_dir_and_no_variable_is_in_use() {
+        let now = SystemTime::now();
+        let (_g, t) = temp_tree("targetdir");
+        let cand = t.join("wt-run");
+        mk_dep(&cand, "debug/deps/a", 10);
+        stamp_all(&cand, now - std::time::Duration::from_secs(700));
+        let real = fs::canonicalize(&cand).unwrap();
+        let procs = t.join("procs");
+        for (pid, args) in [
+            (
+                "5301",
+                format!("cargo\0build\0--target-dir\0{}\0", real.display()),
+            ),
+            (
+                "5302",
+                format!("cargo\0build\0--target-dir={}/debug\0", real.display()),
+            ),
+        ] {
+            fake_proc(&procs, pid, "cargo", &["PATH=/usr/bin"], &[]);
+            fs::write(procs.join(pid).join("cmdline"), args).unwrap();
+            let one = t.join(format!("procs-{pid}"));
+            fs::create_dir_all(&one).unwrap();
+            fs::rename(procs.join(pid), one.join(pid)).unwrap();
+            assert_eq!(pid_using(&cand, &one), Some(pid.parse().unwrap()), "{pid}");
+        }
+        // Another target, or no flag: not in use.
+        let other = t.join("procs-other");
+        fake_proc(&other, "5303", "cargo", &["PATH=/usr/bin"], &[]);
+        fs::write(
+            other.join("5303/cmdline"),
+            "cargo\0build\0--target-dir\0/somewhere/else\0",
+        )
+        .unwrap();
+        assert_eq!(pid_using(&cand, &other), None);
+    }
+
+    #[test]
+    fn a_marker_folder_moved_aside_by_the_launcher_is_never_a_candidate() {
+        let (_g, t) = temp_tree("asidecand");
+        // The name check-fast gives a marker that was a folder.
+        let aside = format!("{PARK_PREFIX}77-lucina-check-target-marker");
+        mk_dep(&t, &format!("{aside}/x"), 1);
+        mk_dep(&t, "wt-keep/debug/deps/y", 1);
+        let names: Vec<_> = candidates(&t, None)
+            .into_iter()
+            .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["wt-keep"], "{names:?}");
+    }
+    // ---- the call sites of the root mount id stop and of the host-cause summary ----
+
+    #[test]
+    fn root_mode_stops_when_the_kernel_gives_no_mount_id_for_the_root() {
+        let (_g, allowed, x) = fixture("runnomnt");
+        mark(&x);
+        NO_ROOT_MNT.with(|c| c.set(true));
+        let r = run(&x, 1, 0, None, false, &guard(&allowed));
+        NO_ROOT_MNT.with(|c| c.set(false));
+        let e = r.unwrap_err();
+        assert_eq!(
+            e,
+            format!(
+                "sweep-target: could not read the mount id of {}; nothing swept",
+                x.display()
+            )
+        );
+        assert!(x.join("wt-a/debug/deps/a.rlib").exists());
+    }
+
+    #[test]
+    fn a_sweep_that_met_only_unreadable_environments_ends_with_the_host_cause_sentence() {
+        use std::os::unix::fs::PermissionsExt;
+        let now = SystemTime::now();
+        let (_g, allowed, x) = fixture("runenv");
+        mark(&x);
+        let old = std::time::Duration::from_secs(700);
+        for wt in ["wt-a", "wt-old"] {
+            if wt == "wt-old" {
+                let big = x.join("wt-old/debug/deps/big");
+                fs::create_dir_all(big.parent().unwrap()).unwrap();
+                fs::File::create(&big).unwrap().set_len(2 << 30).unwrap();
+            }
+            stamp_all(&x.join(wt), now - old);
+        }
+        let procs = allowed.join("procs");
+        fake_proc(&procs, "5401", "cargo", &["PATH=/usr/bin"], &[]);
+        let environ = procs.join("5401/environ");
+        let _restore = Restore(vec![environ.clone()]);
+        fs::set_permissions(&environ, fs::Permissions::from_mode(0o000)).unwrap();
+        let g = Guard {
+            allowed: &allowed,
+            home: None,
+            procs: &procs,
+        };
+        let mut lines = Vec::new();
+        assert_eq!(
+            run_with(&x, 1, 0, None, false, &g, &mut |l| lines
+                .push(l.to_string())),
+            Ok(0)
+        );
+        assert!(
+            x.join("wt-old").exists() && x.join("wt-a").exists(),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("no candidate could be decided")),
+            "{lines:?}"
+        );
     }
 }
