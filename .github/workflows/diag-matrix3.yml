@@ -46,8 +46,10 @@ jobs:
         timeout-minutes: 5
         run: |
           m=tools/ci/lucina-ci/Cargo.toml
-          exe=$(cargo test --release --locked --no-run --message-format=json --manifest-path "$m" 2>/dev/null \
-            | grep -o '"executable":"[^"]*"' | cut -d'"' -f4 | grep "/deps/${{ matrix.test }}-" | head -n 1)
+          cargo test --release --locked --no-run --message-format=json --manifest-path "$m" > cargo.json 2> cargo.err || { tail -n 20 cargo.err; exit 1; }
+          grep -o '"executable":"[^"]*"' cargo.json | cut -d'"' -f4 | sort -u > exes.txt
+          echo "--- executables"; cat exes.txt
+          exe=$(grep "/${{ matrix.test }}-" exes.txt | head -n 1)
           echo "exe=$exe"
           test -n "$exe"
           tools/ci/lucina-ci/target/release/lucina-ci test-binaries --binary "$exe" --cwd tools/ci/lucina-ci
