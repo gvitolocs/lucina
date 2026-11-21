@@ -1,0 +1,53 @@
+# Temporary. The launcher's own runner (`test-binaries`) stops on about one run in four, `cargo test` never did. Each test binary
+# on its own runner under the launcher (`--binary`), four times over: the job that does not end names the binary.
+name: diag-matrix3
+on:
+  push:
+    branches: ['diag/**']
+
+permissions:
+  contents: read
+
+jobs:
+  one:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2, 3, 4]
+        test:
+          - check_fast_cache_root
+          - check_fast_marker
+          - check_fast_max_wait
+          - check_fast_oos
+          - check_fast_priority
+          - check_fast_queue
+          - check_fast_tool_swap
+          - in_lane_worker
+          - inventory_gone_unit
+          - inventory_named_units
+          - merge_gate_step_limits
+          - merge_gate_timeout
+          - merge_gate_waivers
+          - runner_kill_scope
+          - sweep_caches
+          - sweep_main_debug
+          - sweep_root
+          - test_binaries
+          - lucina_ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: cargo build --release --locked --manifest-path tools/ci/lucina-ci/Cargo.toml
+      - name: ${{ matrix.test }} under the launcher, run ${{ matrix.rep }}
+        timeout-minutes: 5
+        run: |
+          m=tools/ci/lucina-ci/Cargo.toml
+          exe=$(cargo test --release --locked --no-run --message-format=json --manifest-path "$m" 2>/dev/null \
+            | grep -o '"executable":"[^"]*"' | cut -d'"' -f4 | grep "/deps/${{ matrix.test }}-" | head -n 1)
+          echo "exe=$exe"
+          test -n "$exe"
+          tools/ci/lucina-ci/target/release/lucina-ci test-binaries --binary "$exe" --cwd tools/ci/lucina-ci
