@@ -1,0 +1,109 @@
+# Temporary. Every variant of the plain launcher-tests step that could explain why it stops in the sync run, side by side.
+name: diag-batch
+on:
+  push:
+    branches: ['diag/**', 'sync/diag**']
+
+permissions:
+  contents: read
+
+env:
+  VERUS_SMALL_RUNNER_CAP_GIB: ${{ vars.VERUS_SMALL_RUNNER_CAP_GIB }}
+
+jobs:
+  state:
+    # What the binaries see: event, ref, HEAD, the history against main, the environment variable names (no values).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: |
+          echo "event=${{ github.event_name }} ref=${{ github.ref }} ref_name=${{ github.ref_name }} sha=${{ github.sha }}"
+          git rev-parse HEAD; git branch -a; git status -sb | head -n 5
+          echo "--- origin/main..HEAD"; git log --oneline origin/main..HEAD | head -n 20
+          echo "--- env names"; env | cut -d= -f1 | sort | tr '\n' ' '; echo
+          echo "--- cgroup"; cat /proc/self/cgroup; echo "--- user manager"; ls /run/user 2>&1; systemctl --user is-system-running 2>&1 | head -n 2
+          echo "--- shell options"; echo "$-"; ps -o pid,ppid,pgid,sid,tty,args -p $$ -p $PPID
+  shallow:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo build --release --locked --manifest-path tools/ci/lucina-ci/Cargo.toml
+      - name: Plain step, shallow checkout
+        timeout-minutes: 7
+        run: tools/ci/lucina-ci/target/release/lucina-ci test-binaries --manifest-path tools/ci/lucina-ci/Cargo.toml
+  concurrency:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    concurrency:
+      group: diagbatch-${{ github.ref }}-${{ github.sha }}-${{ github.event_name }}
+      cancel-in-progress: false
+    outputs:
+      any: ${{ steps.mark.outputs.any }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: cargo build --release --locked --manifest-path tools/ci/lucina-ci/Cargo.toml
+      - name: Plain step, with a concurrency group and job outputs
+        timeout-minutes: 7
+        run: tools/ci/lucina-ci/target/release/lucina-ci test-binaries --manifest-path tools/ci/lucina-ci/Cargo.toml
+      - id: mark
+        run: echo "any=true" >> "$GITHUB_OUTPUT"
+  headline:
+    # The old plan job as it was: same checkout, build and step; the two later steps too.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build the launcher
+        run: cargo build --release --locked --manifest-path tools/ci/lucina-ci/Cargo.toml
+      - name: Launcher tests
+        timeout-minutes: 12
+        run: tools/ci/lucina-ci/target/release/lucina-ci test-binaries --manifest-path tools/ci/lucina-ci/Cargo.toml
+      - name: Every proof is in the inventory
+        run: tools/ci/lucina-ci/target/release/lucina-ci inventory --check
+  twice:
+    # The tests run twice in a row: a second run in the same checkout, with the first one's leftovers.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: cargo build --release --locked --manifest-path tools/ci/lucina-ci/Cargo.toml
+      - name: First run
+        timeout-minutes: 4
+        run: tools/ci/lucina-ci/target/release/lucina-ci test-binaries --manifest-path tools/ci/lucina-ci/Cargo.toml
+      - name: Second run
+        timeout-minutes: 4
+        run: tools/ci/lucina-ci/target/release/lucina-ci test-binaries --manifest-path tools/ci/lucina-ci/Cargo.toml
+  per-binary-last:
+    # The binaries one by one as cargo runs them, the plain way, without our runner: names which one stops, if any.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: cargo test, binary by binary
+        timeout-minutes: 12
+        run: |
+          cd tools/ci/lucina-ci
+          for t in $(ls tests/*.rs | xargs -n1 basename | sed 's/\.rs$//' | grep -v '^common$'); do
+            echo "== $t start $(date -u +%T)"
+            timeout 240 cargo test --release --locked --test "$t" 2>&1 | tail -n 3
+            echo "== $t rc=${PIPESTATUS[0]} $(date -u +%T)"
+          done
