@@ -1,0 +1,52 @@
+# Temporary. One launcher process runs the first k test binaries, in sorted order (fwd) or reversed (rev): the smallest k at which
+# a job stops names the binary that completes the guilty sequence (single binaries never stop: 76 of 76 passed).
+name: diag-matrix4
+on:
+  push:
+    branches: ['diag/**']
+
+permissions:
+  contents: read
+
+jobs:
+  prefix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [fwd, rev]
+        k: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        rep: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: cargo build --release --locked --manifest-path tools/ci/lucina-ci/Cargo.toml
+      - name: ${{ matrix.dir }} first ${{ matrix.k }}, run ${{ matrix.rep }}
+        timeout-minutes: 6
+        run: |
+          m=tools/ci/lucina-ci/Cargo.toml
+          cargo test --release --locked --no-run --message-format=json --manifest-path "$m" > cargo.json 2> cargo.err || { tail -n 20 cargo.err; exit 1; }
+          cat > prefix-step.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          # usage: prefix-step.sh <fwd|rev> <k> <manifest> <launcher> <cargo.json>
+          # Runs the first <k> of the 19 test binaries, in sorted order (fwd) or reversed order (rev), in ONE launcher process.
+          set -eu
+          dir=$1; k=$2; m=$3; launcher=$4; json=$5
+          names="check_fast_cache_root check_fast_marker check_fast_max_wait check_fast_oos check_fast_priority check_fast_queue check_fast_tool_swap in_lane_worker inventory_gone_unit inventory_named_units lucina_ci merge_gate_step_limits merge_gate_timeout merge_gate_waivers runner_kill_scope sweep_caches sweep_main_debug sweep_root test_binaries"
+          if [ "$dir" = rev ]; then names=$(for n in $names; do echo "$n"; done | sort -r | tr '\n' ' '); fi
+          grep -o '"executable":"[^"]*"' "$json" | cut -d'"' -f4 | sort -u > exes.txt
+          args=""; i=0
+          for n in $names; do
+            i=$((i+1)); [ "$i" -le "$k" ] || break
+            exe=$(grep "/$n-" exes.txt | head -n 1)
+            test -n "$exe" || { echo "no executable for $n"; exit 1; }
+            args="$args --binary $exe"
+          done
+          echo "launcher over: $args" | sed 's|/[^ ]*/deps/||g'
+          # shellcheck disable=SC2086
+          "$launcher" test-binaries $args --cwd "$(dirname "$m")"
+          SCRIPT
+          bash prefix-step.sh ${{ matrix.dir }} ${{ matrix.k }} "$m" tools/ci/lucina-ci/target/release/lucina-ci cargo.json
