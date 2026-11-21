@@ -42,12 +42,29 @@ jobs:
           persist-credentials: false
       - name: Build the launcher
         run: cargo build --release --locked --manifest-path tools/ci/lucina-ci/Cargo.toml
-      - name: Launcher tests
-        # Each test binary runs under its own time limit (300 s) and the step under a budget of 900 s, build included; a binary
-        # over its limit is killed and named (`HUNG: <binary> after <n> s`). The limits are LUCINA_CI_TEST_BINARY_LIMIT_S
-        # and LUCINA_CI_TEST_STEP_BUDGET_S.
-        timeout-minutes: 17
-        run: tools/ci/lucina-ci/target/release/lucina-ci test-binaries --manifest-path tools/ci/lucina-ci/Cargo.toml
+      - name: Launcher tests, 1 of 3, the machine
+        timeout-minutes: 2
+        run: |
+          date -u; nproc; free -m; df -h; ulimit -a
+      - name: Launcher tests, 2 of 3, the launcher starts
+        timeout-minutes: 2
+        run: |
+          timeout 120 tools/ci/lucina-ci/target/release/lucina-ci --help | head -n 5; echo "rc=${PIPESTATUS[0]}"
+      - name: Launcher tests, 3 of 3, the test binaries
+        timeout-minutes: 12
+        run: |
+          # Lowest priority, a process and a memory cap, a process listing every 20 s so a stall shows what is running,
+          # and the output both on the console and in a file. The step ends with the real exit code.
+          ulimit -u 4000
+          ulimit -v 12000000
+          ( while :; do echo "--- sample $(date -u +%T)"; free -m | sed -n 2p; ps -eo pid,ppid,stat,etime,rss,args --sort=-rss | head -n 12; sleep 20; done ) &
+          sampler=$!
+          nice -n 19 timeout 600 tools/ci/lucina-ci/target/release/lucina-ci test-binaries --manifest-path tools/ci/lucina-ci/Cargo.toml 2>&1 | tee bin.log
+          rc=${PIPESTATUS[0]}
+          kill "$sampler" 2>/dev/null
+          echo "rc=$rc"
+          tail -n 40 bin.log
+          exit "$rc"
       - name: Every proof is in the inventory
         run: tools/ci/lucina-ci/target/release/lucina-ci inventory --check
       - id: plan
