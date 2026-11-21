@@ -1,0 +1,75 @@
+# Temporary. In sorted order the first 14 test binaries pass and the 15th (runner_kill_scope) stalls on a hosted runner; alone it
+# passes. Pairs (one earlier binary, then runner_kill_scope) and the whole sequence minus one binary name what is needed.
+name: diag-matrix5
+on:
+  push:
+    branches: ['diag/**']
+
+permissions:
+  contents: read
+
+jobs:
+  seq:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2, 3]
+        case:
+          - {label: "pair check_fast_cache_root", seq: "check_fast_cache_root runner_kill_scope"}
+          - {label: "pair check_fast_marker", seq: "check_fast_marker runner_kill_scope"}
+          - {label: "pair check_fast_max_wait", seq: "check_fast_max_wait runner_kill_scope"}
+          - {label: "pair check_fast_oos", seq: "check_fast_oos runner_kill_scope"}
+          - {label: "pair check_fast_priority", seq: "check_fast_priority runner_kill_scope"}
+          - {label: "pair check_fast_queue", seq: "check_fast_queue runner_kill_scope"}
+          - {label: "pair check_fast_tool_swap", seq: "check_fast_tool_swap runner_kill_scope"}
+          - {label: "pair in_lane_worker", seq: "in_lane_worker runner_kill_scope"}
+          - {label: "pair inventory_gone_unit", seq: "inventory_gone_unit runner_kill_scope"}
+          - {label: "pair inventory_named_units", seq: "inventory_named_units runner_kill_scope"}
+          - {label: "pair lucina_ci", seq: "lucina_ci runner_kill_scope"}
+          - {label: "pair merge_gate_step_limits", seq: "merge_gate_step_limits runner_kill_scope"}
+          - {label: "pair merge_gate_timeout", seq: "merge_gate_timeout runner_kill_scope"}
+          - {label: "pair merge_gate_waivers", seq: "merge_gate_waivers runner_kill_scope"}
+          - {label: "all but check_fast_cache_root", seq: "check_fast_marker check_fast_max_wait check_fast_oos check_fast_priority check_fast_queue check_fast_tool_swap in_lane_worker inventory_gone_unit inventory_named_units lucina_ci merge_gate_step_limits merge_gate_timeout merge_gate_waivers runner_kill_scope"}
+          - {label: "all but check_fast_marker", seq: "check_fast_cache_root check_fast_max_wait check_fast_oos check_fast_priority check_fast_queue check_fast_tool_swap in_lane_worker inventory_gone_unit inventory_named_units lucina_ci merge_gate_step_limits merge_gate_timeout merge_gate_waivers runner_kill_scope"}
+          - {label: "all but check_fast_max_wait", seq: "check_fast_cache_root check_fast_marker check_fast_oos check_fast_priority check_fast_queue check_fast_tool_swap in_lane_worker inventory_gone_unit inventory_named_units lucina_ci merge_gate_step_limits merge_gate_timeout merge_gate_waivers runner_kill_scope"}
+          - {label: "all but check_fast_oos", seq: "check_fast_cache_root check_fast_marker check_fast_max_wait check_fast_priority check_fast_queue check_fast_tool_swap in_lane_worker inventory_gone_unit inventory_named_units lucina_ci merge_gate_step_limits merge_gate_timeout merge_gate_waivers runner_kill_scope"}
+          - {label: "all but check_fast_priority", seq: "check_fast_cache_root check_fast_marker check_fast_max_wait check_fast_oos check_fast_queue check_fast_tool_swap in_lane_worker inventory_gone_unit inventory_named_units lucina_ci merge_gate_step_limits merge_gate_timeout merge_gate_waivers runner_kill_scope"}
+          - {label: "all but check_fast_queue", seq: "check_fast_cache_root check_fast_marker check_fast_max_wait check_fast_oos check_fast_priority check_fast_tool_swap in_lane_worker inventory_gone_unit inventory_named_units lucina_ci merge_gate_step_limits merge_gate_timeout merge_gate_waivers runner_kill_scope"}
+          - {label: "all but check_fast_tool_swap", seq: "check_fast_cache_root check_fast_marker check_fast_max_wait check_fast_oos check_fast_priority check_fast_queue in_lane_worker inventory_gone_unit inventory_named_units lucina_ci merge_gate_step_limits merge_gate_timeout merge_gate_waivers runner_kill_scope"}
+          - {label: "all but in_lane_worker", seq: "check_fast_cache_root check_fast_marker check_fast_max_wait check_fast_oos check_fast_priority check_fast_queue check_fast_tool_swap inventory_gone_unit inventory_named_units lucina_ci merge_gate_step_limits merge_gate_timeout merge_gate_waivers runner_kill_scope"}
+          - {label: "all but inventory_gone_unit", seq: "check_fast_cache_root check_fast_marker check_fast_max_wait check_fast_oos check_fast_priority check_fast_queue check_fast_tool_swap in_lane_worker inventory_named_units lucina_ci merge_gate_step_limits merge_gate_timeout merge_gate_waivers runner_kill_scope"}
+          - {label: "all but inventory_named_units", seq: "check_fast_cache_root check_fast_marker check_fast_max_wait check_fast_oos check_fast_priority check_fast_queue check_fast_tool_swap in_lane_worker inventory_gone_unit lucina_ci merge_gate_step_limits merge_gate_timeout merge_gate_waivers runner_kill_scope"}
+          - {label: "all but lucina_ci", seq: "check_fast_cache_root check_fast_marker check_fast_max_wait check_fast_oos check_fast_priority check_fast_queue check_fast_tool_swap in_lane_worker inventory_gone_unit inventory_named_units merge_gate_step_limits merge_gate_timeout merge_gate_waivers runner_kill_scope"}
+          - {label: "all but merge_gate_step_limits", seq: "check_fast_cache_root check_fast_marker check_fast_max_wait check_fast_oos check_fast_priority check_fast_queue check_fast_tool_swap in_lane_worker inventory_gone_unit inventory_named_units lucina_ci merge_gate_timeout merge_gate_waivers runner_kill_scope"}
+          - {label: "all but merge_gate_timeout", seq: "check_fast_cache_root check_fast_marker check_fast_max_wait check_fast_oos check_fast_priority check_fast_queue check_fast_tool_swap in_lane_worker inventory_gone_unit inventory_named_units lucina_ci merge_gate_step_limits merge_gate_waivers runner_kill_scope"}
+          - {label: "all but merge_gate_waivers", seq: "check_fast_cache_root check_fast_marker check_fast_max_wait check_fast_oos check_fast_priority check_fast_queue check_fast_tool_swap in_lane_worker inventory_gone_unit inventory_named_units lucina_ci merge_gate_step_limits merge_gate_timeout runner_kill_scope"}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: cargo build --release --locked --manifest-path tools/ci/lucina-ci/Cargo.toml
+      - name: ${{ matrix.case.label }}, run ${{ matrix.rep }}
+        timeout-minutes: 6
+        run: |
+          m=tools/ci/lucina-ci/Cargo.toml
+          cargo test --release --locked --no-run --message-format=json --manifest-path "$m" > cargo.json 2> cargo.err || { tail -n 20 cargo.err; exit 1; }
+          cat > seq-step.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          # usage: seq-step.sh <manifest> <launcher> <cargo.json> NAME...   one launcher process, the named test binaries in that order
+          set -eu
+          m=$1; launcher=$2; json=$3; shift 3
+          grep -o '"executable":"[^"]*"' "$json" | cut -d'"' -f4 | sort -u > exes.txt
+          args=""
+          for n in "$@"; do
+            exe=$(grep "/$n-" exes.txt | head -n 1)
+            test -n "$exe" || { echo "no executable for $n"; exit 1; }
+            args="$args --binary $exe"
+          done
+          echo "sequence: $*"
+          # shellcheck disable=SC2086
+          "$launcher" test-binaries $args --cwd "$(dirname "$m")"
+          SCRIPT
+          bash seq-step.sh "$m" tools/ci/lucina-ci/target/release/lucina-ci cargo.json ${{ matrix.case.seq }}
