@@ -1,0 +1,51 @@
+# Temporary. Runs the launcher tests three ways, side by side, to find which difference makes the plain step stop.
+name: diag-launcher
+on:
+  push:
+    branches: ['diag/**']
+
+permissions:
+  contents: read
+
+jobs:
+  plain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: cargo build --release --locked --manifest-path tools/ci/lucina-ci/Cargo.toml
+      - name: As on main
+        timeout-minutes: 7
+        run: tools/ci/lucina-ci/target/release/lucina-ci test-binaries --manifest-path tools/ci/lucina-ci/Cargo.toml
+  piped:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: cargo build --release --locked --manifest-path tools/ci/lucina-ci/Cargo.toml
+      - name: Output through tee only
+        timeout-minutes: 7
+        run: |
+          tools/ci/lucina-ci/target/release/lucina-ci test-binaries --manifest-path tools/ci/lucina-ci/Cargo.toml 2>&1 | tee bin.log
+          exit "${PIPESTATUS[0]}"
+  capped:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: cargo build --release --locked --manifest-path tools/ci/lucina-ci/Cargo.toml
+      - name: Priority, caps and timeout only
+        timeout-minutes: 7
+        run: |
+          ulimit -u 4000
+          ulimit -v 12000000
+          nice -n 19 timeout 400 tools/ci/lucina-ci/target/release/lucina-ci test-binaries --manifest-path tools/ci/lucina-ci/Cargo.toml
