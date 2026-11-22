@@ -1,5 +1,5 @@
-//! GATE-03: a deadline must STOP a step, not only flag it. `runner::inner` gives every step its own cgroup scope and,
-//! where no scope can be had, its own process group; at the deadline the step is SIGTERMed, and rounds of SIGKILL follow
+//! A deadline must STOP a step, not only flag it. `runner::inner` gives every step its own cgroup scope (a step that cannot get one fails the check, and is
+//! never run uncapped); at the deadline the step is SIGTERMed, and rounds of SIGKILL follow
 //! until nothing of the step is left or a hard bound passes, and only then is the step reported.
 //!
 //! These tests drive the real binary over a throwaway repository whose `diffgate` step is a shell script that ignores
@@ -22,11 +22,34 @@
 //! running, which is how a step here came back `ok 1.0s` with its sleeps killed by a thread that had finished.)
 
 use std::fs;
-use std::os::unix::process::CommandExt;
+use std::io::{Read, Write};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+mod common;
+
+/// A stub goes in through a child, never from this thread: it is exec'd by the step, and a file this thread still holds open
+/// for writing makes that exec answer "Text file busy" (ETXTBSY) when another thread forks at the same moment, after which
+/// the shell goes on to the next `diffgate` on PATH, the real one. The same helper in SecretaryIOS explains the measurement.
+fn write_exec(path: &Path, script: &str) {
+    let mut child = Command::new("sh")
+        .args(["-c", "cat > \"$1\" && chmod 0755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut w = child.stdin.take().unwrap();
+    w.write_all(script.as_bytes()).unwrap();
+    drop(w);
+    assert!(
+        child.wait().unwrap().success(),
+        "sh cannot write {}: the stand-in is never exec'd",
+        path.display()
+    );
+}
 
 /// `runner::KILL_GRACE_S`: the time a step gets to leave on its own after the deadline's SIGTERM.
 const GRACE_S: f64 = 5.0;
@@ -106,7 +129,7 @@ impl Drop for Case {
     }
 }
 
-/// The step's script: it ignores SIGTERM, says which cgroup it stands in (its own scope, or the fallback), then runs
+/// The step's script: it ignores SIGTERM, says which cgroup it stands in, then runs
 /// `body` and waits for what it started. The counts of `body` name this test's own markers: a pattern that covers every
 /// sleeper of this process would count the sleepers of the tests running next door.
 fn setup(tag: &str, body: &str) -> Case {
@@ -139,8 +162,7 @@ fn setup(tag: &str, body: &str) -> Case {
          wait\n"
     );
     let stub = bin.join("diffgate");
-    fs::write(&stub, &script).unwrap();
-    Command::new("chmod").arg("+x").arg(&stub).status().unwrap();
+    write_exec(&stub, &script);
     Case { repo, bin }
 }
 
@@ -221,16 +243,194 @@ fn outside_group(one: &str) -> String {
     )
 }
 
+/// The number a group signal is built from, or `None` for a number no group signal may ever be built from: `pid` 0 is
+/// this process's own group, `pid` 1 is init, and a number past `i32::MAX` is not a signal target at all. Written down in
+/// one place and used by nothing but its test, because the sweep takes its members by positive pid instead (see `Sweep`):
+/// a negative group id is a whole number handed to something else. On a hosted CI runner the packaged kill program read
+/// `kill -0 -10027` as `kill(-1, 0)`: it takes a negative id from its first digit, so a
+/// group whose number begins with 1 is every process of the user, and with SIGKILL the runner's own worker with them. On
+/// this host the same call is right, which is why the shape lived here for so long.
+fn group_target(pid: u32) -> Option<i32> {
+    if pid <= 1 || pid > i32::MAX as u32 {
+        return None;
+    }
+    Some(-(pid as i32))
+}
+
+/// The three fields of `/proc/<pid>/stat` a sweep reads. The line is `pid (comm) state ppid pgrp … starttime`, and `comm`
+/// holds spaces and parentheses, so the `proc(5)` field numbers only count from after the last `)`: state is field 3
+/// there, `pgrp` field 5, and `starttime` — field 22 — the twentieth token after it.
+struct Stat {
+    state: char,
+    pgrp: u32,
+    starttime: u64,
+}
+
+/// Those fields for `pid`, or `None` when there is no line to read: the process is gone, or went between two reads, which
+/// is the same answer for a sweep.
+fn stat_of(pid: u32) -> Option<Stat> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let f: Vec<&str> = text.rsplit(") ").next()?.split_whitespace().collect();
+    Some(Stat {
+        state: f.first()?.chars().next()?,
+        pgrp: f.get(2)?.parse().ok()?,
+        starttime: f.get(19)?.parse().ok()?,
+    })
+}
+
+/// May this pid be sent a signal at all? Not 0 (that is the caller's own group: the test run, the build and the shell with it),
+/// not 1 (init), and not a number an `i32` cannot carry (`pid as i32` of it would be a negative number, a group).
+fn signalable(pid: u32) -> bool {
+    pid >= 2 && pid <= i32::MAX as u32
+}
+
+/// Removes a folder when dropped, on a panic too, so that a test that makes one leaves nothing behind.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn signalable_refuses_pids_below_two_and_above_i32_max() {
+    for pid in [0u32, 1, 2_147_483_648, u32::MAX] {
+        assert!(!signalable(pid), "pid {pid} must not be signalled");
+    }
+    for pid in [2u32, 12345, 10027, 100027, 2_147_483_647] {
+        assert!(signalable(pid), "pid {pid} may be signalled");
+    }
+}
+
+#[test]
+fn the_folder_guard_removes_its_folder_on_drop_and_on_panic() {
+    let d = std::env::temp_dir().join(format!("kill-scope-guard-{}", std::process::id()));
+    fs::create_dir_all(d.join("inner")).unwrap();
+    drop(RemoveOnDrop(d.clone()));
+    assert!(
+        !d.exists(),
+        "the folder is still there after the guard dropped"
+    );
+    fs::create_dir_all(&d).unwrap();
+    let held = d.clone();
+    let r = std::panic::catch_unwind(move || {
+        let _g = RemoveOnDrop(held);
+        panic!("a test that fails half way");
+    });
+    assert!(r.is_err());
+    assert!(!d.exists(), "the folder is still there after a panic");
+}
+
+/// SIGKILL to one positive pid that the caller read from `/proc` between the scan and this call, or started itself. A
+/// system call and not the `kill` program: the program takes a group as `-<number>`, which is the number the packaged kill
+/// program read from its first digit on a hosted CI runner, and a call needs no fork of its own either.
+fn kill_sigkill(pid: u32) {
+    if !signalable(pid) {
+        // Not a pid this sweep may signal: 0 is its own group, 1 is init, and a number an `i32` cannot carry would turn into
+        // a negative one, a group.
+        return;
+    }
+    // SAFETY: `kill(2)` takes two plain integers (a pid and a signal number) and touches no memory of the caller, so
+    // there is nothing to alias, dereference or unalign. `pid as i32` is the same positive number by the check above,
+    // never the negation of a group id; which process it names is the caller's, and a sweep re-reads that process's
+    // `/proc/<pid>/stat` between the scan and here. `SIGKILL` is a libc constant.
+    let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+}
+
+/// At most this many passes over the table, and no pass starts once this much time has gone: a `Drop` guard must not hold
+/// a test that is already over.
+const SWEEP_ROUNDS: usize = 3;
+const SWEEP_LIMIT_S: u64 = 3;
+
 /// The group of one `check-fast`: what a test leaves no process behind with. Only the check and what inherits its group;
 /// a step's sleepers stand in a group of their own and are taken by `Markers`, because the step is started outside it.
-struct Sweep(u32);
+///
+/// Every member is taken by its OWN positive pid, each one re-read from `/proc` between the scan and the signal. Three
+/// things come of that and of nothing else. A straggler whose leader was already reaped is still reached, because the
+/// table is scanned rather than walked from a leader. The group's number is never handed to a signal as a group target,
+/// which is the hazard `group_target` records. And a stranger that has been started into the leader's number after the
+/// leader was reaped is told from the leader by the start time recorded here — a group id is a name for whoever stands in
+/// it now, never a handle to a set of processes that stays valid.
+struct Sweep {
+    /// The group the child was made leader of by `process_group(0)`.
+    group: u32,
+    /// Field 22 of that leader's `/proc/<pid>/stat`, read while it was certainly alive. `None` when it could not be
+    /// read: without it no leader is ever signalled, which leaves every straggler reachable and every stranger alone.
+    start: Option<u64>,
+}
+
+impl Sweep {
+    /// Records the leader of the group of a child that `spawn` just started with `process_group(0)`, and its start time
+    /// here and now.
+    fn new(pid: u32) -> Self {
+        Sweep {
+            group: pid,
+            start: stat_of(pid).map(|s| s.starttime),
+        }
+    }
+
+    /// Is `pid`, standing in `self.group` as `st` describes it, one of the check's own? Whatever is not the leader is: a
+    /// straggler, or a descendant that stayed in the group. The leader is ours only while it is the process that started
+    /// at the recorded time — which is the case when a test died before waiting for it, and never the case for a stranger
+    /// that has taken the number since.
+    fn is_ours(&self, pid: u32, st: &Stat) -> bool {
+        pid != self.group || self.start.is_some_and(|s| s == st.starttime)
+    }
+
+    /// Is `pid`, described by `st`, one to SIGKILL right now: a live process above pid 1 that is not this test itself,
+    /// standing in this group as a member `is_ours` recognises. Neither a zombie nor a corpse (`Z`, `X`: killed already,
+    /// with nothing left to take). One screen for the scan and for the re-read before every signal, so that the second
+    /// judgement cannot be looser than the first.
+    fn takeable(&self, pid: u32, st: &Stat) -> bool {
+        pid > 1
+            && pid != std::process::id()
+            && !matches!(st.state, 'Z' | 'X')
+            && st.pgrp == self.group
+            && self.is_ours(pid, st)
+    }
+
+    /// Who answers to the group right now. A `/proc` line that cannot be read is a process that went between the
+    /// directory and this read, which is the same answer as not being in the group.
+    fn members(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        for e in fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            let Some(st) = stat_of(pid) else { continue };
+            if self.takeable(pid, &st) {
+                out.push(pid);
+            }
+        }
+        out
+    }
+}
 
 impl Drop for Sweep {
     fn drop(&mut self) {
-        let _ = Command::new("kill")
-            .args(["-KILL", &format!("-{}", self.0)])
-            .stderr(Stdio::null())
-            .status();
+        let end = Instant::now() + Duration::from_secs(SWEEP_LIMIT_S);
+        for _ in 0..SWEEP_ROUNDS {
+            let members = self.members();
+            if members.is_empty() {
+                // The pass that finds nothing is the pass that says the group is empty.
+                return;
+            }
+            for pid in members {
+                // Re-read between the scan and the signal, so that what is aimed at is the process the scan saw and not a
+                // stranger started into the number since. A signal that lands on a stranger is the thing this sweep
+                // exists not to send.
+                let Some(st) = stat_of(pid) else { continue };
+                if self.takeable(pid, &st) {
+                    kill_sigkill(pid);
+                }
+            }
+            if Instant::now() >= end {
+                return;
+            }
+            // A moment for a signal to show in the table before the next pass reads it.
+            sleep(Duration::from_millis(100));
+        }
     }
 }
 
@@ -251,17 +451,16 @@ impl Drop for Markers {
     }
 }
 
-/// Runs the merge gate over `case`. `no_scope` forces the fallback branch (`LUCINA_CI_NO_SCOPE`) on a machine where a
-/// scope is available, so the branch a test means to cover is the branch it gets.
-fn run(case: &Case, cap: &str, no_scope: bool) -> (i32, String) {
-    run_env(case, cap, no_scope, None)
+/// Runs the merge gate over `case`.
+fn run(case: &Case, cap: &str) -> (i32, String) {
+    run_env(case, cap, None, &[])
 }
 
 /// `quota` is `LUCINA_CI_CPU_QUOTA`, the one switch the runner has for the properties of a step's scope: with it set,
 /// `run_unit` asks systemd for `CPUQuota=<it>,TasksMax=256` (`runner.rs`). `None` passes on what this process already
 /// carries, which is the check's own value (`scripts/check-fast` exports it) — so the ordinary cases here run with a
 /// task-capped scope, exactly as a real check does.
-fn run_env(case: &Case, cap: &str, no_scope: bool, quota: Option<&str>) -> (i32, String) {
+fn run_env(case: &Case, cap: &str, quota: Option<&str>, envs: &[(&str, &str)]) -> (i32, String) {
     let path = format!(
         "{}:{}",
         case.bin.display(),
@@ -285,16 +484,14 @@ fn run_env(case: &Case, cap: &str, no_scope: bool, quota: Option<&str>) -> (i32,
     // The check and everything it starts live in this group and no other, so `Sweep` takes them all without touching the
     // test process, which stands in a group of its own.
     .process_group(0);
-    if no_scope {
-        c.env("LUCINA_CI_NO_SCOPE", "1");
-    }
+    c.envs(envs.iter().copied());
     if let Some(q) = quota {
         c.env("LUCINA_CI_CPU_QUOTA", q);
     }
     // The check finds the changed files with `git`, and the report names the commit with it.
     scrub_git_config(&mut c);
     let child = c.spawn().expect("check-fast starts");
-    let _sweep = Sweep(child.id());
+    let _sweep = Sweep::new(child.id());
     let o = child.wait_with_output().expect("check-fast ends");
     let mut text = String::from_utf8_lossy(&o.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&o.stderr));
@@ -387,6 +584,45 @@ fn survivors_after_a_moment(pat: &str) -> Vec<u32> {
         sleep(Duration::from_millis(250));
     }
     survivors(pat)
+}
+
+/// The processes whose WHOLE command line is `exact`. `-x` rather than the default read: the line of the `sh -c` that
+/// starts a sleeper carries the same words with the leader's `$$` unwritten in it, and a search that matches anywhere in
+/// the line would count the founder as well as the work.
+fn exact_matches(exact: &str) -> Vec<u32> {
+    let o = Command::new("pgrep")
+        .args(["-x", "-f", exact])
+        .output()
+        .expect("pgrep runs");
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .collect()
+}
+
+/// Polls `exact_matches` for up to 5 s until `want` processes carry `exact`, then says how many it saw in the end. A
+/// SIGKILL is not in the table the moment it lands, and a fork is not there the moment it is asked for.
+fn wait_for_exact(exact: &str, want: usize) -> Vec<u32> {
+    for _ in 0..50 {
+        let found = exact_matches(exact);
+        if found.len() == want {
+            return found;
+        }
+        sleep(Duration::from_millis(100));
+    }
+    exact_matches(exact)
+}
+
+/// What an exec of `name` would run: the first `name` on this process's `PATH`. The child half of
+/// `the_sweep_calls_no_external_kill` reads this to know that the stub it was started with is what it would find.
+fn first_on_path(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join(name))
+        .find(|p| {
+            use std::os::unix::fs::PermissionsExt;
+            p.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
 }
 
 /// What the host answered when it was asked, in the test's own name, whether it can hand work to a nested
@@ -482,15 +718,18 @@ fn assert_stopped(out: &str, sleepers: &[String], what: &str) {
 /// start, and all of it is gone inside the bound.
 #[test]
 fn a_step_that_ignores_sigterm_is_gone_at_its_deadline() {
+    if common::skip_without_scope("a_step_that_ignores_sigterm_is_gone_at_its_deadline") {
+        return;
+    }
     let s = sleeper(1);
     let _markers = Markers(vec![s.clone()]);
     let body = format!("{s} &\n( {s} & ) &\n{}", counted(&s, 2));
     let case = setup("term", &body);
-    let (_code, out) = run(&case, LIMIT_S, false);
+    let (_code, out) = run(&case, LIMIT_S);
     assert!(
         scoped(&out),
-        "a step is meant to get a scope of its own; it stood in {} instead, which is the branch (b) forces. A runner \
-         that cannot give a scope caps nothing at all.",
+        "a step is meant to get a scope of its own; it stood in {} instead, which is no scope at all. A runner \
+         that cannot give a scope caps nothing, and the check fails instead.",
         cgroup_of(&out).unwrap_or_default()
     );
     assert_eq!(
@@ -501,38 +740,95 @@ fn a_step_that_ignores_sigterm_is_gone_at_its_deadline() {
     assert_stopped(&out, &[s], "sigterm ignored by child and grandchild");
 }
 
-/// (b) The same step where no scope can be had: the fallback runs it as the leader of its own process group and the kill
-/// takes that group. It must still stop the step, and it must not want — or reach — anything else in the cgroup the
-/// check shares with whatever started it.
+/// (b) A step that cannot get its scope is NOT run uncapped. The machine here has no systemd user manager
+/// (`systemctl --user show-environment` fails, as it does where there is no user bus), a `sudo` that would say yes if it
+/// were asked, and a `systemd-run` that refuses. The check must fail with one message that names the step and the reason;
+/// the step's script must never have started; and `sudo` must never have been called. There is no environment switch
+/// that turns this off: setting the retired `LUCINA_CI_NO_SCOPE` changes nothing.
 #[test]
-fn the_same_step_is_gone_at_its_deadline_when_no_scope_can_be_had() {
-    let s = sleeper(2);
-    let _markers = Markers(vec![s.clone()]);
-    let body = format!("{s} &\n( {s} & ) &\n{}", counted(&s, 2));
-    let case = setup("noscope", &body);
-    let (_code, out) = run(&case, LIMIT_S, true);
-    assert_eq!(
-        cgroup_of(&out).as_deref(),
-        Some(own_cgroup().as_str()),
-        "a step with no scope stands in the cgroup it was handed, and its deadline kill takes its process group, not \
-         everything else in that cgroup"
+fn a_step_that_cannot_get_a_scope_fails_and_never_runs_uncapped() {
+    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("gate03-noscope-{}", std::process::id()));
+    let ran = d.join("ran");
+    let log = d.join("calls.log");
+    let case = setup("noscope", &format!("touch '{}'", ran.display()));
+    let stub = |name: &str, body: &str| {
+        write_exec(&case.bin.join(name), &format!("#!/bin/sh\n{body}\n"));
+    };
+    stub(
+        "id",
+        "case \"$1\" in -u|-g) echo 1000 ;; *) exec /usr/bin/id \"$@\" ;; esac",
+    );
+    stub(
+        "systemctl",
+        &format!("echo \"systemctl $*\" >> '{}'\nexit 1", log.display()),
+    );
+    stub(
+        "systemd-run",
+        &format!("echo \"systemd-run $*\" >> '{}'\nexit 1", log.display()),
+    );
+    stub(
+        "sudo",
+        &format!("echo \"sudo $*\" >> '{}'\nexit 0", log.display()),
+    );
+    let (code, out) = run_env(&case, "20", None, &[("LUCINA_CI_NO_SCOPE", "1")]);
+    assert_ne!(code, 0, "a check with no scope for a step must fail: {out}");
+    assert!(
+        out.contains("cannot get a memory-capped scope") && out.contains("no systemd user manager"),
+        "the failure names the reason: {out}"
     );
     assert!(
-        !out.contains("no systemd user session"),
-        "a check with no scope is a fallback, not a refusal: {out}"
+        out.contains("step fast/diffgate:"),
+        "the failure names the step: {out}"
     );
-    assert_eq!(
-        echo_count(&out, &s),
-        2,
-        "the step did not start the child and the grandchild that ignore SIGTERM: {out}"
+    assert!(
+        !ran.exists(),
+        "the step ran although it had no scope, i.e. uncapped: {out}"
     );
-    assert_stopped(&out, &[s], "no scope, sigterm ignored");
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.lines().any(|l| l.starts_with("sudo")),
+        "lucina-ci called sudo: {calls}"
+    );
+    assert!(
+        !calls.lines().any(|l| l.starts_with("systemd-run")),
+        "the step was handed to systemd-run although no user manager answered: {calls}"
+    );
+}
+
+/// lucina-ci never builds an argv with `sudo` in it. The behavioural half is the test above (a `sudo` stub that
+/// is never called); this half reads the sources, where a command line is built, and refuses the word as a program name
+/// or an argument, in code (comments may say it).
+#[test]
+fn no_source_of_lucina_ci_builds_a_sudo_argv() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut seen = 0;
+    for e in fs::read_dir(&src).unwrap().flatten() {
+        let p = e.path();
+        if p.extension().is_none_or(|x| x != "rs") {
+            continue;
+        }
+        seen += 1;
+        for (i, l) in fs::read_to_string(&p).unwrap().lines().enumerate() {
+            let code = l.split("//").next().unwrap_or("");
+            assert!(
+                !code.contains("\"sudo\"") && !code.contains("sudo -"),
+                "{}:{}: a sudo argv in code: {l}",
+                p.display(),
+                i + 1
+            );
+        }
+    }
+    assert!(seen > 0, "no sources read under {}", src.display());
 }
 
 /// (c) A step that finishes inside its limit is not touched by any of this: it passes, the time recorded for it is its
 /// own work and not the kill machinery, and the straggler it leaves behind is taken when the step ends.
 #[test]
 fn a_step_that_ends_in_time_is_untouched() {
+    if common::skip_without_scope("a_step_that_ends_in_time_is_untouched") {
+        return;
+    }
     let s = sleeper(3);
     let _markers = Markers(vec![s.clone()]);
     // `exit 0` before the script's `wait`: the step is meant to end at once and leave a straggler standing, which is what
@@ -541,7 +837,7 @@ fn a_step_that_ends_in_time_is_untouched() {
         "ontime",
         &format!("{s} &\necho gate03-ontime: yes\nexit 0\n"),
     );
-    let (_code, out) = run(&case, "20", false);
+    let (_code, out) = run(&case, "20");
     let (ok, secs) = step_line(&out, "diffgate").expect("the diffgate step reported a time");
     assert!(
         ok,
@@ -564,6 +860,9 @@ fn a_step_that_ends_in_time_is_untouched() {
 /// deadline reaches it with — and nothing else here does.
 #[test]
 fn work_handed_to_a_nested_scope_is_gone_at_its_deadline() {
+    if common::skip_without_scope("work_handed_to_a_nested_scope_is_gone_at_its_deadline") {
+        return;
+    }
     let (nested, plain) = (sleeper(4), sleeper(5));
     let _markers = Markers(vec![nested.clone(), plain.clone()]);
     let counts = format!("{}\n{}", counted(&nested, 1), counted(&plain, 1));
@@ -575,7 +874,7 @@ fn work_handed_to_a_nested_scope_is_gone_at_its_deadline() {
         outside_cgroup(&nested),
     );
     let case = setup("nested", &body);
-    let (_code, out) = run(&case, LIMIT_S, false);
+    let (_code, out) = run(&case, LIMIT_S);
     assert_eq!(
         echo_count(&out, &plain),
         1,
@@ -614,6 +913,9 @@ fn work_handed_to_a_nested_scope_is_gone_at_its_deadline() {
 /// this is the case only the cgroup route takes. A run where that process never appeared is a failure, not a skip.
 #[test]
 fn work_handed_to_a_new_session_is_gone_at_its_deadline() {
+    if common::skip_without_scope("work_handed_to_a_new_session_is_gone_at_its_deadline") {
+        return;
+    }
     let (detached, plain) = (sleeper(6), sleeper(7));
     let _markers = Markers(vec![detached.clone(), plain.clone()]);
     let counts = format!("{}\n{}", counted(&detached, 1), counted(&plain, 1));
@@ -624,7 +926,7 @@ fn work_handed_to_a_new_session_is_gone_at_its_deadline() {
         outside_group(&detached),
     );
     let case = setup("session", &body);
-    let (_code, out) = run(&case, LIMIT_S, false);
+    let (_code, out) = run(&case, LIMIT_S);
     // Observe before judging (GATE-11): the step waited, up to 5 s, until the sleeper stood in a group other than the
     // step's. If that never happened (or the step was cut off before it said so), nothing was judged, and that is a
     // failure here — never a pass.
@@ -667,6 +969,11 @@ fn work_handed_to_a_new_session_is_gone_at_its_deadline() {
 /// sibling, and judges both. The kill is `kill(2)` now: a system call takes no task slot.
 #[test]
 fn a_step_that_has_taken_every_task_slot_is_still_gone_at_its_deadline() {
+    if common::skip_without_scope(
+        "a_step_that_has_taken_every_task_slot_is_still_gone_at_its_deadline",
+    ) {
+        return;
+    }
     let (nested, plain) = (sleeper(8), sleeper(9));
     let _markers = Markers(vec![nested.clone(), plain.clone()]);
     let case = setup("tasksfull", &fill_body(&nested, &plain));
@@ -674,7 +981,7 @@ fn a_step_that_has_taken_every_task_slot_is_still_gone_at_its_deadline() {
     // `CPUQuota=<it>,TasksMax=256` on the scope whenever it is set. There is no switch for a smaller `TasksMax`, so the
     // step fills all 256 of them. The value is the production one (`scripts/check-fast` exports `400%`): the task cap,
     // not the CPU one, is what is under test.
-    let (_code, out) = run_env(&case, LIMIT_S, false, Some("400%"));
+    let (_code, out) = run_env(&case, LIMIT_S, Some("400%"), &[]);
     assert!(
         scoped(&out),
         "the task cap is a scope property, so this case needs a scope of its own: {}",
@@ -727,5 +1034,264 @@ fn a_step_that_has_taken_every_task_slot_is_still_gone_at_its_deadline() {
         &out,
         &[nested, plain],
         "a step that has taken every task slot of its scope",
+    );
+}
+
+/// The shape one `Sweep` is there for, in one place because two tests judge it: a `sh` that is the leader of a group of
+/// its own and has forked a `sleep` into that group, with the leader killed and REAPED first so that what stands is a
+/// member of a group whose number answers to nothing alive. The sleeper's duration is the leader's own pid, so its whole
+/// command line is a marker no other process on the machine carries. The sweep drops inside; the caller judges what its
+/// marker holds afterwards.
+fn straggler_scenario() -> String {
+    let mut sh = Command::new("sh")
+        // The sleeper's three standard streams are cut loose from this scenario's: a straggler that kept the pipe of the
+        // process that runs the scenario would hold a parent's `output()` open until it exits. Redirections are not part
+        // of the sleeper's command line, which stays `sleep 297<leader>`.
+        .args(["-c", "sleep 297$$ >/dev/null 2>&1 </dev/null & wait"])
+        .process_group(0)
+        .spawn()
+        .expect("a group leader of this scenario's own starts");
+    let leader = sh.id();
+    let marker = format!("sleep 297{leader}");
+    let sweep = Sweep::new(leader);
+    let seen = wait_for_exact(&marker, 1);
+    assert_eq!(
+        seen.len(),
+        1,
+        "the sleeper this scenario is about never stood up alone under {marker}: saw {seen:?}"
+    );
+    kill_sigkill(leader);
+    let died = sh.wait().expect("the scenario waits its own leader out");
+    assert_eq!(
+        died.signal(),
+        Some(libc::SIGKILL),
+        "the leader of this scenario's group died of something but the SIGKILL the scenario sent it: {died:?}"
+    );
+    drop(sweep);
+    marker
+}
+
+/// The arithmetic of a group target, in the one place this file writes it. A negative id is a whole number, and
+/// a kill program that reads only its first digit makes this of it: `kill -0 -10027` answering `kill(-1, 0)` on a hosted
+/// CI runner, and `-1` is every process of the user. The sweep builds no target like this; the case for refusing them is
+/// recorded here so the number is written down once.
+#[test]
+fn group_target_is_the_full_group_id_and_refuses_one_and_below() {
+    for pid in [12345u32, 10027, 100027, 1_999_999_999, 2_147_483_647] {
+        assert_eq!(
+            group_target(pid),
+            Some(-(pid as i32)),
+            "{pid} is a group id and is negated whole, not from its first digit"
+        );
+    }
+    assert_eq!(
+        group_target(0),
+        None,
+        "0 is no leader: `-0` is this process's own group"
+    );
+    assert_eq!(
+        group_target(1),
+        None,
+        "init leads nobody's group, and `-1` is the whole user"
+    );
+    assert_eq!(
+        group_target(2_147_483_648),
+        None,
+        "past `i32::MAX` there is no i32 target to build"
+    );
+}
+
+/// The straggler of a check that ended: its leader reaped, one member of the group left standing, and the group named by
+/// a number no live leader answers. Taken by its own pid out of a scan of the table, which is what no group signal has to
+/// be trusted for — and what a host where the packaged kill read a negative target from its first digit turned into a kill
+/// of the whole user. Against the old sweep this is red wherever the external call does not do the work: on a PATH whose
+/// `kill` refuses a group operand before `/usr/bin` is reached, and on such a host the call killed the runner instead of the
+/// straggler. A plain procps-ng on a developer shell does reach the group, so this test pins the mechanism and
+/// `the_sweep_calls_no_external_kill` pins the call.
+#[test]
+fn the_sweep_kills_a_straggler_in_the_group_by_pid() {
+    let marker = straggler_scenario();
+    let left = wait_for_exact(&marker, 0);
+    // Whatever is still standing was started by this scenario, so it is this test's to take away — and it says so before
+    // the failure, because the sweep under judgement is the only guard this shape has.
+    for pid in &left {
+        kill_sigkill(*pid);
+    }
+    assert!(
+        left.is_empty(),
+        "the straggler of a reaped leader outlived the sweep that is there for exactly this: searched {marker}, saw \
+         {left:?}"
+    );
+}
+
+/// A group id is a name for whoever stands in it NOW. Once the leader is reaped, the next program the kernel starts can
+/// be handed that number and become the leader of a group of its own, and taking it would be killing a stranger — the
+/// other half of why the sweep only ever aims at a pid it has just read. Re-use is not something a test can force, so the
+/// one fact that tells a stranger from the leader is set wrong on purpose against a live leader: a sweep that records a
+/// start time no live process carries must leave the leader it finds standing.
+#[test]
+fn the_sweep_leaves_a_stranger_with_the_reused_number_alone() {
+    let dur = format!("296{}", std::process::id());
+    let marker = format!("sleep {dur}");
+    let mut stranger = Command::new("sleep")
+        .arg(&dur)
+        .process_group(0)
+        .spawn()
+        .expect("a process that is the leader of its own group starts");
+    let pid = stranger.id();
+    // The guard that takes this process away if an assertion below fails half way: the same number with the record a
+    // sweep ought to have, which is the leader's real start time. It is what must NOT be used for the judgement, so it
+    // is dropped by hand after it.
+    let clean = Sweep::new(pid);
+    let real = stat_of(pid)
+        .unwrap_or_else(|| {
+            panic!("{marker} is nothing to read: the leader this test stands in never started")
+        })
+        .starttime;
+    // The record of a leader reaped long ago: this number, a start time no live process of this group carries.
+    drop(Sweep {
+        group: pid,
+        start: Some(real + 1),
+    });
+    assert_eq!(
+        exact_matches(&marker),
+        vec![pid],
+        "the sweep killed a process that leads its own group and started at another time than the one it recorded: that \
+         is a stranger holding a reused number, and it is not the check's to take"
+    );
+    drop(clean);
+    // And the other side of the same record: a sweep that DID read this leader's start time takes it, which is what
+    // leaves this test no process behind.
+    let left = wait_for_exact(&marker, 0);
+    for still in &left {
+        kill_sigkill(*still);
+    }
+    assert!(
+        left.is_empty(),
+        "the sweep of a leader recorded as it started left that leader standing: {left:?}"
+    );
+    let _ = stranger.wait();
+}
+
+/// Nothing the sweep does goes through the `kill` *program* any more, and this says so with that program in the way: a
+/// directory holding a `kill` that writes down every call it is asked to make and signals nothing is first on `PATH`, and
+/// the straggler scenario runs against it. A sweep that asked that program would show twice — once in the log, and once
+/// with its straggler still standing, because a stub that signals nothing takes nothing down.
+///
+/// The prepend belongs to a CHILD process rather than to this one: edition 2024 made `set_var` unsafe exactly because the
+/// tests of this file run side by side, other threads reading the same environment inside `Command::spawn` while it is
+/// being rewritten. The child is started with the stub first on its own `PATH` and says, before anything else, what an
+/// exec of `kill` resolves to there — without that proof an empty log would be a promise about nothing.
+#[test]
+fn the_sweep_calls_no_external_kill() {
+    if let Some(child_dir) = std::env::var_os("GATE03_NOKILL_CHILD") {
+        // The child half, started by the parent half at the bottom of this test.
+        let stub = PathBuf::from(child_dir).join("kill");
+        let reached = first_on_path("kill");
+        assert_eq!(
+            reached.as_deref(),
+            Some(stub.as_path()),
+            "this child was not started with the stub `kill` first on its PATH (an exec of `kill` here reaches \
+             {reached:?}), so nothing it did could have been seen by the parent"
+        );
+        let marker = straggler_scenario();
+        println!("gate03-nokill-marker: {marker}");
+        return;
+    }
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("gate03-nokill-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    // Removed when this test ends, on success and on a panic.
+    let _cleanup = RemoveOnDrop(dir.clone());
+    let log = dir.join("external-kill-argv.log");
+    write_exec(
+        &dir.join("kill"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            log.display()
+        ),
+    );
+    let mut child =
+        Command::new(std::env::current_exe().expect("this test binary starts a child of itself"))
+            .args(["--exact", "the_sweep_calls_no_external_kill", "--nocapture"])
+            .env("GATE03_NOKILL_CHILD", &dir)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the scenario child runs");
+    // The child is bounded: a scenario that does not end must fail this test within a minute, not hold it for as long as
+    // something the child left behind lives. Its output is read on threads so a full pipe cannot stall it meanwhile.
+    let readers: Vec<_> = [
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    })
+    .collect();
+    let limit = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        match child.try_wait().expect("the scenario child is waited on") {
+            Some(s) => break Some(s),
+            None if Instant::now() >= limit => break None,
+            None => sleep(Duration::from_millis(50)),
+        }
+    };
+    let Some(status) = status else {
+        // Our own child, by its own handle. Its pipes are not read after this: whatever still holds them may not end.
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the straggler scenario child did not end within 60 s and was killed");
+    };
+    let out: String = readers
+        .into_iter()
+        .map(|r| String::from_utf8_lossy(&r.join().unwrap_or_default()).into_owned())
+        .collect();
+    assert!(
+        status.success(),
+        "the straggler scenario under a stubbed `kill` failed:\n{out}"
+    );
+    let marker = out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("gate03-nokill-marker: "))
+        .unwrap_or_else(|| panic!("the scenario child named no straggler: {out}"))
+        .to_string();
+    // What the child left is this test's to take away should the judgement below fail.
+    let left = wait_for_exact(&marker, 0);
+    for still in &left {
+        kill_sigkill(*still);
+    }
+    assert!(
+        left.is_empty(),
+        "the straggler of the stubbed run is still standing, which is what a sweep that leaves the work to the `kill` \
+         program does when that program answers nothing: {marker} -> {left:?}"
+    );
+    let called = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        called.trim().is_empty(),
+        "the sweep ran an external `kill` program, and asked it for: {called}. A group handed to that program as \
+         `-<number>` is the shape that killed a CI runner: the packaged kill reads a negative target from its first digit."
     );
 }

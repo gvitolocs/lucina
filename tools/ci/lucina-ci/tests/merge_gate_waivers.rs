@@ -12,8 +12,11 @@
 //! `diffgate` step's own line and never the exit code.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+mod common;
 
 /// The rules the step forwards, read from the real list: the list is data, and a rule added to it is forwarded by the
 /// same code these tests exercise.
@@ -75,10 +78,28 @@ fn git(d: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&o.stdout).trim().to_string()
 }
 
+/// A stub goes in through a child, never from this thread: it is exec'd by the step, and a file this thread still holds open
+/// for writing makes that exec answer "Text file busy" (ETXTBSY) when another thread forks at the same moment, after which
+/// the shell goes on to the next `diffgate` on PATH, the real one. The same helper in SecretaryIOS explains the measurement.
+fn write_exec(path: &Path, script: &str) {
+    let mut child = Command::new("sh")
+        .args(["-c", "cat > \"$1\" && chmod 0755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut w = child.stdin.take().unwrap();
+    w.write_all(script.as_bytes()).unwrap();
+    drop(w);
+    assert!(
+        child.wait().unwrap().success(),
+        "sh cannot write {}: the stand-in is never exec'd",
+        path.display()
+    );
+}
+
 fn stub(dir: &Path, name: &str, body: &str) {
-    let p = dir.join(name);
-    fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-    Command::new("chmod").arg("+x").arg(&p).status().unwrap();
+    write_exec(&dir.join(name), &format!("#!/bin/sh\n{body}\n"));
 }
 
 impl Case {
@@ -152,6 +173,11 @@ impl Case {
         .current_dir(&self.repo)
         .env("PATH", path)
         .env_remove("LUCINA_CHECK_FAST_MERGE_CAP_S");
+        // `bq` leaves GIT_CONFIG_COUNT behind without its key: the step's own git calls, and the real diffgate it runs, must not
+        // inherit it.
+        for n in ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"] {
+            c.env_remove(n);
+        }
         match waivers {
             Some(p) => c.env("LAGENT_WAIVERS_FILE", p),
             None => c.env_remove("LAGENT_WAIVERS_FILE"),
@@ -205,7 +231,7 @@ fn forwarded(base: &str, allows: &[&str]) -> Vec<String> {
 fn wline(rule: &str, reason: &str) -> String {
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     format!(
-        "{{\"rule\":\"{}\",\"reason\":\"{}\",\"by\":\"nez@nez_opt\",\"job\":\"job_4ee819df2427\"}}",
+        "{{\"rule\":\"{}\",\"reason\":\"{}\",\"by\":\"lead\",\"job\":\"job_4ee819df2427\"}}",
         esc(rule),
         esc(reason)
     )
@@ -216,14 +242,26 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")
 }
 
-/// The repo's own forwarding list, as the step reads it.
+/// The repo's own forwarding list, as the step reads it: the rule name of each line, its marker left out.
 fn the_list() -> Vec<String> {
     fs::read_to_string(repo_root().join(FORWARD_LIST))
         .unwrap_or_else(|e| panic!("{} is not readable from the test: {e}", FORWARD_LIST))
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(str::to_string)
+        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+        .collect()
+}
+
+/// The rules the list marks `counted`, whose waivers travel only as `N:reason`.
+fn counted_rules() -> Vec<String> {
+    fs::read_to_string(repo_root().join(FORWARD_LIST))
+        .unwrap_or_else(|e| panic!("{} is not readable from the test: {e}", FORWARD_LIST))
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter(|l| l.split_whitespace().nth(1) == Some("counted"))
+        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
         .collect()
 }
 
@@ -231,6 +269,9 @@ fn the_list() -> Vec<String> {
 /// output says nothing about waivers.
 #[test]
 fn no_waivers_file_leaves_the_diffgate_step_exactly_as_it_was() {
+    if common::skip_without_scope("no_waivers_file_leaves_the_diffgate_step_exactly_as_it_was") {
+        return;
+    }
     let c = Case::setup("unset");
     let out = c.run(None);
     assert_eq!(
@@ -253,6 +294,11 @@ fn no_waivers_file_leaves_the_diffgate_step_exactly_as_it_was() {
 /// of the attribute and the semicolons of the reason are diffgate's to read, not the shell's.
 #[test]
 fn a_counted_waiver_of_a_listed_rule_reaches_diffgate_byte_for_byte() {
+    if common::skip_without_scope(
+        "a_counted_waiver_of_a_listed_rule_reaches_diffgate_byte_for_byte",
+    ) {
+        return;
+    }
     let c = Case::setup("counted");
     let reason = "7:seven tests are #[ignore = \"slow\"]; see a/b";
     c.write_lines(&[wline("skipped-test", reason)]);
@@ -274,6 +320,10 @@ fn a_counted_waiver_of_a_listed_rule_reaches_diffgate_byte_for_byte() {
 /// The uncounted reason of the merge that failed, line 9 of job_4ee819df2427, forwarded as it stands.
 #[test]
 fn an_uncounted_waiver_of_a_listed_rule_reaches_diffgate_unchanged() {
+    if common::skip_without_scope("an_uncounted_waiver_of_a_listed_rule_reaches_diffgate_unchanged")
+    {
+        return;
+    }
     let c = Case::setup("uncounted");
     c.write_lines(&[wline("skipped-test", GAL_REASON)]);
     let out = c.run(Some(&c.waivers));
@@ -293,6 +343,10 @@ fn an_uncounted_waiver_of_a_listed_rule_reaches_diffgate_unchanged() {
 /// shell's instructions.
 #[test]
 fn a_reason_holding_quotes_and_a_command_is_one_unchanged_argument() {
+    if common::skip_without_scope("a_reason_holding_quotes_and_a_command_is_one_unchanged_argument")
+    {
+        return;
+    }
     let c = Case::setup("quoted");
     let marker = c.d.join("it-ran");
     let reason = format!(
@@ -313,12 +367,19 @@ fn a_reason_holding_quotes_and_a_command_is_one_unchanged_argument() {
     );
 }
 
-/// Every rule of the list travels: today it holds `skipped-test` alone, and a rule added there is forwarded by this same
+/// Every rule of the list travels: today it holds `skipped-test` and `test-removed`, and a rule added there is forwarded by this same
 /// path (adding it is a gate change the reviewer reads).
 #[test]
 fn every_rule_of_the_forwarding_list_is_forwarded_to_diffgate() {
+    if common::skip_without_scope("every_rule_of_the_forwarding_list_is_forwarded_to_diffgate") {
+        return;
+    }
     let list = the_list();
-    assert_eq!(list, vec!["skipped-test".to_string()], "the list today");
+    assert_eq!(
+        list,
+        vec!["skipped-test".to_string(), "test-removed".to_string()],
+        "the list today"
+    );
     let c = Case::setup("list");
     let lines: Vec<String> = list
         .iter()
@@ -346,6 +407,9 @@ fn every_rule_of_the_forwarding_list_is_forwarded_to_diffgate() {
 /// the call with "--allow: unknown rule", so they stay out of the command and the line says they were left.
 #[test]
 fn the_merge_tool_s_own_rules_are_not_forwarded() {
+    if common::skip_without_scope("the_merge_tool_s_own_rules_are_not_forwarded") {
+        return;
+    }
     let c = Case::setup("not-forwarded");
     c.write_lines(&[
         wline("gate-change", "tools/ci/ of this merge; coordinator allow"),
@@ -369,6 +433,9 @@ fn the_merge_tool_s_own_rules_are_not_forwarded() {
 /// One line of the gate log, counting both sides.
 #[test]
 fn the_step_prints_one_line_about_the_waivers_it_was_given() {
+    if common::skip_without_scope("the_step_prints_one_line_about_the_waivers_it_was_given") {
+        return;
+    }
     let c = Case::setup("summary");
     c.write_lines(&[
         wline("skipped-test", "3:three #[ignore] variants; WM-C004"),
@@ -407,6 +474,9 @@ fn assert_refused(tag: &str, content: &str, says: &str) {
 
 #[test]
 fn a_waivers_file_that_cannot_be_read_fails_the_step() {
+    if common::skip_without_scope("a_waivers_file_that_cannot_be_read_fails_the_step") {
+        return;
+    }
     let c = Case::setup("missing");
     let gone = c.d.join("no-such-dir").join("waivers.jsonl");
     let out = c.run(Some(&gone));
@@ -426,11 +496,17 @@ fn a_waivers_file_that_cannot_be_read_fails_the_step() {
 
 #[test]
 fn an_empty_waivers_file_fails_the_step() {
+    if common::skip_without_scope("an_empty_waivers_file_fails_the_step") {
+        return;
+    }
     assert_refused("empty", "", "holds no waiver line");
 }
 
 #[test]
 fn a_line_that_is_not_json_fails_the_step() {
+    if common::skip_without_scope("a_line_that_is_not_json_fails_the_step") {
+        return;
+    }
     assert_refused(
         "not-json",
         "the reason was written without braces\n",
@@ -440,36 +516,48 @@ fn a_line_that_is_not_json_fails_the_step() {
 
 #[test]
 fn a_line_missing_one_of_the_four_fields_fails_the_step() {
+    if common::skip_without_scope("a_line_missing_one_of_the_four_fields_fails_the_step") {
+        return;
+    }
     assert_refused(
         "no-field",
-        "{\"rule\":\"skipped-test\",\"reason\":\"why\",\"by\":\"nez@nez_opt\"}\n",
+        "{\"rule\":\"skipped-test\",\"reason\":\"why\",\"by\":\"lead\"}\n",
         "no `job` field",
     );
 }
 
 #[test]
 fn a_field_that_is_not_a_string_fails_the_step() {
+    if common::skip_without_scope("a_field_that_is_not_a_string_fails_the_step") {
+        return;
+    }
     assert_refused(
         "not-a-string",
-        "{\"rule\":\"skipped-test\",\"reason\":7,\"by\":\"nez@nez_opt\",\"job\":\"job_4ee819df2427\"}\n",
+        "{\"rule\":\"skipped-test\",\"reason\":7,\"by\":\"lead\",\"job\":\"job_4ee819df2427\"}\n",
         "the value of `reason` is not a string",
     );
 }
 
 #[test]
 fn an_extra_field_fails_the_step() {
+    if common::skip_without_scope("an_extra_field_fails_the_step") {
+        return;
+    }
     assert_refused(
         "extra-field",
-        "{\"rule\":\"skipped-test\",\"reason\":\"why\",\"by\":\"nez@nez_opt\",\"job\":\"job_1\",\"who\":\"me\"}\n",
+        "{\"rule\":\"skipped-test\",\"reason\":\"why\",\"by\":\"lead\",\"job\":\"job_1\",\"who\":\"me\"}\n",
         "5 fields",
     );
 }
 
 #[test]
 fn a_blank_reason_fails_the_step() {
+    if common::skip_without_scope("a_blank_reason_fails_the_step") {
+        return;
+    }
     assert_refused(
         "blank-reason",
-        "{\"rule\":\"skipped-test\",\"reason\":\"   \",\"by\":\"nez@nez_opt\",\"job\":\"job_1\"}\n",
+        "{\"rule\":\"skipped-test\",\"reason\":\"   \",\"by\":\"lead\",\"job\":\"job_1\"}\n",
         "`reason` is empty",
     );
 }
@@ -479,6 +567,9 @@ fn a_blank_reason_fails_the_step() {
 /// difference between this merge and the one that failed.
 #[test]
 fn one_bad_line_waives_nothing_even_beside_a_good_one() {
+    if common::skip_without_scope("one_bad_line_waives_nothing_even_beside_a_good_one") {
+        return;
+    }
     let c = Case::setup("half-bad");
     c.write_lines(&[
         wline("skipped-test", GAL_REASON),
@@ -492,5 +583,116 @@ fn one_bad_line_waives_nothing_even_beside_a_good_one() {
     assert!(
         c.argv().is_none(),
         "diffgate ran and waived from a file this step cannot read:\n{out}"
+    );
+}
+
+/// `test-removed` is forwarded count-exact, as the list holds it: a merge given `--allow test-removed=2:<reason>` passes the
+/// merge's own diffgate, and the fast check's `diffgate` step has to see the same allow. The whole counted allow reaches
+/// diffgate unchanged (diffgate itself compares the count with the refusals), and the gate log carries the reason text.
+#[test]
+fn test_removed_is_on_the_list_as_counted_and_travels_with_its_reason() {
+    if common::skip_without_scope(
+        "test_removed_is_on_the_list_as_counted_and_travels_with_its_reason",
+    ) {
+        return;
+    }
+    assert!(
+        counted_rules().iter().any(|r| r == "test-removed"),
+        "{FORWARD_LIST} does not hold test-removed as a counted rule: {:?}",
+        counted_rules()
+    );
+    let reason =
+        "2:two obsolete tests deleted with the code they covered; coordinator allow of the day";
+    let c = Case::setup("test-removed");
+    c.write_lines(&[wline("test-removed", reason)]);
+    let out = c.run(Some(&c.waivers));
+    assert_eq!(
+        c.argv().expect("diffgate ran"),
+        forwarded(&c.base, &[&format!("test-removed={reason}")]),
+        "the whole counted allow, unchanged, as one argument\n{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "diffgate waivers: 1 forwarded (test-removed: {reason}), 0 not forwarded"
+        )),
+        "the gate log carries the reason text:\n{out}"
+    );
+}
+
+/// The counted form only: an uncounted `test-removed` waiver fails the step and diffgate never runs.
+#[test]
+fn an_uncounted_test_removed_waiver_fails_the_step() {
+    if common::skip_without_scope("an_uncounted_test_removed_waiver_fails_the_step") {
+        return;
+    }
+    let c = Case::setup("test-removed-uncounted");
+    c.write_lines(&[wline("test-removed", "two obsolete tests deleted")]);
+    let out = c.run(Some(&c.waivers));
+    assert!(
+        step_line(&out, "diffgate").starts_with("FAIL"),
+        "an uncounted test-removed waiver was not refused: {}\n{out}",
+        step_line(&out, "diffgate")
+    );
+    assert!(
+        out.contains("diffgate waivers: test-removed is forwarded in counted form only: write --allow test-removed=N:<reason> with N the exact number of refusals"),
+        "the message does not say what to write:\n{out}"
+    );
+    assert!(c.argv().is_none(), "diffgate ran:\n{out}");
+    assert!(!out.contains("forwarded ("), "nothing is forwarded:\n{out}");
+}
+
+/// `skipped-test` is a plain line: its uncounted reason (the allow of the merge that failed) and a counted one both travel.
+#[test]
+fn a_rule_the_list_leaves_plain_travels_in_both_forms() {
+    if common::skip_without_scope("a_rule_the_list_leaves_plain_travels_in_both_forms") {
+        return;
+    }
+    let marked = counted_rules();
+    assert!(
+        !marked.iter().any(|r| r == "skipped-test"),
+        "{FORWARD_LIST} marks skipped-test counted: {marked:?}"
+    );
+    for (tag, reason) in [
+        ("plain-uncounted", GAL_REASON),
+        ("plain-counted", "3:three ignored tests, each one read"),
+    ] {
+        let c = Case::setup(tag);
+        c.write_lines(&[wline("skipped-test", reason)]);
+        let out = c.run(Some(&c.waivers));
+        assert_eq!(
+            c.argv().expect("diffgate ran"),
+            forwarded(&c.base, &[&format!("skipped-test={reason}")]),
+            "{reason} travels as it stands\n{out}"
+        );
+    }
+}
+
+/// A word after the rule name that is not `counted` is a marker this step cannot read: it fails the step and names the line,
+/// rather than silently forwarding a rule that was meant to be restricted.
+#[test]
+fn an_unknown_marker_on_a_list_line_fails_the_step() {
+    if common::skip_without_scope("an_unknown_marker_on_a_list_line_fails_the_step") {
+        return;
+    }
+    let c = Case::setup("unknown-marker");
+    fs::write(
+        c.repo.join(FORWARD_LIST),
+        "# a test-only list\nskipped-test\ntest-removed sometimes\n",
+    )
+    .unwrap();
+    c.write_lines(&[wline("skipped-test", GAL_REASON)]);
+    let out = c.run(Some(&c.waivers));
+    assert!(
+        step_line(&out, "diffgate").starts_with("FAIL"),
+        "a marker the step does not know was not a refusal: {}\n{out}",
+        step_line(&out, "diffgate")
+    );
+    assert!(
+        out.contains("unknown marker \"sometimes\" after test-removed"),
+        "the message does not name the word and the rule:\n{out}"
+    );
+    assert!(
+        c.argv().is_none(),
+        "diffgate ran on a list this step cannot read\n{out}"
     );
 }

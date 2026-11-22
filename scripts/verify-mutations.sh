@@ -2,6 +2,14 @@
 # Non-vacuity check for the Verus proofs: each mutation below weakens the code or strengthens a claim into a
 # false one, and Verus must REJECT every mutant. A mutant that verifies means the proof does not constrain
 # what it claims to. On buildhost run it through the gate:  verify-gate -- scripts/verify-mutations.sh
+
+# Refuse to run inside a lane worker.
+. "$(dirname "$0")/lib/in-lane-worker.sh" || exit 75
+if in_lane_worker; then
+    echo "verify-mutations.sh: refused inside a lane worker (proofs run on GitHub)" >&2
+    exit 75
+fi
+
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)

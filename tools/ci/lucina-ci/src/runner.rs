@@ -191,11 +191,24 @@ fn read_trim(p: &Path) -> Option<String> {
     fs::read_to_string(p).ok().map(|s| s.trim().to_string())
 }
 
-/// `LUCINA_CI_NO_SCOPE=1`: start every step with no systemd scope at all. Production never sets it. It is the switch the
-/// tests drive the scope-less fallback with, because the fallback is the branch GATE-03 is about and a test that waits for
-/// a machine without systemd is not a test. Where no scope is had the step still leads its own process group and still
-/// meets its deadline.
-pub const NO_SCOPE_ENV: &str = "LUCINA_CI_NO_SCOPE";
+static STEP_EXE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Says which binary the steps of this run start from. `cmd_check_fast` sets it to the copy it made in the run's own
+/// directory, and the copy is what a step re-starts: where `current_exe()` is asked instead, a `check-fast` that
+/// was started straight off the built binary loses its steps to any rebuild that replaces that file while it runs.
+/// Unset leaves `current_exe()`, which is right for every command but `check-fast`.
+pub fn install_step_exe(path: PathBuf) {
+    let _ = STEP_EXE.set(path);
+}
+
+fn step_exe() -> Result<PathBuf, String> {
+    STEP_EXE
+        .get()
+        .cloned()
+        .or_else(|| std::env::current_exe().ok())
+        .ok_or_else(|| "cannot find this program's own executable".to_string())
+}
+
 /// The unit name `run_unit` asks systemd for, so the cgroup whose directory starts with this is one this launcher made
 /// for this step and may signal by pid. Anything else is a cgroup the check shares with whatever started it.
 const SCOPE_OUR_PREFIX: &str = "lucina-ci-";
@@ -502,10 +515,6 @@ impl Step {
     }
 }
 
-fn env_flag(k: &str) -> bool {
-    std::env::var(k).is_ok_and(|v| v == "1")
-}
-
 pub fn json_escape(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
@@ -522,7 +531,7 @@ pub fn json_escape(s: &str) -> String {
     o
 }
 
-/// What the inner process needs; passed as `key=value` arguments so that it survives `sudo` and `systemd-run`.
+/// What the inner process needs; passed as `key=value` arguments so that it survives `systemd-run`.
 #[derive(Clone, Debug, Default)]
 pub struct Spec {
     pub unit: String,
@@ -698,16 +707,9 @@ pub fn inner(args: &[String]) -> i32 {
 
     // The cap is checked, not assumed, and what the check proves is that this process stands in the scope `run_unit`
     // asked systemd for: `cgroup.kill` and a kill by pid reach every process in that cgroup, so it may only be aimed at a
-    // cgroup that holds nothing but this step. A step that got no scope stands in the cgroup of whatever started the
-    // check, and there neither the cap nor the pid kill applies: its process group is all it owns and all the kill may
-    // take (GATE-03 Part 1b).
-    let step_cg = if env_flag(NO_SCOPE_ENV) {
-        note(
-            &mut m,
-            "no scope: the step ran uncapped, its own process group takes the deadline kill".into(),
-        );
-        None
-    } else {
+    // cgroup that holds nothing but this step. A step that got no scope never reaches this point: `run_unit` fails the
+    // check for it, so there is no uncapped branch.
+    let step_cg = {
         let cg = match own_cgroup() {
             Ok(c) => c,
             Err(e) => return infra(&mut m, e),
@@ -878,6 +880,34 @@ pub fn inner(args: &[String]) -> i32 {
     outcome.exit_code()
 }
 
+/// How long the probe for a systemd user manager may take. `systemctl --user` waits on a bus that may never answer
+/// (a runner with no user session), and a probe that waits there stops the whole check with it.
+const PROBE_LIMIT_S: u64 = 5;
+
+/// Runs `cmd` and says whether it ended with success within `secs` seconds. One still running then is killed.
+fn succeeds_within(cmd: &mut Command, secs: u64) -> bool {
+    let Ok(mut child) = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let end = Instant::now() + Duration::from_secs(secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(s)) => return s.success(),
+            Ok(None) if Instant::now() < end => sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 /// How to get a scope with a memory cap on this machine.
 fn scope_prefix() -> Result<Vec<String>, String> {
     let base = ["--scope", "--quiet", "--collect"];
@@ -889,88 +919,76 @@ fn scope_prefix() -> Result<Vec<String>, String> {
     if uid == "0" {
         v.push("systemd-run".into());
     } else {
-        let user_bus = Command::new("systemctl")
-            .args(["--user", "show-environment"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
+        let user_bus = succeeds_within(
+            Command::new("systemctl").args(["--user", "show-environment"]),
+            PROBE_LIMIT_S,
+        );
         if user_bus {
             v.extend(["systemd-run".to_string(), "--user".to_string()]);
         } else {
-            let gid = capture(Command::new("id").arg("-g"))
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let sudo = Command::new("sudo")
-                .args(["-n", "true"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success());
-            if !sudo {
-                return Err("no systemd user session and no passwordless sudo: cannot create a memory-capped scope".into());
-            }
-            v.extend(["sudo", "-n", "-E", "systemd-run"].map(str::to_string));
-            v.push(format!("--uid={uid}"));
-            v.push(format!("--gid={gid}"));
+            return Err(
+                "no systemd user manager (`systemctl --user show-environment` fails or does not answer in 5 s)".into(),
+            );
         }
     }
     v.extend(base.map(str::to_string));
     Ok(v)
 }
 
+/// The whole `systemd-run` argv of one step's scope. A step's scope is put in `build.slice`, always: `systemd-run
+/// --user --scope` otherwise lands it in `app.slice`, outside the slice the build queue's jobs are held to, and 80 of them
+/// from several concurrent checks stacked up there until the host ran out of memory. Every other property is as it was.
+fn scope_args(
+    prefix: Vec<String>,
+    spec: &Spec,
+    exe: &Path,
+    cpu_quota: Option<&str>,
+) -> Vec<String> {
+    let mut c = prefix;
+    c.push("--slice=build.slice".into());
+    c.push(format!(
+        "--unit=lucina-ci-{}-{}",
+        std::process::id(),
+        spec.file_stem().replace(['_', '.'], "-")
+    ));
+    c.push("--property=MemoryAccounting=yes".into());
+    c.push(format!("--property=MemoryMax={}", spec.cap_bytes));
+    c.push("--property=MemorySwapMax=0".into());
+    // Otherwise the kernel kills the whole scope, this launcher included, and the report loses its numbers.
+    c.push("--property=OOMPolicy=continue".into());
+    if let Some(q) = cpu_quota {
+        c.push(format!("--property=CPUQuota={q}"));
+        c.push("--property=TasksMax=256".into());
+    }
+    c.push("--".into());
+    c.push(exe.display().to_string());
+    c.push("__inner".into());
+    c.extend(spec.to_args());
+    c
+}
+
 /// Runs one unit under its own capped scope; the report always exists afterwards. Returns the outcome's exit code.
 ///
-/// Every step is meant to get its own scope, and where it cannot get one (no systemd user manager, no passwordless sudo,
-/// or `LUCINA_CI_NO_SCOPE`) a check-fast step is still run — uncapped, as the leader of its own process group, which is
-/// then what the deadline kills. It was not so before GATE-03: `scope_prefix()?` aborted the whole check instead, and the
-/// fallback that the fix adds must never be read as a way to skip a cap a machine can afford.
+/// Every step gets its own capped scope. Where it cannot get one (no systemd user manager) the check FAILS with one
+/// message that names the step and the reason; no step is ever run uncapped, and `lucina-ci` never runs `sudo`
+/// A check-fast step used to fall back to an uncapped process group, and `LUCINA_CI_NO_SCOPE` forced it; that is gone.
 pub fn run_unit(spec: &Spec) -> Result<i32, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let scope = if env_flag(NO_SCOPE_ENV) {
-        Err(format!("{NO_SCOPE_ENV} is set, so no scope is asked for"))
-    } else {
-        scope_prefix()
-    };
-    let (mut cmd, launcher) = match scope {
-        Ok(prefix) => {
-            let mut c = prefix;
-            c.push(format!(
-                "--unit=lucina-ci-{}-{}",
-                std::process::id(),
-                spec.file_stem().replace(['_', '.'], "-")
-            ));
-            c.push("--property=MemoryAccounting=yes".into());
-            c.push(format!("--property=MemoryMax={}", spec.cap_bytes));
-            c.push("--property=MemorySwapMax=0".into());
-            // Otherwise the kernel kills the whole scope, this launcher included, and the report loses its numbers.
-            c.push("--property=OOMPolicy=continue".into());
-            if let Ok(q) = std::env::var("LUCINA_CI_CPU_QUOTA") {
-                c.push(format!("--property=CPUQuota={q}"));
-                c.push("--property=TasksMax=256".into());
-            }
-            c.push("--".into());
-            c.push(exe.display().to_string());
-            c.push("__inner".into());
-            c.extend(spec.to_args());
-            let mut cmd = Command::new(&c[0]);
-            cmd.args(&c[1..]);
-            (cmd, c[0].clone())
-        }
-        Err(why) => {
-            if spec.group != "fast" {
-                // A proof unit's numbers mean nothing without the cap and the counters of a scope it did not get, so a
-                // proof run still stops here rather than report an uncapped unit as if it were a capped one.
-                return Err(why);
-            }
-            let mut c = Command::new(&exe);
-            c.arg("__inner").args(spec.to_args()).env(NO_SCOPE_ENV, "1");
-            // The inner starts the step as the leader of a group of its own, so this group holds the step and nothing
-            // else: not the check, not the session, not the other steps (GATE-03 Part 1b).
-            (c, exe.display().to_string())
-        }
-    };
+    let exe = step_exe()?;
+    let prefix = scope_prefix().map_err(|why| {
+        format!(
+            "step {}: cannot get a memory-capped scope: {why}",
+            spec.unit
+        )
+    })?;
+    let c = scope_args(
+        prefix,
+        spec,
+        &exe,
+        std::env::var("LUCINA_CI_CPU_QUOTA").ok().as_deref(),
+    );
+    let mut cmd = Command::new(&c[0]);
+    cmd.args(&c[1..]);
+    let launcher = c[0].clone();
     let status = cmd
         .status()
         .map_err(|e| format!("cannot start {launcher}: {e}"))?;
@@ -1017,6 +1035,87 @@ pub fn report_field(json: &str, key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    /// The probe for a user manager is bounded: a command that does not answer is a "no", and does not stop the check.
+    #[test]
+    fn a_probe_that_does_not_answer_is_a_no_inside_its_limit() {
+        let t = Instant::now();
+        assert!(!succeeds_within(Command::new("sleep").arg("30"), 1));
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "the probe waited {:?} for a command that never answers",
+            t.elapsed()
+        );
+        assert!(succeeds_within(&mut Command::new("true"), 5));
+        assert!(!succeeds_within(&mut Command::new("false"), 5));
+        assert!(!succeeds_within(&mut Command::new("/nonexistent/probe"), 5));
+    }
+
+    fn test_spec() -> Spec {
+        Spec {
+            unit: "u".into(),
+            group: "fast".into(),
+            kind: "k".into(),
+            target: "t".into(),
+            command: "true".into(),
+            out: "/nonexistent".into(),
+            cap_bytes: 1024,
+            class: "c".into(),
+            mem_total: 4096,
+            timeout_s: 5,
+            verus: String::new(),
+            version: String::new(),
+            verus_sha: String::new(),
+            verifier_sha: String::new(),
+            rust: String::new(),
+            z3: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_step_scope_is_started_in_build_slice_and_nothing_else_changes() {
+        // Exactly one slice argument, spelled exactly so, ahead of the unit and the properties.
+        let prefix: Vec<String> = ["systemd-run", "--user", "--scope", "--quiet", "--collect"]
+            .map(str::to_string)
+            .to_vec();
+        let argv = scope_args(
+            prefix,
+            &test_spec(),
+            Path::new("/x/lucina-ci"),
+            Some("400%"),
+        );
+        assert_eq!(
+            argv.iter().filter(|a| a.starts_with("--slice")).count(),
+            1,
+            "{argv:?}"
+        );
+        assert!(argv.iter().any(|a| a == "--slice=build.slice"), "{argv:?}");
+        for want in [
+            "--property=MemoryAccounting=yes",
+            "--property=MemoryMax=1024",
+            "--property=MemorySwapMax=0",
+            "--property=OOMPolicy=continue",
+            "--property=CPUQuota=400%",
+            "--property=TasksMax=256",
+            "--",
+            "/x/lucina-ci",
+            "__inner",
+        ] {
+            assert!(argv.iter().any(|a| a == want), "{want} missing: {argv:?}");
+        }
+        let no_quota = scope_args(
+            vec!["systemd-run".into()],
+            &test_spec(),
+            Path::new("/x/l"),
+            None,
+        );
+        assert!(no_quota.iter().any(|a| a == "--slice=build.slice"));
+        assert!(
+            !no_quota
+                .iter()
+                .any(|a| a.starts_with("--property=CPUQuota"))
+        );
+    }
 
     #[test]
     fn the_deadline_bounds_the_time_a_step_may_record() {

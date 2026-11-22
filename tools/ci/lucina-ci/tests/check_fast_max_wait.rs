@@ -1,5 +1,6 @@
-//! `scripts/check-fast` passes `--max-wait 900` to a queue whose usage offers it (see `scripts/tests/check-fast-max-wait-test.sh`,
-//! which runs the real launcher over a stub `bq`); called here so `cargo test` covers it, as `check_fast_oos.rs` does.
+//! `scripts/check-fast` passes `--max-wait 3600` to the queue, whatever `CHECK_FAST_SLOT_WAIT_S` says, and a queue whose usage does not
+//! offer it makes the check fail with exit 2 (see `scripts/tests/check-fast-max-wait-test.sh`, which runs a copy of the launcher whose
+//! passwd home is a temp one holding a stub `bq`); called here so `cargo test` covers it, as `check_fast_oos.rs` does.
 
 use std::path::Path;
 use std::process::Command;

@@ -312,12 +312,28 @@ pub fn write_stub(dir: &Path) -> Result<PathBuf, String> {
     Ok(p)
 }
 
+/// The id `kill(2)` takes to signal the whole process group led by `pid`: the negated pid. `None` for a pid that must never be
+/// signalled this way: 0 (the caller's own group), 1 (init), and anything above `i32::MAX` (it would wrap to a negative pid,
+/// which then names a different group, or `-1`, every process the user owns).
+fn group_target(pid: u32) -> Option<i32> {
+    if pid > 1 && pid <= i32::MAX as u32 {
+        Some(-(pid as i32))
+    } else {
+        None
+    }
+}
+
+/// Kills the process group `pid` leads. In-process, not through the external `kill` program: on some hosts that program reads a
+/// negative id from its first digit only, so a group id that starts with 1 turns into `-1`, every process of the user. The
+/// result is ignored, as before: the group may already be gone.
 fn kill_group(pid: u32) {
-    let _ = Command::new("kill")
-        .args(["-s", "KILL", "--", &format!("-{pid}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    if let Some(target) = group_target(pid) {
+        // SAFETY: `kill(2)` takes two integers and touches no memory. The target is the negated pid of a child this process
+        // started, and `group_target` refuses 0, 1 and anything that would not stay a negative pid of that group.
+        unsafe {
+            libc::kill(target, libc::SIGKILL);
+        }
+    }
 }
 
 /// Every pid below `pid` in the process tree, `pid` first, then its descendants and so on.
@@ -929,6 +945,17 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_target_is_the_full_negative_id_or_nothing() {
+        // Ids that begin with 1 are the ones the external program turned into -1.
+        for pid in [12345u32, 10027, 100027, 1_999_999_999] {
+            assert_eq!(group_target(pid), Some(-(pid as i32)), "pid {pid}");
+        }
+        for pid in [0u32, 1, 2_147_483_648, u32::MAX] {
+            assert_eq!(group_target(pid), None, "pid {pid}");
+        }
+    }
 
     fn unit(name: &str, inputs: &[&str]) -> Unit {
         Unit {
@@ -1642,7 +1669,13 @@ if "$verus" crates/x/src/lib.rs > "$work/baseline" 2>&1; then echo "baseline: ve
             alive(&cpid),
             "the liveness check never reads a live sleep as alive: it cannot detect a leak either"
         );
-        let _ = Command::new("kill").args(["-KILL", &cpid]).status();
+        // In-process, with the same guard as the group kill: the pid is the one this test just started.
+        let pid = control.id();
+        assert!(group_target(pid).is_some(), "refusing to signal pid {pid}");
+        // SAFETY: `kill(2)` takes two integers and touches no memory; `pid` is the live child started above, never 0 or 1.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
         let _ = control.wait();
         assert!(!alive(&cpid), "a killed and reaped sleep still reads alive");
 

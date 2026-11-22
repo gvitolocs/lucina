@@ -12,14 +12,17 @@
 //!   lucina-ci spec amend --list | --template   the amendment log a spec change needs (src/amend.rs, docs/ci/SPEC-AMENDMENTS.md)
 //!   lucina-ci roles --check [--base REF] [--merge-gate] | --list [--json|--summary] | --template KIND | --seed   who wrote the code, who proved it, who judged it (src/roles.rs, docs/ci/PROOF-ROLES.md)
 //!   lucina-ci mutants-precheck [--base REF] [--unit NAME] [--all] [--root DIR] [--merge-gate] [--quiet] [--verbose]   the text half of the mutants scripts without Verus (src/mutants_pre.rs)
+//!   lucina-ci kill-scan [--root DIR] [FILE...]   refuse an external kill/pkill program with a negative or variable target (src/killscan.rs)
 //!   lucina-ci roles --audit | --authors UNIT [--base REF]   the authorship walk alone: both sets per unit, or for one unit (report only)
 //!   lucina-ci green-commit|sync-plan|sync-gate the automatic public sync and the install gate (docs/ci/PUBLIC-SYNC.md)
 
 mod amend;
 mod authorship;
+mod budget;
 mod coverage;
 mod fast;
 mod inventory;
+mod killscan;
 mod mutants_pre;
 mod roles;
 mod runner;
@@ -28,6 +31,7 @@ mod spec;
 mod srcid;
 mod sweep;
 mod sync;
+mod testbin;
 mod trust;
 mod verdict;
 
@@ -1172,6 +1176,50 @@ fn cmd_output_check(a: &Args) -> Result<i32, String> {
     }
 }
 
+/// `test-binaries [--manifest-path Cargo.toml] [--limit-s 300] [--budget-s 900] [--binary EXE]... [--cwd DIR] [-- ARGS]`:
+/// `cargo test` with a clock on every test binary (`testbin.rs`). `--binary` runs the given executables and builds nothing.
+/// `LUCINA_CI_TEST_BINARY_LIMIT_S` and `LUCINA_CI_TEST_STEP_BUDGET_S` set the two limits when the flags are not given. The
+/// budget counts from the start of the step, the build included.
+fn cmd_test_binaries(a: &Args) -> Result<i32, String> {
+    let began = std::time::Instant::now();
+    let env_num = |k: &str, d: u64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let limit = a.num("--limit-s", env_num("LUCINA_CI_TEST_BINARY_LIMIT_S", 300))?;
+    let budget = a.num("--budget-s", env_num("LUCINA_CI_TEST_STEP_BUDGET_S", 900))?;
+    let extra: Vec<String> =
+        a.0.iter()
+            .position(|x| x == "--")
+            .map(|i| a.0[i + 1..].to_vec())
+            .unwrap_or_default();
+    let given = a.vals("--binary");
+    let (exes, cwd) = if given.is_empty() {
+        let manifest = PathBuf::from(
+            a.val("--manifest-path")
+                .unwrap_or_else(|| "Cargo.toml".into()),
+        );
+        let exes = testbin::build(&manifest, &[])?;
+        let dir = manifest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        (exes, dir)
+    } else {
+        let cwd = a
+            .val("--cwd")
+            .map_or_else(|| PathBuf::from("."), PathBuf::from);
+        (given.iter().map(PathBuf::from).collect(), cwd)
+    };
+    let s = testbin::Settings {
+        limit: std::time::Duration::from_secs(limit),
+        budget: std::time::Duration::from_secs(budget),
+        used: began.elapsed(),
+    };
+    testbin::run_all(&exes, &cwd, &extra, &s)
+}
 /// `infra-check`: a failed job's log on stdin; exit 0 when the runner's network failed, not a test (sync::is_infra_failure).
 fn cmd_infra_check() -> Result<i32, String> {
     use std::io::Read;
@@ -1403,7 +1451,9 @@ fn cmd_snapshot(a: &Args) -> Result<i32, String> {
 fn main() -> ExitCode {
     let mut all: Vec<String> = std::env::args().skip(1).collect();
     if all.is_empty() {
-        eprintln!("usage: lucina-ci inventory|trust|plan|run|selftest|gate|merge-check ...");
+        eprintln!(
+            "usage: lucina-ci inventory|trust|plan|run|selftest|gate|merge-check|test-binaries|kill-scan ..."
+        );
         return ExitCode::from(2);
     }
     let cmd = all.remove(0);
@@ -1431,7 +1481,10 @@ fn main() -> ExitCode {
         "spec" => spec::cmd(&a.0),
         "roles" => roles::cmd(&a.0),
         "mutants-precheck" => cmd_mutants_precheck(&a),
+        "kill-scan" => killscan::cmd(&a.0),
         "check-fast" => cmd_check_fast(&a),
+        "test-binaries" => cmd_test_binaries(&a),
+        "merge-gate-budget" => budget::cmd_merge_gate_budget(),
         "perf" => cmd_perf(&a),
         "__alloc" => cmd_alloc(&a),
         _ => Err(format!("unknown command {cmd}")),
@@ -1535,6 +1588,19 @@ const MERGE_STEP_LIMITS: &[(&str, u64)] = &[
 ];
 /// The limit of a step named in no table and no override.
 const MERGE_STEP_LIMIT_DEFAULT: u64 = 180;
+/// The own timeouts, in seconds, of the steps `cmd_check_fast` builds itself (the cargo steps have theirs in `fast::cargo_steps`,
+/// `mutants-text` in `mutants_pre::STEP_TIMEOUT_S`). They are constants, and not literals at the call sites, so that
+/// `budget::merge_gate_worst_case_secs` adds up the very numbers the steps run under.
+const DIFFGATE_STEP_TIMEOUT_S: u64 = 60;
+const SHELLCHECK_STEP_TIMEOUT_S: u64 = 30;
+const ACTIONLINT_STEP_TIMEOUT_S: u64 = 30;
+const SECRETS_STEP_TIMEOUT_S: u64 = 60;
+const INVENTORY_STEP_TIMEOUT_S: u64 = 30;
+const SPEC_STEP_TIMEOUT_S: u64 = 60;
+const ROLES_STEP_TIMEOUT_S: u64 = 300;
+const TRUST_STEP_TIMEOUT_S: u64 = 60;
+/// `merge-gate-budget`, run when a change edits `.lucina/pipeline.toml` (`budget::pipeline_changed`).
+const MERGE_GATE_BUDGET_STEP_TIMEOUT_S: u64 = 30;
 /// A step that used more than this share of its limit prints `near-limit`, so the next raise of a limit comes from
 /// a line in the log rather than from a merge that failed.
 const MERGE_NEAR_LIMIT_SHARE: f64 = 0.8;
@@ -1591,8 +1657,8 @@ impl MergeCaps {
 }
 
 /// The merge-gate limit of one step: what `LUCINA_CHECK_FAST_MERGE_CAP_S` says, else the table, else 180.
-/// The clock is the step's OWN run time: `scripts/check-fast` takes its queue slot (`bq run --class short --max-wait ...`)
-/// before this binary starts, so a step's limit starts after the wait.
+/// The clock is the step's OWN run time: `scripts/check-fast` re-runs itself as ONE `bq run --class long --max-wait 3600` job and takes its
+/// slot before this binary starts, so a step's limit starts after the wait.
 fn merge_step_limit(name: &str) -> Option<u64> {
     let caps = MergeCaps::from_env();
     caps.limit_of(name, merge_step_cap())
@@ -1860,16 +1926,90 @@ fn parse_waiver_line(line: &str) -> Result<Waiver, String> {
     })
 }
 
-/// The rules whose waivers reach diffgate (`WAIVER_RULES_FILE`). A list that cannot be read forwards nothing, which leaves
-/// every waiver unused and every refusal refused: the safe direction for a gate.
-fn forwarded_waiver_rules(root: &Path) -> Vec<String> {
-    fs::read_to_string(root.join(WAIVER_RULES_FILE))
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(str::to_string)
-        .collect()
+/// One line of the forwarding list: a rule, and whether its waivers travel only in diffgate's counted form.
+#[derive(Debug)]
+struct ForwardRule {
+    rule: String,
+    /// The `counted` marker: diffgate takes `--allow <rule>=N:<reason>`, and only that form is forwarded.
+    counted_only: bool,
+}
+
+/// A reason in diffgate's counted form: a decimal integer of at least 1 and the colon that follows it.
+fn counted_reason(reason: &str) -> bool {
+    let digits = reason
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(reason.len());
+    digits > 0
+        && reason.as_bytes().get(digits) == Some(&b':')
+        && reason[..digits].parse::<u64>().is_ok_and(|n| n >= 1)
+}
+
+/// The list text as the step reads it: a rule name and at most one `counted` marker per line, `#` comments and blank lines
+/// ignored. `path` is only named in the message. Any other word is `Err`, because a marker this step cannot read is a
+/// condition put on a waiver, and reading it as no condition would forward more than was allowed.
+fn parse_waiver_rules(text: &str, path: &Path) -> Result<Vec<ForwardRule>, String> {
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        let rule = words.next().unwrap_or_default().to_string();
+        let counted_only = match words.next() {
+            None => false,
+            Some("counted") => match words.next() {
+                Some(extra) => {
+                    return Err(format!(
+                        "{} line {}: {rule} carries a second marker {extra:?}: a line is a rule name and at most the word counted",
+                        path.display(),
+                        n + 1
+                    ));
+                }
+                None => true,
+            },
+            Some(unknown) => {
+                return Err(format!(
+                    "{} line {}: unknown marker {unknown:?} after {rule}: a line is a rule name and at most the word counted",
+                    path.display(),
+                    n + 1
+                ));
+            }
+        };
+        out.push(ForwardRule { rule, counted_only });
+    }
+    Ok(out)
+}
+
+/// The rules whose waivers reach diffgate (`WAIVER_RULES_FILE`). A list that is not there forwards nothing, which leaves
+/// every waiver unused and every refusal refused: the safe direction for a gate. A list that is there but cannot be read
+/// exactly is `Err`: the step fails and diffgate never runs.
+fn forwarded_waiver_rules(root: &Path) -> Result<Vec<ForwardRule>, String> {
+    let path = root.join(WAIVER_RULES_FILE);
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Ok(Vec::new()),
+    };
+    parse_waiver_rules(&text, &path)
+}
+
+/// The first waiver of a rule the list marks `counted` whose reason is not in counted form, as the rule name.
+fn uncounted_waiver<'a>(waivers: &'a [Waiver], rules: &[ForwardRule]) -> Option<&'a str> {
+    waivers
+        .iter()
+        .find(|w| {
+            rules
+                .iter()
+                .any(|r| r.rule == w.rule && r.counted_only && !counted_reason(&w.reason))
+        })
+        .map(|w| w.rule.as_str())
+}
+
+/// The step's refusal of an uncounted waiver of a rule the list forwards in counted form only.
+fn counted_waiver_refusal(rule: &str) -> String {
+    format!(
+        "diffgate waivers: {rule} is forwarded in counted form only: write --allow {rule}=N:<reason> with N the exact number of refusals"
+    )
 }
 
 /// The waivers this merge job was given: `None` when `LAGENT_WAIVERS_FILE` is not set, which is every run that is not a
@@ -1897,11 +2037,21 @@ fn merge_waivers() -> Result<Option<Vec<Waiver>>, String> {
 /// The diffgate call of the step and the one line it prints about the merge waivers. A forwarded reason is passed through
 /// unchanged, so diffgate's counted form `RULE=N:reason` reaches it byte for byte; the quotes are the shell's problem
 /// (`shell_quote`), since the step runs its command through `bash -c`.
-fn diffgate_with_waivers(base: &str, waivers: &[Waiver], rules: &[String]) -> (String, String) {
+///
+/// A waiver of a rule the list marks `counted` that is not in counted form is refused here, with the builder: the command
+/// then holds no `--allow`, and the second value is the reason the step must not run diffgate at all. The invariant does
+/// not depend on a call site remembering to check it.
+fn diffgate_with_waivers(
+    base: &str,
+    waivers: &[Waiver],
+    rules: &[ForwardRule],
+) -> (String, Option<String>, String) {
     let mut cmd = format!("diffgate --repo . --base {base}");
-    let (fwd, kept): (Vec<&Waiver>, Vec<&Waiver>) =
-        waivers.iter().partition(|w| rules.contains(&w.rule));
-    for w in &fwd {
+    let halt = uncounted_waiver(waivers, rules).map(counted_waiver_refusal);
+    let (fwd, kept): (Vec<&Waiver>, Vec<&Waiver>) = waivers
+        .iter()
+        .partition(|w| rules.iter().any(|r| r.rule == w.rule));
+    for w in fwd.iter().filter(|_| halt.is_none()) {
         cmd.push_str(&format!(
             " --allow {}",
             shell_quote(&format!("{}={}", w.rule, w.reason))
@@ -1934,7 +2084,185 @@ fn diffgate_with_waivers(base: &str, waivers: &[Waiver], rules: &[String]) -> (S
         fwd.len(),
         kept.len()
     );
-    (cmd, summary)
+    (cmd, halt, summary)
+}
+
+/// The per-run directory of `check-fast`, taken away with this value: the trap that removes it on every exit, in
+/// the form Rust has. Until now only the last statement of a run that reached its end removed it, so a check that left
+/// early — a step it could not start, a proof toolchain it could not read, a panic — left `check-fast-<pid>` in `$TMPDIR`
+/// behind. `$TMPDIR` is the run's own folder under `~/scratch/tmp` (set at the top of `scripts/check-fast`), and a box that
+/// keeps its checks keeps the leftovers too. The one exit no guard covers is a signal that kills the check itself: nothing
+/// of a dead process runs afterwards.
+struct RunDir(PathBuf);
+
+impl Drop for RunDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// What `self_copy` wrote, as it wrote it: the length and an FNV-1a 64 hash of the bytes it copied. Checked once
+/// more by `verify_self_copy`, right before the first step execs the copy, so a copy that anything else wrote to between the
+/// two is not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CopyId {
+    len: u64,
+    hash: u64,
+}
+
+fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Creates the directory a `check-fast` run lives in, `base/check-fast-<pid>`, as a directory this run made and nobody else
+/// can write. `base` is `temp_dir()`, which is `$TMPDIR` and so the caller's: a relative one, or `/`, is refused
+/// before anything is made. The directory is made with `mkdir(2)` at mode 0700 and never with `create_dir_all`, which
+/// reports success for a directory that is already there — and follows a symlink to one — so a name planted in a shared
+/// `/tmp` before the run (the pid is guessable) used to be accepted, and the copy of the tool the steps exec was then written
+/// into a place another process could write. An existing path of any kind fails the check; it is never reused. After the
+/// call, what stands there is looked at once with `lstat`: a real directory, owned by this uid, no group or world bits.
+/// `RunDir` takes it away only when this has returned `Ok`, so a failure removes nothing.
+fn make_run_dir(base: &Path, pid: u32) -> Result<PathBuf, String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if !base.is_absolute() || base.parent().is_none() {
+        return Err(format!(
+            "{}: the temp directory must be an absolute path other than / (TMPDIR); refusing to make the run directory there",
+            base.display()
+        ));
+    }
+    let dir = base.join(format!("check-fast-{pid}"));
+    match fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(format!(
+                "{}: already exists; a run never reuses a directory it did not make (remove it if it is a leftover)",
+                dir.display()
+            ));
+        }
+        Err(e) => return Err(format!("{}: {e}", dir.display())),
+    }
+    let m = fs::symlink_metadata(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // SAFETY: geteuid(2) takes no argument and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if !m.file_type().is_dir() || m.file_type().is_symlink() {
+        return Err(format!(
+            "{}: not a real directory after it was made",
+            dir.display()
+        ));
+    }
+    if m.uid() != me {
+        return Err(format!(
+            "{}: owned by uid {}, not by this run's uid {me}",
+            dir.display(),
+            m.uid()
+        ));
+    }
+    if m.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{}: mode {:o} gives group or world access",
+            dir.display(),
+            m.mode() & 0o7777
+        ));
+    }
+    Ok(dir)
+}
+
+/// A copy of this executable, under the run's own directory: the binary every step of a `check-fast` is started from
+/// The tool lives at one path every worktree shares, and the launcher installs a new build into it by rename
+/// while another check may already be running; that rename takes the name away from the process that was started from it,
+/// and each step of the check is this same binary re-started as `__inner`. A copy made once, at the start, belongs to this
+/// run alone and no rebuild can reach it. The copy is chosen over keying the installed binary by its source id, because an
+/// id only separates *different* sources — a merge and its own lane build the same source and would still replace each other
+/// — and it is a copy and not a link, so that no write of another build reaches the bytes a step starts from, through the
+/// name or through the inode.
+///
+/// The copy is written with `O_EXCL` at mode 0700 into a `bin` directory made the same way (`make_run_dir` made the
+/// run's), so a name that is already there fails instead of being followed or overwritten, and nothing but this user can
+/// open it for writing. Its length and hash are returned, and `verify_self_copy` looks at them again before the first step.
+fn self_copy(dir: &Path) -> Result<(PathBuf, CopyId), String> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let from = std::env::current_exe().map_err(|e| format!("this program: {e}"))?;
+    let bin = dir.join("bin");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&bin)
+        .map_err(|e| format!("{}: {e}", bin.display()))?;
+    let to = bin.join("lucina-ci");
+    let mut src = fs::File::open(&from).map_err(|e| format!("{}: {e}", from.display()))?;
+    let mut dst = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&to)
+        .map_err(|e| format!("{}: {e}", to.display()))?;
+    let mut buf = vec![0u8; 1 << 16];
+    let (mut len, mut hash) = (0u64, FNV_BASIS);
+    loop {
+        let n = src
+            .read(&mut buf)
+            .map_err(|e| format!("{}: {e}", from.display()))?;
+        if n == 0 {
+            break;
+        }
+        dst.write_all(&buf[..n])
+            .map_err(|e| format!("{}: {e}", to.display()))?;
+        len += n as u64;
+        hash = fnv1a(hash, &buf[..n]);
+    }
+    dst.sync_all()
+        .map_err(|e| format!("{}: {e}", to.display()))?;
+    Ok((to, CopyId { len, hash }))
+}
+
+/// The copy is still the file `self_copy` wrote: a regular file (not a link), no group or world write, and the length and hash
+/// recorded when it was written. A mismatch fails the check before any step runs.
+fn verify_self_copy(path: &Path, id: CopyId) -> Result<(), String> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !m.file_type().is_file() {
+        return Err(format!(
+            "{}: the tool copy is not a regular file any more",
+            path.display()
+        ));
+    }
+    if m.mode() & 0o022 != 0 {
+        return Err(format!(
+            "{}: the tool copy became writable by others",
+            path.display()
+        ));
+    }
+    let mut f = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut buf = vec![0u8; 1 << 16];
+    let (mut len, mut hash) = (0u64, FNV_BASIS);
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        len += n as u64;
+        hash = fnv1a(hash, &buf[..n]);
+    }
+    if (CopyId { len, hash }) != id {
+        return Err(format!(
+            "{}: the tool copy changed after it was written (length {} hash {:016x}, written as length {} hash {:016x}); refusing to run its steps",
+            path.display(),
+            len,
+            hash,
+            id.len,
+            id.hash
+        ));
+    }
+    Ok(())
 }
 
 /// `check-fast [--base REF] [--proofs] [--all-proofs] [--mutants] [--no-build]`
@@ -2012,10 +2340,13 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
         changed.len()
     );
     let b = runner::budget(a.num("--mem-cap-gib", 8)?, None, runner::mem_total()?)?;
-    let out = std::env::temp_dir()
-        .join(format!("check-fast-{}", std::process::id()))
-        .display()
-        .to_string();
+    // Where this run lives while it runs: the directory `--out` names for the step reports and the proof json, the copy of
+    // this binary its steps start from, and nothing else. It goes with the run however the run ended (`RunDir`).
+    let out_dir = make_run_dir(&std::env::temp_dir(), std::process::id())?;
+    let _out_dir = RunDir(out_dir.clone());
+    let out = out_dir.display().to_string();
+    let (own_copy, copy_id) = self_copy(&out_dir)?;
+    runner::install_step_exe(own_copy.clone());
     let none = runner::Toolchain {
         verus: String::new(),
         version: String::new(),
@@ -2042,6 +2373,9 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
         Ok(())
     };
 
+    // Once, right before the first step execs it: the copy is still what was written.
+    verify_self_copy(&own_copy, copy_id)?;
+
     if tool_exists("diffgate") {
         // With no LAGENT_WAIVERS_FILE the command is the plain one this step has always run (finding GATE-01).
         match merge_waivers() {
@@ -2049,15 +2383,34 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
                 "diffgate",
                 &format!("diffgate --repo . --base {base}"),
                 "script",
-                60,
+                DIFFGATE_STEP_TIMEOUT_S,
                 &none,
                 &mut failed,
             )?,
             Ok(Some(ws)) => {
-                let (cmd, summary) =
-                    diffgate_with_waivers(&base, &ws, &forwarded_waiver_rules(&root));
-                println!("{summary}");
-                step("diffgate", &cmd, "script", 60, &none, &mut failed)?;
+                // A list this step cannot read exactly, or a waiver that breaks a condition the list puts on its rule
+                // (`counted`: only `N:reason` travels), fails the step and diffgate never runs with a partial list.
+                let cmd = match forwarded_waiver_rules(&root) {
+                    Err(e) => {
+                        let m = format!("diffgate waivers: {e}: refusing, nothing is waived");
+                        format!("echo {} >&2; exit 1", shell_quote(&m))
+                    }
+                    Ok(list) => match diffgate_with_waivers(&base, &ws, &list) {
+                        (_, Some(m), _) => format!("echo {} >&2; exit 1", shell_quote(&m)),
+                        (cmd, None, summary) => {
+                            println!("{summary}");
+                            cmd
+                        }
+                    },
+                };
+                step(
+                    "diffgate",
+                    &cmd,
+                    "script",
+                    DIFFGATE_STEP_TIMEOUT_S,
+                    &none,
+                    &mut failed,
+                )?;
             }
             // A waivers file this step cannot read exactly is not a reason to waive nothing quietly: the step fails,
             // diffgate never runs, and the message says which line of which file is what.
@@ -2070,7 +2423,7 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
                     ))
                 ),
                 "script",
-                60,
+                DIFFGATE_STEP_TIMEOUT_S,
                 &none,
                 &mut failed,
             )?,
@@ -2084,6 +2437,16 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
         .iter()
         .filter_map(|p| fast::owner_of(&root, &members, p))
         .collect();
+    let standalone = owners
+        .iter()
+        .filter(|o| matches!(o, fast::Owner::Standalone(_)))
+        .count();
+    if merge_gate && standalone > budget::ASSUMED_STANDALONE_CRATES {
+        println!(
+            "check-fast: this change touches {standalone} standalone crates; the merge-gate budget (`lucina-ci merge-gate-budget`, outer limit timeout_min in .lucina/pipeline.toml) assumes {}, so the gate may be killed by the outer limit",
+            budget::ASSUMED_STANDALONE_CRATES
+        );
+    }
     for o in &owners {
         if let fast::Owner::Other(d) = o {
             skipped.push(format!(
@@ -2109,7 +2472,7 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
                 "shellcheck",
                 &format!("shellcheck -S error {}", sh.join(" ")),
                 "script",
-                30,
+                SHELLCHECK_STEP_TIMEOUT_S,
                 &none,
                 &mut failed,
             )?;
@@ -2122,7 +2485,7 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
             "actionlint",
             "actionlint -color=false .github/workflows/*.yml",
             "script",
-            30,
+            ACTIONLINT_STEP_TIMEOUT_S,
             &none,
             &mut failed,
         )?;
@@ -2143,23 +2506,39 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
             let cmd = format!(
                 "for f in {list}; do gitleaks dir --no-banner --redact {config} \"$f\" || exit 1; done"
             );
-            step("secrets", &cmd, "script", 60, &none, &mut failed)?;
+            step(
+                "secrets",
+                &cmd,
+                "script",
+                SECRETS_STEP_TIMEOUT_S,
+                &none,
+                &mut failed,
+            )?;
         }
     } else {
         skipped.push("secret scan: gitleaks not installed here".into());
     }
 
-    // The proofs the change reaches. Inventory first: a new proof must be listed.
-    let exe = std::env::current_exe()
-        .map_err(|e| e.to_string())?
-        .display()
-        .to_string();
+    // The proofs the change reaches. Inventory first: a new proof must be listed. These steps are this program started
+    // again by name, so the name is the run's own copy, not the path the check happened to be launched from.
+    let exe = own_copy.display().to_string();
+    // A merge that edits the pipeline file is checked against the budget the gate's outer limit must hold.
+    if merge_gate && budget::pipeline_changed(&changed) {
+        step(
+            "merge-gate-budget",
+            &format!("{exe} merge-gate-budget"),
+            "script",
+            MERGE_GATE_BUDGET_STEP_TIMEOUT_S,
+            &none,
+            &mut failed,
+        )?;
+    }
     if root.join(inventory::INVENTORY).exists() {
         step(
             "inventory",
             &format!("{exe} inventory --check"),
             "script",
-            30,
+            INVENTORY_STEP_TIMEOUT_S,
             &none,
             &mut failed,
         )?;
@@ -2171,7 +2550,7 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
                 if merge_gate { " --merge-gate" } else { "" }
             ),
             "script",
-            60,
+            SPEC_STEP_TIMEOUT_S,
             &none,
             &mut failed,
         )?;
@@ -2183,7 +2562,7 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
                 if merge_gate { " --merge-gate" } else { "" }
             ),
             "script",
-            300,
+            ROLES_STEP_TIMEOUT_S,
             &none,
             &mut failed,
         )?;
@@ -2198,7 +2577,7 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
             "trust",
             &format!("{exe} trust --check --base {base}"),
             "script",
-            60,
+            TRUST_STEP_TIMEOUT_S,
             &none,
             &mut failed,
         )?;
@@ -2298,7 +2677,6 @@ fn cmd_check_fast(a: &Args) -> Result<i32, String> {
             }
         }
     }
-    let _ = fs::remove_dir_all(&out);
     for s in &skipped {
         println!("skipped  {s}");
     }
@@ -2372,6 +2750,126 @@ fn cmd_perf(a: &Args) -> Result<i32, String> {
         bad += !ok as i32;
     }
     Ok((bad > 0) as i32)
+}
+
+#[cfg(test)]
+mod run_dir_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+    /// A scratch directory of this test alone, removed on every exit, panics included.
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn new(tag: &str) -> Tmp {
+            let d = std::env::temp_dir().join(format!("rundir-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&d);
+            fs::create_dir_all(&d).unwrap();
+            Tmp(d)
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn the_run_directory_is_new_private_and_ours() {
+        let t = Tmp::new("ok");
+        let d = make_run_dir(&t.0, 4242).unwrap();
+        assert_eq!(d, t.0.join("check-fast-4242"));
+        let m = fs::symlink_metadata(&d).unwrap();
+        assert!(m.is_dir());
+        assert_eq!(m.mode() & 0o777, 0o700, "no group or world bits");
+    }
+
+    #[test]
+    fn a_run_directory_that_already_exists_fails_the_check_and_is_left_alone() {
+        let t = Tmp::new("exists");
+        let pre = t.0.join("check-fast-7");
+        fs::create_dir(&pre).unwrap();
+        fs::write(pre.join("theirs"), "x").unwrap();
+        let e = make_run_dir(&t.0, 7).unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+        assert!(pre.join("theirs").exists(), "never reused, never emptied");
+    }
+
+    #[test]
+    fn a_symlink_in_place_of_the_run_directory_fails_and_its_target_is_untouched() {
+        let t = Tmp::new("link");
+        let target = t.0.join("elsewhere");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, t.0.join("check-fast-9")).unwrap();
+        let e = make_run_dir(&t.0, 9).unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+        assert!(fs::read_dir(&target).unwrap().next().is_none());
+        // a dangling link is refused the same way
+        symlink(t.0.join("nowhere"), t.0.join("check-fast-10")).unwrap();
+        assert!(make_run_dir(&t.0, 10).is_err());
+    }
+
+    #[test]
+    fn a_relative_or_root_temp_dir_is_refused_before_anything_is_made() {
+        assert!(make_run_dir(Path::new(""), 1).is_err());
+        assert!(make_run_dir(Path::new("relative/tmp"), 1).is_err());
+        assert!(make_run_dir(Path::new(".."), 1).is_err());
+        let e = make_run_dir(Path::new("/"), 1).unwrap_err();
+        assert!(e.contains("other than /"), "{e}");
+        assert!(!Path::new("/check-fast-1").exists());
+    }
+
+    #[test]
+    fn the_tool_copy_is_exclusive_private_and_checked_before_it_is_run() {
+        let t = Tmp::new("copy");
+        let d = make_run_dir(&t.0, 11).unwrap();
+        let (copy, id) = self_copy(&d).unwrap();
+        let m = fs::symlink_metadata(&copy).unwrap();
+        assert!(m.is_file());
+        assert_eq!(m.mode() & 0o077, 0, "no group or world bits");
+        assert_eq!(m.len(), id.len);
+        verify_self_copy(&copy, id).unwrap();
+        // a second copy into the same directory fails: the name is never overwritten
+        assert!(self_copy(&d).is_err());
+        assert_eq!(fs::metadata(&copy).unwrap().len(), id.len);
+    }
+
+    #[test]
+    fn a_tampered_tool_copy_fails_the_check_by_content_by_length_and_by_link() {
+        let t = Tmp::new("tamper");
+        let d = make_run_dir(&t.0, 12).unwrap();
+        let (copy, id) = self_copy(&d).unwrap();
+        let good = fs::read(&copy).unwrap();
+        // one byte flipped, same length
+        let mut bad = good.clone();
+        bad[0] ^= 0xff;
+        fs::write(&copy, &bad).unwrap();
+        assert!(verify_self_copy(&copy, id).unwrap_err().contains("changed"));
+        // appended
+        let mut longer = good.clone();
+        longer.push(0);
+        fs::write(&copy, &longer).unwrap();
+        assert!(verify_self_copy(&copy, id).is_err());
+        // replaced by a symlink to a file with the right bytes
+        let real = t.0.join("real");
+        fs::write(&real, &good).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_file(&copy).unwrap();
+        symlink(&real, &copy).unwrap();
+        assert!(
+            verify_self_copy(&copy, id)
+                .unwrap_err()
+                .contains("regular file")
+        );
+        // made writable by others
+        fs::remove_file(&copy).unwrap();
+        fs::write(&copy, &good).unwrap();
+        fs::set_permissions(&copy, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            verify_self_copy(&copy, id)
+                .unwrap_err()
+                .contains("writable")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2625,12 +3123,34 @@ mod tests {
                               passed; the same assertions run against the in-process Fake; the ignored variants run in a \
                               scheduled non-gating job; WM-C004 / GAL-01; coordinator allow 2026-11-17";
 
-    fn rules(skipped: bool) -> Vec<String> {
+    fn rules(skipped: bool) -> Vec<ForwardRule> {
         if skipped {
-            vec!["skipped-test".to_string()]
+            plain_list(&["skipped-test"])
         } else {
             vec![]
         }
+    }
+
+    /// A forwarding list of the given rules, every one a plain line (either form travels).
+    fn plain_list(rules: &[&str]) -> Vec<ForwardRule> {
+        rules
+            .iter()
+            .map(|r| ForwardRule {
+                rule: (*r).to_string(),
+                counted_only: false,
+            })
+            .collect()
+    }
+
+    /// A forwarding list of the given rules, every one of them marked `counted`.
+    fn counted_list(rules: &[&str]) -> Vec<ForwardRule> {
+        rules
+            .iter()
+            .map(|r| ForwardRule {
+                rule: (*r).to_string(),
+                counted_only: true,
+            })
+            .collect()
     }
 
     /// The repository this test file sits in: the rules list is data, so the tests read the real one.
@@ -2730,7 +3250,7 @@ mod tests {
             w.reason, reason,
             "the escapes of the file are the reason's own characters"
         );
-        let (cmd, summary) = diffgate_with_waivers("abc123", &[w], &rules(true));
+        let (cmd, _halt, summary) = diffgate_with_waivers("abc123", &[w], &rules(true));
         assert_eq!(
             cmd,
             "diffgate --repo . --base abc123 --allow 'skipped-test=7:seven tests are #[ignore = \"slow\"]; see a/b'"
@@ -2744,7 +3264,7 @@ mod tests {
     #[test]
     fn an_uncounted_waiver_is_forwarded_with_its_reason_unchanged() {
         let w = parse_waiver_line(&waiver_line("skipped-test", GAL_REASON)).unwrap();
-        let (cmd, summary) = diffgate_with_waivers("2ef62d3b", &[w], &rules(true));
+        let (cmd, _halt, summary) = diffgate_with_waivers("2ef62d3b", &[w], &rules(true));
         assert!(
             cmd.starts_with("diffgate --repo . --base 2ef62d3b --allow 'skipped-test=")
                 && cmd.ends_with("'"),
@@ -2776,8 +3296,11 @@ mod tests {
             ))
             .unwrap(),
         ];
-        let (cmd, summary) =
-            diffgate_with_waivers("abc123", &ws, &forwarded_waiver_rules(&this_repo()));
+        let (cmd, _halt, summary) = diffgate_with_waivers(
+            "abc123",
+            &ws,
+            &forwarded_waiver_rules(&this_repo()).unwrap(),
+        );
         assert_eq!(
             cmd, "diffgate --repo . --base abc123",
             "the plain command, as today"
@@ -2791,12 +3314,12 @@ mod tests {
     /// The list is data: whatever it names is forwarded, so a rule added later is covered by this test and needs no code.
     #[test]
     fn every_rule_of_the_forwarding_list_is_forwarded() {
-        let list = forwarded_waiver_rules(&this_repo());
+        let list = forwarded_waiver_rules(&this_repo()).unwrap();
         assert!(!list.is_empty(), "{WAIVER_RULES_FILE} reads as empty");
-        for r in &list {
+        for r in list.iter().map(|r| r.rule.as_str()) {
             let reason = "5:five of them; the coordinator allow of today";
             let w = parse_waiver_line(&waiver_line(r, reason)).unwrap();
-            let (cmd, summary) = diffgate_with_waivers("abc123", &[w], &list);
+            let (cmd, _halt, summary) = diffgate_with_waivers("abc123", &[w], &list);
             assert_eq!(
                 cmd,
                 format!("diffgate --repo . --base abc123 --allow '{r}={reason}'"),
@@ -2810,20 +3333,163 @@ mod tests {
     }
 
     #[test]
-    fn the_forwarding_list_holds_skipped_test_and_nothing_else_today() {
-        assert_eq!(
-            forwarded_waiver_rules(&this_repo()),
-            vec!["skipped-test".to_string()]
+    fn the_forwarding_list_holds_skipped_test_plain_and_test_removed_counted() {
+        let list = forwarded_waiver_rules(&this_repo()).unwrap();
+        let held: Vec<(&str, bool)> = list
+            .iter()
+            .map(|r| (r.rule.as_str(), r.counted_only))
+            .collect();
+        assert_eq!(held, vec![("skipped-test", false), ("test-removed", true)]);
+    }
+
+    /// A list line is a rule name and at most the word `counted`; comments and blank lines carry no rule.
+    #[test]
+    fn a_plain_list_line_names_a_rule_with_no_marker() {
+        let list = parse_waiver_rules(
+            "# a comment\n\n  skipped-test  \n",
+            Path::new(WAIVER_RULES_FILE),
+        )
+        .unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].rule, "skipped-test");
+        assert!(
+            !list[0].counted_only,
+            "a plain line forwards both forms, as it always did"
         );
+    }
+
+    #[test]
+    fn the_counted_marker_is_read_off_the_line() {
+        let list =
+            parse_waiver_rules("test-removed counted\n", Path::new(WAIVER_RULES_FILE)).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].rule, "test-removed");
+        assert!(list[0].counted_only);
+    }
+
+    #[test]
+    fn an_unknown_marker_on_a_list_line_is_an_error() {
+        let e = parse_waiver_rules(
+            "skipped-test\ntest-removed sometimes\n",
+            Path::new(WAIVER_RULES_FILE),
+        )
+        .expect_err("a marker the step does not know is not read as no marker");
+        assert!(e.contains("line 2"), "the line is named: {e}");
+        assert!(e.contains("sometimes"), "the word is named: {e}");
+        assert!(e.contains("test-removed"), "the rule is named: {e}");
+    }
+
+    #[test]
+    fn a_second_marker_on_a_list_line_is_an_error() {
+        let e = parse_waiver_rules("test-removed counted once\n", Path::new(WAIVER_RULES_FILE))
+            .expect_err("a line holds at most one marker");
+        assert!(e.contains("once"), "the word is named: {e}");
+    }
+
+    /// The counted form: digits and the colon after them, of at least one refusal.
+    #[test]
+    fn the_counted_form_is_digits_then_a_colon_of_at_least_one() {
+        for r in ["2:two tests", "1:one", "42:many"] {
+            assert!(counted_reason(r), "{r} is counted");
+        }
+        for r in [
+            "two tests",
+            "0:none of them",
+            ":no count",
+            "2 two",
+            " 2:leading space",
+            "two",
+        ] {
+            assert!(!counted_reason(r), "{r} is not counted");
+        }
+    }
+
+    /// `skipped-test` stays a plain line: both forms travel, no condition.
+    #[test]
+    fn a_plain_rule_travels_in_both_forms_and_is_never_refused() {
+        let list = plain_list(&["skipped-test"]);
+        for reason in ["the lead checked each one", "3:three of them"] {
+            let w = parse_waiver_line(&waiver_line("skipped-test", reason)).unwrap();
+            assert_eq!(uncounted_waiver(std::slice::from_ref(&w), &list), None);
+            let (cmd, _halt, _summary) = diffgate_with_waivers("abc123", &[w], &list);
+            assert!(
+                cmd.ends_with(&format!(" --allow 'skipped-test={reason}'")),
+                "{reason} travels unchanged: {cmd}"
+            );
+        }
+    }
+
+    /// `test-removed` is count-exact: only `N:reason` travels, an uncounted waiver of it is refused.
+    #[test]
+    fn a_counted_rule_refuses_an_uncounted_waiver() {
+        let list = counted_list(&["test-removed"]);
+        let w = parse_waiver_line(&waiver_line("test-removed", "two tests deleted")).unwrap();
+        let ws = [w];
+        let rule = uncounted_waiver(&ws, &list).expect("an uncounted waiver of a counted rule");
+        assert_eq!(rule, "test-removed");
+        assert_eq!(
+            counted_waiver_refusal(rule),
+            "diffgate waivers: test-removed is forwarded in counted form only: write --allow test-removed=N:<reason> with N the exact number of refusals"
+        );
+    }
+
+    /// The invariant lives with the builder: called directly, with an uncounted waiver of a counted rule beside a good
+    /// plain one, it adds no `--allow` at all and says why diffgate must not run.
+    #[test]
+    fn the_builder_itself_refuses_an_uncounted_waiver_of_a_counted_rule() {
+        let list = vec![
+            ForwardRule {
+                rule: "skipped-test".to_string(),
+                counted_only: false,
+            },
+            ForwardRule {
+                rule: "test-removed".to_string(),
+                counted_only: true,
+            },
+        ];
+        let ws = [
+            parse_waiver_line(&waiver_line("skipped-test", "the lead read each one")).unwrap(),
+            parse_waiver_line(&waiver_line("test-removed", "two tests deleted")).unwrap(),
+        ];
+        let (cmd, halt, _summary) = diffgate_with_waivers("abc123", &ws, &list);
+        assert_eq!(cmd, "diffgate --repo . --base abc123", "no partial list");
+        assert_eq!(
+            halt.expect("the builder says why diffgate must not run"),
+            counted_waiver_refusal("test-removed")
+        );
+    }
+
+    #[test]
+    fn a_counted_rule_forwards_its_counted_waiver_unchanged() {
+        let list = counted_list(&["test-removed"]);
+        let reason = "2:two obsolete tests deleted with the code they covered";
+        let w = parse_waiver_line(&waiver_line("test-removed", reason)).unwrap();
+        assert_eq!(uncounted_waiver(std::slice::from_ref(&w), &list), None);
+        let (cmd, _halt, summary) = diffgate_with_waivers("abc123", &[w], &list);
+        assert_eq!(
+            cmd,
+            format!("diffgate --repo . --base abc123 --allow 'test-removed={reason}'")
+        );
+        assert_eq!(
+            summary,
+            format!("diffgate waivers: 1 forwarded (test-removed: {reason}), 0 not forwarded")
+        );
+    }
+
+    #[test]
+    fn a_count_of_zero_is_not_a_count() {
+        let list = counted_list(&["test-removed"]);
+        let w = parse_waiver_line(&waiver_line("test-removed", "0:nothing was refused")).unwrap();
+        assert_eq!(uncounted_waiver(&[w], &list), Some("test-removed"));
     }
 
     #[test]
     fn a_list_that_is_not_there_forwards_nothing() {
         let w = parse_waiver_line(&waiver_line("skipped-test", "the reason")).unwrap();
-        let (cmd, summary) = diffgate_with_waivers(
+        let (cmd, _halt, summary) = diffgate_with_waivers(
             "abc123",
             &[w],
-            &forwarded_waiver_rules(Path::new("/nonexistent-root")),
+            &forwarded_waiver_rules(Path::new("/nonexistent-root")).unwrap(),
         );
         assert_eq!(cmd, "diffgate --repo . --base abc123");
         assert_eq!(
@@ -2839,7 +3505,7 @@ mod tests {
             parse_waiver_line(&waiver_line("skipped-test", GAL_REASON)).unwrap(),
             parse_waiver_line(&waiver_line("gate-change", "tools/ci/; coordinator allow")).unwrap(),
         ];
-        let (cmd, summary) = diffgate_with_waivers("38d67292", &ws, &rules(true));
+        let (cmd, _halt, summary) = diffgate_with_waivers("38d67292", &ws, &rules(true));
         assert_eq!(cmd.matches(" --allow ").count(), 1, "{cmd}");
         assert_eq!(
             summary,

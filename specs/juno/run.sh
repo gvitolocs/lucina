@@ -20,6 +20,23 @@
 #
 # tla-checker 0.24.11 note: an IF ... THEN ... ELSE used as a value in a /\ list nested in an outer IF's branch takes
 # the next aligned conjunct into its ELSE (TLC and tla-mc do not). These specs parenthesize such IFs; keep it so.
+
+# Refuse to run inside a lane worker. The helper is at ../../../scripts/lib here and at ../../scripts/lib where this folder is
+# published one level higher; the nearer one is tried first. If neither exists the script refuses to run.
+_ilw_d=$(dirname "$0")
+if [ -f "$_ilw_d/../../scripts/lib/in-lane-worker.sh" ]; then
+    . "$_ilw_d/../../scripts/lib/in-lane-worker.sh" || exit 75
+elif [ -f "$_ilw_d/../../../scripts/lib/in-lane-worker.sh" ]; then
+    . "$_ilw_d/../../../scripts/lib/in-lane-worker.sh" || exit 75
+else
+    echo "run.sh: scripts/lib/in-lane-worker.sh not found at ../../scripts/lib or ../../../scripts/lib; refusing to run" >&2
+    exit 75
+fi
+if in_lane_worker; then
+    echo "run.sh: refused inside a lane worker (proofs run on GitHub)" >&2
+    exit 75
+fi
+
 set -uo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)

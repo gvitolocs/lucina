@@ -10,8 +10,11 @@
 //! pass at a limit the default would have cut, since the table's numbers are minutes apart.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+mod common;
 
 fn copy_dir(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
@@ -50,10 +53,28 @@ fn git(d: &Path, args: &[&str]) {
     );
 }
 
+/// A stub goes in through a child, never from this thread: it is exec'd by the step, and a file this thread still holds open
+/// for writing makes that exec answer "Text file busy" (ETXTBSY) when another thread forks at the same moment, after which
+/// the shell goes on to the next `diffgate` on PATH, the real one. The same helper in SecretaryIOS explains the measurement.
+fn write_exec(path: &Path, script: &str) {
+    let mut child = Command::new("sh")
+        .args(["-c", "cat > \"$1\" && chmod 0755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut w = child.stdin.take().unwrap();
+    w.write_all(script.as_bytes()).unwrap();
+    drop(w);
+    assert!(
+        child.wait().unwrap().success(),
+        "sh cannot write {}: the stand-in is never exec'd",
+        path.display()
+    );
+}
+
 fn stub(dir: &Path, name: &str, body: &str) {
-    let p = dir.join(name);
-    fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-    Command::new("chmod").arg("+x").arg(&p).status().unwrap();
+    write_exec(&dir.join(name), &format!("#!/bin/sh\n{body}\n"));
 }
 
 /// A repository whose `main` is empty and whose `work` branch adds this crate: the whole crate is then "changed", which is
@@ -139,6 +160,11 @@ fn step_line<'a>(out: &'a str, name: &str) -> &'a str {
 /// never above the step's own timeout.
 #[test]
 fn merge_gate_prints_each_step_s_own_limit_and_keeps_180_for_the_rest() {
+    if common::skip_without_scope(
+        "merge_gate_prints_each_step_s_own_limit_and_keeps_180_for_the_rest",
+    ) {
+        return;
+    }
     let (repo, bin) = setup("limits", "0.2", "0.2", "0.2");
     let (_code, out) = run(&repo, &bin, None);
     assert!(
@@ -171,6 +197,11 @@ fn merge_gate_prints_each_step_s_own_limit_and_keeps_180_for_the_rest() {
 /// timeout is still a failure that names its own limit, never a skip.
 #[test]
 fn merge_gate_a_step_with_a_larger_limit_passes_where_the_default_cuts_it() {
+    if common::skip_without_scope(
+        "merge_gate_a_step_with_a_larger_limit_passes_where_the_default_cuts_it",
+    ) {
+        return;
+    }
     let (repo, bin) = setup("bigger", "1.5", "1.5", "1.5");
     let (code, out) = run(&repo, &bin, Some("1,unit-tests-tools-ci-lucina-ci=3"));
     assert_ne!(code, 0, "two steps timed out: {out}");
@@ -204,6 +235,11 @@ fn merge_gate_a_step_with_a_larger_limit_passes_where_the_default_cuts_it() {
 /// line rather than from a merge that failed.
 #[test]
 fn merge_gate_a_step_past_eighty_percent_of_its_limit_prints_near_limit() {
+    if common::skip_without_scope(
+        "merge_gate_a_step_past_eighty_percent_of_its_limit_prints_near_limit",
+    ) {
+        return;
+    }
     let (repo, bin) = setup("near", "5.0", "0", "0");
     let (_code, out) = run(&repo, &bin, Some("10,unit-tests-tools-ci-lucina-ci=6"));
     let line = step_line(&out, "unit-tests-tools-ci-lucina-ci");

@@ -5,6 +5,14 @@
 #   `... //@omit`   is dropped (a derive Verus does not check, and that holds no logic)
 #   `//@ proof`     becomes `proof`
 # Run through verify-gate: verify-gate -- scripts/verify-shipped.sh
+
+# Refuse to run inside a lane worker.
+. "$(dirname "$0")/lib/in-lane-worker.sh" || exit 75
+if in_lane_worker; then
+    echo "verify-shipped.sh: refused inside a lane worker (proofs run on GitHub)" >&2
+    exit 75
+fi
+
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
